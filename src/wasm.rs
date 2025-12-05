@@ -64,14 +64,17 @@ pub fn run_simulation(config_json: &str) -> Result<JsValue, JsValue> {
 
     let result = SimulationResult {
         metrics: MetricsData {
+            ttft_min: summary.ttft_min,
             ttft_mean: summary.ttft_mean,
             ttft_p50: summary.ttft_p50,
             ttft_p90: summary.ttft_p90,
             ttft_p99: summary.ttft_p99,
+            e2e_min: summary.e2e_min,
             e2e_mean: summary.e2e_mean,
             e2e_p50: summary.e2e_p50,
             e2e_p90: summary.e2e_p90,
             e2e_p99: summary.e2e_p99,
+            per_token_min: summary.per_token_min,
             per_token_mean: summary.per_token_mean,
             per_token_p50: summary.per_token_p50,
             per_token_p90: summary.per_token_p90,
@@ -245,14 +248,17 @@ pub fn run_simulation_streaming(config_json: &str, progress_callback: &Function)
 
     let result = SimulationResult {
         metrics: MetricsData {
+            ttft_min: summary.ttft_min,
             ttft_mean: summary.ttft_mean,
             ttft_p50: summary.ttft_p50,
             ttft_p90: summary.ttft_p90,
             ttft_p99: summary.ttft_p99,
+            e2e_min: summary.e2e_min,
             e2e_mean: summary.e2e_mean,
             e2e_p50: summary.e2e_p50,
             e2e_p90: summary.e2e_p90,
             e2e_p99: summary.e2e_p99,
+            per_token_min: summary.per_token_min,
             per_token_mean: summary.per_token_mean,
             per_token_p50: summary.per_token_p50,
             per_token_p90: summary.per_token_p90,
@@ -320,14 +326,17 @@ struct SimulationResult {
 
 #[derive(Serialize, Deserialize)]
 struct MetricsData {
+    ttft_min: f64,
     ttft_mean: f64,
     ttft_p50: f64,
     ttft_p90: f64,
     ttft_p99: f64,
+    e2e_min: f64,
     e2e_mean: f64,
     e2e_p50: f64,
     e2e_p90: f64,
     e2e_p99: f64,
+    per_token_min: f64,
     per_token_mean: f64,
     per_token_p50: f64,
     per_token_p90: f64,

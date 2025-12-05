@@ -28,20 +28,18 @@ block_size = 16
 [workload]
 arrival_pattern = "closed_loop"
 arrival_rate = 1.0              # Not used for closed_loop, but required by config
-num_concurrent_users = 1000     # 64 concurrent users (matches blog post benchmark)
-num_requests = 1000             # 10 requests per user for steady state
+num_concurrent_users = 64       # 64 concurrent users (matches blog post benchmark)
+num_requests = 640              # 10 requests per user for steady state
 seed = 42
 
-# Fixed sequence lengths for easier comparison
+# Fixed sequence lengths for easier comparison (ISL=1024, OSL=1024)
 [workload.input_len_dist]
-type = "lognormal"
-mean = 6
-std_dev = 0.1
+type = "fixed"
+value = 1024
 
 [workload.output_len_dist]
-type = "lognormal"
-mean = 6
-std_dev = 0.1
+type = "fixed"
+value = 1024
 
 [simulation]
 log_interval = 10

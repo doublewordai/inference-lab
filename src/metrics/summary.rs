@@ -2,16 +2,19 @@
 #[derive(Debug)]
 pub struct MetricsSummary {
     // Latency metrics (in milliseconds)
+    pub ttft_min: f64,
     pub ttft_mean: f64,
     pub ttft_p50: f64,
     pub ttft_p90: f64,
     pub ttft_p99: f64,
 
+    pub e2e_min: f64,
     pub e2e_mean: f64,
     pub e2e_p50: f64,
     pub e2e_p90: f64,
     pub e2e_p99: f64,
 
+    pub per_token_min: f64,
     pub per_token_mean: f64,
     pub per_token_p50: f64,
     pub per_token_p90: f64,
@@ -53,16 +56,16 @@ impl MetricsSummary {
 
         println!("Latency Metrics (ms):");
         println!(
-            "  TTFT: mean={:.2}, p50={:.2}, p90={:.2}, p99={:.2}",
-            self.ttft_mean, self.ttft_p50, self.ttft_p90, self.ttft_p99
+            "  TTFT: min={:.2}, mean={:.2}, p50={:.2}, p90={:.2}, p99={:.2}",
+            self.ttft_min, self.ttft_mean, self.ttft_p50, self.ttft_p90, self.ttft_p99
         );
         println!(
-            "  E2E:  mean={:.2}, p50={:.2}, p90={:.2}, p99={:.2}",
-            self.e2e_mean, self.e2e_p50, self.e2e_p90, self.e2e_p99
+            "  E2E:  min={:.2}, mean={:.2}, p50={:.2}, p90={:.2}, p99={:.2}",
+            self.e2e_min, self.e2e_mean, self.e2e_p50, self.e2e_p90, self.e2e_p99
         );
         println!(
-            "  Per-token: mean={:.2}, p50={:.2}, p90={:.2}, p99={:.2}",
-            self.per_token_mean, self.per_token_p50, self.per_token_p90, self.per_token_p99
+            "  Per-token: min={:.2}, mean={:.2}, p50={:.2}, p90={:.2}, p99={:.2}",
+            self.per_token_min, self.per_token_mean, self.per_token_p50, self.per_token_p90, self.per_token_p99
         );
 
         println!("\nThroughput Metrics:");

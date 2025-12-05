@@ -220,16 +220,19 @@ impl MetricsCollector {
 
         MetricsSummary {
             // Latency (convert to milliseconds) - use streaming quantiles for O(1) lookups
+            ttft_min: self.ttft_quantiles.min() * 1000.0,
             ttft_mean: self.ttft_quantiles.mean() * 1000.0,
             ttft_p50: self.ttft_quantiles.p50() * 1000.0,
             ttft_p90: self.ttft_quantiles.p90() * 1000.0,
             ttft_p99: self.ttft_quantiles.p99() * 1000.0,
 
+            e2e_min: self.e2e_quantiles.min() * 1000.0,
             e2e_mean: self.e2e_quantiles.mean() * 1000.0,
             e2e_p50: self.e2e_quantiles.p50() * 1000.0,
             e2e_p90: self.e2e_quantiles.p90() * 1000.0,
             e2e_p99: self.e2e_quantiles.p99() * 1000.0,
 
+            per_token_min: self.per_token_quantiles.min() * 1000.0,
             per_token_mean: self.per_token_quantiles.mean() * 1000.0,
             per_token_p50: self.per_token_quantiles.p50() * 1000.0,
             per_token_p90: self.per_token_quantiles.p90() * 1000.0,

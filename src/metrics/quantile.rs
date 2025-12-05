@@ -126,6 +126,18 @@ impl StreamingQuantiles {
         q_i + d * (q_id - q_i) / (n_id - n_i)
     }
 
+    pub fn min(&self) -> f64 {
+        if self.count == 0 {
+            0.0
+        } else if self.count < 11 {
+            self.markers[..self.count]
+                .iter()
+                .fold(f64::INFINITY, |a, &b| a.min(b))
+        } else {
+            self.markers[0]
+        }
+    }
+
     pub fn p50(&self) -> f64 {
         if self.count < 11 {
             self.fallback_quantile(0.50)

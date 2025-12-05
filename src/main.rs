@@ -66,6 +66,8 @@ impl Args {
 struct LatencyRow {
     #[tabled(rename = "Metric")]
     metric: String,
+    #[tabled(rename = "Min")]
+    min: String,
     #[tabled(rename = "Mean")]
     mean: String,
     #[tabled(rename = "p50")]
@@ -369,6 +371,7 @@ fn print_final_metrics(
     let latency_rows = vec![
         LatencyRow {
             metric: "TTFT (ms)".to_string(),
+            min: format!("{:.2}", summary.ttft_min),
             mean: format!("{:.2}", summary.ttft_mean),
             p50: format!("{:.2}", summary.ttft_p50),
             p90: format!("{:.2}", summary.ttft_p90),
@@ -376,6 +379,7 @@ fn print_final_metrics(
         },
         LatencyRow {
             metric: "E2E Latency (ms)".to_string(),
+            min: format!("{:.2}", summary.e2e_min),
             mean: format!("{:.2}", summary.e2e_mean),
             p50: format!("{:.2}", summary.e2e_p50),
             p90: format!("{:.2}", summary.e2e_p90),
@@ -383,6 +387,7 @@ fn print_final_metrics(
         },
         LatencyRow {
             metric: "Per-Token Latency (ms)".to_string(),
+            min: format!("{:.2}", summary.per_token_min),
             mean: format!("{:.2}", summary.per_token_mean),
             p50: format!("{:.2}", summary.per_token_p50),
             p90: format!("{:.2}", summary.per_token_p90),
@@ -483,18 +488,21 @@ fn save_metrics_json(
     let json_data = json!({
         "latency_metrics": {
             "ttft_ms": {
+                "min": summary.ttft_min,
                 "mean": summary.ttft_mean,
                 "p50": summary.ttft_p50,
                 "p90": summary.ttft_p90,
                 "p99": summary.ttft_p99,
             },
             "e2e_ms": {
+                "min": summary.e2e_min,
                 "mean": summary.e2e_mean,
                 "p50": summary.e2e_p50,
                 "p90": summary.e2e_p90,
                 "p99": summary.e2e_p99,
             },
             "per_token_ms": {
+                "min": summary.per_token_min,
                 "mean": summary.per_token_mean,
                 "p50": summary.per_token_p50,
                 "p90": summary.per_token_p90,
