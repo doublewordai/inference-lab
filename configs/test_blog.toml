@@ -1,0 +1,47 @@
+# Test config matching blog post parameters
+# H100 TP=2, FP8, Llama-3-70B, ISL=1024, OSL=1024, 64 concurrent users
+
+[hardware]
+name = "H100 TP=2"
+compute_flops = 3.958e15       # 1979 TFLOPS FP8 × 2 for TP=2
+memory_bandwidth = 6.7e12      # 3.35 TB/s × 2 for TP=2
+memory_capacity = 171798691840 # 160 GB (80GB × 2)
+gpu_memory_utilization = 0.9   # vLLM default
+bytes_per_param = 1            # FP8
+
+[model]
+name = "Llama-3-70B"
+num_parameters = 70000000000
+num_layers = 80
+hidden_dim = 8192
+num_heads = 64
+num_kv_heads = 8             # GQA: 8 KV heads shared across 64 query heads
+max_seq_len = 8192
+
+[scheduler]
+max_num_batched_tokens = 8192
+max_num_seqs = 1000           # 64 concurrent users
+policy = "sif"
+enable_chunked_prefill = true
+block_size = 16
+
+[workload]
+arrival_pattern = "closed_loop"
+arrival_rate = 1.0              # Not used for closed_loop, but required by config
+num_concurrent_users = 1000     # 64 concurrent users (matches blog post benchmark)
+num_requests = 1000             # 10 requests per user for steady state
+seed = 42
+
+# Fixed sequence lengths for easier comparison
+[workload.input_len_dist]
+type = "lognormal"
+mean = 6
+std_dev = 0.1
+
+[workload.output_len_dist]
+type = "lognormal"
+mean = 6
+std_dev = 0.1
+
+[simulation]
+log_interval = 10

@@ -1,0 +1,48 @@
+# Configuration for Qwen3-30B-A3B MoE model
+# Model: https://huggingface.co/Qwen/Qwen3-30B-A3B-Instruct-2507
+# Architecture: Mixture-of-Experts with 128 experts, 8 active per token
+# Total: ~30B parameters, Active: ~3.3B parameters per token
+
+[hardware]
+name = "H100"
+compute_flops = 1.513e15        # 1513 TFLOPS bf16
+memory_bandwidth = 3.35e12      # 3.35 TB/s
+memory_capacity = 85899345920   # 80 GB
+kv_cache_capacity = 68719476736 # 64 GB
+bytes_per_param = 2             # bf16
+
+[model]
+name = "Qwen3-30B-A3B"
+num_parameters = 30500000000         # ~30.5B total params (all 128 experts)
+num_active_parameters = 3340000000   # ~3.34B active params (8 out of 128 experts)
+num_layers = 48
+hidden_dim = 2048
+num_heads = 32
+num_kv_heads = 4                     # GQA: 4 KV heads
+max_seq_len = 32768                  # Supports up to 32K context
+
+[scheduler]
+max_num_batched_tokens = 8192
+max_num_seqs = 256
+policy = "fcfs"                      # or "priority"
+enable_chunked_prefill = true
+block_size = 16
+
+[workload]
+arrival_pattern = "poisson"
+arrival_rate = 5.0                   # requests/sec
+num_requests = 400
+seed = 42
+
+[workload.input_len_dist]
+type = "lognormal"
+mean = 6.9                           # ln(1000) ≈ 6.9, median ~1000 tokens
+std_dev = 0.7                        # ~2x variation
+
+[workload.output_len_dist]
+type = "lognormal"
+mean = 5.3                           # ln(200) ≈ 5.3, median ~200 tokens
+std_dev = 0.8                        # Heavier tail for outputs
+
+[simulation]
+log_interval = 5                     # Log every 5 iterations

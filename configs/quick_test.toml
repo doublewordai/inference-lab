@@ -1,0 +1,45 @@
+# Quick test config for CLI testing
+# H100 with small number of requests
+
+[hardware]
+name = "H100"
+compute_flops = 1.979e15       # 1979 TFLOPS FP8
+memory_bandwidth = 3.35e12     # 3.35 TB/s
+memory_capacity = 85899345920  # 80 GB
+gpu_memory_utilization = 0.9
+bytes_per_param = 1            # FP8
+
+[model]
+name = "Llama-3-70B"
+num_parameters = 70000000000
+num_layers = 80
+hidden_dim = 8192
+num_heads = 64
+num_kv_heads = 8             # GQA
+max_seq_len = 8192
+
+[scheduler]
+max_num_batched_tokens = 8192
+max_num_seqs = 100
+policy = "fcfs"
+enable_chunked_prefill = true
+block_size = 16
+
+[workload]
+arrival_pattern = "poisson"
+arrival_rate = 2.0
+num_requests = 50            # Small for quick testing
+seed = 42
+
+[workload.input_len_dist]
+type = "lognormal"
+mean = 6
+std_dev = 0.5
+
+[workload.output_len_dist]
+type = "lognormal"
+mean = 5
+std_dev = 0.5
+
+[simulation]
+log_interval = 5

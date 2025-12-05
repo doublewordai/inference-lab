@@ -1,0 +1,44 @@
+# Example configuration for LLM Inference Simulator
+
+[hardware]
+name = "H100"
+compute_flops = 1.513e15        # 1513 TFLOPS bf16
+memory_bandwidth = 3.35e12      # 3.35 TB/s
+memory_capacity = 85899345920   # 80 GB
+kv_cache_capacity = 68719476736 # 64 GB
+bytes_per_param = 2             # bf16
+
+[model]
+name = "Llama-3-70B"
+num_parameters = 70000000000
+num_layers = 80
+hidden_dim = 8192
+num_heads = 64
+num_kv_heads = 8        # GQA: 8 KV heads
+max_seq_len = 8192
+
+[scheduler]
+max_num_batched_tokens = 8192
+max_num_seqs = 256
+policy = "fcfs"               # or "priority"
+enable_chunked_prefill = true
+block_size = 16
+
+[workload]
+arrival_pattern = "poisson"
+arrival_rate = 5.0          # requests/sec
+num_requests = 400          # More requests for realistic test
+seed = 42
+
+[workload.input_len_dist]
+type = "lognormal"
+mean = 6.9        # ln(1000) ≈ 6.9, median ~1000 tokens
+std_dev = 0.7     # ~2x variation
+
+[workload.output_len_dist]
+type = "lognormal"
+mean = 5.3        # ln(200) ≈ 5.3, median ~200 tokens
+std_dev = 0.8     # Heavier tail for outputs
+
+[simulation]
+log_interval = 5 # Log every 5 iterations
