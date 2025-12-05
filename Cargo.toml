@@ -6,8 +6,10 @@ authors = ["Doubleword"]
 description = "High-performance LLM inference simulator for analyzing serving systems"
 license = "MIT"
 repository = "https://github.com/doublewordai/inference-lab"
+readme = "README.md"
 keywords = ["llm", "inference", "simulator", "performance"]
 categories = ["simulation", "wasm"]
+exclude = ["pkg/", ".npmrc", "node_modules/"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]
