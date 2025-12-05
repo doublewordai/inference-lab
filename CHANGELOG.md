@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/doublewordai/inference-lab/compare/inference-lab-v0.2.0...inference-lab-v0.3.0) (2025-12-05)
+
+
+### Features
+
+* bump version ([53df6e6](https://github.com/doublewordai/inference-lab/commit/53df6e67b9cb2f62e78294e5ac62395df0774a0e))
+
 ## [0.2.0](https://github.com/doublewordai/inference-lab/compare/inference-lab-v0.1.1...inference-lab-v0.2.0) (2025-12-05)
 
 
