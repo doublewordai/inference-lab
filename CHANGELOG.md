@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.1](https://github.com/doublewordai/inference-lab/compare/v0.1.0...v0.1.1) (2025-12-05)
+
+
+### Bug Fixes
+
+* sync release-please with published versions ([ac9e8e6](https://github.com/doublewordai/inference-lab/commit/ac9e8e6f38b68fdd3948623fb6e7fa42557ece9c))
+
 ## 0.1.0 (2025-12-05)
 
 
