@@ -23,7 +23,7 @@ cargo add inference-lab
 ### As an npm Package (WASM)
 
 ```bash
-npm install @doubleword/inference-lab
+npm install @doublewordai/inference-lab
 ```
 
 ### CLI Tool
