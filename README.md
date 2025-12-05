@@ -2,6 +2,7 @@
 
 High-performance LLM inference simulator for analyzing serving systems. Simulates GPU clusters serving LLM inference workloads with realistic performance modeling.
 
+
 ## Features
 
 - **Accurate Performance Modeling**: Models compute (FLOPS) and memory bandwidth constraints
