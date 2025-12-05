@@ -1,0 +1,16 @@
+{
+  "release-type": "rust",
+  "packages": {
+    ".": {
+      "package-name": "inference-lab",
+      "changelog-path": "CHANGELOG.md",
+      "extra-files": [
+        {
+          "type": "json",
+          "path": "package.json",
+          "jsonpath": "$.version"
+        }
+      ]
+    }
+  }
+}
