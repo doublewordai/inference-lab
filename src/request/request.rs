@@ -118,8 +118,8 @@ impl Request {
 
         // If we've crossed into decode phase, update output tokens
         if self.num_computed_tokens > self.num_prompt_tokens {
-            let new_output_tokens = (self.num_computed_tokens - self.num_prompt_tokens)
-                .min(self.max_output_tokens); // Cap at max
+            let new_output_tokens =
+                (self.num_computed_tokens - self.num_prompt_tokens).min(self.max_output_tokens); // Cap at max
 
             // Record first token time if this is the first output token
             if self.first_token_time.is_none() && new_output_tokens > 0 {

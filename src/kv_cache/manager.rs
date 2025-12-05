@@ -76,8 +76,7 @@ impl KVCacheManager {
     /// Calculate how many new blocks are needed for a request
     fn calculate_blocks_needed(&self, request: &Request, num_new_tokens: u32) -> usize {
         let total_tokens = request.num_computed_tokens + num_new_tokens;
-        let total_blocks_needed =
-            ((total_tokens + self.block_size - 1) / self.block_size) as usize;
+        let total_blocks_needed = ((total_tokens + self.block_size - 1) / self.block_size) as usize;
         total_blocks_needed.saturating_sub(request.kv_blocks.len())
     }
 

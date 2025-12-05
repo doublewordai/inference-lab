@@ -60,7 +60,8 @@ impl ModelConfig {
         let head_dim = self.hidden_dim / self.num_heads;
 
         // Bytes per token per layer
-        let bytes_per_token_per_layer = 2 * kv_heads as u64 * head_dim as u64 * bytes_per_param as u64;
+        let bytes_per_token_per_layer =
+            2 * kv_heads as u64 * head_dim as u64 * bytes_per_param as u64;
 
         // If no sliding window, all layers use full attention
         if self.sliding_window.is_none() || self.num_sliding_layers.is_none() {
@@ -103,7 +104,8 @@ impl ModelConfig {
         let full_layers_kv = bytes_per_token_per_layer * num_full as u64 * seq_len as u64;
 
         // Sliding window layers: capped at window size
-        let sliding_layers_kv = bytes_per_token_per_layer * num_sliding as u64 * seq_len.min(window) as u64;
+        let sliding_layers_kv =
+            bytes_per_token_per_layer * num_sliding as u64 * seq_len.min(window) as u64;
 
         full_layers_kv + sliding_layers_kv
     }

@@ -52,9 +52,7 @@ impl LengthDistribution {
 
         match self {
             LengthDistribution::Fixed { value } => *value,
-            LengthDistribution::Uniform { min, max } => {
-                rng.gen_range(*min..=*max)
-            }
+            LengthDistribution::Uniform { min, max } => rng.gen_range(*min..=*max),
             LengthDistribution::Normal { mean, std_dev } => {
                 let normal = rand_distr::Normal::new(*mean, *std_dev).unwrap();
                 normal.sample(rng).max(1.0) as u32

@@ -1,3 +1,3 @@
 pub mod simulator;
 
-pub use simulator::{Simulator, ProgressInfo, TimeSeriesPoint};
+pub use simulator::{ProgressInfo, Simulator, TimeSeriesPoint};

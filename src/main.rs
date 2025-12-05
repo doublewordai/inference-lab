@@ -6,10 +6,7 @@ use std::time::Instant;
 #[cfg(feature = "cli")]
 use colored::Colorize;
 #[cfg(feature = "cli")]
-use tabled::{
-    settings::Style,
-    Table, Tabled,
-};
+use tabled::{settings::Style, Table, Tabled};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "LLM Inference Simulator", long_about = None)]
@@ -83,14 +80,8 @@ struct LatencyRow {
 struct ThroughputRow {
     #[tabled(rename = "Metric")]
     metric: String,
-    #[tabled(rename = "Mean")]
-    mean: String,
-    #[tabled(rename = "p50")]
-    p50: String,
-    #[tabled(rename = "p90")]
-    p90: String,
-    #[tabled(rename = "p99")]
-    p99: String,
+    #[tabled(rename = "Value")]
+    value: String,
 }
 
 fn main() {
@@ -195,7 +186,13 @@ fn main() {
 
     // Print final metrics
     let summary = simulator.get_metrics_summary();
-    print_final_metrics(&summary, simulator.get_current_time(), elapsed, verbosity, use_color);
+    print_final_metrics(
+        &summary,
+        simulator.get_current_time(),
+        elapsed,
+        verbosity,
+        use_color,
+    );
 
     // Save to JSON if requested
     if let Some(output_path) = args.output {
@@ -238,8 +235,8 @@ fn run_with_dashboard(simulator: &mut Simulator, use_color: bool, config: &Confi
 
     simulator
         .run_with_callback(|progress| {
-            let percent = (progress.completed_requests as f64 / total_requests as f64 * 100.0)
-                .min(100.0);
+            let percent =
+                (progress.completed_requests as f64 / total_requests as f64 * 100.0).min(100.0);
             let bar_width = 40;
             let filled = (bar_width as f64 * percent / 100.0) as usize;
             let bar: String = "█".repeat(filled) + &"░".repeat(bar_width - filled);
@@ -283,7 +280,10 @@ fn run_with_dashboard(simulator: &mut Simulator, use_color: bool, config: &Confi
                     "  Queue:    {} running, {} waiting",
                     progress.running, progress.waiting
                 );
-                println!("  KV Cache: {:.1}% utilized", progress.kv_cache_util * 100.0);
+                println!(
+                    "  KV Cache: {:.1}% utilized",
+                    progress.kv_cache_util * 100.0
+                );
                 println!("{}", "━".repeat(60));
             }
         })
@@ -339,7 +339,10 @@ fn print_final_metrics(
             "E2E:  {:.2}ms (p50: {:.2}ms, p99: {:.2}ms)",
             summary.e2e_mean, summary.e2e_p50, summary.e2e_p99
         );
-        println!("Throughput: {:.0} output tok/s", summary.output_tokens_per_sec);
+        println!(
+            "Throughput: {:.0} output tok/s",
+            summary.output_tokens_per_sec
+        );
         return;
     }
 
@@ -408,24 +411,15 @@ fn print_final_metrics(
     let throughput_rows = vec![
         ThroughputRow {
             metric: "Input Tokens/sec".to_string(),
-            mean: format!("{:.2}", summary.input_tokens_per_sec),
-            p50: format!("{:.2}", summary.input_tokens_per_sec_p50),
-            p90: format!("{:.2}", summary.input_tokens_per_sec_p90),
-            p99: format!("{:.2}", summary.input_tokens_per_sec_p99),
+            value: format!("{:.2}", summary.input_tokens_per_sec),
         },
         ThroughputRow {
             metric: "Output Tokens/sec".to_string(),
-            mean: format!("{:.2}", summary.output_tokens_per_sec),
-            p50: format!("{:.2}", summary.output_tokens_per_sec_p50),
-            p90: format!("{:.2}", summary.output_tokens_per_sec_p90),
-            p99: format!("{:.2}", summary.output_tokens_per_sec_p99),
+            value: format!("{:.2}", summary.output_tokens_per_sec),
         },
         ThroughputRow {
             metric: "Requests/sec".to_string(),
-            mean: format!("{:.2}", summary.requests_per_sec),
-            p50: format!("{:.2}", summary.requests_per_sec_p50),
-            p90: format!("{:.2}", summary.requests_per_sec_p90),
-            p99: format!("{:.2}", summary.requests_per_sec_p99),
+            value: format!("{:.2}", summary.requests_per_sec),
         },
     ];
 
@@ -440,7 +434,10 @@ fn print_final_metrics(
     } else {
         println!("\nUTILIZATION");
     }
-    println!("  • KV Cache:  {:.1}% avg", summary.avg_kv_cache_util * 100.0);
+    println!(
+        "  • KV Cache:  {:.1}% avg",
+        summary.avg_kv_cache_util * 100.0
+    );
     println!("  • FLOPS:     {:.1}% avg", summary.avg_flops_util * 100.0);
     println!(
         "  • Bandwidth: {:.1}% avg",
@@ -475,8 +472,14 @@ fn print_final_metrics(
 ) {
     // Fallback for when CLI features are not available
     println!("\nSimulation Complete ({:.1}s)", sim_time);
-    println!("TTFT: {:.2}ms (p50: {:.2}ms)", summary.ttft_mean, summary.ttft_p50);
-    println!("E2E: {:.2}ms (p50: {:.2}ms)", summary.e2e_mean, summary.e2e_p50);
+    println!(
+        "TTFT: {:.2}ms (p50: {:.2}ms)",
+        summary.ttft_mean, summary.ttft_p50
+    );
+    println!(
+        "E2E: {:.2}ms (p50: {:.2}ms)",
+        summary.e2e_mean, summary.e2e_p50
+    );
 }
 
 fn save_metrics_json(
@@ -510,24 +513,9 @@ fn save_metrics_json(
             },
         },
         "throughput_metrics": {
-            "input_tokens_per_sec": {
-                "mean": summary.input_tokens_per_sec,
-                "p50": summary.input_tokens_per_sec_p50,
-                "p90": summary.input_tokens_per_sec_p90,
-                "p99": summary.input_tokens_per_sec_p99,
-            },
-            "output_tokens_per_sec": {
-                "mean": summary.output_tokens_per_sec,
-                "p50": summary.output_tokens_per_sec_p50,
-                "p90": summary.output_tokens_per_sec_p90,
-                "p99": summary.output_tokens_per_sec_p99,
-            },
-            "requests_per_sec": {
-                "mean": summary.requests_per_sec,
-                "p50": summary.requests_per_sec_p50,
-                "p90": summary.requests_per_sec_p90,
-                "p99": summary.requests_per_sec_p99,
-            },
+            "input_tokens_per_sec": summary.input_tokens_per_sec,
+            "output_tokens_per_sec": summary.output_tokens_per_sec,
+            "requests_per_sec": summary.requests_per_sec,
         },
         "utilization": {
             "avg_kv_cache_util": summary.avg_kv_cache_util,

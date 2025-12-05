@@ -1,5 +1,4 @@
 /// Core inference arithmetic formulas based on the inference-arithmetic.mdx blog post
-
 use crate::config::{HardwareConfig, ModelConfig};
 
 /// Calculate the compute-bound threshold (number of tokens at which inference becomes compute-bound)
@@ -82,12 +81,12 @@ mod tests {
     fn test_compute_bound_threshold_h100() {
         let mut hardware = crate::config::HardwareConfig {
             name: "H100".to_string(),
-            compute_flops: 1.513e15,      // 1513 TFLOPS bf16
-            memory_bandwidth: 3.35e12,    // 3.35 TB/s
+            compute_flops: 1.513e15,   // 1513 TFLOPS bf16
+            memory_bandwidth: 3.35e12, // 3.35 TB/s
             memory_capacity: 80_000_000_000,
             kv_cache_capacity: 60_000_000_000,
             gpu_memory_utilization: 0.9,
-            bytes_per_param: 2,           // bf16
+            bytes_per_param: 2, // bf16
             compute_bound_threshold: 0,
         };
         hardware.compute_threshold();

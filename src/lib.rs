@@ -16,4 +16,4 @@ pub use kv_cache::KVCacheManager;
 pub use metrics::{MetricsCollector, MetricsSummary};
 pub use request::{Request, RequestStatus};
 pub use scheduler::Scheduler;
-pub use simulation::{Simulator, ProgressInfo, TimeSeriesPoint};
+pub use simulation::{ProgressInfo, Simulator, TimeSeriesPoint};

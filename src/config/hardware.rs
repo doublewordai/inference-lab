@@ -49,7 +49,8 @@ impl HardwareConfig {
     /// This matches vLLM's behavior: requested_memory - non_kv_cache_memory
     pub fn compute_kv_cache_capacity(&mut self, model_size_bytes: u64) {
         if self.kv_cache_capacity == 0 {
-            let requested_memory = (self.memory_capacity as f64 * self.gpu_memory_utilization) as u64;
+            let requested_memory =
+                (self.memory_capacity as f64 * self.gpu_memory_utilization) as u64;
             // In vLLM, non_kv_cache_memory includes weights + activations + overhead
             // For simplicity, we approximate this as just the model weights
             self.kv_cache_capacity = requested_memory.saturating_sub(model_size_bytes);

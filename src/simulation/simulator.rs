@@ -16,10 +16,10 @@ pub struct TimeSeriesPoint {
     pub num_decoding: usize,
     pub prefill_tokens: u32,
     pub decode_tokens: u32,
-    pub input_throughput: f64,   // Input tokens per second (windowed)
-    pub output_throughput: f64,  // Output tokens per second (windowed)
-    pub ttft_p50: f64,           // TTFT p50 in recent window (ms)
-    pub tpot_p50: f64,           // TPOT p50 in recent window (ms)
+    pub input_throughput: f64,  // Input tokens per second (windowed)
+    pub output_throughput: f64, // Output tokens per second (windowed)
+    pub ttft_p50: f64,          // TTFT p50 in recent window (ms)
+    pub tpot_p50: f64,          // TPOT p50 in recent window (ms)
 }
 
 pub struct ProgressInfo<'a> {
@@ -31,8 +31,12 @@ pub struct ProgressInfo<'a> {
     pub kv_cache_util: f64,
     pub time_series: Option<&'a [TimeSeriesPoint]>,
     pub metrics: Option<crate::metrics::MetricsSummary>,
-    pub latency_samples: Option<((&'a [f64], &'a [f64]), (&'a [f64], &'a [f64]), (&'a [f64], &'a [f64]))>,
-    pub distribution_samples: Option<(&'a [u32], &'a [u32])>,  // (input_lengths, output_lengths)
+    pub latency_samples: Option<(
+        (&'a [f64], &'a [f64]),
+        (&'a [f64], &'a [f64]),
+        (&'a [f64], &'a [f64]),
+    )>,
+    pub distribution_samples: Option<(&'a [u32], &'a [u32])>, // (input_lengths, output_lengths)
 }
 
 pub struct Simulator {
@@ -197,9 +201,11 @@ impl Simulator {
                     .compute_engine
                     .calculate_bandwidth_utilization(bytes_transferred, iteration_time);
 
-                let flops_util = self
-                    .compute_engine
-                    .calculate_flops_utilization(&batch_requests, &tokens_per_req, iteration_time);
+                let flops_util = self.compute_engine.calculate_flops_utilization(
+                    &batch_requests,
+                    &tokens_per_req,
+                    iteration_time,
+                );
 
                 (bandwidth_util, flops_util)
             } else {
@@ -244,10 +250,9 @@ impl Simulator {
                 let output_throughput = decode_tokens as f64 / self.sample_interval;
 
                 // Get latency mean for events since last sample
-                let (ttft_mean, tpot_mean) = self.metrics.get_interval_latencies(
-                    self.prev_sample_time,
-                    self.current_time
-                );
+                let (ttft_mean, tpot_mean) = self
+                    .metrics
+                    .get_interval_latencies(self.prev_sample_time, self.current_time);
 
                 self.time_series_data.push(TimeSeriesPoint {
                     time: self.current_time,
@@ -278,7 +283,8 @@ impl Simulator {
                 self.metrics.record_request_completion(&request);
 
                 // For closed-loop workloads, generate a new request when one completes
-                self.request_generator.on_request_complete(self.current_time);
+                self.request_generator
+                    .on_request_complete(self.current_time);
             }
 
             // 9. Periodic logging
@@ -401,9 +407,11 @@ impl Simulator {
                     .compute_engine
                     .calculate_bandwidth_utilization(bytes_transferred, iteration_time);
 
-                let flops_util = self
-                    .compute_engine
-                    .calculate_flops_utilization(&batch_requests, &tokens_per_req, iteration_time);
+                let flops_util = self.compute_engine.calculate_flops_utilization(
+                    &batch_requests,
+                    &tokens_per_req,
+                    iteration_time,
+                );
 
                 (bandwidth_util, flops_util)
             } else {
@@ -447,10 +455,9 @@ impl Simulator {
                 let output_throughput = decode_tokens as f64 / self.sample_interval;
 
                 // Get latency mean for events since last sample
-                let (ttft_mean, tpot_mean) = self.metrics.get_interval_latencies(
-                    self.prev_sample_time,
-                    self.current_time
-                );
+                let (ttft_mean, tpot_mean) = self
+                    .metrics
+                    .get_interval_latencies(self.prev_sample_time, self.current_time);
 
                 self.time_series_data.push(TimeSeriesPoint {
                     time: self.current_time,
@@ -481,7 +488,8 @@ impl Simulator {
                 self.metrics.record_request_completion(&request);
 
                 // For closed-loop workloads, generate a new request when one completes
-                self.request_generator.on_request_complete(self.current_time);
+                self.request_generator
+                    .on_request_complete(self.current_time);
             }
 
             // 10. Send progress update if enough time has passed
@@ -491,12 +499,12 @@ impl Simulator {
                 let output_lengths = self.metrics.get_output_lengths();
 
                 // Only send new samples since last callback (delta) - track each metric separately
-                let ttft_delta = &latency_samples.0.0[self.last_sent_ttft_count..];
-                let ttft_timestamps_delta = &latency_samples.0.1[self.last_sent_ttft_count..];
-                let e2e_delta = &latency_samples.1.0[self.last_sent_e2e_count..];
-                let e2e_timestamps_delta = &latency_samples.1.1[self.last_sent_e2e_count..];
-                let tpot_delta = &latency_samples.2.0[self.last_sent_tpot_count..];
-                let tpot_timestamps_delta = &latency_samples.2.1[self.last_sent_tpot_count..];
+                let ttft_delta = &latency_samples.0 .0[self.last_sent_ttft_count..];
+                let ttft_timestamps_delta = &latency_samples.0 .1[self.last_sent_ttft_count..];
+                let e2e_delta = &latency_samples.1 .0[self.last_sent_e2e_count..];
+                let e2e_timestamps_delta = &latency_samples.1 .1[self.last_sent_e2e_count..];
+                let tpot_delta = &latency_samples.2 .0[self.last_sent_tpot_count..];
+                let tpot_timestamps_delta = &latency_samples.2 .1[self.last_sent_tpot_count..];
                 let input_delta = &input_lengths[self.last_sent_input_count..];
                 let output_delta = &output_lengths[self.last_sent_output_count..];
 
@@ -509,15 +517,19 @@ impl Simulator {
                     kv_cache_util: kv_util,
                     time_series: Some(&self.time_series_data),
                     metrics: Some(self.metrics.compute_summary(self.current_time)),
-                    latency_samples: Some(((ttft_delta, ttft_timestamps_delta), (e2e_delta, e2e_timestamps_delta), (tpot_delta, tpot_timestamps_delta))),
+                    latency_samples: Some((
+                        (ttft_delta, ttft_timestamps_delta),
+                        (e2e_delta, e2e_timestamps_delta),
+                        (tpot_delta, tpot_timestamps_delta),
+                    )),
                     distribution_samples: Some((input_delta, output_delta)),
                 };
                 callback(progress);
 
                 // Update last sent sample counts for each metric
-                self.last_sent_ttft_count = latency_samples.0.0.len();
-                self.last_sent_e2e_count = latency_samples.1.0.len();
-                self.last_sent_tpot_count = latency_samples.2.0.len();
+                self.last_sent_ttft_count = latency_samples.0 .0.len();
+                self.last_sent_e2e_count = latency_samples.1 .0.len();
+                self.last_sent_tpot_count = latency_samples.2 .0.len();
                 self.last_sent_input_count = input_lengths.len();
                 self.last_sent_output_count = output_lengths.len();
                 last_callback_time = self.current_time;
@@ -533,12 +545,12 @@ impl Simulator {
                 let output_lengths = self.metrics.get_output_lengths();
 
                 // Only send new samples since last callback (delta) - track each metric separately
-                let ttft_delta = &latency_samples.0.0[self.last_sent_ttft_count..];
-                let ttft_timestamps_delta = &latency_samples.0.1[self.last_sent_ttft_count..];
-                let e2e_delta = &latency_samples.1.0[self.last_sent_e2e_count..];
-                let e2e_timestamps_delta = &latency_samples.1.1[self.last_sent_e2e_count..];
-                let tpot_delta = &latency_samples.2.0[self.last_sent_tpot_count..];
-                let tpot_timestamps_delta = &latency_samples.2.1[self.last_sent_tpot_count..];
+                let ttft_delta = &latency_samples.0 .0[self.last_sent_ttft_count..];
+                let ttft_timestamps_delta = &latency_samples.0 .1[self.last_sent_ttft_count..];
+                let e2e_delta = &latency_samples.1 .0[self.last_sent_e2e_count..];
+                let e2e_timestamps_delta = &latency_samples.1 .1[self.last_sent_e2e_count..];
+                let tpot_delta = &latency_samples.2 .0[self.last_sent_tpot_count..];
+                let tpot_timestamps_delta = &latency_samples.2 .1[self.last_sent_tpot_count..];
                 let input_delta = &input_lengths[self.last_sent_input_count..];
                 let output_delta = &output_lengths[self.last_sent_output_count..];
 
@@ -551,7 +563,11 @@ impl Simulator {
                     kv_cache_util: kv_util,
                     time_series: Some(&self.time_series_data),
                     metrics: Some(self.metrics.compute_summary(self.current_time)),
-                    latency_samples: Some(((ttft_delta, ttft_timestamps_delta), (e2e_delta, e2e_timestamps_delta), (tpot_delta, tpot_timestamps_delta))),
+                    latency_samples: Some((
+                        (ttft_delta, ttft_timestamps_delta),
+                        (e2e_delta, e2e_timestamps_delta),
+                        (tpot_delta, tpot_timestamps_delta),
+                    )),
                     distribution_samples: Some((input_delta, output_delta)),
                 };
                 callback(progress);
@@ -582,7 +598,9 @@ impl Simulator {
         self.current_time
     }
 
-    pub fn get_latency_samples(&self) -> (
+    pub fn get_latency_samples(
+        &self,
+    ) -> (
         (&[f64], &[f64]), // (ttft_samples, ttft_timestamps)
         (&[f64], &[f64]), // (e2e_samples, e2e_timestamps)
         (&[f64], &[f64]), // (tpot_samples, tpot_timestamps)

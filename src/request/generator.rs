@@ -68,7 +68,11 @@ impl RequestGenerator {
             }
 
             // Find the earliest pending request that has arrived
-            if let Some(pos) = self.pending_closed_loop_requests.iter().position(|&t| t <= current_time) {
+            if let Some(pos) = self
+                .pending_closed_loop_requests
+                .iter()
+                .position(|&t| t <= current_time)
+            {
                 let arrival_time = self.pending_closed_loop_requests.remove(pos);
 
                 // Generate request
@@ -134,12 +138,7 @@ impl RequestGenerator {
     }
 
     /// Sample the next arrival time based on the arrival pattern
-    fn sample_next_arrival(
-        current_time: f64,
-        pattern: &str,
-        rate: f64,
-        rng: &mut StdRng,
-    ) -> f64 {
+    fn sample_next_arrival(current_time: f64, pattern: &str, rate: f64, rng: &mut StdRng) -> f64 {
         match pattern.to_lowercase().as_str() {
             "poisson" => {
                 // Poisson process: inter-arrival times are exponentially distributed
@@ -185,7 +184,8 @@ impl RequestGenerator {
             if is_closed_loop {
                 // For closed-loop, we're finished when we've generated max_requests
                 // AND have no pending requests
-                self.requests_generated >= max_requests && self.pending_closed_loop_requests.is_empty()
+                self.requests_generated >= max_requests
+                    && self.pending_closed_loop_requests.is_empty()
             } else {
                 self.requests_generated >= max_requests
             }

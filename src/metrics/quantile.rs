@@ -3,8 +3,8 @@
 pub struct StreamingQuantiles {
     // Marker positions and heights for P² algorithm
     // We track 5 markers for p50, p90, p99
-    markers: [f64; 11],  // Marker heights (actual values)
-    positions: [f64; 11], // Marker positions (count-based)
+    markers: [f64; 11],           // Marker heights (actual values)
+    positions: [f64; 11],         // Marker positions (count-based)
     desired_positions: [f64; 11], // Desired positions based on quantiles
     count: usize,
 }
@@ -27,7 +27,8 @@ impl StreamingQuantiles {
 
             if self.count == 11 {
                 // Sort initial markers
-                self.markers.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                self.markers
+                    .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                 // Initialize desired positions for p50, p90, p99
                 self.update_desired_positions();
             }
@@ -90,15 +91,15 @@ impl StreamingQuantiles {
         // Markers at indices: 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10
         // Target quantiles: min, p1, p10, p25, p50, p75, p90, p95, p99, p99.9, max
         self.desired_positions[0] = 1.0;
-        self.desired_positions[1] = 1.0 + 0.01 * (n - 1.0);   // p1
-        self.desired_positions[2] = 1.0 + 0.10 * (n - 1.0);   // p10
-        self.desired_positions[3] = 1.0 + 0.25 * (n - 1.0);   // p25
-        self.desired_positions[4] = 1.0 + 0.50 * (n - 1.0);   // p50
-        self.desired_positions[5] = 1.0 + 0.75 * (n - 1.0);   // p75
-        self.desired_positions[6] = 1.0 + 0.90 * (n - 1.0);   // p90
-        self.desired_positions[7] = 1.0 + 0.95 * (n - 1.0);   // p95
-        self.desired_positions[8] = 1.0 + 0.99 * (n - 1.0);   // p99
-        self.desired_positions[9] = 1.0 + 0.999 * (n - 1.0);  // p99.9
+        self.desired_positions[1] = 1.0 + 0.01 * (n - 1.0); // p1
+        self.desired_positions[2] = 1.0 + 0.10 * (n - 1.0); // p10
+        self.desired_positions[3] = 1.0 + 0.25 * (n - 1.0); // p25
+        self.desired_positions[4] = 1.0 + 0.50 * (n - 1.0); // p50
+        self.desired_positions[5] = 1.0 + 0.75 * (n - 1.0); // p75
+        self.desired_positions[6] = 1.0 + 0.90 * (n - 1.0); // p90
+        self.desired_positions[7] = 1.0 + 0.95 * (n - 1.0); // p95
+        self.desired_positions[8] = 1.0 + 0.99 * (n - 1.0); // p99
+        self.desired_positions[9] = 1.0 + 0.999 * (n - 1.0); // p99.9
         self.desired_positions[10] = n;
     }
 
@@ -110,10 +111,9 @@ impl StreamingQuantiles {
         let n_i1 = self.positions[i + 1];
         let n_i_1 = self.positions[i - 1];
 
-        q_i + d / (n_i1 - n_i_1) * (
-            (n_i - n_i_1 + d) * (q_i1 - q_i) / (n_i1 - n_i)
-            + (n_i1 - n_i - d) * (q_i - q_i_1) / (n_i - n_i_1)
-        )
+        q_i + d / (n_i1 - n_i_1)
+            * ((n_i - n_i_1 + d) * (q_i1 - q_i) / (n_i1 - n_i)
+                + (n_i1 - n_i - d) * (q_i - q_i_1) / (n_i - n_i_1))
     }
 
     fn linear(&self, i: usize, d: f64) -> f64 {

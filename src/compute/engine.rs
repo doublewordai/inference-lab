@@ -1,5 +1,4 @@
 /// Compute engine for calculating inference timing
-
 use super::arithmetic;
 use crate::config::{HardwareConfig, ModelConfig};
 use crate::request::Request;
@@ -29,7 +28,12 @@ impl ComputeEngine {
         let total_tokens: u32 = tokens_per_request.iter().sum();
 
         // Calculate compute time: FLOPs / compute throughput
-        let flops = arithmetic::flops_for_tokens(total_tokens, &self.model, batch_requests, tokens_per_request);
+        let flops = arithmetic::flops_for_tokens(
+            total_tokens,
+            &self.model,
+            batch_requests,
+            tokens_per_request,
+        );
         let compute_time = flops / self.hardware.compute_flops;
 
         // Calculate memory time: bytes transferred / memory bandwidth
@@ -52,17 +56,18 @@ impl ComputeEngine {
         }
 
         let total_tokens: u32 = tokens_per_request.iter().sum();
-        let flops = arithmetic::flops_for_tokens(total_tokens, &self.model, batch_requests, tokens_per_request);
+        let flops = arithmetic::flops_for_tokens(
+            total_tokens,
+            &self.model,
+            batch_requests,
+            tokens_per_request,
+        );
         let theoretical_time = flops / self.hardware.compute_flops;
         (theoretical_time / actual_time).min(1.0)
     }
 
     /// Calculate memory bandwidth utilization for this iteration (0.0 to 1.0)
-    pub fn calculate_bandwidth_utilization(
-        &self,
-        bytes_transferred: f64,
-        actual_time: f64,
-    ) -> f64 {
+    pub fn calculate_bandwidth_utilization(&self, bytes_transferred: f64, actual_time: f64) -> f64 {
         if actual_time == 0.0 {
             return 0.0;
         }

@@ -78,7 +78,8 @@ impl Scheduler {
                 tokens_to_schedule = tokens_to_schedule.min(remaining_prefill);
 
                 // Apply chunked prefill limit if enabled (vLLM's long_prefill_token_threshold)
-                if self.config.enable_chunked_prefill && self.config.long_prefill_token_threshold > 0
+                if self.config.enable_chunked_prefill
+                    && self.config.long_prefill_token_threshold > 0
                 {
                     tokens_to_schedule =
                         tokens_to_schedule.min(self.config.long_prefill_token_threshold);
@@ -119,10 +120,10 @@ impl Scheduler {
 
             // Allocate blocks if needed
             if blocks_needed > 0 {
-                if let Some(blocks) = self.kv_cache_manager.allocate_blocks(
-                    &self.running[idx],
-                    tokens_to_schedule,
-                ) {
+                if let Some(blocks) = self
+                    .kv_cache_manager
+                    .allocate_blocks(&self.running[idx], tokens_to_schedule)
+                {
                     self.running[idx].kv_blocks.extend(blocks);
                 } else {
                     // Shouldn't happen since we checked above
@@ -185,8 +186,9 @@ impl Scheduler {
                 }
 
                 // Allocate blocks
-                if let Some(blocks) =
-                    self.kv_cache_manager.allocate_blocks(&request, tokens_to_schedule)
+                if let Some(blocks) = self
+                    .kv_cache_manager
+                    .allocate_blocks(&request, tokens_to_schedule)
                 {
                     request.kv_blocks.extend(blocks);
                 } else {
@@ -198,7 +200,9 @@ impl Scheduler {
                 let new_idx = self.running.len();
 
                 decision.scheduled_new.push(new_idx);
-                decision.tokens_per_request.insert(new_idx, tokens_to_schedule);
+                decision
+                    .tokens_per_request
+                    .insert(new_idx, tokens_to_schedule);
                 token_budget -= tokens_to_schedule;
 
                 self.running.push(request);
@@ -365,13 +369,7 @@ mod tests {
             config.model.kv_cache_bytes_per_token,
             false,
         );
-        Scheduler::new(
-            config.scheduler,
-            config.hardware,
-            config.model,
-            kv_cache,
-        )
-        .unwrap()
+        Scheduler::new(config.scheduler, config.hardware, config.model, kv_cache).unwrap()
     }
 
     fn create_test_request(id: &str, prompt: u32, output: u32) -> Request {
