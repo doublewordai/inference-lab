@@ -1,0 +1,31 @@
+{
+  "name": "@doubleword/inference-lab",
+  "version": "0.1.0",
+  "description": "High-performance LLM inference simulator for analyzing serving systems",
+  "main": "pkg/inference_lab.js",
+  "types": "pkg/inference_lab.d.ts",
+  "files": [
+    "pkg"
+  ],
+  "scripts": {
+    "build": "wasm-pack build --target web --no-default-features --out-dir pkg",
+    "build:cli": "cargo build --release",
+    "publish:npm": "npm publish --access public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/doubleword/inference-lab.git"
+  },
+  "keywords": [
+    "llm",
+    "inference",
+    "simulator",
+    "wasm",
+    "performance"
+  ],
+  "author": "Doubleword",
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  }
+}
