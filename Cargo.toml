@@ -24,7 +24,7 @@ rand_distr = "0.4"
 ordered-float = "4.0"
 env_logger = { version = "0.11", optional = true }
 log = "0.4"
-tabled = { version = "0.16", optional = true }
+tabled = { version = "0.20", optional = true }
 colored = { version = "2.1", optional = true }
 wasm-bindgen = "0.2"
 serde-wasm-bindgen = "0.6"
