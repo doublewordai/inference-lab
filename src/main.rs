@@ -1,5 +1,5 @@
 use clap::Parser;
-use sim::{Config, Simulator};
+use inference_lab::{Config, Simulator};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -316,7 +316,7 @@ fn run_verbose(simulator: &mut Simulator, use_color: bool, config: &Config) {
 
 #[cfg(feature = "cli")]
 fn print_final_metrics(
-    summary: &sim::metrics::MetricsSummary,
+    summary: &inference_lab::metrics::MetricsSummary,
     sim_time: f64,
     real_time: std::time::Duration,
     verbosity: VerbosityLevel,
@@ -462,7 +462,7 @@ fn print_final_metrics(
 
 #[cfg(not(feature = "cli"))]
 fn print_final_metrics(
-    summary: &sim::metrics::MetricsSummary,
+    summary: &inference_lab::metrics::MetricsSummary,
     sim_time: f64,
     real_time: std::time::Duration,
     verbosity: VerbosityLevel,
@@ -475,7 +475,7 @@ fn print_final_metrics(
 }
 
 fn save_metrics_json(
-    summary: &sim::metrics::MetricsSummary,
+    summary: &inference_lab::metrics::MetricsSummary,
     path: &PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use serde_json::json;
