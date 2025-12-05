@@ -14,7 +14,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/doubleword/inference-lab.git"
+    "url": "https://github.com/doublewordai/inference-lab.git"
   },
   "keywords": [
     "llm",

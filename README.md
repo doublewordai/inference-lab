@@ -159,4 +159,4 @@ MIT
 
 ## Repository
 
-https://github.com/doubleword/inference-lab
+https://github.com/doublewordai/inference-lab

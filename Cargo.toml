@@ -1,7 +1,13 @@
 [package]
-name = "sim"
+name = "inference-lab"
 version = "0.1.0"
 edition = "2021"
+authors = ["Doubleword"]
+description = "High-performance LLM inference simulator for analyzing serving systems"
+license = "MIT"
+repository = "https://github.com/doublewordai/inference-lab"
+keywords = ["llm", "inference", "simulator", "performance"]
+categories = ["simulation", "wasm"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]
