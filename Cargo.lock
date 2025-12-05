@@ -228,6 +228,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "inference-lab"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "colored",
+ "console_error_panic_hook",
+ "env_logger",
+ "getrandom",
+ "js-sys",
+ "log",
+ "ordered-float",
+ "rand",
+ "rand_distr",
+ "serde",
+ "serde-wasm-bindgen",
+ "serde_json",
+ "tabled",
+ "toml",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -553,28 +575,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf41e0cfaf7226dca15e8197172c295a782857fcb97fad1808a166870dee75a3"
 dependencies = [
  "serde",
-]
-
-[[package]]
-name = "sim"
-version = "0.1.0"
-dependencies = [
- "clap",
- "colored",
- "console_error_panic_hook",
- "env_logger",
- "getrandom",
- "js-sys",
- "log",
- "ordered-float",
- "rand",
- "rand_distr",
- "serde",
- "serde-wasm-bindgen",
- "serde_json",
- "tabled",
- "toml",
- "wasm-bindgen",
 ]
 
 [[package]]

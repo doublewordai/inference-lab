@@ -1,5 +1,5 @@
 {
-  "name": "@doubleword/inference-lab",
+  "name": "@doublewordai/inference-lab",
   "version": "0.1.0",
   "description": "High-performance LLM inference simulator for analyzing serving systems",
   "main": "pkg/inference_lab.js",
@@ -26,6 +26,7 @@
   "author": "Doubleword",
   "license": "MIT",
   "publishConfig": {
+    "registry": "https://npm.pkg.github.com",
     "access": "public"
   }
 }

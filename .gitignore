@@ -2,3 +2,4 @@
 /pkg
 web/node_modules
 web/dist
+.npmrc
