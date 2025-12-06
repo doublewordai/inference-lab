@@ -25,7 +25,7 @@ ordered-float = "4.0"
 env_logger = { version = "0.11", optional = true }
 log = "0.4"
 tabled = { version = "0.16", optional = true }
-colored = { version = "2.1", optional = true }
+colored = { version = "3.0", optional = true }
 wasm-bindgen = "0.2"
 serde-wasm-bindgen = "0.6"
 js-sys = "0.3"
