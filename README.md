@@ -63,6 +63,8 @@ cargo install inference-lab
 
 ### CLI
 
+**Note:** The CLI tool is only available if you install it using `cargo install inference-lab` (see above).
+
 ```bash
 # Run with default configuration
 inference-lab --config configs/config.toml
@@ -92,17 +94,51 @@ import init, { run_simulation } from '@doubleword/inference-lab';
 
 await init();
 
-const config = `
-[hardware]
-name = "H100"
-compute_flops = 2e15
-memory_bandwidth = 3.35e12
-# ... rest of config
-`;
+const config = {
+  hardware: {
+    name: "H100",
+    compute_flops: 1.513e15,
+    memory_bandwidth: 3.35e12,
+    memory_capacity: 85899345920,
+    bytes_per_param: 2
+  },
+  model: {
+    name: "Llama-3-70B",
+    num_parameters: 70000000000,
+    num_layers: 80,
+    hidden_dim: 8192,
+    num_heads: 64,
+    num_kv_heads: 8,
+    max_seq_len: 8192
+  },
+  scheduler: {
+    max_num_batched_tokens: 8192,
+    max_num_seqs: 256,
+    policy: "fcfs",
+    enable_chunked_prefill: true,
+    block_size: 16
+  },
+  workload: {
+    arrival_pattern: "poisson",
+    arrival_rate: 5.0,
+    num_requests: 400,
+    seed: 42,
+    input_len_dist: {
+      type: "lognormal",
+      mean: 6.9,
+      std_dev: 0.7
+    },
+    output_len_dist: {
+      type: "lognormal",
+      mean: 5.3,
+      std_dev: 0.8
+    }
+  }
+};
 
-const results = run_simulation(config);
-console.log('TTFT P50:', results.ttft_p50);
-console.log('Throughput:', results.throughput);
+const results = run_simulation(JSON.stringify(config));
+console.log('TTFT P50:', results.metrics.ttft_p50);
+console.log('Throughput:', results.metrics.output_tokens_per_sec);
 ```
 
 ## Configuration
