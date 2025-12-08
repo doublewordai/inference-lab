@@ -1,7 +1,8 @@
 # Inference Lab
 
-High-performance LLM inference simulator for analyzing serving systems. Simulates GPU clusters serving LLM inference workloads with realistic performance modeling.
-
+LLM inference simulator for analyzing serving systems.
+Simulates GPU clusters serving LLM inference workloads with realistic
+performance modeling.
 
 ## Features
 
@@ -12,6 +13,31 @@ High-performance LLM inference simulator for analyzing serving systems. Simulate
 - **Workload Generation**: Supports Poisson, Gamma, and closed-loop patterns
 - **WebAssembly Support**: Run simulations in the browser via WASM
 - **CLI Tool**: Standalone binary for command-line usage
+
+## How does it work?
+
+`inference-lab` uses discrete-event simulation to model the behavior of a
+multi-GPU node serving LLM inference requests with the vLLM library. It
+contains a facsimile of the vLLM queueing, scheduling, and execution logic,
+with only the actual model inference replaced by a performance model based on
+the supplied GPU specs and model architecture.
+
+Within each simulation step, the simulator:
+
+1. Processes any newly arrived requests, adding them to the scheduling queue.
+2. Schedules requests to serve based on the selected scheduling policy.
+3. Calculates the compute and memory bandwidth usage for the workload that the
+   scheduled requests represent, and the theoretical time required to execute
+the workload on the specified hardware.
+4. Increments the simulation time by the calculated execution time, updating the
+   state of all requests accordingly.
+
+Caveats:
+
+1. This assumes perfectly optimized GPU execution, ignoring kernel launch
+   overheads, poorly optimized kernels, application overhead, thermals, etc.
+2. We simulate tensor parallel execution, but don't model multi-GPU
+   communication overheads.
 
 ## Installation
 
@@ -160,4 +186,4 @@ MIT
 
 ## Repository
 
-https://github.com/doublewordai/inference-lab
+<https://github.com/doublewordai/inference-lab>
