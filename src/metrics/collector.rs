@@ -24,10 +24,10 @@ pub struct MetricsCollector {
     // Throughput tracking
     // (computed from totals at the end)
 
-    // Resource utilization (sampled periodically)
-    kv_cache_utilization_samples: Vec<f64>,
-    flops_utilization_samples: Vec<f64>,
-    bandwidth_utilization_samples: Vec<f64>,
+    // Resource utilization (streaming aggregation)
+    kv_cache_util_tracker: StreamingQuantiles,
+    flops_util_tracker: StreamingQuantiles,
+    bandwidth_util_tracker: StreamingQuantiles,
 
     // Preemption metrics
     total_preemptions: u64,
@@ -63,9 +63,9 @@ impl MetricsCollector {
             total_input_tokens: 0,
             total_output_tokens: 0,
             start_time,
-            kv_cache_utilization_samples: Vec::new(),
-            flops_utilization_samples: Vec::new(),
-            bandwidth_utilization_samples: Vec::new(),
+            kv_cache_util_tracker: StreamingQuantiles::new(),
+            flops_util_tracker: StreamingQuantiles::new(),
+            bandwidth_util_tracker: StreamingQuantiles::new(),
             total_preemptions: 0,
             preemptions_per_request: Vec::new(),
             completed_requests: 0,
@@ -94,9 +94,9 @@ impl MetricsCollector {
             self.current_interval_ttft_count += 1;
         }
 
-        // E2E latency (excluding time spent preempted)
+        // E2E latency
         if let Some(completion_time) = request.completion_time {
-            let e2e = completion_time - request.arrival_time - request.preempted_time;
+            let e2e = completion_time - request.arrival_time;
             self.e2e_latency_samples.push(e2e);
             self.e2e_timestamps.push(completion_time);
             self.e2e_quantiles.add(e2e);
@@ -188,19 +188,13 @@ impl MetricsCollector {
         flops_util: f64,
         bandwidth_util: f64,
     ) {
-        self.kv_cache_utilization_samples.push(kv_cache_util);
-        self.flops_utilization_samples.push(flops_util);
-        self.bandwidth_utilization_samples.push(bandwidth_util);
-    }
-
-    /// Record throughput metrics (no longer needed - computed from totals)
-    pub fn record_throughput_sample(&mut self, _current_time: f64) {
-        // Throughput percentiles removed - they were measuring cumulative throughput over time
-        // which is not meaningful. We now only report mean throughput.
+        self.kv_cache_util_tracker.add(kv_cache_util);
+        self.flops_util_tracker.add(flops_util);
+        self.bandwidth_util_tracker.add(bandwidth_util);
     }
 
     /// Compute final summary statistics
-    pub fn compute_summary(&self, current_time: f64) -> MetricsSummary {
+    pub fn compute_summary(&mut self, current_time: f64) -> MetricsSummary {
         let elapsed = current_time - self.start_time;
 
         MetricsSummary {
@@ -228,10 +222,10 @@ impl MetricsCollector {
             output_tokens_per_sec: self.total_output_tokens as f64 / elapsed,
             requests_per_sec: self.completed_requests as f64 / elapsed,
 
-            // Utilization (average over all samples)
-            avg_kv_cache_util: mean(&self.kv_cache_utilization_samples),
-            avg_flops_util: mean(&self.flops_utilization_samples),
-            avg_bandwidth_util: mean(&self.bandwidth_utilization_samples),
+            // Utilization (average over all samples) - O(1) from streaming mean
+            avg_kv_cache_util: self.kv_cache_util_tracker.mean(),
+            avg_flops_util: self.flops_util_tracker.mean(),
+            avg_bandwidth_util: self.bandwidth_util_tracker.mean(),
 
             // Preemption
             total_preemptions: self.total_preemptions,
@@ -242,22 +236,6 @@ impl MetricsCollector {
             total_requests: self.total_requests,
         }
     }
-}
-
-/// Calculate mean of samples
-fn mean(samples: &[f64]) -> f64 {
-    if samples.is_empty() {
-        return 0.0;
-    }
-    let valid_samples: Vec<f64> = samples
-        .iter()
-        .filter(|x| !x.is_nan() && x.is_finite())
-        .copied()
-        .collect();
-    if valid_samples.is_empty() {
-        return 0.0;
-    }
-    valid_samples.iter().sum::<f64>() / valid_samples.len() as f64
 }
 
 /// Calculate mean of u32 samples
@@ -271,15 +249,6 @@ fn mean_u32(samples: &[u32]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_mean() {
-        let samples = vec![1.0, 2.0, 3.0, 4.0, 5.0];
-        assert_eq!(mean(&samples), 3.0);
-
-        let empty: Vec<f64> = vec![];
-        assert_eq!(mean(&empty), 0.0);
-    }
 
     #[test]
     fn test_mean_u32() {
@@ -362,8 +331,8 @@ mod tests {
 
         collector.record_request_completion(&req);
 
-        // E2E = completion - arrival - preempted_time = 10.0 - 1.0 - 3.0 = 6.0
-        assert_eq!(collector.e2e_latency_samples[0], 6.0);
+        // E2E = completion - arrival = 10.0 - 1.0 = 9.0 (includes preemption time)
+        assert_eq!(collector.e2e_latency_samples[0], 9.0);
         assert_eq!(collector.total_preemptions, 2);
     }
 
@@ -379,8 +348,8 @@ mod tests {
 
         collector.record_request_completion(&req);
 
-        // E2E = 20.0 - 0.0 - 7.5 = 12.5 (actual processing time)
-        assert_eq!(collector.e2e_latency_samples[0], 12.5);
+        // E2E = 20.0 - 0.0 = 20.0 (includes preemption time)
+        assert_eq!(collector.e2e_latency_samples[0], 20.0);
         assert_eq!(collector.total_preemptions, 5);
         assert_eq!(collector.preemptions_per_request[0], 5);
     }
@@ -437,11 +406,11 @@ mod tests {
         req1.completion_time = Some(4.0);
         req1.preempted_time = 0.0;
 
-        // Request 2: TTFT=2.0, E2E=5.0 (with preemption)
+        // Request 2: TTFT=2.0, E2E=8.0 (with preemption)
         let mut req2 = Request::new("req-2".to_string(), 0, 2.0, 100, 10);
         req2.first_token_time = Some(4.0);
         req2.completion_time = Some(10.0);
-        req2.preempted_time = 1.0; // 8.0 - 1.0 = 7.0 actual, then - 2.0 arrival = 5.0
+        req2.preempted_time = 1.0;
 
         collector.record_request_completion(&req1);
         collector.record_request_completion(&req2);
@@ -454,8 +423,8 @@ mod tests {
         assert_eq!(collector.ttft_samples[1], 2.0);
 
         // Check E2E values
-        assert_eq!(collector.e2e_latency_samples[0], 3.0); // 4.0 - 1.0 - 0.0
-        assert_eq!(collector.e2e_latency_samples[1], 7.0); // 10.0 - 2.0 - 1.0
+        assert_eq!(collector.e2e_latency_samples[0], 3.0); // 4.0 - 1.0
+        assert_eq!(collector.e2e_latency_samples[1], 8.0); // 10.0 - 2.0
     }
 
     #[test]

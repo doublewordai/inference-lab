@@ -38,3 +38,4 @@ cli = ["clap", "env_logger", "tabled", "colored"]
 
 [profile.release]
 opt-level = "s" # Optimize for size in WASM
+debug = true # Enable debug symbols for profiling

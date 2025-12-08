@@ -119,81 +119,30 @@ impl Simulator {
             // 2. Run scheduler
             let decision = self.scheduler.schedule(self.current_time);
 
-            // 3. Calculate iteration time
-            let iteration_time = if decision.num_scheduled() > 0 {
-                // Build batch of scheduled requests
+            // 3. Calculate iteration time and utilization (build batch once, reuse for both)
+            let (iteration_time, bandwidth_util, flops_util) = if decision.num_scheduled() > 0 {
+                // Build batch of scheduled requests and tokens in a single pass
                 let running = self.scheduler.running_mut();
-                let batch_requests: Vec<&_> = decision
-                    .scheduled_new
-                    .iter()
-                    .chain(decision.scheduled_running.iter())
-                    .filter_map(|&idx| running.get(idx))
-                    .collect();
+                let mut batch_requests = Vec::new();
+                let mut tokens_per_req = Vec::new();
 
-                let tokens_per_req: Vec<u32> = batch_requests
-                    .iter()
-                    .enumerate()
-                    .map(|(i, _req)| {
-                        let idx = if i < decision.scheduled_new.len() {
-                            decision.scheduled_new[i]
-                        } else {
-                            decision.scheduled_running[i - decision.scheduled_new.len()]
-                        };
-                        *decision.tokens_per_request.get(&idx).unwrap_or(&0)
-                    })
-                    .collect();
-
-                self.compute_engine
-                    .calculate_iteration_time(&batch_requests, &tokens_per_req)
-            } else {
-                0.001 // Small time step when idle
-            };
-
-            // 4. Advance time
-            self.current_time += iteration_time;
-
-            // 5. Determine which requests were prefilling vs decoding BEFORE updating state
-            let mut prefilling_reqs = std::collections::HashSet::new();
-            for (&idx, &_tokens) in &decision.tokens_per_request {
-                if let Some(request) = self.scheduler.running().get(idx) {
-                    if request.is_prefill() {
-                        prefilling_reqs.insert(idx);
+                for (i, &idx) in decision.scheduled_new.iter().enumerate() {
+                    if let Some(req) = running.get(idx) {
+                        batch_requests.push(req);
+                        tokens_per_req.push(decision.tokens_for_new[i]);
                     }
                 }
-            }
 
-            // 6. Update request states
-            for (&idx, &tokens) in &decision.tokens_per_request {
-                if let Some(request) = self.scheduler.running_mut().get_mut(idx) {
-                    request.record_generated_tokens(tokens, self.current_time);
+                for (i, &idx) in decision.scheduled_running.iter().enumerate() {
+                    if let Some(req) = running.get(idx) {
+                        batch_requests.push(req);
+                        tokens_per_req.push(decision.tokens_for_running[i]);
+                    }
                 }
-            }
 
-            // 7. Record iteration metrics (before moving completed requests)
-            let kv_util = self.scheduler.kv_cache_manager().utilization();
-
-            // Calculate bandwidth and flops utilization
-            let (bandwidth_util, flops_util) = if decision.num_scheduled() > 0 {
-                let running = self.scheduler.running_mut();
-                let batch_requests: Vec<&_> = decision
-                    .scheduled_new
-                    .iter()
-                    .chain(decision.scheduled_running.iter())
-                    .filter_map(|&idx| running.get(idx))
-                    .collect();
-
-                let tokens_per_req: Vec<u32> = batch_requests
-                    .iter()
-                    .enumerate()
-                    .map(|(i, _req)| {
-                        let idx = if i < decision.scheduled_new.len() {
-                            decision.scheduled_new[i]
-                        } else {
-                            decision.scheduled_running[i - decision.scheduled_new.len()]
-                        };
-                        *decision.tokens_per_request.get(&idx).unwrap_or(&0)
-                    })
-                    .collect();
+                let iteration_time = self
+                    .compute_engine
+                    .calculate_iteration_time(&batch_requests, &tokens_per_req);
 
                 let bytes_transferred = self
                     .compute_engine
@@ -208,10 +157,38 @@ impl Simulator {
                     iteration_time,
                 );
 
-                (bandwidth_util, flops_util)
+                (iteration_time, bandwidth_util, flops_util)
             } else {
-                (0.0, 0.0)
+                (0.001, 0.0, 0.0) // Small time step when idle
             };
+
+            // 4. Advance time
+            self.current_time += iteration_time;
+
+            // 5. Determine which requests were prefilling vs decoding BEFORE updating state
+            let mut prefilling_reqs = std::collections::HashSet::new();
+            for &idx in decision.scheduled_new.iter().chain(decision.scheduled_running.iter()) {
+                if let Some(request) = self.scheduler.running().get(idx) {
+                    if request.is_prefill() {
+                        prefilling_reqs.insert(idx);
+                    }
+                }
+            }
+
+            // 6. Update request states
+            for (i, &idx) in decision.scheduled_new.iter().enumerate() {
+                if let Some(request) = self.scheduler.running_mut().get_mut(idx) {
+                    request.record_generated_tokens(decision.tokens_for_new[i], self.current_time);
+                }
+            }
+            for (i, &idx) in decision.scheduled_running.iter().enumerate() {
+                if let Some(request) = self.scheduler.running_mut().get_mut(idx) {
+                    request.record_generated_tokens(decision.tokens_for_running[i], self.current_time);
+                }
+            }
+
+            // 7. Record iteration metrics (before moving completed requests)
+            let kv_util = self.scheduler.kv_cache_manager().utilization();
 
             self.metrics
                 .record_iteration_metrics(kv_util, flops_util, bandwidth_util);
@@ -234,16 +211,22 @@ impl Simulator {
                 }
 
                 // Count tokens scheduled in this iteration
-                for (&idx, &tokens) in &decision.tokens_per_request {
+                for (i, &idx) in decision.scheduled_new.iter().enumerate() {
+                    let tokens = decision.tokens_for_new[i];
                     if prefilling_reqs.contains(&idx) {
                         prefill_tokens += tokens;
                     } else {
                         decode_tokens += tokens;
                     }
                 }
-
-                // Record throughput sample
-                self.metrics.record_throughput_sample(self.current_time);
+                for (i, &idx) in decision.scheduled_running.iter().enumerate() {
+                    let tokens = decision.tokens_for_running[i];
+                    if prefilling_reqs.contains(&idx) {
+                        prefill_tokens += tokens;
+                    } else {
+                        decode_tokens += tokens;
+                    }
+                }
 
                 // Calculate windowed throughput (tokens per second)
                 let input_throughput = prefill_tokens as f64 / self.sample_interval;
@@ -287,6 +270,10 @@ impl Simulator {
 
             // 10. Send progress update if enough time has passed
             if self.current_time - last_callback_time >= callback_interval {
+                // Compute summary first (requires &mut self)
+                let summary = self.metrics.compute_summary(self.current_time);
+
+                // Then get immutable references
                 let latency_samples = self.metrics.get_latency_samples();
                 let input_lengths = self.metrics.get_input_lengths();
                 let output_lengths = self.metrics.get_output_lengths();
@@ -309,7 +296,7 @@ impl Simulator {
                     waiting: self.scheduler.num_waiting(),
                     kv_cache_util: kv_util,
                     time_series: Some(&self.time_series_data),
-                    metrics: Some(self.metrics.compute_summary(self.current_time)),
+                    metrics: Some(summary),
                     latency_samples: Some((
                         (ttft_delta, ttft_timestamps_delta),
                         (e2e_delta, e2e_timestamps_delta),
@@ -333,6 +320,10 @@ impl Simulator {
             // 11. Check termination conditions
             if self.should_terminate() {
                 // Send final progress update with any remaining samples
+                // Compute summary first (requires &mut self)
+                let summary = self.metrics.compute_summary(self.current_time);
+
+                // Then get immutable references
                 let latency_samples = self.metrics.get_latency_samples();
                 let input_lengths = self.metrics.get_input_lengths();
                 let output_lengths = self.metrics.get_output_lengths();
@@ -355,7 +346,7 @@ impl Simulator {
                     waiting: self.scheduler.num_waiting(),
                     kv_cache_util: kv_util,
                     time_series: Some(&self.time_series_data),
-                    metrics: Some(self.metrics.compute_summary(self.current_time)),
+                    metrics: Some(summary),
                     latency_samples: Some((
                         (ttft_delta, ttft_timestamps_delta),
                         (e2e_delta, e2e_timestamps_delta),
@@ -371,7 +362,7 @@ impl Simulator {
         Ok(())
     }
 
-    pub fn get_metrics_summary(&self) -> crate::metrics::MetricsSummary {
+    pub fn get_metrics_summary(&mut self) -> crate::metrics::MetricsSummary {
         self.metrics.compute_summary(self.current_time)
     }
 

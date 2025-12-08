@@ -1,5 +1,4 @@
 use crate::request::Request;
-use std::collections::HashMap;
 
 /// Result of a scheduling decision
 #[derive(Debug)]
@@ -16,9 +15,11 @@ pub struct ScheduleDecision {
     /// Completed requests
     pub completed: Vec<Request>,
 
-    /// Number of tokens to process for each scheduled request
-    /// Key: index in running queue, Value: number of tokens
-    pub tokens_per_request: HashMap<usize, u32>,
+    /// Number of tokens for each newly scheduled request (parallel to scheduled_new)
+    pub tokens_for_new: Vec<u32>,
+
+    /// Number of tokens for each continuing request (parallel to scheduled_running)
+    pub tokens_for_running: Vec<u32>,
 }
 
 impl ScheduleDecision {
@@ -28,13 +29,14 @@ impl ScheduleDecision {
             scheduled_running: Vec::new(),
             preempted: Vec::new(),
             completed: Vec::new(),
-            tokens_per_request: HashMap::new(),
+            tokens_for_new: Vec::new(),
+            tokens_for_running: Vec::new(),
         }
     }
 
     /// Get total number of tokens scheduled in this iteration
     pub fn total_tokens(&self) -> u32 {
-        self.tokens_per_request.values().sum()
+        self.tokens_for_new.iter().sum::<u32>() + self.tokens_for_running.iter().sum::<u32>()
     }
 
     /// Get number of scheduled requests (new + running)

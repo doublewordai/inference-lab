@@ -134,7 +134,7 @@ impl Scheduler {
 
             // Schedule this request
             decision.scheduled_running.push(idx);
-            decision.tokens_per_request.insert(idx, tokens_to_schedule);
+            decision.tokens_for_running.push(tokens_to_schedule);
             token_budget -= tokens_to_schedule;
             idx += 1;
         }
@@ -200,9 +200,7 @@ impl Scheduler {
                 let new_idx = self.running.len();
 
                 decision.scheduled_new.push(new_idx);
-                decision
-                    .tokens_per_request
-                    .insert(new_idx, tokens_to_schedule);
+                decision.tokens_for_new.push(tokens_to_schedule);
                 token_budget -= tokens_to_schedule;
 
                 self.running.push(request);
