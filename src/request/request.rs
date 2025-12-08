@@ -167,7 +167,7 @@ mod tests {
         assert_eq!(req.max_output_tokens, 50);
         assert_eq!(req.num_computed_tokens, 0);
         assert_eq!(req.num_output_tokens, 0);
-        assert_eq!(req.num_tokens, 100);
+        assert_eq!(req.num_tokens, 150); // prompt + max_output
     }
 
     #[test]
@@ -187,13 +187,16 @@ mod tests {
     fn test_tokens_to_process() {
         let mut req = Request::new("req-1".to_string(), 0, 0.0, 100, 50);
 
-        assert_eq!(req.tokens_to_process(), 100);
+        assert_eq!(req.tokens_to_process(), 150); // prompt(100) + max_output(50)
 
         req.num_computed_tokens = 50;
-        assert_eq!(req.tokens_to_process(), 50);
+        assert_eq!(req.tokens_to_process(), 100); // 150 - 50
 
         req.num_computed_tokens = 100;
-        assert_eq!(req.tokens_to_process(), 0);
+        assert_eq!(req.tokens_to_process(), 50); // 150 - 100 (in decode phase now)
+
+        req.num_computed_tokens = 150;
+        assert_eq!(req.tokens_to_process(), 0); // All tokens processed
     }
 
     #[test]
@@ -220,14 +223,14 @@ mod tests {
         req.record_generated_tokens(50, 1.0);
         assert_eq!(req.num_computed_tokens, 50);
         assert_eq!(req.num_output_tokens, 0);
-        assert_eq!(req.num_tokens, 100);
+        assert_eq!(req.num_tokens, 150); // prompt(100) + max_output(50)
         assert!(req.first_token_time.is_none());
 
         // Complete prefill and start decode
         req.record_generated_tokens(51, 2.0);
         assert_eq!(req.num_computed_tokens, 101);
         assert_eq!(req.num_output_tokens, 1);
-        assert_eq!(req.num_tokens, 101);
+        assert_eq!(req.num_tokens, 150); // Stays fixed at prompt(100) + max_output(50)
         assert_eq!(req.first_token_time, Some(2.0));
         assert_eq!(req.token_generation_times.len(), 1);
 
@@ -235,7 +238,7 @@ mod tests {
         req.record_generated_tokens(1, 3.0);
         assert_eq!(req.num_computed_tokens, 102);
         assert_eq!(req.num_output_tokens, 2);
-        assert_eq!(req.num_tokens, 102);
+        assert_eq!(req.num_tokens, 150); // Stays fixed
         assert_eq!(req.first_token_time, Some(2.0)); // Doesn't change
         assert_eq!(req.token_generation_times.len(), 2);
     }

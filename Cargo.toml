@@ -37,4 +37,4 @@ default = ["cli"]
 cli = ["clap", "env_logger", "tabled", "colored"]
 
 [profile.release]
-opt-level = "s"  # Optimize for size in WASM
+opt-level = "s" # Optimize for size in WASM

@@ -38,7 +38,6 @@ pub fn run_simulation(config_json: &str) -> Result<JsValue, JsValue> {
         .map_err(|e| JsValue::from_str(&format!("Config parse error: {}", e)))?;
 
     // Compute derived fields (same as from_file)
-    config.hardware.compute_threshold();
     config
         .model
         .compute_kv_cache_size(config.hardware.bytes_per_param);
@@ -54,8 +53,10 @@ pub fn run_simulation(config_json: &str) -> Result<JsValue, JsValue> {
     let mut simulator = crate::Simulator::new(config)
         .map_err(|e| JsValue::from_str(&format!("Simulator error: {}", e)))?;
 
-    // Run simulation
-    simulator.run();
+    // Run simulation with no-op callback
+    simulator
+        .run_with_callback(|_| {})
+        .map_err(|e| JsValue::from_str(&e))?;
 
     // Extract metrics
     let summary = simulator.get_metrics_summary();
@@ -142,7 +143,6 @@ pub fn run_simulation_streaming(
         .map_err(|e| JsValue::from_str(&format!("Config parse error: {}", e)))?;
 
     // Compute derived fields (same as from_file)
-    config.hardware.compute_threshold();
     config
         .model
         .compute_kv_cache_size(config.hardware.bytes_per_param);

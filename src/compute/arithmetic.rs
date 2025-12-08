@@ -1,12 +1,6 @@
 /// Core inference arithmetic formulas based on the inference-arithmetic.mdx blog post
 use crate::config::{HardwareConfig, ModelConfig};
 
-/// Calculate the compute-bound threshold (number of tokens at which inference becomes compute-bound)
-/// Formula: threshold = (bytes_per_param * compute_flops) / memory_bandwidth
-pub fn compute_bound_threshold(hardware: &HardwareConfig) -> u32 {
-    (hardware.bytes_per_param as f64 * hardware.compute_flops / hardware.memory_bandwidth) as u32
-}
-
 /// Calculate FLOPS for a given number of tokens
 /// Formula: FLOPS = 2 * num_tokens * active_parameters + attention_flops
 /// For MoE models, uses active_parameters (not total) since only some experts are activated
@@ -66,37 +60,10 @@ pub fn total_memory_transfer(
     weight_bytes + kv_bytes
 }
 
-/// Check if a workload is compute-bound
-/// A workload is compute-bound if the number of tokens >= compute-bound threshold
-pub fn is_compute_bound(num_tokens: u32, hardware: &HardwareConfig) -> bool {
-    num_tokens >= hardware.compute_bound_threshold
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::Config;
-
-    #[test]
-    fn test_compute_bound_threshold_h100() {
-        let mut hardware = crate::config::HardwareConfig {
-            name: "H100".to_string(),
-            compute_flops: 1.513e15,   // 1513 TFLOPS bf16
-            memory_bandwidth: 3.35e12, // 3.35 TB/s
-            memory_capacity: 80_000_000_000,
-            kv_cache_capacity: 60_000_000_000,
-            gpu_memory_utilization: 0.9,
-            bytes_per_param: 2, // bf16
-            compute_bound_threshold: 0,
-        };
-        hardware.compute_threshold();
-
-        let threshold = compute_bound_threshold(&hardware);
-
-        // Should be approximately 903 for H100 bf16
-        assert!(threshold > 900 && threshold < 910);
-        assert_eq!(threshold, hardware.compute_bound_threshold);
-    }
 
     #[test]
     fn test_flops_calculation() {
@@ -150,28 +117,5 @@ mod tests {
         let expected_weights = 14_000_000_000.0;
         let expected_kv = 524_288.0 * (50.0 + 100.0 + 150.0);
         assert_eq!(total, expected_weights + expected_kv);
-    }
-
-    #[test]
-    fn test_is_compute_bound() {
-        let mut hardware = crate::config::HardwareConfig {
-            name: "Test".to_string(),
-            compute_flops: 1e15,
-            memory_bandwidth: 1e12,
-            memory_capacity: 80_000_000_000,
-            kv_cache_capacity: 60_000_000_000,
-            gpu_memory_utilization: 0.9,
-            bytes_per_param: 2,
-            compute_bound_threshold: 0,
-        };
-        hardware.compute_threshold();
-
-        // Threshold should be 2000
-        assert_eq!(hardware.compute_bound_threshold, 2000);
-
-        assert!(!is_compute_bound(1000, &hardware));
-        assert!(!is_compute_bound(1999, &hardware));
-        assert!(is_compute_bound(2000, &hardware));
-        assert!(is_compute_bound(3000, &hardware));
     }
 }

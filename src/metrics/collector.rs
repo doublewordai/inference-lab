@@ -40,6 +40,12 @@ pub struct MetricsCollector {
     // Length distributions
     input_lengths: Vec<u32>,
     output_lengths: Vec<u32>,
+
+    // Interval accumulators for O(1) mean computation
+    current_interval_ttft_sum: f64,
+    current_interval_ttft_count: u32,
+    current_interval_tpot_sum: f64,
+    current_interval_tpot_count: u32,
 }
 
 impl MetricsCollector {
@@ -66,6 +72,10 @@ impl MetricsCollector {
             total_requests: 0,
             input_lengths: Vec::new(),
             output_lengths: Vec::new(),
+            current_interval_ttft_sum: 0.0,
+            current_interval_ttft_count: 0,
+            current_interval_tpot_sum: 0.0,
+            current_interval_tpot_count: 0,
         }
     }
 
@@ -79,6 +89,9 @@ impl MetricsCollector {
             self.ttft_samples.push(ttft);
             self.ttft_timestamps.push(completion_time); // Use completion time, not first token time
             self.ttft_quantiles.add(ttft);
+            // Accumulate for interval mean
+            self.current_interval_ttft_sum += ttft;
+            self.current_interval_ttft_count += 1;
         }
 
         // E2E latency (excluding time spent preempted)
@@ -97,6 +110,9 @@ impl MetricsCollector {
             self.per_token_latency_samples.push(tpot);
             self.per_token_timestamps.push(curr_time);
             self.per_token_quantiles.add(tpot);
+            // Accumulate for interval mean
+            self.current_interval_tpot_sum += tpot;
+            self.current_interval_tpot_count += 1;
         }
 
         // Throughput counters
@@ -139,40 +155,28 @@ impl MetricsCollector {
         )
     }
 
-    /// Get latency mean for events in a time range
-    /// Returns (ttft_mean_ms, tpot_mean_ms) for samples in the given time range
+    /// Get latency mean for the current interval and reset accumulators
+    /// Returns (ttft_mean_ms, tpot_mean_ms) for samples since last call
     /// Returns f64::NAN if no samples in interval (allows chart to skip intervals and draw lines)
-    pub fn get_interval_latencies(&self, start_time: f64, end_time: f64) -> (f64, f64) {
-        // Collect TTFT samples in interval
-        let ttft_interval: Vec<f64> = self
-            .ttft_samples
-            .iter()
-            .zip(&self.ttft_timestamps)
-            .filter(|(_, &timestamp)| timestamp > start_time && timestamp <= end_time)
-            .map(|(&sample, _)| sample * 1000.0) // Convert to ms
-            .collect();
-
-        // Collect TPOT samples in interval
-        let tpot_interval: Vec<f64> = self
-            .per_token_latency_samples
-            .iter()
-            .zip(&self.per_token_timestamps)
-            .filter(|(_, &timestamp)| timestamp > start_time && timestamp <= end_time)
-            .map(|(&sample, _)| sample * 1000.0) // Convert to ms
-            .collect();
-
-        // Calculate mean for each
-        let ttft_mean = if ttft_interval.is_empty() {
-            f64::NAN // Use NaN so chart skips this point
+    pub fn get_interval_latencies(&mut self) -> (f64, f64) {
+        // Calculate mean from accumulators
+        let ttft_mean = if self.current_interval_ttft_count > 0 {
+            (self.current_interval_ttft_sum / self.current_interval_ttft_count as f64) * 1000.0
         } else {
-            ttft_interval.iter().sum::<f64>() / ttft_interval.len() as f64
+            f64::NAN // Use NaN so chart skips this point
         };
 
-        let tpot_mean = if tpot_interval.is_empty() {
-            f64::NAN // Use NaN so chart skips this point
+        let tpot_mean = if self.current_interval_tpot_count > 0 {
+            (self.current_interval_tpot_sum / self.current_interval_tpot_count as f64) * 1000.0
         } else {
-            tpot_interval.iter().sum::<f64>() / tpot_interval.len() as f64
+            f64::NAN // Use NaN so chart skips this point
         };
+
+        // Reset accumulators for next interval
+        self.current_interval_ttft_sum = 0.0;
+        self.current_interval_ttft_count = 0;
+        self.current_interval_tpot_sum = 0.0;
+        self.current_interval_tpot_count = 0;
 
         (ttft_mean, tpot_mean)
     }
@@ -240,20 +244,6 @@ impl MetricsCollector {
     }
 }
 
-/// Calculate percentile of a sorted array
-fn percentile(samples: &[f64], p: f64) -> f64 {
-    if samples.is_empty() {
-        return 0.0;
-    }
-    let mut sorted: Vec<f64> = samples.iter().filter(|x| !x.is_nan()).copied().collect();
-    if sorted.is_empty() {
-        return 0.0;
-    }
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let idx = ((sorted.len() as f64 - 1.0) * p) as usize;
-    sorted[idx]
-}
-
 /// Calculate mean of samples
 fn mean(samples: &[f64]) -> f64 {
     if samples.is_empty() {
@@ -281,15 +271,6 @@ fn mean_u32(samples: &[u32]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_percentile() {
-        let samples = vec![1.0, 2.0, 3.0, 4.0, 5.0];
-
-        assert_eq!(percentile(&samples, 0.0), 1.0);
-        assert_eq!(percentile(&samples, 0.5), 3.0);
-        assert_eq!(percentile(&samples, 1.0), 5.0);
-    }
 
     #[test]
     fn test_mean() {

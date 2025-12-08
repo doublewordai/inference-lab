@@ -120,20 +120,29 @@ fn main() {
         println!("  Hardware: {}", config.hardware.name);
         println!("  Model: {}", config.model.name);
         println!(
-            "  Compute-bound threshold: {} tokens",
-            config.hardware.compute_bound_threshold
-        );
-        println!(
             "  Max batched tokens: {}",
             config.scheduler.max_num_batched_tokens
         );
-        if config.scheduler.enable_chunked_prefill {
-            println!(
-                "  Chunked prefill enabled: {} tokens/chunk",
-                config.scheduler.long_prefill_token_threshold
-            );
+
+        // Print arrival pattern with relevant details
+        match config.workload.arrival_pattern.to_lowercase().as_str() {
+            "closed_loop" => {
+                if let Some(users) = config.workload.num_concurrent_users {
+                    println!("  Arrival: closed-loop ({} concurrent users)", users);
+                } else {
+                    println!("  Arrival: closed-loop");
+                }
+            }
+            "batched" => {
+                println!("  Arrival: batched (all requests at t=0)");
+            }
+            pattern => {
+                println!(
+                    "  Arrival: {} ({} req/sec)",
+                    pattern, config.workload.arrival_rate
+                );
+            }
         }
-        println!("  Arrival rate: {} req/sec", config.workload.arrival_rate);
         println!(
             "  Number of requests: {}",
             config
@@ -168,16 +177,19 @@ fn main() {
             run_verbose(&mut simulator, use_color, &config);
         }
         VerbosityLevel::Debug => {
-            // Debug mode uses the old run() method which has detailed logging
-            simulator.run();
+            // Debug mode with no progress callbacks
+            simulator.run_with_callback(|_| {}).unwrap();
             let elapsed = start_time.elapsed();
+            println!("\nSimulation complete!");
             if verbosity >= VerbosityLevel::Normal {
                 println!(
-                    "\nSimulation completed in {:.2}s (real time)",
+                    "Simulation completed in {:.2}s (real time)\n",
                     elapsed.as_secs_f64()
                 );
             }
-            // Metrics already printed by run()
+            // Print final metrics for debug mode
+            let summary = simulator.get_metrics_summary();
+            summary.print();
             return;
         }
     }

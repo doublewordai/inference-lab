@@ -30,20 +30,9 @@ pub struct HardwareConfig {
 
     /// Number of bytes per parameter (1 for fp8, 2 for bf16)
     pub bytes_per_param: u32,
-
-    /// Compute-bound threshold (derived from flops/bandwidth ratio)
-    /// This is calculated: bytes_per_param * compute_flops / memory_bandwidth
-    #[serde(skip)]
-    pub compute_bound_threshold: u32,
 }
 
 impl HardwareConfig {
-    /// Calculate and set the compute-bound threshold
-    pub fn compute_threshold(&mut self) {
-        self.compute_bound_threshold =
-            (self.bytes_per_param as f64 * self.compute_flops / self.memory_bandwidth) as u32;
-    }
-
     /// Calculate KV cache capacity if not explicitly set
     /// Formula: (memory_capacity * gpu_memory_utilization) - model_size
     /// This matches vLLM's behavior: requested_memory - non_kv_cache_memory
@@ -55,11 +44,5 @@ impl HardwareConfig {
             // For simplicity, we approximate this as just the model weights
             self.kv_cache_capacity = requested_memory.saturating_sub(model_size_bytes);
         }
-    }
-
-    /// Initialize with threshold pre-computed
-    pub fn with_threshold(mut self) -> Self {
-        self.compute_threshold();
-        self
     }
 }

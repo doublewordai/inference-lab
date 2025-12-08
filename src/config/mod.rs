@@ -32,7 +32,6 @@ impl Config {
         let mut config: Config = toml::from_str(&contents)?;
 
         // Compute derived fields
-        config.hardware.compute_threshold();
         config
             .model
             .compute_kv_cache_size(config.hardware.bytes_per_param);
@@ -59,9 +58,7 @@ impl Config {
             kv_cache_capacity: 60_000_000_000,
             gpu_memory_utilization: 0.9,
             bytes_per_param: 2,
-            compute_bound_threshold: 0,
         };
-        hardware.compute_threshold();
 
         let mut model = ModelConfig {
             name: "Test Model".to_string(),
@@ -117,25 +114,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_hardware_compute_bound_threshold() {
-        let mut hw = HardwareConfig {
-            name: "Test".to_string(),
-            compute_flops: 1.513e15,
-            memory_bandwidth: 3.35e12,
-            memory_capacity: 80_000_000_000,
-            kv_cache_capacity: 60_000_000_000,
-            gpu_memory_utilization: 0.9,
-            bytes_per_param: 2,
-            compute_bound_threshold: 0,
-        };
-        hw.compute_threshold();
-
-        // Should be approximately 903 for H100 bf16
-        assert!(hw.compute_bound_threshold > 900);
-        assert!(hw.compute_bound_threshold < 910);
-    }
-
-    #[test]
     fn test_model_kv_cache_calculation() {
         let mut model = ModelConfig {
             name: "Test".to_string(),
@@ -163,7 +141,6 @@ mod tests {
     #[test]
     fn test_config_creation() {
         let config = Config::test_default();
-        assert!(config.hardware.compute_bound_threshold > 0);
         assert!(config.model.kv_cache_bytes_per_token > 0);
     }
 }
