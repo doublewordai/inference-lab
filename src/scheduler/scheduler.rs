@@ -452,4 +452,208 @@ mod tests {
             assert_eq!(idx, scheduler.num_running() - 1);
         }
     }
+
+    fn create_scheduler_with_policy(policy: &str) -> Scheduler {
+        let mut config = Config::test_default();
+        config.scheduler.policy = policy.to_string();
+        let kv_cache = KVCacheManager::new(
+            config.hardware.kv_cache_capacity,
+            config.scheduler.block_size,
+            config.model.kv_cache_bytes_per_token,
+            false,
+        );
+        Scheduler::new(config.scheduler, config.hardware, config.model, kv_cache).unwrap()
+    }
+
+    #[test]
+    fn test_sjf_selection() {
+        let mut scheduler = create_scheduler_with_policy("sjf");
+
+        // Add requests with different output lengths
+        scheduler.add_request(create_test_request("req-long", 16, 100)); // longest
+        scheduler.add_request(create_test_request("req-short", 16, 10)); // shortest
+        scheduler.add_request(create_test_request("req-medium", 16, 50)); // medium
+
+        // SJF should select the shortest job first (output=10)
+        let idx = scheduler.select_next_waiting_request();
+        assert_eq!(scheduler.waiting.get(idx).unwrap().max_output_tokens, 10);
+    }
+
+    #[test]
+    fn test_sjf_preemption() {
+        let mut scheduler = create_scheduler_with_policy("sjf");
+
+        // Add running requests with different remaining outputs
+        let mut req1 = create_test_request("req-1", 16, 100);
+        req1.num_output_tokens = 50; // 50 remaining
+        req1.status = RequestStatus::Running;
+
+        let mut req2 = create_test_request("req-2", 16, 50);
+        req2.num_output_tokens = 10; // 40 remaining
+        req2.status = RequestStatus::Running;
+
+        let mut req3 = create_test_request("req-3", 16, 30);
+        req3.num_output_tokens = 5; // 25 remaining
+        req3.status = RequestStatus::Running;
+
+        scheduler.running.push(req1);
+        scheduler.running.push(req2);
+        scheduler.running.push(req3);
+
+        // SJF should preempt the longest remaining job (req-1 with 50 remaining)
+        let victim_idx = scheduler.select_preemption_victim().unwrap();
+        assert_eq!(
+            scheduler.running[victim_idx].max_output_tokens
+                - scheduler.running[victim_idx].num_output_tokens,
+            50
+        );
+    }
+
+    #[test]
+    fn test_sif_selection() {
+        let mut scheduler = create_scheduler_with_policy("sif");
+
+        // Add requests with different input lengths
+        scheduler.add_request(create_test_request("req-long", 200, 10)); // longest input
+        scheduler.add_request(create_test_request("req-short", 50, 10)); // shortest input
+        scheduler.add_request(create_test_request("req-medium", 100, 10)); // medium input
+
+        // SIF should select the shortest input first (prompt=50)
+        let idx = scheduler.select_next_waiting_request();
+        assert_eq!(scheduler.waiting.get(idx).unwrap().num_prompt_tokens, 50);
+    }
+
+    #[test]
+    fn test_sif_preemption() {
+        let mut scheduler = create_scheduler_with_policy("sif");
+
+        // Add running requests with different input lengths
+        let mut req1 = create_test_request("req-1", 200, 10);
+        req1.status = RequestStatus::Running;
+
+        let mut req2 = create_test_request("req-2", 50, 10);
+        req2.status = RequestStatus::Running;
+
+        let mut req3 = create_test_request("req-3", 100, 10);
+        req3.status = RequestStatus::Running;
+
+        scheduler.running.push(req1);
+        scheduler.running.push(req2);
+        scheduler.running.push(req3);
+
+        // SIF should preempt the longest input (req-1 with 200 tokens)
+        let victim_idx = scheduler.select_preemption_victim().unwrap();
+        assert_eq!(scheduler.running[victim_idx].num_prompt_tokens, 200);
+    }
+
+    #[test]
+    fn test_lif_selection() {
+        let mut scheduler = create_scheduler_with_policy("lif");
+
+        // Add requests with different input lengths
+        scheduler.add_request(create_test_request("req-long", 200, 10)); // longest input
+        scheduler.add_request(create_test_request("req-short", 50, 10)); // shortest input
+        scheduler.add_request(create_test_request("req-medium", 100, 10)); // medium input
+
+        // LIF should select the longest input first (prompt=200)
+        let idx = scheduler.select_next_waiting_request();
+        assert_eq!(scheduler.waiting.get(idx).unwrap().num_prompt_tokens, 200);
+    }
+
+    #[test]
+    fn test_lif_preemption() {
+        let mut scheduler = create_scheduler_with_policy("lif");
+
+        // Add running requests with different input lengths
+        let mut req1 = create_test_request("req-1", 200, 10);
+        req1.status = RequestStatus::Running;
+
+        let mut req2 = create_test_request("req-2", 50, 10);
+        req2.status = RequestStatus::Running;
+
+        let mut req3 = create_test_request("req-3", 100, 10);
+        req3.status = RequestStatus::Running;
+
+        scheduler.running.push(req1);
+        scheduler.running.push(req2);
+        scheduler.running.push(req3);
+
+        // LIF should preempt the shortest input (req-2 with 50 tokens)
+        let victim_idx = scheduler.select_preemption_victim().unwrap();
+        assert_eq!(scheduler.running[victim_idx].num_prompt_tokens, 50);
+    }
+
+    #[test]
+    fn test_priority_selection_fifo() {
+        let mut scheduler = create_scheduler_with_policy("priority");
+
+        // Priority uses FIFO for selection (takes first)
+        scheduler.add_request(create_test_request("req-1", 100, 10));
+        scheduler.add_request(create_test_request("req-2", 200, 20));
+        scheduler.add_request(create_test_request("req-3", 50, 5));
+
+        let idx = scheduler.select_next_waiting_request();
+        assert_eq!(idx, 0); // Should always be first
+    }
+
+    #[test]
+    fn test_priority_preemption() {
+        let mut scheduler = create_scheduler_with_policy("priority");
+
+        // Add running requests with different priorities (lower value = higher priority)
+        let mut req1 = create_test_request("req-1", 100, 10);
+        req1.priority = 0; // highest priority
+        req1.arrival_time = 1.0;
+        req1.status = RequestStatus::Running;
+
+        let mut req2 = create_test_request("req-2", 100, 10);
+        req2.priority = 5; // lowest priority
+        req2.arrival_time = 2.0;
+        req2.status = RequestStatus::Running;
+
+        let mut req3 = create_test_request("req-3", 100, 10);
+        req3.priority = 2; // medium priority
+        req3.arrival_time = 3.0;
+        req3.status = RequestStatus::Running;
+
+        scheduler.running.push(req1);
+        scheduler.running.push(req2);
+        scheduler.running.push(req3);
+
+        // Priority should preempt the lowest priority (highest value = 5)
+        let victim_idx = scheduler.select_preemption_victim().unwrap();
+        assert_eq!(scheduler.running[victim_idx].priority, 5);
+    }
+
+    #[test]
+    fn test_fcfs_selection_fifo() {
+        let scheduler = create_test_scheduler(); // default is FCFS
+
+        let mut sched = scheduler;
+        sched.add_request(create_test_request("req-1", 100, 10));
+        sched.add_request(create_test_request("req-2", 200, 20));
+        sched.add_request(create_test_request("req-3", 50, 5));
+
+        // FCFS always selects first (FIFO)
+        let idx = sched.select_next_waiting_request();
+        assert_eq!(idx, 0);
+    }
+
+    #[test]
+    fn test_policy_selection_deterministic() {
+        // Test that policies produce deterministic results for fixed inputs
+        let mut scheduler = create_scheduler_with_policy("sjf");
+
+        scheduler.add_request(create_test_request("req-1", 16, 100));
+        scheduler.add_request(create_test_request("req-2", 16, 10));
+        scheduler.add_request(create_test_request("req-3", 16, 50));
+
+        let idx1 = scheduler.select_next_waiting_request();
+        let idx2 = scheduler.select_next_waiting_request();
+        let idx3 = scheduler.select_next_waiting_request();
+
+        // Should always select same index for same state
+        assert_eq!(idx1, idx2);
+        assert_eq!(idx2, idx3);
+    }
 }

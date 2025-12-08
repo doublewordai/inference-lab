@@ -408,3 +408,224 @@ impl Simulator {
             && self.scheduler.num_waiting() == 0
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn create_minimal_test_config() -> Config {
+        let mut config = Config::test_default();
+        config.workload.num_requests = Some(10); // Small number for fast tests
+        config.workload.arrival_rate = 10.0; // Fast arrival
+        config
+    }
+
+    #[test]
+    fn test_simulation_completes_all_requests() {
+        let config = create_minimal_test_config();
+        let mut simulator = Simulator::new(config).unwrap();
+
+        simulator.run_with_callback(|_| {}).unwrap();
+
+        let summary = simulator.get_metrics_summary();
+
+        // All requests should complete
+        assert_eq!(summary.completed_requests, summary.total_requests);
+        assert_eq!(summary.completed_requests, 10);
+    }
+
+    #[test]
+    fn test_simulation_time_progresses() {
+        let config = create_minimal_test_config();
+        let mut simulator = Simulator::new(config).unwrap();
+
+        let start_time = simulator.get_current_time();
+        simulator.run_with_callback(|_| {}).unwrap();
+        let end_time = simulator.get_current_time();
+
+        // Time should advance
+        assert!(end_time > start_time);
+    }
+
+    #[test]
+    fn test_simulation_metrics_reasonable() {
+        let config = create_minimal_test_config();
+        let mut simulator = Simulator::new(config).unwrap();
+
+        simulator.run_with_callback(|_| {}).unwrap();
+
+        let summary = simulator.get_metrics_summary();
+
+        // Latencies should be positive and finite
+        assert!(summary.ttft_mean > 0.0 && summary.ttft_mean.is_finite());
+        assert!(summary.e2e_mean > 0.0 && summary.e2e_mean.is_finite());
+        assert!(summary.per_token_mean > 0.0 && summary.per_token_mean.is_finite());
+
+        // Percentiles should be ordered
+        assert!(summary.ttft_min <= summary.ttft_p50);
+        assert!(summary.ttft_p50 <= summary.ttft_p90);
+        assert!(summary.ttft_p90 <= summary.ttft_p99);
+
+        assert!(summary.e2e_min <= summary.e2e_p50);
+        assert!(summary.e2e_p50 <= summary.e2e_p90);
+        assert!(summary.e2e_p90 <= summary.e2e_p99);
+
+        // Utilization should be between 0 and 1
+        assert!(summary.avg_kv_cache_util >= 0.0 && summary.avg_kv_cache_util <= 1.0);
+        assert!(summary.avg_flops_util >= 0.0 && summary.avg_flops_util <= 1.0);
+        assert!(summary.avg_bandwidth_util >= 0.0 && summary.avg_bandwidth_util <= 1.0);
+
+        // Throughput should be positive
+        assert!(summary.input_tokens_per_sec > 0.0);
+        assert!(summary.output_tokens_per_sec > 0.0);
+        assert!(summary.requests_per_sec > 0.0);
+    }
+
+    #[test]
+    fn test_simulation_no_infinite_loop() {
+        let config = create_minimal_test_config();
+        let mut simulator = Simulator::new(config).unwrap();
+
+        // Run with a callback that counts iterations
+        let mut iteration_count = 0;
+        simulator
+            .run_with_callback(|_| {
+                iteration_count += 1;
+            })
+            .unwrap();
+
+        // Should terminate in reasonable number of iterations
+        // With 10 requests and fast arrival, should be < 1000 iterations
+        assert!(iteration_count < 1000);
+        assert!(iteration_count > 0);
+    }
+
+    #[test]
+    fn test_simulation_with_fcfs_policy() {
+        let mut config = create_minimal_test_config();
+        config.scheduler.policy = "fcfs".to_string();
+
+        let mut simulator = Simulator::new(config).unwrap();
+        simulator.run_with_callback(|_| {}).unwrap();
+
+        let summary = simulator.get_metrics_summary();
+        assert_eq!(summary.completed_requests, 10);
+    }
+
+    #[test]
+    fn test_simulation_with_sjf_policy() {
+        let mut config = create_minimal_test_config();
+        config.scheduler.policy = "sjf".to_string();
+
+        let mut simulator = Simulator::new(config).unwrap();
+        simulator.run_with_callback(|_| {}).unwrap();
+
+        let summary = simulator.get_metrics_summary();
+        assert_eq!(summary.completed_requests, 10);
+    }
+
+    #[test]
+    fn test_simulation_with_priority_policy() {
+        let mut config = create_minimal_test_config();
+        config.scheduler.policy = "priority".to_string();
+
+        let mut simulator = Simulator::new(config).unwrap();
+        simulator.run_with_callback(|_| {}).unwrap();
+
+        let summary = simulator.get_metrics_summary();
+        assert_eq!(summary.completed_requests, 10);
+    }
+
+    #[test]
+    fn test_simulation_different_policies_produce_results() {
+        let mut config_fcfs = create_minimal_test_config();
+        config_fcfs.scheduler.policy = "fcfs".to_string();
+        config_fcfs.workload.seed = 42;
+
+        let mut config_sjf = create_minimal_test_config();
+        config_sjf.scheduler.policy = "sjf".to_string();
+        config_sjf.workload.seed = 42; // Same seed for comparison
+
+        let mut sim_fcfs = Simulator::new(config_fcfs).unwrap();
+        let mut sim_sjf = Simulator::new(config_sjf).unwrap();
+
+        sim_fcfs.run_with_callback(|_| {}).unwrap();
+        sim_sjf.run_with_callback(|_| {}).unwrap();
+
+        let summary_fcfs = sim_fcfs.get_metrics_summary();
+        let summary_sjf = sim_sjf.get_metrics_summary();
+
+        // Both should complete all requests
+        assert_eq!(summary_fcfs.completed_requests, 10);
+        assert_eq!(summary_sjf.completed_requests, 10);
+
+        // Metrics should be reasonable for both (not testing exact equality,
+        // as policies may produce different latencies)
+        assert!(summary_fcfs.e2e_mean > 0.0);
+        assert!(summary_sjf.e2e_mean > 0.0);
+    }
+
+    #[test]
+    fn test_simulation_with_chunked_prefill() {
+        let mut config = create_minimal_test_config();
+        config.scheduler.enable_chunked_prefill = true;
+        config.scheduler.long_prefill_token_threshold = 512;
+
+        let mut simulator = Simulator::new(config).unwrap();
+        simulator.run_with_callback(|_| {}).unwrap();
+
+        let summary = simulator.get_metrics_summary();
+        assert_eq!(summary.completed_requests, 10);
+    }
+
+    #[test]
+    fn test_simulation_preemption_metrics() {
+        let config = create_minimal_test_config();
+        let mut simulator = Simulator::new(config).unwrap();
+
+        simulator.run_with_callback(|_| {}).unwrap();
+
+        let summary = simulator.get_metrics_summary();
+
+        // Preemption metrics should be non-negative
+        assert!(summary.total_preemptions >= 0);
+        assert!(summary.preemptions_per_request_mean >= 0.0);
+    }
+
+    #[test]
+    fn test_simulation_time_series_collected() {
+        let config = create_minimal_test_config();
+        let mut simulator = Simulator::new(config).unwrap();
+
+        simulator.run_with_callback(|_| {}).unwrap();
+
+        let time_series = simulator.get_time_series_data();
+
+        // Should have collected some time series data
+        assert!(!time_series.is_empty());
+
+        // Time should be monotonically increasing
+        for i in 1..time_series.len() {
+            assert!(time_series[i].time >= time_series[i - 1].time);
+        }
+    }
+
+    #[test]
+    fn test_simulation_latency_samples_collected() {
+        let config = create_minimal_test_config();
+        let mut simulator = Simulator::new(config).unwrap();
+
+        simulator.run_with_callback(|_| {}).unwrap();
+
+        let ((ttft, ttft_ts), (e2e, e2e_ts), (tpot, tpot_ts)) = simulator.get_latency_samples();
+
+        // Should have latency samples
+        assert!(!ttft.is_empty());
+        assert!(!e2e.is_empty());
+
+        // Timestamps should match samples
+        assert_eq!(ttft.len(), ttft_ts.len());
+        assert_eq!(e2e.len(), e2e_ts.len());
+        assert_eq!(tpot.len(), tpot_ts.len());
+    }
+}

@@ -318,4 +318,189 @@ mod tests {
         assert_eq!(summary.completed_requests, 1);
         assert_eq!(summary.total_requests, 10);
     }
+
+    #[test]
+    fn test_ttft_calculation() {
+        let mut collector = MetricsCollector::new(0.0);
+
+        // Request: arrival=1.0, first_token=3.5
+        let mut req = Request::new("req-1".to_string(), 0, 1.0, 100, 20);
+        req.first_token_time = Some(3.5);
+        req.completion_time = Some(5.0);
+
+        collector.record_request_completion(&req);
+
+        // TTFT = first_token_time - arrival_time = 3.5 - 1.0 = 2.5
+        assert_eq!(collector.ttft_samples[0], 2.5);
+        assert_eq!(collector.ttft_timestamps[0], 5.0); // timestamp is completion_time
+    }
+
+    #[test]
+    fn test_e2e_without_preemption() {
+        let mut collector = MetricsCollector::new(0.0);
+
+        // Request with no preemption: arrival=1.0, completion=5.0, preempted_time=0.0
+        let mut req = Request::new("req-1".to_string(), 0, 1.0, 100, 20);
+        req.completion_time = Some(5.0);
+        req.preempted_time = 0.0;
+
+        collector.record_request_completion(&req);
+
+        // E2E = completion - arrival - preempted_time = 5.0 - 1.0 - 0.0 = 4.0
+        assert_eq!(collector.e2e_latency_samples[0], 4.0);
+    }
+
+    #[test]
+    fn test_e2e_with_preemption() {
+        let mut collector = MetricsCollector::new(0.0);
+
+        // Request with preemption: arrival=1.0, completion=10.0, preempted_time=3.0
+        let mut req = Request::new("req-1".to_string(), 0, 1.0, 100, 20);
+        req.completion_time = Some(10.0);
+        req.preempted_time = 3.0; // spent 3 seconds preempted
+        req.num_preemptions = 2;
+
+        collector.record_request_completion(&req);
+
+        // E2E = completion - arrival - preempted_time = 10.0 - 1.0 - 3.0 = 6.0
+        assert_eq!(collector.e2e_latency_samples[0], 6.0);
+        assert_eq!(collector.total_preemptions, 2);
+    }
+
+    #[test]
+    fn test_e2e_with_multiple_preemptions() {
+        let mut collector = MetricsCollector::new(0.0);
+
+        // Request: arrival=0.0, completion=20.0, preempted_time=7.5
+        let mut req = Request::new("req-1".to_string(), 0, 0.0, 100, 20);
+        req.completion_time = Some(20.0);
+        req.preempted_time = 7.5;
+        req.num_preemptions = 5;
+
+        collector.record_request_completion(&req);
+
+        // E2E = 20.0 - 0.0 - 7.5 = 12.5 (actual processing time)
+        assert_eq!(collector.e2e_latency_samples[0], 12.5);
+        assert_eq!(collector.total_preemptions, 5);
+        assert_eq!(collector.preemptions_per_request[0], 5);
+    }
+
+    #[test]
+    fn test_tpot_calculation() {
+        let mut collector = MetricsCollector::new(0.0);
+
+        // Request with token generation times
+        let mut req = Request::new("req-1".to_string(), 0, 1.0, 100, 20);
+        req.completion_time = Some(5.0);
+        // Times: 2.0, 2.1, 2.25, 2.5
+        req.token_generation_times = vec![2.0, 2.1, 2.25, 2.5];
+
+        collector.record_request_completion(&req);
+
+        // TPOT samples: [2.1-2.0, 2.25-2.1, 2.5-2.25] = [0.1, 0.15, 0.25]
+        assert_eq!(collector.per_token_latency_samples.len(), 3);
+        assert!((collector.per_token_latency_samples[0] - 0.1).abs() < 1e-10);
+        assert!((collector.per_token_latency_samples[1] - 0.15).abs() < 1e-10);
+        assert_eq!(collector.per_token_latency_samples[2], 0.25);
+
+        // Timestamps should be the current token generation time
+        assert_eq!(collector.per_token_timestamps[0], 2.1);
+        assert_eq!(collector.per_token_timestamps[1], 2.25);
+        assert_eq!(collector.per_token_timestamps[2], 2.5);
+    }
+
+    #[test]
+    fn test_ttft_not_affected_by_preemption() {
+        let mut collector = MetricsCollector::new(0.0);
+
+        // TTFT should NOT subtract preemption time
+        // arrival=1.0, first_token=5.0, preempted_time=2.0
+        let mut req = Request::new("req-1".to_string(), 0, 1.0, 100, 20);
+        req.first_token_time = Some(5.0);
+        req.completion_time = Some(10.0);
+        req.preempted_time = 2.0;
+
+        collector.record_request_completion(&req);
+
+        // TTFT = first_token_time - arrival_time = 5.0 - 1.0 = 4.0
+        // (preemption time NOT subtracted)
+        assert_eq!(collector.ttft_samples[0], 4.0);
+    }
+
+    #[test]
+    fn test_multiple_requests_aggregation() {
+        let mut collector = MetricsCollector::new(0.0);
+
+        // Request 1: TTFT=1.0, E2E=3.0
+        let mut req1 = Request::new("req-1".to_string(), 0, 1.0, 100, 10);
+        req1.first_token_time = Some(2.0);
+        req1.completion_time = Some(4.0);
+        req1.preempted_time = 0.0;
+
+        // Request 2: TTFT=2.0, E2E=5.0 (with preemption)
+        let mut req2 = Request::new("req-2".to_string(), 0, 2.0, 100, 10);
+        req2.first_token_time = Some(4.0);
+        req2.completion_time = Some(10.0);
+        req2.preempted_time = 1.0; // 8.0 - 1.0 = 7.0 actual, then - 2.0 arrival = 5.0
+
+        collector.record_request_completion(&req1);
+        collector.record_request_completion(&req2);
+
+        assert_eq!(collector.ttft_samples.len(), 2);
+        assert_eq!(collector.e2e_latency_samples.len(), 2);
+
+        // Check TTFT values
+        assert_eq!(collector.ttft_samples[0], 1.0);
+        assert_eq!(collector.ttft_samples[1], 2.0);
+
+        // Check E2E values
+        assert_eq!(collector.e2e_latency_samples[0], 3.0); // 4.0 - 1.0 - 0.0
+        assert_eq!(collector.e2e_latency_samples[1], 7.0); // 10.0 - 2.0 - 1.0
+    }
+
+    #[test]
+    fn test_throughput_calculation() {
+        let mut collector = MetricsCollector::new(0.0);
+
+        // Request 1: 100 input, 50 output tokens
+        let mut req1 = Request::new("req-1".to_string(), 0, 1.0, 100, 50);
+        req1.completion_time = Some(5.0);
+        req1.num_output_tokens = 50;
+
+        // Request 2: 200 input, 30 output tokens
+        let mut req2 = Request::new("req-2".to_string(), 0, 2.0, 200, 30);
+        req2.completion_time = Some(6.0);
+        req2.num_output_tokens = 30;
+
+        collector.record_request_completion(&req1);
+        collector.record_request_completion(&req2);
+
+        // Total: 300 input, 80 output, 2 requests over 10 seconds
+        let summary = collector.compute_summary(10.0);
+
+        assert_eq!(summary.input_tokens_per_sec, 30.0); // 300 / 10
+        assert_eq!(summary.output_tokens_per_sec, 8.0); // 80 / 10
+        assert_eq!(summary.requests_per_sec, 0.2); // 2 / 10
+    }
+
+    #[test]
+    fn test_metrics_summary_conversion_to_milliseconds() {
+        let mut collector = MetricsCollector::new(0.0);
+
+        // Request with known latencies in seconds
+        let mut req = Request::new("req-1".to_string(), 0, 1.0, 100, 10);
+        req.first_token_time = Some(1.5); // TTFT = 0.5 seconds
+        req.completion_time = Some(3.0); // E2E = 2.0 seconds
+        req.preempted_time = 0.0;
+        req.token_generation_times = vec![1.5, 1.6]; // TPOT = 0.1 seconds
+
+        collector.record_request_completion(&req);
+
+        let summary = collector.compute_summary(10.0);
+
+        // All metrics should be converted to milliseconds (use approximate comparison)
+        assert!((summary.ttft_mean - 500.0).abs() < 0.001); // 0.5 * 1000
+        assert!((summary.e2e_mean - 2000.0).abs() < 0.001); // 2.0 * 1000
+        assert!((summary.per_token_mean - 100.0).abs() < 0.001); // 0.1 * 1000
+    }
 }

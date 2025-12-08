@@ -184,3 +184,171 @@ impl StreamingQuantiles {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_empty_quantiles() {
+        let quantiles = StreamingQuantiles::new();
+        assert_eq!(quantiles.min(), 0.0);
+        assert_eq!(quantiles.p50(), 0.0);
+        assert_eq!(quantiles.p90(), 0.0);
+        assert_eq!(quantiles.p99(), 0.0);
+        assert_eq!(quantiles.mean(), 0.0);
+    }
+
+    #[test]
+    fn test_single_value() {
+        let mut quantiles = StreamingQuantiles::new();
+        quantiles.add(42.0);
+        assert_eq!(quantiles.min(), 42.0);
+        assert_eq!(quantiles.p50(), 42.0);
+        assert_eq!(quantiles.p90(), 42.0);
+        assert_eq!(quantiles.p99(), 42.0);
+        assert_eq!(quantiles.mean(), 42.0);
+    }
+
+    #[test]
+    fn test_few_values_sorted() {
+        let mut quantiles = StreamingQuantiles::new();
+        for i in 1..=5 {
+            quantiles.add(i as f64);
+        }
+        // For fixed input, we should get fixed output
+        assert_eq!(quantiles.min(), 1.0);
+        assert_eq!(quantiles.p50(), 3.0);
+        assert_eq!(quantiles.p90(), 4.0);
+        assert_eq!(quantiles.p99(), 4.0);
+        assert_eq!(quantiles.mean(), 3.0);
+    }
+
+    #[test]
+    fn test_uniform_distribution() {
+        let mut quantiles = StreamingQuantiles::new();
+        // Add values 1 to 1000 - deterministic dataset
+        for i in 1..=1000 {
+            quantiles.add(i as f64);
+        }
+
+        // For this exact dataset, algorithm should produce exact values
+        assert_eq!(quantiles.min(), 1.0);
+        assert_eq!(quantiles.p50(), 500.0);
+        assert_eq!(quantiles.p90(), 900.0);
+        assert_eq!(quantiles.p99(), 990.0);
+    }
+
+    #[test]
+    fn test_quantile_ordering() {
+        let mut quantiles = StreamingQuantiles::new();
+        // Add 1000 values
+        for i in 1..=1000 {
+            quantiles.add(i as f64);
+        }
+
+        // Quantiles should be ordered: min <= p50 <= p90 <= p99
+        assert!(quantiles.min() <= quantiles.p50());
+        assert!(quantiles.p50() <= quantiles.p90());
+        assert!(quantiles.p90() <= quantiles.p99());
+    }
+
+    #[test]
+    fn test_skewed_distribution() {
+        let mut quantiles = StreamingQuantiles::new();
+        // Heavy tail: mostly small values, few large values
+        // 900 values of 1.0, 90 values of 10.0, 10 values of 100.0
+        for _ in 0..900 {
+            quantiles.add(1.0);
+        }
+        for _ in 0..90 {
+            quantiles.add(10.0);
+        }
+        for _ in 0..10 {
+            quantiles.add(100.0);
+        }
+
+        // For this fixed dataset, should get fixed values
+        assert_eq!(quantiles.min(), 1.0);
+        assert_eq!(quantiles.p50(), 1.010241318586147);
+        assert_eq!(quantiles.p90(), 5.014807349038084);
+        assert_eq!(quantiles.p99(), 58.33620606034887);
+    }
+
+    #[test]
+    fn test_duplicate_values() {
+        let mut quantiles = StreamingQuantiles::new();
+        // All same value
+        for _ in 0..100 {
+            quantiles.add(5.0);
+        }
+
+        assert_eq!(quantiles.min(), 5.0);
+        assert_eq!(quantiles.p50(), 5.0);
+        assert_eq!(quantiles.p90(), 5.0);
+        assert_eq!(quantiles.p99(), 5.0);
+        assert_eq!(quantiles.mean(), 5.0);
+    }
+
+    #[test]
+    fn test_reverse_order() {
+        let mut quantiles = StreamingQuantiles::new();
+        // Add values in reverse order: 1000 down to 1
+        for i in (1..=1000).rev() {
+            quantiles.add(i as f64);
+        }
+
+        // Insertion order affects streaming algorithm results
+        assert_eq!(quantiles.min(), 1.0);
+        assert_eq!(quantiles.p50(), 501.0);
+        assert_eq!(quantiles.p90(), 901.0);
+        assert_eq!(quantiles.p99(), 991.0);
+    }
+
+    #[test]
+    fn test_boundary_11_values() {
+        let mut quantiles = StreamingQuantiles::new();
+        // Exactly 11 values (boundary where algorithm switches from exact to streaming)
+        for i in 1..=11 {
+            quantiles.add(i as f64 * 10.0); // [10, 20, 30, ..., 110]
+        }
+
+        // After sorting: [10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110]
+        // With 11 values, this is still in the initial phase
+        assert_eq!(quantiles.min(), 10.0);
+        assert_eq!(quantiles.p50(), 50.0);
+        assert_eq!(quantiles.p90(), 70.0);
+        assert_eq!(quantiles.p99(), 90.0);
+    }
+
+    #[test]
+    fn test_values_beyond_initial_11() {
+        let mut quantiles = StreamingQuantiles::new();
+        // Add 20 values to test streaming phase
+        for i in 1..=20 {
+            quantiles.add(i as f64);
+        }
+
+        // Fixed dataset should produce fixed results
+        assert_eq!(quantiles.min(), 1.0);
+        assert_eq!(quantiles.p50(), 9.0);
+        assert_eq!(quantiles.p90(), 13.0);
+        assert_eq!(quantiles.p99(), 17.0);
+    }
+
+    #[test]
+    fn test_extreme_values() {
+        let mut quantiles = StreamingQuantiles::new();
+        quantiles.add(0.001);
+        quantiles.add(1000000.0);
+        quantiles.add(0.002);
+        quantiles.add(0.003);
+        quantiles.add(0.004);
+
+        // Fixed dataset should produce fixed results
+        assert_eq!(quantiles.min(), 0.001);
+        assert_eq!(quantiles.p50(), 0.003);
+        assert_eq!(quantiles.p90(), 0.004);
+        assert_eq!(quantiles.p99(), 0.004);
+    }
+}
