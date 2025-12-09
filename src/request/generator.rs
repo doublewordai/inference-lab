@@ -24,11 +24,9 @@ impl RequestGenerator {
         if is_closed_loop {
             if let Some(num_users) = workload.num_concurrent_users {
                 // Generate initial requests for all concurrent users
-                for _ in 0..num_users {
-                    pending_closed_loop_requests.push(0.0);
-                }
+                pending_closed_loop_requests = vec![0.0; num_users]
             }
-        }
+        };
 
         let next_arrival_time = if is_closed_loop && !pending_closed_loop_requests.is_empty() {
             0.0 // Start immediately with the first batch
@@ -82,13 +80,21 @@ impl RequestGenerator {
                 let num_prompt_tokens = self.workload.input_len_dist.sample(&mut self.rng);
                 let max_output_tokens = self.workload.output_len_dist.sample(&mut self.rng);
 
-                let request = Request::new(
+                let mut request = Request::new(
                     request_id,
                     0, // Default priority
                     arrival_time,
                     num_prompt_tokens,
                     max_output_tokens,
                 );
+
+                // Generate block hashes for the prompt
+                // For now, sample from a small range to get realistic cache hit rates
+                // First few blocks more likely to be shared (simulating common system prompts)
+                let num_blocks = num_prompt_tokens.div_ceil(16) as usize; // Assume 16-token blocks
+                request.prompt_block_hashes = (0..num_blocks)
+                    .map(|_| self.rng.gen_range(0..u64::MAX))
+                    .collect();
 
                 self.requests_generated += 1;
                 return Some(request);
@@ -116,13 +122,21 @@ impl RequestGenerator {
         let num_prompt_tokens = self.workload.input_len_dist.sample(&mut self.rng);
         let max_output_tokens = self.workload.output_len_dist.sample(&mut self.rng);
 
-        let request = Request::new(
+        let mut request = Request::new(
             request_id,
             0, // Default priority
             self.next_arrival_time,
             num_prompt_tokens,
             max_output_tokens,
         );
+
+        // Generate block hashes for the prompt
+        // For now, sample from a small range to get realistic cache hit rates
+        // First few blocks more likely to be shared (simulating common system prompts)
+        let num_blocks = num_prompt_tokens.div_ceil(16) as usize; // Assume 16-token blocks
+        request.prompt_block_hashes = (0..num_blocks)
+            .map(|_| self.rng.gen_range(0..u64::MAX))
+            .collect();
 
         self.requests_generated += 1;
 

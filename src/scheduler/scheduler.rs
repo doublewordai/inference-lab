@@ -150,10 +150,12 @@ impl Scheduler {
                 let selected_idx = self.select_next_waiting_request();
                 let mut request = self.waiting.get(selected_idx).unwrap().clone();
 
-                // Check for prefix cache hits
-                let cached_tokens = self.kv_cache_manager.check_prefix_cache(&request);
+                // Check for prefix cache hits (peek doesn't increment any prefix cache stats)
+                let cached_tokens = self.kv_cache_manager.peek_prefix_cache(&request);
                 request.num_cached_tokens = cached_tokens;
-                request.num_computed_tokens += cached_tokens;
+                // Note: We don't advance num_computed_tokens here!
+                // Cached tokens save COMPUTE time but we still need to allocate KV blocks
+                // num_computed_tokens is advanced after we process the tokens
 
                 // Calculate tokens to schedule
                 let mut tokens_to_schedule = request.tokens_to_process().min(token_budget);
@@ -185,11 +187,15 @@ impl Scheduler {
                     break; // Can't fit, stop scheduling new requests
                 }
 
+                // query the prefix cache (increments prefix cache stats)
+                self.kv_cache_manager.query_prefix_cache(&request);
+
                 // Allocate blocks
                 if let Some(blocks) = self
                     .kv_cache_manager
                     .allocate_blocks(&request, tokens_to_schedule)
                 {
+                    // This should always succeed - because of the check above?
                     request.kv_blocks.extend(blocks);
                 } else {
                     break;
@@ -214,8 +220,7 @@ impl Scheduler {
     /// Calculate how many new blocks are needed for a request
     fn calculate_blocks_needed(&self, request: &Request, num_new_tokens: u32) -> usize {
         let total_tokens = request.num_computed_tokens + num_new_tokens;
-        let total_blocks_needed =
-            ((total_tokens + self.config.block_size - 1) / self.config.block_size) as usize;
+        let total_blocks_needed = total_tokens.div_ceil(self.config.block_size) as usize;
         total_blocks_needed.saturating_sub(request.kv_blocks.len())
     }
 
@@ -414,7 +419,7 @@ mod tests {
         let decision = scheduler.schedule(0.0);
 
         // Both should be scheduled if token budget allows
-        assert!(decision.scheduled_new.len() >= 1);
+        assert!(!decision.scheduled_new.is_empty());
         assert!(scheduler.num_running() >= 1);
     }
 

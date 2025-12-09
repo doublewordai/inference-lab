@@ -167,7 +167,11 @@ impl Simulator {
 
             // 5. Determine which requests were prefilling vs decoding BEFORE updating state
             let mut prefilling_reqs = std::collections::HashSet::new();
-            for &idx in decision.scheduled_new.iter().chain(decision.scheduled_running.iter()) {
+            for &idx in decision
+                .scheduled_new
+                .iter()
+                .chain(decision.scheduled_running.iter())
+            {
                 if let Some(request) = self.scheduler.running().get(idx) {
                     if request.is_prefill() {
                         prefilling_reqs.insert(idx);
@@ -183,7 +187,8 @@ impl Simulator {
             }
             for (i, &idx) in decision.scheduled_running.iter().enumerate() {
                 if let Some(request) = self.scheduler.running_mut().get_mut(idx) {
-                    request.record_generated_tokens(decision.tokens_for_running[i], self.current_time);
+                    request
+                        .record_generated_tokens(decision.tokens_for_running[i], self.current_time);
                 }
             }
 
@@ -271,7 +276,14 @@ impl Simulator {
             // 10. Send progress update if enough time has passed
             if self.current_time - last_callback_time >= callback_interval {
                 // Compute summary first (requires &mut self)
-                let summary = self.metrics.compute_summary(self.current_time);
+                let kv_manager = self.scheduler.kv_cache_manager();
+                let summary = self.metrics.compute_summary(
+                    self.current_time,
+                    kv_manager.num_prefix_cache_hits,
+                    kv_manager.num_prefix_cache_misses,
+                    kv_manager.hit_size_sum,
+                    kv_manager.hit_size_count,
+                );
 
                 // Then get immutable references
                 let latency_samples = self.metrics.get_latency_samples();
@@ -315,13 +327,18 @@ impl Simulator {
                 last_callback_time = self.current_time;
             }
 
-            // Note: Periodic logging removed for callback mode - callback replaces it
-
             // 11. Check termination conditions
             if self.should_terminate() {
                 // Send final progress update with any remaining samples
                 // Compute summary first (requires &mut self)
-                let summary = self.metrics.compute_summary(self.current_time);
+                let kv_manager = self.scheduler.kv_cache_manager();
+                let summary = self.metrics.compute_summary(
+                    self.current_time,
+                    kv_manager.num_prefix_cache_hits,
+                    kv_manager.num_prefix_cache_misses,
+                    kv_manager.hit_size_sum,
+                    kv_manager.hit_size_count,
+                );
 
                 // Then get immutable references
                 let latency_samples = self.metrics.get_latency_samples();
@@ -363,7 +380,14 @@ impl Simulator {
     }
 
     pub fn get_metrics_summary(&mut self) -> crate::metrics::MetricsSummary {
-        self.metrics.compute_summary(self.current_time)
+        let kv_manager = self.scheduler.kv_cache_manager();
+        self.metrics.compute_summary(
+            self.current_time,
+            kv_manager.num_prefix_cache_hits,
+            kv_manager.num_prefix_cache_misses,
+            kv_manager.hit_size_sum,
+            kv_manager.hit_size_count,
+        )
     }
 
     pub fn get_time_series_data(&self) -> &[TimeSeriesPoint] {
@@ -579,7 +603,6 @@ mod tests {
         let summary = simulator.get_metrics_summary();
 
         // Preemption metrics should be non-negative
-        assert!(summary.total_preemptions >= 0);
         assert!(summary.preemptions_per_request_mean >= 0.0);
     }
 

@@ -194,10 +194,26 @@ impl MetricsCollector {
     }
 
     /// Compute final summary statistics
-    pub fn compute_summary(&mut self, current_time: f64) -> MetricsSummary {
+    pub fn compute_summary(
+        &mut self,
+        current_time: f64,
+        prefix_cache_hits: u64,
+        prefix_cache_misses: u64,
+        prefix_cache_hit_size_sum: u64,
+        prefix_cache_hit_size_count: u64,
+    ) -> MetricsSummary {
         let elapsed = current_time - self.start_time;
 
+        let total_prefix_checks = prefix_cache_hits + prefix_cache_misses;
+        let prefix_cache_hit_rate = if total_prefix_checks > 0 {
+            prefix_cache_hits as f64 / total_prefix_checks as f64
+        } else {
+            0.0
+        };
+
         MetricsSummary {
+            prefix_cache_hit_size_sum,
+            prefix_cache_hit_size_count,
             // Latency (convert to milliseconds) - use streaming quantiles for O(1) lookups
             ttft_min: self.ttft_quantiles.min() * 1000.0,
             ttft_mean: self.ttft_quantiles.mean() * 1000.0,
@@ -234,6 +250,11 @@ impl MetricsCollector {
             // Counts
             completed_requests: self.completed_requests,
             total_requests: self.total_requests,
+
+            // Prefix cache
+            prefix_cache_hits,
+            prefix_cache_misses,
+            prefix_cache_hit_rate,
         }
     }
 }
@@ -283,7 +304,7 @@ mod tests {
         // E2E should be 5.0 - 1.0 = 4.0
         assert_eq!(collector.e2e_latency_samples[0], 4.0);
 
-        let summary = collector.compute_summary(10.0);
+        let summary = collector.compute_summary(10.0, 0, 0, 0, 0);
         assert_eq!(summary.completed_requests, 1);
         assert_eq!(summary.total_requests, 10);
     }
@@ -445,7 +466,7 @@ mod tests {
         collector.record_request_completion(&req2);
 
         // Total: 300 input, 80 output, 2 requests over 10 seconds
-        let summary = collector.compute_summary(10.0);
+        let summary = collector.compute_summary(10.0, 0, 0, 0, 0);
 
         assert_eq!(summary.input_tokens_per_sec, 30.0); // 300 / 10
         assert_eq!(summary.output_tokens_per_sec, 8.0); // 80 / 10
@@ -465,7 +486,7 @@ mod tests {
 
         collector.record_request_completion(&req);
 
-        let summary = collector.compute_summary(10.0);
+        let summary = collector.compute_summary(10.0, 0, 0, 0, 0);
 
         // All metrics should be converted to milliseconds (use approximate comparison)
         assert!((summary.ttft_mean - 500.0).abs() < 0.001); // 0.5 * 1000

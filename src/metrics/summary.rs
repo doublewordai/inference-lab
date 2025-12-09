@@ -37,6 +37,13 @@ pub struct MetricsSummary {
     // Request counts
     pub completed_requests: u64,
     pub total_requests: u64,
+
+    // Prefix cache metrics
+    pub prefix_cache_hits: u64,
+    pub prefix_cache_misses: u64,
+    pub prefix_cache_hit_rate: f64,
+    pub prefix_cache_hit_size_sum: u64,
+    pub prefix_cache_hit_size_count: u64,
 }
 
 impl MetricsSummary {
@@ -89,5 +96,14 @@ impl MetricsSummary {
             "  Completed: {}/{}",
             self.completed_requests, self.total_requests
         );
+
+        println!("\nPrefix Cache:");
+        println!("  Hits:       {}", self.prefix_cache_hits);
+        println!("  Misses:     {}", self.prefix_cache_misses);
+        println!(
+            "  Average hit size {}",
+            self.prefix_cache_hit_size_sum / self.prefix_cache_hit_size_count
+        );
+        println!("  Hit rate:   {:.1}%", self.prefix_cache_hit_rate * 100.0);
     }
 }

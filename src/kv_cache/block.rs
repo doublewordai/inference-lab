@@ -28,9 +28,10 @@ impl Block {
     }
 
     /// Allocate this block (increment ref count, mark as not free)
-    pub fn allocate(&mut self) {
+    pub fn allocate(&mut self, content_hash: Option<u64>) -> Option<u64> {
         self.ref_count += 1;
         self.is_free = false;
+        std::mem::replace(&mut self.content_hash, content_hash)
     }
 
     /// Release this block (decrement ref count, mark as free if ref count reaches 0)
@@ -40,8 +41,8 @@ impl Block {
         }
 
         if self.ref_count == 0 {
+            // Leave the content hash in there. When we overwrite the block, we will update it.
             self.is_free = true;
-            self.content_hash = None;
         }
     }
 }
@@ -63,11 +64,11 @@ mod tests {
     fn test_block_allocate() {
         let mut block = Block::new(0);
 
-        block.allocate();
+        block.allocate(None);
         assert_eq!(block.ref_count, 1);
         assert!(!block.is_free);
 
-        block.allocate();
+        block.allocate(None);
         assert_eq!(block.ref_count, 2);
         assert!(!block.is_free);
     }
@@ -75,8 +76,8 @@ mod tests {
     #[test]
     fn test_block_release() {
         let mut block = Block::new(0);
-        block.allocate();
-        block.allocate();
+        block.allocate(None);
+        block.allocate(None);
 
         block.release();
         assert_eq!(block.ref_count, 1);

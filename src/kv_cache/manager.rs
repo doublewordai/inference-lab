@@ -19,12 +19,17 @@ pub struct KVCacheManager {
     /// Enable prefix caching
     enable_prefix_caching: bool,
 
-    /// Prefix cache: hash -> block_id
+    /// Prefix cache: maps block hash -> block_id
+    /// Its a big flat hash map - the hashes are supposed to be incremental hashes of all of the
+    /// tokens up to a certain point. If a sequence with block (1, 2, 3, 4, 5) is in the cache,
+    /// then we get the prefix cache entry by doing cat(cache[1], cache[2], ...).
     prefix_cache: HashMap<u64, BlockId>,
 
     /// Metrics
     pub num_prefix_cache_hits: u64,
     pub num_prefix_cache_misses: u64,
+    pub hit_size_count: u64,
+    pub hit_size_sum: u64,
 }
 
 impl KVCacheManager {
@@ -51,6 +56,8 @@ impl KVCacheManager {
             prefix_cache: HashMap::new(),
             num_prefix_cache_hits: 0,
             num_prefix_cache_misses: 0,
+            hit_size_count: 0,
+            hit_size_sum: 0,
         }
     }
 
@@ -58,17 +65,34 @@ impl KVCacheManager {
     /// Returns Some(Vec<BlockId>) if successful, None if insufficient blocks
     pub fn allocate_blocks(&mut self, request: &Request, num_tokens: u32) -> Option<Vec<BlockId>> {
         let blocks_needed = self.calculate_blocks_needed(request, num_tokens);
+        let hashes = request.get_prompt_block_hashes();
 
         if self.free_blocks.len() < blocks_needed {
             return None; // Not enough blocks
         }
 
         let mut allocated = Vec::new();
-        for _ in 0..blocks_needed {
+        let mut evicted_hashes = Vec::new();
+        for i in 0..blocks_needed {
             let block_id = self.free_blocks.pop().unwrap();
-            self.blocks[block_id as usize].allocate();
+            let evicted_hash = self.blocks[block_id as usize].allocate(hashes.get(i).cloned());
+            evicted_hashes.extend(evicted_hash);
             allocated.push(block_id);
         }
+
+        // Update prefix cache with newly allocated/deallocated blocks
+        if self.enable_prefix_caching {
+            // remove all the content hashes that were overwritten
+            for hash in evicted_hashes {
+                self.prefix_cache.remove(&hash);
+            }
+            // Store the new block hashes
+            for (i, &hash) in hashes.iter().enumerate() {
+                if let Some(&block_id) = allocated.get(i) {
+                    self.prefix_cache.insert(hash, block_id);
+                }
+            }
+        };
 
         Some(allocated)
     }
@@ -76,7 +100,7 @@ impl KVCacheManager {
     /// Calculate how many new blocks are needed for a request
     fn calculate_blocks_needed(&self, request: &Request, num_new_tokens: u32) -> usize {
         let total_tokens = request.num_computed_tokens + num_new_tokens;
-        let total_blocks_needed = ((total_tokens + self.block_size - 1) / self.block_size) as usize;
+        let total_blocks_needed = total_tokens.div_ceil(self.block_size) as usize;
         total_blocks_needed.saturating_sub(request.kv_blocks.len())
     }
 
@@ -102,40 +126,46 @@ impl KVCacheManager {
         1.0 - (self.free_blocks.len() as f64 / self.total_blocks as f64)
     }
 
-    /// Check for prefix cache hits (simplified hash-based implementation)
-    pub fn check_prefix_cache(&mut self, request: &Request) -> u32 {
+    /// Check for prefix cache hits
+    /// Returns the number of tokens that can be served from the cache
+    pub fn peek_prefix_cache(&mut self, request: &Request) -> u32 {
         if !self.enable_prefix_caching {
             return 0;
         }
 
-        // Simplified: hash the prompt tokens
-        let prompt_hash = self.hash_prompt(&request.request_id, request.num_prompt_tokens);
+        // Get block hashes from the request
+        let block_hashes = request.get_prompt_block_hashes();
 
-        if let Some(&_block_id) = self.prefix_cache.get(&prompt_hash) {
-            self.num_prefix_cache_hits += 1;
-            // Return number of cached tokens
-            // For simplicity, assume full blocks are cached up to block_size
-            self.block_size.min(request.num_prompt_tokens)
-        } else {
-            self.num_prefix_cache_misses += 1;
-            // Cache the prompt for future requests
-            if let Some(&first_block) = request.kv_blocks.first() {
-                self.prefix_cache.insert(prompt_hash, first_block);
-            }
-            0
+        if block_hashes.is_empty() {
+            // If there are no block hashes, then theres no caching, so don't increment anything
+            return 0;
         }
+
+        // Check consecutive blocks from the start until we find a miss
+        let mut cached_blocks = 0;
+        for &hash in block_hashes {
+            if self.prefix_cache.contains_key(&hash) {
+                cached_blocks += 1;
+            } else {
+                // First cache miss = end of cached prefix
+                break;
+            }
+        }
+
+        cached_blocks * self.block_size
     }
 
-    /// Hash a prompt for prefix caching
-    fn hash_prompt(&self, request_id: &str, num_tokens: u32) -> u64 {
-        // Simplified hash - in reality would hash actual token IDs
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
+    pub fn query_prefix_cache(&mut self, request: &Request) -> u32 {
+        let tokens = self.peek_prefix_cache(request);
+        self.hit_size_count += 1;
+        self.hit_size_sum += tokens as u64;
 
-        let mut hasher = DefaultHasher::new();
-        request_id.hash(&mut hasher);
-        num_tokens.hash(&mut hasher);
-        hasher.finish()
+        if tokens == 0 {
+            self.num_prefix_cache_misses += 1;
+        } else {
+            self.num_prefix_cache_hits += 1;
+        }
+        tokens
     }
 }
 
@@ -227,19 +257,29 @@ mod tests {
     fn test_prefix_caching() {
         let mut manager = KVCacheManager::new(16000, 16, 100, true);
 
+        // Create first request with a block hash
         let mut request1 = create_test_request("req-1", 16);
+        request1.prompt_block_hashes = vec![12345]; // Synthetic hash for 1 block
         let blocks1 = manager.allocate_blocks(&request1, 16).unwrap();
         request1.kv_blocks.extend(blocks1);
 
-        // First check - should miss
-        let cached = manager.check_prefix_cache(&request1);
+        // First check - should miss (hash not in cache yet)
+        let cached = manager.query_prefix_cache(&request1);
         assert_eq!(cached, 0);
         assert_eq!(manager.num_prefix_cache_misses, 1);
 
-        // Second check with same prompt - should hit
-        let request2 = create_test_request("req-1", 16);
-        let cached = manager.check_prefix_cache(&request2);
-        assert_eq!(cached, 16);
+        // Second request with same block hash - should hit
+        let mut request2 = create_test_request("req-2", 16);
+        request2.prompt_block_hashes = vec![12345]; // Same hash = shared prefix
+        let cached = manager.query_prefix_cache(&request2);
+        assert_eq!(cached, 16); // 1 block * 16 tokens per block
         assert_eq!(manager.num_prefix_cache_hits, 1);
+
+        // Third request with different hash - should miss
+        let mut request3 = create_test_request("req-3", 16);
+        request3.prompt_block_hashes = vec![67890]; // Different hash
+        let cached = manager.query_prefix_cache(&request3);
+        assert_eq!(cached, 0);
+        assert_eq!(manager.num_prefix_cache_misses, 2);
     }
 }

@@ -33,8 +33,13 @@ pub struct Request {
     /// Total tokens (prompt + output)
     pub num_tokens: u32,
 
-    /// Number of prefix-cached tokens
+    /// Number of prefix-cached tokens (set by cache manager)
     pub num_cached_tokens: u32,
+
+    /// Synthetic block hashes for prefix caching modeling
+    /// In synthetic mode: pre-generated hashes (some shared, some unique)
+    /// In semantic mode: will be computed from actual token content
+    pub prompt_block_hashes: Vec<u64>,
 
     /// KV cache blocks allocated to this request
     pub kv_blocks: Vec<BlockId>,
@@ -78,6 +83,7 @@ impl Request {
             num_output_tokens: 0,
             num_tokens: num_prompt_tokens + max_output_tokens, // Total tokens to process
             num_cached_tokens: 0,
+            prompt_block_hashes: Vec::new(),
             kv_blocks: Vec::new(),
             num_preemptions: 0,
             first_token_time: None,
@@ -86,6 +92,15 @@ impl Request {
             preempted_time: 0.0,
             last_preempted_at: None,
         }
+    }
+
+    /// Get block hashes for the prompt
+    /// These should be thought of as 'incremental hashes' - i.e. the hash of block n is the hash
+    /// of all the tokens up to that block (not just that block alone).
+    /// In synthetic mode: returns pre-generated hashes
+    /// In semantic mode: will compute from actual token content
+    pub fn get_prompt_block_hashes(&self) -> &[u64] {
+        &self.prompt_block_hashes
     }
 
     /// Check if this is in prefill phase

@@ -34,6 +34,10 @@ struct Args {
     /// Save metrics to JSON file
     #[arg(short, long)]
     output: Option<PathBuf>,
+
+    /// Override the random seed (overrides config file)
+    #[arg(long)]
+    seed: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -102,13 +106,21 @@ fn main() {
     }
 
     // Load configuration
-    let config = match Config::from_file(&args.config) {
+    let mut config = match Config::from_file(&args.config) {
         Ok(config) => config,
         Err(e) => {
             eprintln!("Error loading configuration: {}", e);
             std::process::exit(1);
         }
     };
+
+    // Override seed if provided via CLI
+    if let Some(seed) = args.seed {
+        config.workload.seed = seed;
+        if verbosity >= VerbosityLevel::Normal {
+            println!("Overriding seed with CLI value: {}\n", seed);
+        }
+    }
 
     // Print configuration summary
     if verbosity >= VerbosityLevel::Normal {
@@ -151,6 +163,7 @@ fn main() {
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| "unlimited".to_string())
         );
+        println!("  Seed: {}", config.workload.seed);
         println!();
     }
 
@@ -336,27 +349,7 @@ fn print_final_metrics(
     verbosity: VerbosityLevel,
     use_color: bool,
 ) {
-    if verbosity == VerbosityLevel::Quiet {
-        // Minimal output for quiet mode
-        println!(
-            "Simulating... done ({:.1}s simulated, {:.2}s real)",
-            sim_time,
-            real_time.as_secs_f64()
-        );
-        println!(
-            "TTFT: {:.2}ms (p50: {:.2}ms, p99: {:.2}ms)",
-            summary.ttft_mean, summary.ttft_p50, summary.ttft_p99
-        );
-        println!(
-            "E2E:  {:.2}ms (p50: {:.2}ms, p99: {:.2}ms)",
-            summary.e2e_mean, summary.e2e_p50, summary.e2e_p99
-        );
-        println!(
-            "Throughput: {:.0} output tok/s",
-            summary.output_tokens_per_sec
-        );
-        return;
-    }
+    // Quiet mode now uses the same output as normal mode (no special case)
 
     // Header
     if use_color {
@@ -472,6 +465,27 @@ fn print_final_metrics(
     );
     println!("  • Simulation Time: {:.1}s", sim_time);
     println!("  • Real Time: {:.2}s", real_time.as_secs_f64());
+
+    // Prefix Cache Section
+    if summary.prefix_cache_hits + summary.prefix_cache_misses > 0 {
+        if use_color {
+            println!("\n{}", "PREFIX CACHE".yellow().bold());
+        } else {
+            println!("\nPREFIX CACHE");
+        }
+        println!("  • Hits:      {}", summary.prefix_cache_hits);
+        println!("  • Misses:    {}", summary.prefix_cache_misses);
+        println!(
+            "  • Avg hit size: {}/{}={}",
+            summary.prefix_cache_hit_size_sum,
+            summary.prefix_cache_hit_size_count,
+            summary.prefix_cache_hit_size_sum / summary.prefix_cache_hit_size_count
+        );
+        println!(
+            "  • Hit Rate:  {:.1}%",
+            summary.prefix_cache_hit_rate * 100.0
+        );
+    }
 }
 
 #[cfg(not(feature = "cli"))]
@@ -541,6 +555,11 @@ fn save_metrics_json(
         "requests": {
             "completed": summary.completed_requests,
             "total": summary.total_requests,
+        },
+        "prefix_cache": {
+            "hits": summary.prefix_cache_hits,
+            "misses": summary.prefix_cache_misses,
+            "hit_rate": summary.prefix_cache_hit_rate,
         },
     });
 
