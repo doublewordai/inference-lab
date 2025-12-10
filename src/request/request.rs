@@ -121,6 +121,16 @@ impl Request {
         self.num_output_tokens >= self.max_output_tokens
     }
 
+    /// Get total tokens (prompt + max output)
+    pub fn total_tokens(&self) -> u32 {
+        self.num_prompt_tokens + self.max_output_tokens
+    }
+
+    /// Get remaining tokens to process
+    pub fn remaining_tokens(&self) -> u32 {
+        self.num_prompt_tokens + self.max_output_tokens - self.num_computed_tokens
+    }
+
     /// Calculate KV cache requirement for this request
     pub fn kv_cache_size(&self, model: &ModelConfig) -> u64 {
         model.kv_cache_size_for_sequence(self.num_tokens)

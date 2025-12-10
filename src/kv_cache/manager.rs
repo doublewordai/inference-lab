@@ -121,6 +121,11 @@ impl KVCacheManager {
         self.free_blocks.len()
     }
 
+    /// Get total number of blocks
+    pub fn total_blocks(&self) -> usize {
+        self.total_blocks as usize
+    }
+
     /// Get cache utilization (0.0 to 1.0)
     pub fn utilization(&self) -> f64 {
         1.0 - (self.free_blocks.len() as f64 / self.total_blocks as f64)
