@@ -13,3 +13,6 @@ tokenizer.json
 test_*.toml
 wildchat_*.toml
 qwen_chat_template.txt
+
+# mdBook output
+docs/book/
