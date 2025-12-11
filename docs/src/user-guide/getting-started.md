@@ -4,6 +4,14 @@ This guide will help you get started with Inference Lab.
 
 ## Installation
 
+Install from crates.io:
+
+```bash
+cargo install --locked inference-lab
+```
+
+Or build from source:
+
 ```bash
 cargo build --release
 ```
@@ -11,7 +19,7 @@ cargo build --release
 ## Running Your First Simulation
 
 ```bash
-./target/release/inference-lab -c config.toml
+inference-lab -c config.toml
 ```
 
 ## Next Steps

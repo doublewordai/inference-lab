@@ -1,5 +1,7 @@
 # Inference Lab
 
+**[Documentation](https://doublewordai.github.io/inference-lab/)**
+
 LLM inference simulator for analyzing serving systems.
 Simulates GPU clusters serving LLM inference workloads with realistic
 performance modeling.

@@ -1,5 +1,9 @@
 use serde::Deserialize;
 
+fn default_arrival_rate() -> f64 {
+    1.0
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct WorkloadConfig {
     /// Path to dataset file (JSONL in OpenAI batch API format)
@@ -11,6 +15,8 @@ pub struct WorkloadConfig {
     pub arrival_pattern: String,
 
     /// Mean arrival rate (requests per second)
+    /// Not used for "closed_loop" or "batched" patterns
+    #[serde(default = "default_arrival_rate")]
     pub arrival_rate: f64,
 
     /// Input sequence length distribution (ignored in dataset mode)

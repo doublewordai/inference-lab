@@ -367,6 +367,67 @@ impl RequestGenerator {
             return None;
         }
 
+        let is_closed_loop = self.workload.arrival_pattern.to_lowercase() == "closed_loop";
+
+        // For closed-loop, handle pending requests
+        if is_closed_loop {
+            // Check if we've generated all requests
+            if let Some(max_requests) = self.workload.num_requests {
+                if self.requests_generated >= max_requests {
+                    // Clear any remaining pending requests that won't be used
+                    self.pending_closed_loop_requests.clear();
+                    return None;
+                }
+            }
+
+            // Find the earliest pending request that has arrived
+            if let Some(pos) = self
+                .pending_closed_loop_requests
+                .iter()
+                .position(|&t| t <= current_time)
+            {
+                let arrival_time = self.pending_closed_loop_requests.remove(pos);
+
+                // Receive from channel
+                let entry = match self.dataset_receiver.as_ref()?.recv() {
+                    Ok(Some(e)) => e,
+                    Ok(None) => {
+                        // End of dataset signaled
+                        self.dataset_exhausted = true;
+                        return None;
+                    }
+                    Err(_) => {
+                        // Channel error (sender dropped)
+                        self.dataset_exhausted = true;
+                        return None;
+                    }
+                };
+
+                // Sample actual output length from distribution
+                let sampled_output_len = self.workload.output_len_dist.sample(&mut self.rng);
+
+                // If max_output_tokens is specified in the dataset, cap at that; otherwise use sampled value
+                let max_output_tokens = entry.max_output_tokens.unwrap_or(16384);
+                let target_output_tokens = sampled_output_len.min(max_output_tokens);
+
+                let mut request = Request::new_with_target(
+                    entry.request_id.clone(),
+                    0,
+                    arrival_time,
+                    entry.num_prompt_tokens(),
+                    max_output_tokens,
+                    target_output_tokens,
+                );
+
+                request.prompt_block_hashes = Self::compute_block_hashes(&entry.prompt_tokens, 16);
+                self.requests_generated += 1;
+
+                return Some(request);
+            }
+            return None;
+        }
+
+        // Non-closed-loop: original logic
         // Check if it's time for next arrival
         if self.next_arrival_time > current_time {
             return None;
@@ -432,18 +493,28 @@ impl RequestGenerator {
 
     /// Check if all requests have been generated
     pub fn is_finished(&self) -> bool {
+        let is_closed_loop = self.workload.arrival_pattern.to_lowercase() == "closed_loop";
+
         // Dataset mode: check if we've hit limit or dataset is exhausted
         if self.is_dataset_mode() {
             // If num_requests is set, check against that limit
             if let Some(max_requests) = self.workload.num_requests {
-                return self.requests_generated >= max_requests;
+                if is_closed_loop {
+                    // For closed-loop with dataset, we're finished when we've generated max_requests
+                    // AND have no pending requests (or dataset is exhausted)
+                    return (self.requests_generated >= max_requests
+                        && self.pending_closed_loop_requests.is_empty())
+                        || self.dataset_exhausted;
+                } else {
+                    return self.requests_generated >= max_requests;
+                }
             }
             // Otherwise, check if dataset has been fully consumed
             return self.dataset_exhausted;
         }
 
+        // Synthetic workload mode
         if let Some(max_requests) = self.workload.num_requests {
-            let is_closed_loop = self.workload.arrival_pattern.to_lowercase() == "closed_loop";
             if is_closed_loop {
                 // For closed-loop, we're finished when we've generated max_requests
                 // AND have no pending requests

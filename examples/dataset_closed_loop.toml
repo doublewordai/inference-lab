@@ -1,0 +1,50 @@
+# Example configuration for dataset mode with closed-loop pattern
+# This simulates a fixed number of concurrent users replaying real requests
+
+[hardware]
+name = "H100"
+compute_flops = 1.513e15        # 1513 TFLOPS bf16
+memory_bandwidth = 3.35e12      # 3.35 TB/s
+memory_capacity = 85899345920   # 80 GB
+kv_cache_capacity = 68719476736 # 64 GB
+bytes_per_param = 2             # bf16
+
+[model]
+name = "Llama-3-70B"
+num_parameters = 70000000000
+num_layers = 80
+hidden_dim = 8192
+num_heads = 64
+num_kv_heads = 8
+max_seq_len = 8192
+
+[scheduler]
+max_num_batched_tokens = 8192
+max_num_seqs = 256
+policy = "fcfs"
+enable_chunked_prefill = true
+block_size = 16
+
+[workload]
+# Dataset mode - specify path to JSONL file
+dataset_path = "wildchat_50k.jsonl"
+
+# Closed-loop pattern - fixed concurrent users
+arrival_pattern = "closed_loop"
+num_concurrent_users = 10  # 10 concurrent users
+
+# Limit total number of requests to process
+num_requests = 100
+
+# Input distribution is ignored in dataset mode (comes from dataset)
+input_len_dist = { type = "fixed", value = 100 }
+
+# Output distribution samples actual generation length (simulates EOS)
+# Capped by max_tokens in dataset
+output_len_dist = { type = "lognormal", mean = 5.3, std_dev = 0.8 }
+
+# Random seed for reproducibility
+seed = 42
+
+[simulation]
+log_interval = 10

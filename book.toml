@@ -10,5 +10,5 @@ build-dir = "docs/book"
 [output.html]
 default-theme = "light"
 preferred-dark-theme = "navy"
-git-repository-url = "https://github.com/your-username/inference-lab"
-edit-url-template = "https://github.com/your-username/inference-lab/edit/main/{path}"
+git-repository-url = "https://github.com/doublewordai/inference-lab"
+edit-url-template = "https://github.com/doublewordai/inference-lab/edit/main/{path}"
