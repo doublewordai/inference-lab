@@ -265,13 +265,15 @@ mod tests {
         // Create first request with a block hash
         let mut request1 = create_test_request("req-1", 16);
         request1.prompt_block_hashes = vec![12345]; // Synthetic hash for 1 block
-        let blocks1 = manager.allocate_blocks(&request1, 16).unwrap();
-        request1.kv_blocks.extend(blocks1);
 
         // First check - should miss (hash not in cache yet)
         let cached = manager.query_prefix_cache(&request1);
         assert_eq!(cached, 0);
         assert_eq!(manager.num_prefix_cache_misses, 1);
+
+        // Now allocate blocks (this adds to cache)
+        let blocks1 = manager.allocate_blocks(&request1, 16).unwrap();
+        request1.kv_blocks.extend(blocks1);
 
         // Second request with same block hash - should hit
         let mut request2 = create_test_request("req-2", 16);

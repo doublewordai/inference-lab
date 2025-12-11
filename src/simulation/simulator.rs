@@ -1,5 +1,6 @@
 use crate::compute::ComputeEngine;
 use crate::config::Config;
+use crate::dataset::{BatchTokenizerFn, DatasetLoader};
 use crate::kv_cache::KVCacheManager;
 use crate::metrics::MetricsCollector;
 use crate::request::RequestGenerator;
@@ -62,6 +63,15 @@ pub struct Simulator {
 
 impl Simulator {
     pub fn new(config: Config) -> Result<Self, String> {
+        Self::new_with_tokenizer(config, None).map(|(sim, _)| sim)
+    }
+
+    /// Create a new simulator with an optional batch tokenizer for dataset mode
+    /// Returns the simulator and the potentially updated config (e.g., num_requests set from dataset)
+    pub fn new_with_tokenizer(
+        mut config: Config,
+        tokenizer: Option<BatchTokenizerFn>,
+    ) -> Result<(Self, Config), String> {
         let kv_cache_manager = KVCacheManager::new(
             config.hardware.kv_cache_capacity,
             config.scheduler.block_size,
@@ -76,11 +86,44 @@ impl Simulator {
             kv_cache_manager,
         )?;
 
-        let compute_engine = ComputeEngine::new(config.hardware, config.model);
-        let request_generator = RequestGenerator::new(config.workload);
+        let compute_engine = ComputeEngine::new(config.hardware.clone(), config.model.clone());
+
+        // Create request generator - use dataset if provided
+        let request_generator = if let Some(dataset_path) = &config.workload.dataset_path {
+            // Dataset mode requires a tokenizer
+            let tokenizer = tokenizer.ok_or_else(|| {
+                format!(
+                    "Dataset path '{}' provided but no tokenizer function supplied",
+                    dataset_path
+                )
+            })?;
+
+            // Count entries for progress tracking (if num_requests not set)
+            if config.workload.num_requests.is_none() {
+                let total_entries = DatasetLoader::count_entries(dataset_path)
+                    .map_err(|e| format!("Failed to count entries in '{}': {}", dataset_path, e))?;
+                config.workload.num_requests = Some(total_entries);
+            }
+
+            // Load dataset iterator (streams unparsed entries on-demand)
+            let dataset_iterator = DatasetLoader::from_file(dataset_path)
+                .map_err(|e| format!("Failed to load dataset from '{}': {}", dataset_path, e))?;
+
+            // Pass iterator with tokenizer for batch tokenization in background thread
+            RequestGenerator::from_dataset(
+                config.workload.clone(),
+                dataset_iterator,
+                None,
+                tokenizer,
+            )
+        } else {
+            // Synthetic mode
+            RequestGenerator::new(config.workload.clone())
+        };
+
         let metrics = MetricsCollector::new(0.0);
 
-        Ok(Self {
+        let simulator = Self {
             scheduler,
             compute_engine,
             request_generator,
@@ -96,7 +139,9 @@ impl Simulator {
             last_sent_tpot_count: 0,
             last_sent_input_count: 0,
             last_sent_output_count: 0,
-        })
+        };
+
+        Ok((simulator, config))
     }
 
     /// Run the simulation with progress callbacks
@@ -159,7 +204,15 @@ impl Simulator {
 
                 (iteration_time, bandwidth_util, flops_util)
             } else {
-                (0.001, 0.0, 0.0) // Small time step when idle
+                // When idle, jump directly to next arrival time (if more requests coming)
+                if !self.request_generator.is_finished() {
+                    let next_arrival = self.request_generator.peek_next_arrival_time();
+                    let time_until_next = (next_arrival - self.current_time).max(0.001);
+                    (time_until_next, 0.0, 0.0)
+                } else {
+                    // No more requests, small increment to finish pending work
+                    (0.001, 0.0, 0.0)
+                }
             };
 
             // 4. Advance time

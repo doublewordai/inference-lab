@@ -1,0 +1,42 @@
+# Example configuration for dataset mode
+
+[hardware]
+name = "H100"
+compute_flops = 1.513e15        # bf16 TFLOPS
+memory_bandwidth = 3.35e12      # bytes/sec
+memory_capacity = 85899345920   # 80 GB
+kv_cache_capacity = 68719476736 # 64 GB for KV cache
+bytes_per_param = 2             # bf16 = 2 bytes
+
+[model]
+name = "Llama-3-70B"
+num_parameters = 70000000000
+num_layers = 80
+hidden_dim = 8192
+num_heads = 64
+num_kv_heads = 8
+max_seq_len = 8192
+
+[scheduler]
+max_num_batched_tokens = 8192
+max_num_seqs = 256
+policy = "fcfs"
+enable_chunked_prefill = true
+long_prefill_token_threshold = 512
+block_size = 16
+
+[workload]
+# Dataset mode - specify path to JSONL file in OpenAI batch API format
+dataset_path = "examples/sample_dataset.jsonl"
+
+# Arrival pattern still applies to determine when requests arrive
+arrival_pattern = "poisson"
+arrival_rate = 1.0  # 1 request per second
+
+# Note: input_len_dist is ignored (comes from dataset)
+# output_len_dist samples actual output length (simulates EOS), capped by dataset max_tokens
+input_len_dist = { type = "fixed", value = 100 }  # Ignored in dataset mode
+output_len_dist = { type = "fixed", value = 50 }  # Samples actual generation length
+
+# Random seed for reproducibility (affects arrival times)
+seed = 42

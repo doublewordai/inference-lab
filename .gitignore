@@ -3,3 +3,13 @@
 web/node_modules
 web/dist
 .npmrc
+
+# Large test datasets and models (user-specific)
+wildchat_*.jsonl
+tokenizer.json
+*.gz
+
+# User test configs (not examples)
+test_*.toml
+wildchat_*.toml
+qwen_chat_template.txt

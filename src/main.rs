@@ -1,7 +1,13 @@
 use clap::Parser;
-use inference_lab::{Config, Simulator};
+use inference_lab::{BatchTokenizerFn, Config, Message, Simulator};
 use std::path::PathBuf;
 use std::time::Instant;
+
+#[cfg(feature = "cli")]
+use tokenizers::Tokenizer;
+
+#[cfg(feature = "cli")]
+use minijinja::Environment;
 
 #[cfg(feature = "cli")]
 use colored::Colorize;
@@ -14,6 +20,14 @@ struct Args {
     /// Path to the TOML configuration file
     #[arg(short, long, default_value = "config.toml")]
     config: PathBuf,
+
+    /// Path to tokenizer.json file (required if dataset_path is set in config)
+    #[arg(short, long)]
+    tokenizer: Option<PathBuf>,
+
+    /// Chat template (Jinja2 format) or path to template file. Use "None" for simple concatenation. Required when using datasets.
+    #[arg(long)]
+    chat_template: Option<String>,
 
     /// Minimal output (final metrics only)
     #[arg(short, long)]
@@ -88,6 +102,94 @@ struct ThroughputRow {
     value: String,
 }
 
+/// Apply chat template to messages using Jinja2
+#[cfg(feature = "cli")]
+fn apply_chat_template(template: &str, messages: &[Message]) -> Result<String, String> {
+    let env = Environment::new();
+    let tmpl = env
+        .template_from_str(template)
+        .map_err(|e| format!("Invalid template: {}", e))?;
+
+    // Convert messages to the format expected by chat templates
+    let messages_json: Vec<serde_json::Value> = messages
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "role": m.role,
+                "content": m.content
+            })
+        })
+        .collect();
+
+    // Render the template
+    let context = serde_json::json!({
+        "messages": messages_json,
+        "add_generation_prompt": true,
+        "bos_token": "<s>",
+        "eos_token": "</s>",
+    });
+
+    tmpl.render(context)
+        .map_err(|e| format!("Template rendering failed: {}", e))
+}
+
+/// Load a tokenizer from a file and create a BatchTokenizerFn
+#[cfg(feature = "cli")]
+fn load_tokenizer(
+    tokenizer_path: &PathBuf,
+    chat_template: Option<String>,
+) -> Result<BatchTokenizerFn, String> {
+    let tokenizer = Tokenizer::from_file(tokenizer_path)
+        .map_err(|e| format!("Failed to load tokenizer: {}", e))?;
+
+    // Load template: check if it's a file path first, otherwise use as template string
+    let template = match chat_template {
+        Some(ref t) if t == "None" => None,
+        Some(t) => {
+            // Try to read as file first
+            if let Ok(content) = std::fs::read_to_string(&t) {
+                Some(content)
+            } else {
+                // Not a file, use as template string directly
+                Some(t)
+            }
+        }
+        None => None,
+    };
+
+    Ok(Box::new(move |message_batches: &[&[Message]]| {
+        // Apply chat template and collect all texts
+        let texts: Result<Vec<String>, String> = message_batches
+            .iter()
+            .map(|messages| {
+                if let Some(ref tmpl) = template {
+                    apply_chat_template(tmpl, messages)
+                } else {
+                    // Simple concatenation fallback
+                    Ok(messages
+                        .iter()
+                        .map(|m| format!("{}: {}", m.role, m.content))
+                        .collect::<Vec<_>>()
+                        .join("\n"))
+                }
+            })
+            .collect();
+
+        let texts = texts?;
+
+        // Batch encode all texts at once (much faster!)
+        let encodings = tokenizer
+            .encode_batch(texts, false)
+            .map_err(|e| format!("Failed to batch tokenize: {}", e))?;
+
+        // Extract token IDs from all encodings
+        Ok(encodings
+            .into_iter()
+            .map(|enc| enc.get_ids().to_vec())
+            .collect())
+    }))
+}
+
 fn main() {
     env_logger::init();
 
@@ -122,7 +224,62 @@ fn main() {
         }
     }
 
-    // Print configuration summary
+    // Load tokenizer if needed for dataset mode
+    #[cfg(feature = "cli")]
+    let tokenizer = if config.workload.dataset_path.is_some() {
+        match &args.tokenizer {
+            Some(tokenizer_path) => {
+                // Check if chat template is provided
+                if args.chat_template.is_none() {
+                    eprintln!("Error: --chat-template is required when using datasets.");
+                    eprintln!("Use --chat-template \"<template>\" or --chat-template None for simple concatenation.");
+                    std::process::exit(1);
+                }
+
+                if verbosity >= VerbosityLevel::Normal {
+                    println!("Loading tokenizer from: {:?}", tokenizer_path);
+                    if let Some(ref tmpl) = args.chat_template {
+                        if tmpl == "None" {
+                            println!("Using simple message concatenation (no chat template)");
+                        } else if std::path::Path::new(tmpl).exists() {
+                            println!("Loading chat template from: {:?}", tmpl);
+                        } else {
+                            println!("Using custom chat template (inline)");
+                        }
+                    }
+                }
+
+                match load_tokenizer(tokenizer_path, args.chat_template.clone()) {
+                    Ok(tok) => Some(tok),
+                    Err(e) => {
+                        eprintln!("Error loading tokenizer: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+            None => {
+                eprintln!("Error: dataset_path is set in config but no tokenizer specified.");
+                eprintln!("Please provide a tokenizer using --tokenizer <path-to-tokenizer.json>");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
+
+    #[cfg(not(feature = "cli"))]
+    let tokenizer = None;
+
+    // Create simulator (returns updated config with counted dataset entries if applicable)
+    let (mut simulator, config) = match Simulator::new_with_tokenizer(config, tokenizer) {
+        Ok((sim, cfg)) => (sim, cfg),
+        Err(e) => {
+            eprintln!("Error creating simulator: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    // Print configuration summary (after simulator creation to show updated dataset entry count)
     if verbosity >= VerbosityLevel::Normal {
         if use_color {
             println!("{}", "Configuration:".green().bold());
@@ -166,15 +323,6 @@ fn main() {
         println!("  Seed: {}", config.workload.seed);
         println!();
     }
-
-    // Create simulator
-    let mut simulator = match Simulator::new(config.clone()) {
-        Ok(sim) => sim,
-        Err(e) => {
-            eprintln!("Error creating simulator: {}", e);
-            std::process::exit(1);
-        }
-    };
 
     let start_time = Instant::now();
 
@@ -282,8 +430,8 @@ fn run_with_dashboard(simulator: &mut Simulator, use_color: bool, config: &Confi
                     percent
                 );
                 println!(
-                    "  Time:     {:.1}s simulated",
-                    progress.current_time.to_string().yellow()
+                    "  Time:     {}s simulated",
+                    format!("{:.1}", progress.current_time).yellow()
                 );
                 println!(
                     "  Queue:    {} running, {} waiting",
@@ -316,8 +464,6 @@ fn run_with_dashboard(simulator: &mut Simulator, use_color: bool, config: &Confi
 }
 
 fn run_verbose(simulator: &mut Simulator, use_color: bool, config: &Config) {
-    let total_requests = config.workload.num_requests.unwrap_or(1000) as u64;
-
     if use_color {
         println!("{}", "Starting simulation...".green());
     } else {
@@ -326,11 +472,19 @@ fn run_verbose(simulator: &mut Simulator, use_color: bool, config: &Config) {
 
     simulator
         .run_with_callback(|progress| {
+            // Use actual total_requests from progress (updated dynamically)
+            // For dataset mode, this tracks requests as they arrive
+            let total_display = if let Some(num_req) = config.workload.num_requests {
+                num_req.to_string()
+            } else {
+                progress.total_requests.to_string()
+            };
+
             println!(
                 "[{:.1}s] {}/{} requests | {} running, {} waiting | KV: {:.1}% | FLOPS: {:.1}% | BW: {:.1}%",
                 progress.current_time,
                 progress.completed_requests,
-                total_requests,
+                total_display,
                 progress.running,
                 progress.waiting,
                 progress.kv_cache_util * 100.0,

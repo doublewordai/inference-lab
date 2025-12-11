@@ -24,6 +24,10 @@ pub struct Request {
     /// Maximum number of output tokens to generate
     pub max_output_tokens: u32,
 
+    /// Actual number of output tokens to generate (sampled, may be less than max)
+    /// This simulates hitting an EOS token
+    pub target_output_tokens: u32,
+
     /// Number of tokens computed so far
     pub num_computed_tokens: u32,
 
@@ -64,13 +68,14 @@ pub struct Request {
 }
 
 impl Request {
-    /// Create a new request
-    pub fn new(
+    /// Create a new request with a target output length
+    pub fn new_with_target(
         request_id: String,
         priority: i32,
         arrival_time: f64,
         num_prompt_tokens: u32,
         max_output_tokens: u32,
+        target_output_tokens: u32,
     ) -> Self {
         Self {
             request_id,
@@ -79,9 +84,10 @@ impl Request {
             status: RequestStatus::Waiting,
             num_prompt_tokens,
             max_output_tokens,
+            target_output_tokens,
             num_computed_tokens: 0,
             num_output_tokens: 0,
-            num_tokens: num_prompt_tokens + max_output_tokens, // Total tokens to process
+            num_tokens: num_prompt_tokens + target_output_tokens,
             num_cached_tokens: 0,
             prompt_block_hashes: Vec::new(),
             kv_blocks: Vec::new(),
@@ -92,6 +98,24 @@ impl Request {
             preempted_time: 0.0,
             last_preempted_at: None,
         }
+    }
+
+    /// Create a new request (target = max)
+    pub fn new(
+        request_id: String,
+        priority: i32,
+        arrival_time: f64,
+        num_prompt_tokens: u32,
+        max_output_tokens: u32,
+    ) -> Self {
+        Self::new_with_target(
+            request_id,
+            priority,
+            arrival_time,
+            num_prompt_tokens,
+            max_output_tokens,
+            max_output_tokens, // Target = max (used for synthetic workloads)
+        )
     }
 
     /// Get block hashes for the prompt
@@ -118,7 +142,7 @@ impl Request {
 
     /// Check if request is done
     pub fn is_finished(&self) -> bool {
-        self.num_output_tokens >= self.max_output_tokens
+        self.num_output_tokens >= self.target_output_tokens
     }
 
     /// Get total tokens (prompt + max output)
