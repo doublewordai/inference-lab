@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1](https://github.com/doublewordai/inference-lab/compare/inference-lab-v0.3.0...inference-lab-v0.3.1) (2025-12-11)
+
+
+### Bug Fixes
+
+* **deps:** update rust crate tokenizers to 0.22 ([3d14b09](https://github.com/doublewordai/inference-lab/commit/3d14b09aaaafdafdea10d1bc3d128d818e2c5418))
+
 ## [0.3.0](https://github.com/doublewordai/inference-lab/compare/inference-lab-v0.2.0...inference-lab-v0.3.0) (2025-12-11)
 
 
