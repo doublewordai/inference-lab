@@ -26,6 +26,11 @@ pub struct SchedulerConfig {
 
     /// Block size for KV cache (in tokens)
     pub block_size: u32,
+
+    /// Enable preemption-free scheduling mode
+    /// When enabled, uses conservative admission control to guarantee zero preemptions
+    #[serde(default)]
+    pub enable_preemption_free: bool,
 }
 
 fn default_max_num_partial_prefills() -> u32 {

@@ -63,6 +63,11 @@ impl Scheduler {
                 let mut req = self.running.remove(idx);
                 req.status = RequestStatus::Completed;
                 req.completion_time = Some(current_time);
+
+                // Free KV cache blocks
+                self.kv_cache_manager.free_blocks(&req.kv_blocks);
+                req.kv_blocks.clear();
+
                 decision.completed.push(req);
                 continue;
             }
@@ -94,7 +99,21 @@ impl Scheduler {
                 self.calculate_blocks_needed(&self.running[idx], tokens_to_schedule);
 
             if blocks_needed > 0 && self.kv_cache_manager.num_free_blocks() < blocks_needed {
-                // Need to preempt
+                // Need to preempt or skip
+                if self.config.enable_preemption_free {
+                    // In preemption-free mode, we shouldn't reach this point
+                    eprintln!("ERROR: Admission control failed!");
+                    eprintln!("  blocks_needed: {}", blocks_needed);
+                    eprintln!("  free_blocks: {}", self.kv_cache_manager.num_free_blocks());
+                    eprintln!("  running_requests: {}", self.running.len());
+                    eprintln!("  waiting_requests: {}", self.waiting.len());
+                    eprintln!("  current_time: {}", current_time);
+                    eprintln!("  request_id: {}", self.running[idx].request_id);
+                    eprintln!("  tokens_to_schedule: {}", tokens_to_schedule);
+                    unreachable!();
+                }
+
+                // Normal preemption logic
                 if let Some(preempt_idx) = self.select_preemption_victim() {
                     let mut preempted_req = self.running.remove(preempt_idx);
                     self.preempt_request(&mut preempted_req, current_time);
@@ -149,6 +168,13 @@ impl Scheduler {
                 // Select next request based on scheduling policy
                 let selected_idx = self.select_next_waiting_request();
                 let mut request = self.waiting.get(selected_idx).unwrap().clone();
+
+                // In preemption-free mode, check if we can safely admit this request
+                if self.config.enable_preemption_free {
+                    if !self.can_admit_without_preemption(&request) {
+                        break; // Can't admit without risking future preemption need
+                    }
+                }
 
                 // Check for prefix cache hits (peek doesn't increment any prefix cache stats)
                 let cached_tokens = self.kv_cache_manager.peek_prefix_cache(&request);
@@ -224,6 +250,26 @@ impl Scheduler {
         total_blocks_needed.saturating_sub(request.kv_blocks.len())
     }
 
+    /// Check if we can admit a new request without risking preemption
+    /// Conservative approach: ensure total allocated + needed for all to complete fits
+    fn can_admit_without_preemption(&self, request: &Request) -> bool {
+        // Calculate total blocks that will EVER be needed by all running + new
+        let mut max_blocks_needed = 0;
+
+        for r in &self.running {
+            let total_needed = r.total_tokens().div_ceil(self.config.block_size) as usize;
+            max_blocks_needed += total_needed;
+        }
+
+        // Add new request
+        let new_total = request.total_tokens().div_ceil(self.config.block_size) as usize;
+        max_blocks_needed += new_total;
+
+        // Check against total capacity (not just free blocks!)
+        let total_blocks = self.kv_cache_manager.total_blocks();
+        max_blocks_needed <= total_blocks
+    }
+
     /// Find the index of the best waiting request to schedule based on policy
     fn select_next_waiting_request(&self) -> usize {
         if self.waiting.is_empty() {
@@ -234,15 +280,6 @@ impl Scheduler {
             SchedulingPolicy::FCFS | SchedulingPolicy::Priority => {
                 // FCFS and Priority: always take first (FIFO order)
                 0
-            }
-            SchedulingPolicy::SJF => {
-                // Shortest Job First: find request with smallest output length
-                self.waiting
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, r)| r.max_output_tokens)
-                    .map(|(idx, _)| idx)
-                    .unwrap_or(0)
             }
             SchedulingPolicy::SIF => {
                 // Shortest Input First: find request with smallest input length
@@ -259,6 +296,42 @@ impl Scheduler {
                     .iter()
                     .enumerate()
                     .max_by_key(|(_, r)| r.num_prompt_tokens)
+                    .map(|(idx, _)| idx)
+                    .unwrap_or(0)
+            }
+            SchedulingPolicy::SOF => {
+                // Shortest Output First: find request with smallest output length
+                self.waiting
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, r)| r.max_output_tokens)
+                    .map(|(idx, _)| idx)
+                    .unwrap_or(0)
+            }
+            SchedulingPolicy::LOF => {
+                // Longest Output First: find request with largest output length
+                self.waiting
+                    .iter()
+                    .enumerate()
+                    .max_by_key(|(_, r)| r.max_output_tokens)
+                    .map(|(idx, _)| idx)
+                    .unwrap_or(0)
+            }
+            SchedulingPolicy::STF => {
+                // Shortest Total First: find request with smallest total length
+                self.waiting
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, r)| r.total_tokens())
+                    .map(|(idx, _)| idx)
+                    .unwrap_or(0)
+            }
+            SchedulingPolicy::LTF => {
+                // Longest Total First: find request with largest total length
+                self.waiting
+                    .iter()
+                    .enumerate()
+                    .max_by_key(|(_, r)| r.total_tokens())
                     .map(|(idx, _)| idx)
                     .unwrap_or(0)
             }
@@ -284,14 +357,6 @@ impl Scheduler {
                     .max_by_key(|(_, r)| (r.priority, OrderedFloat(r.arrival_time)))
                     .map(|(idx, _)| idx)
             }
-            SchedulingPolicy::SJF => {
-                // SJF: preempt the longest remaining job
-                self.running
-                    .iter()
-                    .enumerate()
-                    .max_by_key(|(_, r)| r.max_output_tokens - r.num_output_tokens)
-                    .map(|(idx, _)| idx)
-            }
             SchedulingPolicy::SIF => {
                 // SIF: preempt the request with longest input
                 self.running
@@ -301,11 +366,46 @@ impl Scheduler {
                     .map(|(idx, _)| idx)
             }
             SchedulingPolicy::LIF => {
-                // LIF: preempt the request with shortest input
+                // LIF: preempt the request with longest input to avoid starvation
+                // (prioritizes long inputs, but must sacrifice long when memory tight)
                 self.running
                     .iter()
                     .enumerate()
-                    .min_by_key(|(_, r)| r.num_prompt_tokens)
+                    .max_by_key(|(_, r)| r.num_prompt_tokens)
+                    .map(|(idx, _)| idx)
+            }
+            SchedulingPolicy::SOF => {
+                // SOF: preempt the longest remaining output
+                self.running
+                    .iter()
+                    .enumerate()
+                    .max_by_key(|(_, r)| r.max_output_tokens - r.num_output_tokens)
+                    .map(|(idx, _)| idx)
+            }
+            SchedulingPolicy::LOF => {
+                // LOF: preempt the longest remaining output to avoid starvation
+                // (prioritizes long, but must sacrifice long when memory tight)
+                self.running
+                    .iter()
+                    .enumerate()
+                    .max_by_key(|(_, r)| r.max_output_tokens - r.num_output_tokens)
+                    .map(|(idx, _)| idx)
+            }
+            SchedulingPolicy::STF => {
+                // STF: preempt the request with longest total remaining
+                self.running
+                    .iter()
+                    .enumerate()
+                    .max_by_key(|(_, r)| r.remaining_tokens())
+                    .map(|(idx, _)| idx)
+            }
+            SchedulingPolicy::LTF => {
+                // LTF: preempt the request with longest total remaining to avoid starvation
+                // (prioritizes long totals, but must sacrifice long when memory tight)
+                self.running
+                    .iter()
+                    .enumerate()
+                    .max_by_key(|(_, r)| r.remaining_tokens())
                     .map(|(idx, _)| idx)
             }
         }
@@ -469,22 +569,22 @@ mod tests {
     }
 
     #[test]
-    fn test_sjf_selection() {
-        let mut scheduler = create_scheduler_with_policy("sjf");
+    fn test_sof_selection() {
+        let mut scheduler = create_scheduler_with_policy("sof");
 
         // Add requests with different output lengths
         scheduler.add_request(create_test_request("req-long", 16, 100)); // longest
         scheduler.add_request(create_test_request("req-short", 16, 10)); // shortest
         scheduler.add_request(create_test_request("req-medium", 16, 50)); // medium
 
-        // SJF should select the shortest job first (output=10)
+        // SOF should select the shortest output first (output=10)
         let idx = scheduler.select_next_waiting_request();
         assert_eq!(scheduler.waiting.get(idx).unwrap().max_output_tokens, 10);
     }
 
     #[test]
-    fn test_sjf_preemption() {
-        let mut scheduler = create_scheduler_with_policy("sjf");
+    fn test_sof_preemption() {
+        let mut scheduler = create_scheduler_with_policy("sof");
 
         // Add running requests with different remaining outputs
         let mut req1 = create_test_request("req-1", 16, 100);
@@ -503,7 +603,7 @@ mod tests {
         scheduler.running.push(req2);
         scheduler.running.push(req3);
 
-        // SJF should preempt the longest remaining job (req-1 with 50 remaining)
+        // SOF should preempt the longest remaining output (req-1 with 50 remaining)
         let victim_idx = scheduler.select_preemption_victim().unwrap();
         assert_eq!(
             scheduler.running[victim_idx].max_output_tokens
@@ -581,9 +681,9 @@ mod tests {
         scheduler.running.push(req2);
         scheduler.running.push(req3);
 
-        // LIF should preempt the shortest input (req-2 with 50 tokens)
+        // LIF should preempt the longest input to avoid starvation (req-1 with 200 tokens)
         let victim_idx = scheduler.select_preemption_victim().unwrap();
-        assert_eq!(scheduler.running[victim_idx].num_prompt_tokens, 50);
+        assert_eq!(scheduler.running[victim_idx].num_prompt_tokens, 200);
     }
 
     #[test]
@@ -658,5 +758,146 @@ mod tests {
         // Should always select same index for same state
         assert_eq!(idx1, idx2);
         assert_eq!(idx2, idx3);
+    }
+
+    fn create_scheduler_with_preemption_free() -> Scheduler {
+        let mut config = Config::test_default();
+        config.scheduler.enable_preemption_free = true;
+        let kv_cache = KVCacheManager::new(
+            config.hardware.kv_cache_capacity,
+            config.scheduler.block_size,
+            config.model.kv_cache_bytes_per_token,
+            false,
+        );
+        Scheduler::new(config.scheduler, config.hardware, config.model, kv_cache).unwrap()
+    }
+
+    #[test]
+    fn test_preemption_free_admission_control() {
+        // Create a scheduler with small cache capacity
+        let mut config = Config::test_default();
+        config.scheduler.enable_preemption_free = true;
+        config.hardware.kv_cache_capacity = 100_000_000; // Small cache
+        let kv_cache = KVCacheManager::new(
+            config.hardware.kv_cache_capacity,
+            config.scheduler.block_size,
+            config.model.kv_cache_bytes_per_token,
+            false,
+        );
+        let mut scheduler =
+            Scheduler::new(config.scheduler, config.hardware, config.model, kv_cache).unwrap();
+
+        // Calculate how many blocks we have
+        let total_blocks = scheduler.kv_cache_manager().total_blocks();
+
+        // Add a request that takes up 60% of the cache
+        let blocks_for_first = (total_blocks * 60) / 100;
+        let tokens_for_first = blocks_for_first * 16; // block_size = 16
+        let large_req = create_test_request(
+            "req-large",
+            tokens_for_first as u32 / 2,
+            tokens_for_first as u32 / 2,
+        );
+        scheduler.add_request(large_req);
+
+        // Schedule it
+        let decision1 = scheduler.schedule(0.0);
+        assert_eq!(
+            decision1.scheduled_new.len(),
+            1,
+            "First request should be scheduled"
+        );
+        assert_eq!(scheduler.num_running(), 1);
+
+        // Try to add another request that needs 60% - should not be admitted (would exceed capacity)
+        let another_large = create_test_request(
+            "req-large2",
+            tokens_for_first as u32 / 2,
+            tokens_for_first as u32 / 2,
+        );
+        scheduler.add_request(another_large);
+
+        let decision2 = scheduler.schedule(0.0);
+        // Should not admit the second request because 60% + 60% > 100%
+        assert_eq!(
+            decision2.scheduled_new.len(),
+            0,
+            "Second request should not be admitted"
+        );
+        assert_eq!(scheduler.num_running(), 1);
+        assert_eq!(scheduler.num_waiting(), 1);
+    }
+
+    #[test]
+    fn test_preemption_free_no_preemptions() {
+        let mut scheduler = create_scheduler_with_preemption_free();
+
+        // Add multiple requests
+        scheduler.add_request(create_test_request("req-1", 100, 50));
+        scheduler.add_request(create_test_request("req-2", 100, 50));
+        scheduler.add_request(create_test_request("req-3", 100, 50));
+
+        let mut total_preemptions = 0;
+        let mut time = 0.0;
+
+        // Run scheduler for many iterations
+        for _ in 0..100 {
+            let decision = scheduler.schedule(time);
+            total_preemptions += decision.preempted.len();
+
+            // Update running requests
+            for (idx, &tokens) in decision
+                .scheduled_running
+                .iter()
+                .zip(decision.tokens_for_running.iter())
+            {
+                scheduler.running[*idx].record_generated_tokens(tokens, time);
+            }
+
+            for (idx, &tokens) in decision
+                .scheduled_new
+                .iter()
+                .zip(decision.tokens_for_new.iter())
+            {
+                scheduler.running[*idx].record_generated_tokens(tokens, time);
+            }
+
+            time += 0.01;
+
+            if scheduler.num_running() == 0 && scheduler.num_waiting() == 0 {
+                break;
+            }
+        }
+
+        // Assert zero preemptions
+        assert_eq!(total_preemptions, 0);
+    }
+
+    #[test]
+    fn test_preemption_free_fcfs_ordering() {
+        let mut scheduler = create_scheduler_with_preemption_free();
+
+        // Add requests with different arrival times
+        let mut req1 = create_test_request("req-1", 16, 10);
+        req1.arrival_time = 0.0;
+
+        let mut req2 = create_test_request("req-2", 16, 10);
+        req2.arrival_time = 1.0;
+
+        let mut req3 = create_test_request("req-3", 16, 10);
+        req3.arrival_time = 2.0;
+
+        scheduler.add_request(req1);
+        scheduler.add_request(req2);
+        scheduler.add_request(req3);
+
+        // Schedule first batch
+        let decision = scheduler.schedule(0.0);
+
+        // Should maintain FCFS ordering
+        assert!(!decision.scheduled_new.is_empty());
+        if !scheduler.running.is_empty() {
+            assert_eq!(scheduler.running[0].request_id, "req-1");
+        }
     }
 }

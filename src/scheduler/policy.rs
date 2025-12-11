@@ -5,12 +5,24 @@ pub enum SchedulingPolicy {
     FCFS,
     /// Priority-based: requests ordered by priority value (lower = higher priority)
     Priority,
-    /// Shortest Job First: prioritize requests with smallest output length
-    SJF,
+
+    // Input-based policies (prompt length)
     /// Shortest Input First: prioritize requests with smallest input length
     SIF,
     /// Longest Input First: prioritize requests with largest input length
     LIF,
+
+    // Output-based policies (generation length)
+    /// Shortest Output First: prioritize requests with smallest output length
+    SOF,
+    /// Longest Output First: prioritize requests with largest output length
+    LOF,
+
+    // Total-based policies (input + output)
+    /// Shortest Total First: prioritize requests with smallest total length
+    STF,
+    /// Longest Total First: prioritize requests with largest total length
+    LTF,
 }
 
 impl SchedulingPolicy {
@@ -18,9 +30,14 @@ impl SchedulingPolicy {
         match s.to_lowercase().as_str() {
             "fcfs" => Ok(SchedulingPolicy::FCFS),
             "priority" => Ok(SchedulingPolicy::Priority),
-            "sjf" => Ok(SchedulingPolicy::SJF),
             "sif" => Ok(SchedulingPolicy::SIF),
             "lif" => Ok(SchedulingPolicy::LIF),
+            "sof" => Ok(SchedulingPolicy::SOF),
+            "lof" => Ok(SchedulingPolicy::LOF),
+            "stf" => Ok(SchedulingPolicy::STF),
+            "ltf" => Ok(SchedulingPolicy::LTF),
+            // Backward compatibility
+            "sjf" => Ok(SchedulingPolicy::SOF),
             _ => Err(format!("Unknown scheduling policy: {}", s)),
         }
     }
@@ -45,14 +62,6 @@ mod tests {
             SchedulingPolicy::Priority
         );
         assert_eq!(
-            SchedulingPolicy::from_str("sjf").unwrap(),
-            SchedulingPolicy::SJF
-        );
-        assert_eq!(
-            SchedulingPolicy::from_str("SJF").unwrap(),
-            SchedulingPolicy::SJF
-        );
-        assert_eq!(
             SchedulingPolicy::from_str("sif").unwrap(),
             SchedulingPolicy::SIF
         );
@@ -67,6 +76,47 @@ mod tests {
         assert_eq!(
             SchedulingPolicy::from_str("LIF").unwrap(),
             SchedulingPolicy::LIF
+        );
+        assert_eq!(
+            SchedulingPolicy::from_str("sof").unwrap(),
+            SchedulingPolicy::SOF
+        );
+        assert_eq!(
+            SchedulingPolicy::from_str("SOF").unwrap(),
+            SchedulingPolicy::SOF
+        );
+        assert_eq!(
+            SchedulingPolicy::from_str("lof").unwrap(),
+            SchedulingPolicy::LOF
+        );
+        assert_eq!(
+            SchedulingPolicy::from_str("LOF").unwrap(),
+            SchedulingPolicy::LOF
+        );
+        assert_eq!(
+            SchedulingPolicy::from_str("stf").unwrap(),
+            SchedulingPolicy::STF
+        );
+        assert_eq!(
+            SchedulingPolicy::from_str("STF").unwrap(),
+            SchedulingPolicy::STF
+        );
+        assert_eq!(
+            SchedulingPolicy::from_str("ltf").unwrap(),
+            SchedulingPolicy::LTF
+        );
+        assert_eq!(
+            SchedulingPolicy::from_str("LTF").unwrap(),
+            SchedulingPolicy::LTF
+        );
+        // Test backward compatibility
+        assert_eq!(
+            SchedulingPolicy::from_str("sjf").unwrap(),
+            SchedulingPolicy::SOF
+        );
+        assert_eq!(
+            SchedulingPolicy::from_str("SJF").unwrap(),
+            SchedulingPolicy::SOF
         );
         assert!(SchedulingPolicy::from_str("unknown").is_err());
     }

@@ -1,0 +1,57 @@
+# Configuration for Qwen3-30B-A3B MoE model with Preemption-Free Scheduling
+# Model: https://huggingface.co/Qwen/Qwen3-30B-A3B-Instruct-2507
+# Architecture: Mixture-of-Experts with 128 experts, 8 active per token
+# Total: ~30B parameters, Active: ~3.3B parameters per token
+#
+# PREEMPTION-FREE MODE:
+# This configuration enables conservative admission control to guarantee zero preemptions.
+# Expected behavior:
+# - Zero preemptions (no wasted work)
+# - Predictable latency (no preemption delays)
+# - Lower utilization due to conservative admission
+# - Higher queueing delays (requests wait longer before admission)
+
+[hardware]
+name = "H100"
+compute_flops = 1.513e15        # 1513 TFLOPS bf16
+memory_bandwidth = 3.35e12      # 3.35 TB/s
+memory_capacity = 85899345920   # 80 GB
+kv_cache_capacity = 68719476736 # 64 GB
+bytes_per_param = 2             # bf16
+
+[model]
+name = "Qwen3-30B-A3B"
+num_parameters = 30500000000       # ~30.5B total params (all 128 experts)
+num_active_parameters = 3340000000 # ~3.34B active params (8 out of 128 experts)
+num_layers = 48
+hidden_dim = 2048
+num_heads = 32
+num_kv_heads = 4                   # GQA: 4 KV heads
+max_seq_len = 32768                # Supports up to 32K context
+
+[scheduler]
+max_num_batched_tokens = 16384  # Doubled token budget to allocate faster
+max_num_seqs = 650              # Increased to saturate KV cache
+policy = "fcfs"                 # FCFS ensures fairness
+enable_chunked_prefill = true   # Disable chunked prefill to allocate full prompts immediately
+block_size = 16
+enable_preemption_free = true   # Enable conservative admission control for zero preemptions
+
+[workload]
+arrival_pattern = "batched" # All requests arrive at t=0 to fill cache quickly
+arrival_rate = 5.0          # Not used for batched pattern
+num_requests = 3000         # More requests to sustain load longer
+seed = 42
+
+[workload.input_len_dist]
+type = "lognormal"
+mean = 8.11        # ln(3300) ≈ 8.11, median ~3300 tokens (much longer prompts)
+std_dev = 0.5      # Less variation for consistent sizing
+
+[workload.output_len_dist]
+type = "lognormal"
+mean = 8.60        # ln(5431) tokens
+std_dev = 0.4      # Low variation for consistent sizing
+
+[simulation]
+log_interval = 5 # Log every 5 iterations

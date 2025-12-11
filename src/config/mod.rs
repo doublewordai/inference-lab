@@ -83,6 +83,7 @@ impl Config {
             long_prefill_token_threshold: 0,
             max_num_partial_prefills: 1,
             block_size: 16,
+            enable_preemption_free: false,
         };
         scheduler.set_default_prefill_threshold(model.max_seq_len);
 
