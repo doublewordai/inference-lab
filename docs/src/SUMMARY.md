@@ -5,14 +5,8 @@
 # User Guide
 
 - [Getting Started](./user-guide/getting-started.md)
-- [Configuration](./user-guide/configuration.md)
 - [Running Simulations](./user-guide/running-simulations.md)
-
-# Architecture
-
-- [Overview](./architecture/overview.md)
-- [Scheduling Policies](./architecture/scheduling.md)
-- [Request Processing](./architecture/request-processing.md)
+- [Configuration](./user-guide/configuration.md)
 
 # Reference
 

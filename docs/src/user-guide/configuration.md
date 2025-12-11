@@ -243,7 +243,31 @@ input_len_dist = { type = "fixed", value = 100 }  # Ignored
 output_len_dist = { type = "fixed", value = 50 }  # Samples EOS
 ```
 
-The dataset should be in OpenAI batch API format (JSONL).
+**Dataset Format:** JSONL file in OpenAI batch API format. Each line should be a JSON object with a `messages` field containing an array of message objects.
+
+Example:
+```json
+{"custom_id": "req-1", "messages": [{"role": "user", "content": "Hello!"}], "max_tokens": 100}
+```
+
+**Tokenizer:** Dataset mode requires a tokenizer file to convert text to tokens. You'll need to provide this via the `--tokenizer` flag:
+```bash
+inference-lab -c config.toml --tokenizer tokenizer.json
+```
+
+The tokenizer should be a HuggingFace tokenizers JSON file (typically `tokenizer.json` from the model repository).
+
+**Chat Template:** You'll also need to specify how to format messages via `--chat-template`:
+- Use `"None"` for simple concatenation of messages
+- Use a Jinja2 template string for custom formatting (e.g., `"{{user}}\n{{assistant}}"`)
+- Most models have their own chat template format
+
+Example with no template:
+```bash
+inference-lab -c config.toml \
+  --tokenizer tokenizer.json \
+  --chat-template None
+```
 
 ### Closed-Loop Workload
 
