@@ -88,6 +88,7 @@ impl Config {
         scheduler.set_default_prefill_threshold(model.max_seq_len);
 
         let workload = WorkloadConfig {
+            dataset_path: None,
             arrival_pattern: "poisson".to_string(),
             arrival_rate: 1.0,
             num_concurrent_users: None,

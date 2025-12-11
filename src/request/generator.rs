@@ -1,7 +1,12 @@
 use super::Request;
 use crate::config::WorkloadConfig;
+use crate::dataset::{BatchTokenizerFn, DatasetEntry, UnparsedEntry};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use rand_distr::{Distribution, Exp};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::sync::mpsc::{sync_channel, Receiver};
+use std::thread;
 
 /// Generates requests based on workload configuration
 pub struct RequestGenerator {
@@ -12,6 +17,10 @@ pub struct RequestGenerator {
     next_request_id: u64,
     /// For closed-loop: track pending requests to generate when completions occur
     pending_closed_loop_requests: Vec<f64>,
+    /// Dataset receiver (if using dataset mode) - receives pre-loaded entries from background thread
+    dataset_receiver: Option<Receiver<Option<DatasetEntry>>>,
+    /// Track if dataset has been exhausted (received None from channel)
+    dataset_exhausted: bool,
 }
 
 impl RequestGenerator {
@@ -46,12 +55,172 @@ impl RequestGenerator {
             requests_generated: 0,
             next_request_id: 0,
             pending_closed_loop_requests,
+            dataset_receiver: None,
+            dataset_exhausted: false,
         }
+    }
+
+    /// Create a new generator from a dataset iterator
+    /// Spawns a background thread to read, parse, and batch-tokenize entries in parallel
+    /// Buffer size controls memory usage (entries buffered ahead of simulation)
+    pub fn from_dataset<I>(
+        workload: WorkloadConfig,
+        dataset_iterator: I,
+        _total_entries: Option<usize>,
+        tokenizer: BatchTokenizerFn,
+    ) -> Self
+    where
+        I: Iterator<Item = Result<Option<UnparsedEntry>, Box<dyn std::error::Error>>>
+            + Send
+            + 'static,
+    {
+        let rng = StdRng::seed_from_u64(workload.seed);
+        let is_closed_loop = workload.arrival_pattern.to_lowercase() == "closed_loop";
+
+        // For closed-loop, initialize with N requests at time 0
+        let mut pending_closed_loop_requests = Vec::new();
+        if is_closed_loop {
+            if let Some(num_users) = workload.num_concurrent_users {
+                pending_closed_loop_requests = vec![0.0; num_users]
+            }
+        };
+
+        let next_arrival_time = if is_closed_loop && !pending_closed_loop_requests.is_empty() {
+            0.0
+        } else {
+            0.0 // First request arrives at t=0
+        };
+
+        // Spawn background thread to load and batch-tokenize entries
+        // Buffer size: 5000 entries (~10-50MB depending on token counts)
+        let (sender, receiver) = sync_channel::<Option<DatasetEntry>>(5000);
+
+        thread::spawn(move || {
+            let batch_size: usize = std::env::var("TOKENIZER_BATCH_SIZE")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(32); // Default: 32 (optimal for latency/throughput balance)
+            let mut batch = Vec::with_capacity(batch_size);
+
+            for result in dataset_iterator {
+                match result {
+                    Ok(Some(unparsed)) => {
+                        batch.push(unparsed);
+
+                        // Process batch when full
+                        if batch.len() >= batch_size {
+                            if let Err(_) =
+                                Self::tokenize_and_send_batch(&mut batch, &tokenizer, &sender)
+                            {
+                                // Receiver dropped, simulation ended early
+                                break;
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        // End of dataset - flush remaining batch and send completion signal
+                        if !batch.is_empty() {
+                            let _ = Self::tokenize_and_send_batch(&mut batch, &tokenizer, &sender);
+                        }
+                        let _ = sender.send(None);
+                        break;
+                    }
+                    Err(e) => {
+                        eprintln!("Error loading dataset entry: {}", e);
+                        break;
+                    }
+                }
+            }
+        });
+
+        Self {
+            workload,
+            rng,
+            next_arrival_time,
+            requests_generated: 0,
+            next_request_id: 0,
+            pending_closed_loop_requests,
+            dataset_receiver: Some(receiver),
+            dataset_exhausted: false,
+        }
+    }
+
+    /// Check if using dataset mode
+    pub fn is_dataset_mode(&self) -> bool {
+        self.dataset_receiver.is_some()
+    }
+
+    /// Batch tokenize and send entries to the channel
+    /// Returns Err if the receiver dropped (simulation ended)
+    fn tokenize_and_send_batch(
+        batch: &mut Vec<UnparsedEntry>,
+        tokenizer: &BatchTokenizerFn,
+        sender: &std::sync::mpsc::SyncSender<Option<DatasetEntry>>,
+    ) -> Result<(), ()> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+
+        // Collect all message arrays to tokenize together
+        let message_arrays: Vec<&[_]> = batch.iter().map(|e| e.messages.as_slice()).collect();
+
+        // Batch tokenize all entries at once (much faster!)
+        let all_tokens = match tokenizer(&message_arrays) {
+            Ok(tokens) => tokens,
+            Err(e) => {
+                eprintln!("Batch tokenization failed: {}", e);
+                return Err(());
+            }
+        };
+
+        // Send tokenized entries
+        for (unparsed, prompt_tokens) in batch.drain(..).zip(all_tokens.into_iter()) {
+            let entry = DatasetEntry {
+                request_id: unparsed.request_id,
+                prompt_tokens,
+                max_output_tokens: unparsed.max_output_tokens,
+            };
+
+            // Send to channel - returns Err if receiver dropped
+            if sender.send(Some(entry)).is_err() {
+                return Err(());
+            }
+        }
+        Ok(())
+    }
+
+    /// Get the next scheduled arrival time
+    pub fn peek_next_arrival_time(&self) -> f64 {
+        self.next_arrival_time
+    }
+
+    /// Compute block hashes from token IDs (for real prefix caching)
+    /// Uses incremental hashing: hash of block i includes all tokens up to block i
+    fn compute_block_hashes(tokens: &[u32], block_size: usize) -> Vec<u64> {
+        let num_blocks = tokens.len().div_ceil(block_size);
+        let mut hashes = Vec::with_capacity(num_blocks);
+
+        for block_idx in 0..num_blocks {
+            let end = ((block_idx + 1) * block_size).min(tokens.len());
+            let block_tokens = &tokens[..end]; // All tokens up to this block
+
+            // Hash all tokens cumulatively
+            let mut hasher = DefaultHasher::new();
+            block_tokens.hash(&mut hasher);
+            hashes.push(hasher.finish());
+        }
+
+        hashes
     }
 
     /// Get the next request if its arrival time is before the given time
     /// Returns None if no request is ready or all requests have been generated
     pub fn next_if_before(&mut self, current_time: f64) -> Option<Request> {
+        // Dataset mode
+        if self.is_dataset_mode() {
+            return self.next_from_dataset(current_time);
+        }
+
         let is_closed_loop = self.workload.arrival_pattern.to_lowercase() == "closed_loop";
 
         // For closed-loop, check pending requests
@@ -191,8 +360,88 @@ impl RequestGenerator {
         }
     }
 
+    /// Get next request from dataset (receives from background thread)
+    fn next_from_dataset(&mut self, current_time: f64) -> Option<Request> {
+        // If already exhausted, no more requests
+        if self.dataset_exhausted {
+            return None;
+        }
+
+        // Check if it's time for next arrival
+        if self.next_arrival_time > current_time {
+            return None;
+        }
+
+        // Receive from channel
+        let entry = match self.dataset_receiver.as_ref()?.recv() {
+            Ok(Some(e)) => e,
+            Ok(None) => {
+                // End of dataset signaled
+                self.dataset_exhausted = true;
+                return None;
+            }
+            Err(_) => {
+                // Channel error (sender dropped)
+                self.dataset_exhausted = true;
+                return None;
+            }
+        };
+
+        let arrival_time = self.next_arrival_time;
+
+        // Sample actual output length from distribution
+        let sampled_output_len = self.workload.output_len_dist.sample(&mut self.rng);
+
+        // If max_output_tokens is specified in the dataset, cap at that; otherwise use sampled value
+        let max_output_tokens = entry.max_output_tokens.unwrap_or(16384);
+        let target_output_tokens = sampled_output_len.min(max_output_tokens);
+
+        let mut request = Request::new_with_target(
+            entry.request_id.clone(),
+            0,
+            arrival_time,
+            entry.num_prompt_tokens(),
+            max_output_tokens,
+            target_output_tokens,
+        );
+
+        request.prompt_block_hashes = Self::compute_block_hashes(&entry.prompt_tokens, 16);
+        self.requests_generated += 1;
+
+        // Sample next arrival time AFTER creating the request
+        // but ONLY if we haven't hit the request limit
+        // This prevents sampling a bogus future time for a request that won't exist
+        let should_sample_next = if let Some(max_requests) = self.workload.num_requests {
+            self.requests_generated < max_requests
+        } else {
+            // No limit set, keep sampling (will stop when channel sends None)
+            true
+        };
+
+        if should_sample_next {
+            self.next_arrival_time = Self::sample_next_arrival(
+                self.next_arrival_time,
+                &self.workload.arrival_pattern,
+                self.workload.arrival_rate,
+                &mut self.rng,
+            );
+        }
+
+        Some(request)
+    }
+
     /// Check if all requests have been generated
     pub fn is_finished(&self) -> bool {
+        // Dataset mode: check if we've hit limit or dataset is exhausted
+        if self.is_dataset_mode() {
+            // If num_requests is set, check against that limit
+            if let Some(max_requests) = self.workload.num_requests {
+                return self.requests_generated >= max_requests;
+            }
+            // Otherwise, check if dataset has been fully consumed
+            return self.dataset_exhausted;
+        }
+
         if let Some(max_requests) = self.workload.num_requests {
             let is_closed_loop = self.workload.arrival_pattern.to_lowercase() == "closed_loop";
             if is_closed_loop {
@@ -245,6 +494,7 @@ mod tests {
 
     fn create_test_workload(pattern: &str, rate: f64, num_requests: usize) -> WorkloadConfig {
         WorkloadConfig {
+            dataset_path: None,
             arrival_pattern: pattern.to_string(),
             arrival_rate: rate,
             num_concurrent_users: None,

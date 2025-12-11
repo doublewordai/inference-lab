@@ -26,15 +26,20 @@ env_logger = { version = "0.11", optional = true }
 log = "0.4"
 tabled = { version = "0.16", optional = true }
 colored = { version = "2.1", optional = true }
+tokenizers = { version = "0.20", optional = true }
+minijinja = { version = "2.0", optional = true }
 wasm-bindgen = "0.2"
 serde-wasm-bindgen = "0.6"
 js-sys = "0.3"
 getrandom = { version = "0.2", features = ["js"] }
 console_error_panic_hook = "0.1"
 
+[dev-dependencies]
+tempfile = "3.8"
+
 [features]
 default = ["cli"]
-cli = ["clap", "env_logger", "tabled", "colored"]
+cli = ["clap", "env_logger", "tabled", "colored", "tokenizers", "minijinja"]
 
 [profile.release]
 opt-level = "s" # Optimize for size in WASM

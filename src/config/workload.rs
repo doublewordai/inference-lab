@@ -2,16 +2,21 @@ use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct WorkloadConfig {
+    /// Path to dataset file (JSONL in OpenAI batch API format)
+    /// If provided, dataset mode is used instead of synthetic workload
+    #[serde(default)]
+    pub dataset_path: Option<String>,
+
     /// Arrival pattern: "poisson", "uniform", "burst", "fixed_rate", "closed_loop", "batched"
     pub arrival_pattern: String,
 
     /// Mean arrival rate (requests per second)
     pub arrival_rate: f64,
 
-    /// Input sequence length distribution
+    /// Input sequence length distribution (ignored in dataset mode)
     pub input_len_dist: LengthDistribution,
 
-    /// Output sequence length distribution
+    /// Output sequence length distribution (ignored in dataset mode)
     pub output_len_dist: LengthDistribution,
 
     /// Total number of requests to simulate (None = run until duration)
