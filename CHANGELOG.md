@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.3.0](https://github.com/doublewordai/inference-lab/compare/inference-lab-v0.2.0...inference-lab-v0.3.0) (2025-12-11)
+
+
+### Features
+
+* add SOF/SIF/STF/LIF/LOF/LTF scheduling ([86ddad5](https://github.com/doublewordai/inference-lab/commit/86ddad5af805105e3820a74ab402115a94cf1269))
+* bump version ([53df6e6](https://github.com/doublewordai/inference-lab/commit/53df6e67b9cb2f62e78294e5ac62395df0774a0e))
+* real datasets ([935331d](https://github.com/doublewordai/inference-lab/commit/935331dc106fb74d29488e5ff77b6ee5d01b6a77))
+
+
+### Bug Fixes
+
+* enable closed loop + dataset mode ([0a64745](https://github.com/doublewordai/inference-lab/commit/0a64745d77dfc479a2b6c1ad82929c55fdf28b9b))
+* optimizations ([f8d76be](https://github.com/doublewordai/inference-lab/commit/f8d76be4342dfe1a3856bf3d19ed3c174e41441d))
+* proper prefix caching modelling ([cc6947b](https://github.com/doublewordai/inference-lab/commit/cc6947b72846ebecde8abc4c0a9f1726612ebc9c))
+* update readme ([6316efe](https://github.com/doublewordai/inference-lab/commit/6316efe9a565ca2b2c0ede35b33d4dd6ca52ac5f))
+
 ## [0.2.0](https://github.com/doublewordai/inference-lab/compare/inference-lab-v0.1.1...inference-lab-v0.2.0) (2025-12-05)
 
 
