@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/doublewordai/inference-lab/compare/inference-lab-v0.3.1...inference-lab-v0.4.0) (2026-01-24)
+
+
+### Features
+
+* add OpenAI-compatible serve mode with Docker support ([2d12260](https://github.com/doublewordai/inference-lab/commit/2d12260f0391154a2f7ac4568cd62514e1b1a8f5))
+
 ## [0.3.1](https://github.com/doublewordai/inference-lab/compare/inference-lab-v0.3.0...inference-lab-v0.3.1) (2025-12-11)
 
 
