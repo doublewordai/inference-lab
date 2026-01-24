@@ -1,6 +1,6 @@
 {
   "name": "@doublewordai/inference-lab",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "High-performance LLM inference simulator for analyzing serving systems",
   "main": "pkg/inference_lab.js",
   "types": "pkg/inference_lab.d.ts",
