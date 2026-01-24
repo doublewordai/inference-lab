@@ -14,9 +14,48 @@ use colored::Colorize;
 #[cfg(feature = "cli")]
 use tabled::{settings::Style, Table, Tabled};
 
+// --- CLI argument structures ---
+
+#[cfg(feature = "serve")]
 #[derive(Parser, Debug)]
 #[command(author, version, about = "LLM Inference Simulator", long_about = None)]
-struct Args {
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[cfg(feature = "serve")]
+#[derive(clap::Subcommand, Debug)]
+enum Commands {
+    /// Run a batch simulation
+    Sim(SimArgs),
+    /// Start an OpenAI-compatible inference server
+    Serve(ServeArgs),
+}
+
+#[cfg(feature = "serve")]
+#[derive(Parser, Debug)]
+struct ServeArgs {
+    /// Path to the TOML configuration file
+    #[arg(short, long, default_value = "config.toml")]
+    config: PathBuf,
+
+    /// Port to listen on
+    #[arg(short, long, default_value_t = 8080)]
+    port: u16,
+
+    /// Host to bind to
+    #[arg(long, default_value = "0.0.0.0")]
+    host: String,
+
+    /// Path to tokenizer.json file (for accurate token counting)
+    #[arg(short, long)]
+    tokenizer: Option<PathBuf>,
+}
+
+#[derive(Parser, Debug)]
+#[cfg_attr(not(feature = "serve"), command(author, version, about = "LLM Inference Simulator", long_about = None))]
+struct SimArgs {
     /// Path to the TOML configuration file
     #[arg(short, long, default_value = "config.toml")]
     config: PathBuf,
@@ -62,7 +101,7 @@ enum VerbosityLevel {
     Debug,
 }
 
-impl Args {
+impl SimArgs {
     fn verbosity_level(&self) -> VerbosityLevel {
         if self.debug {
             VerbosityLevel::Debug
@@ -190,10 +229,44 @@ fn load_tokenizer(
     }))
 }
 
-fn main() {
+// --- Entry points ---
+
+#[cfg(feature = "serve")]
+#[tokio::main]
+async fn main() {
     env_logger::init();
 
-    let args = Args::parse();
+    let cli = Cli::parse();
+    match cli.command {
+        Commands::Sim(args) => run_sim(args),
+        Commands::Serve(args) => {
+            let config = match Config::from_file(&args.config) {
+                Ok(config) => config,
+                Err(e) => {
+                    eprintln!("Error loading configuration: {}", e);
+                    std::process::exit(1);
+                }
+            };
+
+            if let Err(e) =
+                inference_lab::serve::start_server(config, args.host, args.port, args.tokenizer)
+                    .await
+            {
+                eprintln!("Server error: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "cli", not(feature = "serve")))]
+fn main() {
+    env_logger::init();
+    let args = SimArgs::parse();
+    run_sim(args);
+}
+
+fn run_sim(args: SimArgs) {
     let verbosity = args.verbosity_level();
     let use_color = !args.no_color;
 
@@ -329,7 +402,7 @@ fn main() {
     // Run simulation based on verbosity
     match verbosity {
         VerbosityLevel::Quiet => {
-            run_quiet(&mut simulator, use_color);
+            run_quiet(&mut simulator);
         }
         VerbosityLevel::Normal => {
             run_with_dashboard(&mut simulator, use_color, &config);
@@ -382,7 +455,7 @@ fn main() {
     }
 }
 
-fn run_quiet(simulator: &mut Simulator, _use_color: bool) {
+fn run_quiet(simulator: &mut Simulator) {
     simulator
         .run_with_callback(|_progress| {
             // No output during simulation
@@ -463,17 +536,11 @@ fn run_with_dashboard(simulator: &mut Simulator, use_color: bool, config: &Confi
         .unwrap();
 }
 
-fn run_verbose(simulator: &mut Simulator, use_color: bool, config: &Config) {
-    if use_color {
-        println!("{}", "Starting simulation...".green());
-    } else {
-        println!("Starting simulation...");
-    }
+fn run_verbose(simulator: &mut Simulator, _use_color: bool, config: &Config) {
+    println!("Starting simulation...");
 
     simulator
         .run_with_callback(|progress| {
-            // Use actual total_requests from progress (updated dynamically)
-            // For dataset mode, this tracks requests as they arrive
             let total_display = if let Some(num_req) = config.workload.num_requests {
                 num_req.to_string()
             } else {
@@ -500,11 +567,9 @@ fn print_final_metrics(
     summary: &inference_lab::metrics::MetricsSummary,
     sim_time: f64,
     real_time: std::time::Duration,
-    verbosity: VerbosityLevel,
+    _verbosity: VerbosityLevel,
     use_color: bool,
 ) {
-    // Quiet mode now uses the same output as normal mode (no special case)
-
     // Header
     if use_color {
         println!(
@@ -646,8 +711,8 @@ fn print_final_metrics(
 fn print_final_metrics(
     summary: &inference_lab::metrics::MetricsSummary,
     sim_time: f64,
-    real_time: std::time::Duration,
-    verbosity: VerbosityLevel,
+    _real_time: std::time::Duration,
+    _verbosity: VerbosityLevel,
     _use_color: bool,
 ) {
     // Fallback for when CLI features are not available

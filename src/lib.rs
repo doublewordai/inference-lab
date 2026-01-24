@@ -10,6 +10,9 @@ pub mod simulation;
 #[cfg(target_arch = "wasm32")]
 pub mod wasm;
 
+#[cfg(feature = "serve")]
+pub mod serve;
+
 // Re-export key types
 pub use compute::ComputeEngine;
 pub use config::Config;

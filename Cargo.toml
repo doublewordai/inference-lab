@@ -28,6 +28,11 @@ tabled = { version = "0.16", optional = true }
 colored = { version = "2.1", optional = true }
 tokenizers = { version = "0.22", optional = true }
 minijinja = { version = "2.0", optional = true }
+tokio = { version = "1", features = ["full"], optional = true }
+axum = { version = "0.8", optional = true }
+tower-http = { version = "0.6", features = ["cors"], optional = true }
+uuid = { version = "1", features = ["v4"], optional = true }
+tokio-stream = { version = "0.1", optional = true }
 wasm-bindgen = "0.2"
 serde-wasm-bindgen = "0.6"
 js-sys = "0.3"
@@ -40,6 +45,7 @@ tempfile = "3.8"
 [features]
 default = ["cli"]
 cli = ["clap", "env_logger", "tabled", "colored", "tokenizers", "minijinja"]
+serve = ["cli", "tokio", "axum", "tower-http", "uuid", "tokio-stream"]
 
 [profile.release]
 opt-level = "s" # Optimize for size in WASM
