@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.2](https://github.com/doublewordai/inference-lab/compare/inference-lab-v0.4.1...inference-lab-v0.4.2) (2026-01-24)
+
+
+### Bug Fixes
+
+* trigger Docker build on release events ([ea3e3ea](https://github.com/doublewordai/inference-lab/commit/ea3e3eab1217fce6cde3770847a88ebe53fe1f0b))
+
 ## [0.4.1](https://github.com/doublewordai/inference-lab/compare/inference-lab-v0.4.0...inference-lab-v0.4.1) (2026-01-24)
 
 

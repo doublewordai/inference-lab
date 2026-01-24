@@ -1,6 +1,6 @@
 [package]
 name = "inference-lab"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 authors = ["Doubleword"]
 description = "High-performance LLM inference simulator for analyzing serving systems"
