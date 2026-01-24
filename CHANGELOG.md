@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/doublewordai/inference-lab/compare/inference-lab-v0.4.3...inference-lab-v0.5.0) (2026-01-24)
+
+
+### Features
+
+* multi-model serve mode with directory-based config loading ([3bbe32f](https://github.com/doublewordai/inference-lab/commit/3bbe32fc8cf5d1cdd398968519b1fab527302857))
+
 ## [0.4.3](https://github.com/doublewordai/inference-lab/compare/inference-lab-v0.4.2...inference-lab-v0.4.3) (2026-01-24)
 
 
