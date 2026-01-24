@@ -25,8 +25,9 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/target/release/inference-lab /usr/local/bin/inference-lab
+COPY configs/ /etc/inference-lab/configs/
 
 EXPOSE 8080
 
 ENTRYPOINT ["inference-lab", "serve"]
-CMD ["--port", "8080", "--host", "0.0.0.0"]
+CMD ["--config", "/etc/inference-lab/configs/", "--port", "8080", "--host", "0.0.0.0"]

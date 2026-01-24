@@ -6,6 +6,7 @@ use axum::{
         IntoResponse, Json,
     },
 };
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -15,9 +16,9 @@ use tokio_stream::wrappers::ReceiverStream;
 use super::types::*;
 
 pub struct AppState {
-    pub engine_tx: mpsc::Sender<EngineRequest>,
-    pub model_name: String,
-    pub tokenizer: Option<tokenizers::Tokenizer>,
+    pub engines: HashMap<String, mpsc::Sender<EngineRequest>>,
+    pub model_names: Vec<String>,
+    pub tokenizer: Option<Arc<tokenizers::Tokenizer>>,
 }
 
 pub async fn health() -> Json<serde_json::Value> {
@@ -30,14 +31,20 @@ pub async fn list_models(State(state): State<Arc<AppState>>) -> Json<ModelList> 
         .unwrap()
         .as_secs();
 
-    Json(ModelList {
-        object: "list",
-        data: vec![ModelEntry {
-            id: state.model_name.clone(),
+    let data = state
+        .model_names
+        .iter()
+        .map(|name| ModelEntry {
+            id: name.clone(),
             object: "model",
             created: now,
             owned_by: "inference-lab",
-        }],
+        })
+        .collect();
+
+    Json(ModelList {
+        object: "list",
+        data,
     })
 }
 
@@ -45,6 +52,20 @@ pub async fn chat_completions(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    // Look up engine for requested model
+    let engine_tx = state.engines.get(&req.model).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": {
+                    "message": format!("Model '{}' not found. Available models: {}", req.model, state.model_names.join(", ")),
+                    "type": "invalid_request_error",
+                    "code": "model_not_found"
+                }
+            })),
+        )
+    })?;
+
     // Tokenize the messages to get prompt token count
     let prompt_tokens = count_prompt_tokens(&state, &req.messages);
 
@@ -61,7 +82,7 @@ pub async fn chat_completions(
     };
 
     // Send to engine
-    state.engine_tx.send(engine_req).await.map_err(|_| {
+    engine_tx.send(engine_req).await.map_err(|_| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({"error": "engine unavailable"})),

@@ -1,0 +1,44 @@
+# Qwen/Qwen3-VL-235B-A22B-Instruct-FP8
+# MoE Vision-Language model: 128 experts, 8 active per token
+# Total: ~235B params, Active: ~22B params per token, FP8 quantized
+# Deployed on 2x B200 (TP=2)
+
+[hardware]
+name = "2xB200"
+compute_flops = 20.0e15         # 10 PFLOPS FP8 per B200 (liquid cooled), x2 for TP=2
+memory_bandwidth = 16.0e12      # 8 TB/s per B200, x2 for TP=2
+memory_capacity = 412316860416  # 192 GB per B200, x2 = 384 GB
+bytes_per_param = 1             # FP8
+
+[model]
+name = "Qwen/Qwen3-VL-235B-A22B-Instruct-FP8"
+num_parameters = 235000000000
+num_active_parameters = 22000000000
+num_layers = 94
+hidden_dim = 4096
+num_heads = 64
+num_kv_heads = 4
+max_seq_len = 32768
+
+[scheduler]
+max_num_batched_tokens = 8192
+max_num_seqs = 256
+policy = "fcfs"
+enable_chunked_prefill = true
+block_size = 16
+
+[workload]
+arrival_pattern = "poisson"
+arrival_rate = 5.0
+num_requests = 1000
+seed = 42
+
+[workload.input_len_dist]
+type = "lognormal"
+mean = 7.6
+std_dev = 0.8
+
+[workload.output_len_dist]
+type = "lognormal"
+mean = 6.2
+std_dev = 0.9

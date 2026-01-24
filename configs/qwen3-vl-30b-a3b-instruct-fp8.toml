@@ -1,0 +1,43 @@
+# Qwen/Qwen3-VL-30B-A3B-Instruct-FP8
+# MoE Vision-Language model: 128 experts, 8 active per token
+# Total: ~30.5B params, Active: ~3.3B params per token, FP8 quantized
+
+[hardware]
+name = "H100"
+compute_flops = 1.979e15        # H100 SXM5 FP8 dense tensor core TFLOPS
+memory_bandwidth = 3.35e12      # 3.35 TB/s
+memory_capacity = 85899345920   # 80 GB HBM3
+bytes_per_param = 1             # FP8
+
+[model]
+name = "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8"
+num_parameters = 30500000000
+num_active_parameters = 3340000000
+num_layers = 48
+hidden_dim = 2048
+num_heads = 32
+num_kv_heads = 4
+max_seq_len = 32768
+
+[scheduler]
+max_num_batched_tokens = 16384
+max_num_seqs = 512
+policy = "fcfs"
+enable_chunked_prefill = true
+block_size = 16
+
+[workload]
+arrival_pattern = "poisson"
+arrival_rate = 10.0
+num_requests = 1000
+seed = 42
+
+[workload.input_len_dist]
+type = "lognormal"
+mean = 7.6
+std_dev = 0.8
+
+[workload.output_len_dist]
+type = "lognormal"
+mean = 6.2
+std_dev = 0.9

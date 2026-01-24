@@ -36,7 +36,7 @@ enum Commands {
 #[cfg(feature = "serve")]
 #[derive(Parser, Debug)]
 struct ServeArgs {
-    /// Path to the TOML configuration file
+    /// Path to a TOML config file or directory of TOML configs (one per model)
     #[arg(short, long, default_value = "config.toml")]
     config: PathBuf,
 
@@ -240,16 +240,46 @@ async fn main() {
     match cli.command {
         Commands::Sim(args) => run_sim(args),
         Commands::Serve(args) => {
-            let config = match Config::from_file(&args.config) {
-                Ok(config) => config,
-                Err(e) => {
-                    eprintln!("Error loading configuration: {}", e);
+            let configs = if args.config.is_dir() {
+                // Load all .toml files from directory
+                let mut configs = Vec::new();
+                let entries = match std::fs::read_dir(&args.config) {
+                    Ok(entries) => entries,
+                    Err(e) => {
+                        eprintln!("Error reading config directory {:?}: {}", args.config, e);
+                        std::process::exit(1);
+                    }
+                };
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().and_then(|e| e.to_str()) == Some("toml") {
+                        match Config::from_file(&path) {
+                            Ok(config) => configs.push(config),
+                            Err(e) => {
+                                eprintln!("Error loading config {:?}: {}", path, e);
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                }
+                if configs.is_empty() {
+                    eprintln!("No .toml config files found in {:?}", args.config);
                     std::process::exit(1);
+                }
+                configs
+            } else {
+                // Single config file
+                match Config::from_file(&args.config) {
+                    Ok(config) => vec![config],
+                    Err(e) => {
+                        eprintln!("Error loading configuration: {}", e);
+                        std::process::exit(1);
+                    }
                 }
             };
 
             if let Err(e) =
-                inference_lab::serve::start_server(config, args.host, args.port, args.tokenizer)
+                inference_lab::serve::start_server(configs, args.host, args.port, args.tokenizer)
                     .await
             {
                 eprintln!("Server error: {}", e);
