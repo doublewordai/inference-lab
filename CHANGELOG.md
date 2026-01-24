@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.1](https://github.com/doublewordai/inference-lab/compare/inference-lab-v0.4.0...inference-lab-v0.4.1) (2026-01-24)
+
+
+### Bug Fixes
+
+* match release-please tag format in Docker workflow ([4a41b05](https://github.com/doublewordai/inference-lab/commit/4a41b05b11af6fd6f152837740b1ef090e29bdc6))
+
 ## [0.4.0](https://github.com/doublewordai/inference-lab/compare/inference-lab-v0.3.1...inference-lab-v0.4.0) (2026-01-24)
 
 
