@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0](https://github.com/doublewordai/inference-lab/compare/inference-lab-v0.5.0...inference-lab-v0.6.0) (2026-03-23)
+
+
+### Features
+
+* add /v1/completions support ([#38](https://github.com/doublewordai/inference-lab/issues/38)) ([bc3e5fb](https://github.com/doublewordai/inference-lab/commit/bc3e5fbda370da6f1acc67dc94be0822c3e2e6ba))
+
 ## [0.5.0](https://github.com/doublewordai/inference-lab/compare/inference-lab-v0.4.3...inference-lab-v0.5.0) (2026-01-24)
 
 
