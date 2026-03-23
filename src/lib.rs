@@ -16,7 +16,9 @@ pub mod serve;
 // Re-export key types
 pub use compute::ComputeEngine;
 pub use config::Config;
-pub use dataset::{BatchTokenizerFn, DatasetEntry, DatasetLoader, Message, TokenizerFn};
+pub use dataset::{
+    BatchTokenizerFn, DatasetEntry, DatasetLoader, Message, PromptInput, TokenizerFn,
+};
 pub use kv_cache::KVCacheManager;
 pub use metrics::{MetricsCollector, MetricsSummary};
 pub use request::{Request, RequestStatus};
