@@ -3,15 +3,15 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Lines};
 use std::path::Path;
 
-/// A tokenizer function that takes messages and returns tokenized output.
+/// A tokenizer function that takes either chat messages or a raw prompt and returns tokenized output.
 /// This allows different implementations (tiktoken, transformers.js, etc.)
 /// to be passed in from the CLI or WASM interface.
-/// The tokenizer should apply the appropriate chat template.
-pub type TokenizerFn = Box<dyn Fn(&[Message]) -> Result<Vec<u32>, String> + Send + Sync>;
+/// The tokenizer should apply the appropriate chat template for chat-style requests.
+pub type TokenizerFn = Box<dyn Fn(&PromptInput) -> Result<Vec<u32>, String> + Send + Sync>;
 
-/// A batch tokenizer function that takes multiple message arrays and returns multiple token vectors.
+/// A batch tokenizer function that takes multiple prompt inputs and returns multiple token vectors.
 /// This is much faster than tokenizing one at a time.
-pub type BatchTokenizerFn = Box<dyn Fn(&[&[Message]]) -> Result<Vec<Vec<u32>>, String> + Send>;
+pub type BatchTokenizerFn = Box<dyn Fn(&[PromptInput]) -> Result<Vec<Vec<u32>>, String> + Send>;
 
 /// OpenAI Batch API format - JSONL entries
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,19 +25,33 @@ pub struct BatchRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestBody {
     pub model: String,
-    pub messages: Vec<Message>,
     #[serde(default)]
     pub max_tokens: Option<u32>,
     #[serde(default)]
     pub temperature: Option<f32>,
     #[serde(default)]
     pub top_p: Option<f32>,
+    #[serde(flatten)]
+    pub input: RequestInput,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RequestInput {
+    Chat { messages: Vec<Message> },
+    Completion { prompt: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub role: String,
     pub content: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum PromptInput {
+    Messages(Vec<Message>),
+    Prompt(String),
 }
 
 /// A processed dataset entry ready for simulation
@@ -58,7 +72,7 @@ impl DatasetEntry {
 #[derive(Debug, Clone)]
 pub struct UnparsedEntry {
     pub request_id: String,
-    pub messages: Vec<Message>,
+    pub prompt_input: PromptInput,
     pub max_output_tokens: Option<u32>,
 }
 
@@ -119,7 +133,10 @@ impl<R: BufRead> Iterator for DatasetIterator<R> {
 
             return Some(Ok(Some(UnparsedEntry {
                 request_id: batch_request.custom_id,
-                messages: batch_request.body.messages,
+                prompt_input: match batch_request.body.input {
+                    RequestInput::Chat { messages } => PromptInput::Messages(messages),
+                    RequestInput::Completion { prompt } => PromptInput::Prompt(prompt),
+                },
                 max_output_tokens: batch_request.body.max_tokens,
             })));
         }
@@ -183,7 +200,10 @@ mod tests {
 
         let batch_request: BatchRequest = serde_json::from_str(json).unwrap();
         assert_eq!(batch_request.custom_id, "request-1");
-        assert_eq!(batch_request.body.messages.len(), 2);
+        match batch_request.body.input {
+            RequestInput::Chat { messages } => assert_eq!(messages.len(), 2),
+            RequestInput::Completion { .. } => panic!("expected chat request"),
+        }
         assert_eq!(batch_request.body.max_tokens, Some(100));
     }
 
@@ -196,9 +216,14 @@ mod tests {
 
         let entry1 = iter.next().unwrap().unwrap().unwrap();
         assert_eq!(entry1.request_id, "req-1");
-        assert_eq!(entry1.messages.len(), 1);
-        assert_eq!(entry1.messages[0].role, "user");
-        assert_eq!(entry1.messages[0].content, "Hello");
+        match entry1.prompt_input {
+            PromptInput::Messages(messages) => {
+                assert_eq!(messages.len(), 1);
+                assert_eq!(messages[0].role, "user");
+                assert_eq!(messages[0].content, "Hello");
+            }
+            PromptInput::Prompt(_) => panic!("expected chat prompt input"),
+        }
         assert_eq!(entry1.max_output_tokens, Some(10));
 
         let entry2 = iter.next().unwrap().unwrap().unwrap();
@@ -211,5 +236,27 @@ mod tests {
 
         // After that, iterator itself should be exhausted
         assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn test_parse_completion_batch_request() {
+        let json = r#"{
+            "custom_id": "request-2",
+            "method": "POST",
+            "url": "/v1/completions",
+            "body": {
+                "model": "gpt-3.5-turbo-instruct",
+                "prompt": "Hello, world",
+                "max_tokens": 32
+            }
+        }"#;
+
+        let batch_request: BatchRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(batch_request.custom_id, "request-2");
+        match batch_request.body.input {
+            RequestInput::Completion { prompt } => assert_eq!(prompt, "Hello, world"),
+            RequestInput::Chat { .. } => panic!("expected completion request"),
+        }
+        assert_eq!(batch_request.body.max_tokens, Some(32));
     }
 }

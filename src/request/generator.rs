@@ -161,11 +161,9 @@ impl RequestGenerator {
             return Ok(());
         }
 
-        // Collect all message arrays to tokenize together
-        let message_arrays: Vec<&[_]> = batch.iter().map(|e| e.messages.as_slice()).collect();
-
         // Batch tokenize all entries at once (much faster!)
-        let all_tokens = match tokenizer(&message_arrays) {
+        let prompt_inputs: Vec<_> = batch.iter().map(|e| e.prompt_input.clone()).collect();
+        let all_tokens = match tokenizer(&prompt_inputs) {
             Ok(tokens) => tokens,
             Err(e) => {
                 eprintln!("Batch tokenization failed: {}", e);

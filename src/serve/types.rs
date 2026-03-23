@@ -12,6 +12,16 @@ pub struct ChatCompletionRequest {
     pub max_tokens: u32,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct CompletionRequest {
+    pub model: String,
+    pub prompt: String,
+    #[serde(default)]
+    pub stream: bool,
+    #[serde(default = "default_max_tokens")]
+    pub max_tokens: u32,
+}
+
 fn default_max_tokens() -> u32 {
     256
 }
@@ -35,6 +45,16 @@ pub struct ChatCompletionResponse {
 }
 
 #[derive(Debug, Serialize)]
+pub struct CompletionResponse {
+    pub id: String,
+    pub object: &'static str,
+    pub created: u64,
+    pub model: String,
+    pub choices: Vec<CompletionChoice>,
+    pub usage: Usage,
+}
+
+#[derive(Debug, Serialize)]
 pub struct Choice {
     pub index: u32,
     pub message: ChoiceMessage,
@@ -45,6 +65,13 @@ pub struct Choice {
 pub struct ChoiceMessage {
     pub role: &'static str,
     pub content: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CompletionChoice {
+    pub text: String,
+    pub index: u32,
+    pub finish_reason: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -66,6 +93,15 @@ pub struct ChatCompletionChunk {
 }
 
 #[derive(Debug, Serialize)]
+pub struct CompletionChunk {
+    pub id: String,
+    pub object: &'static str,
+    pub created: u64,
+    pub model: String,
+    pub choices: Vec<CompletionChunkChoice>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct ChunkChoice {
     pub index: u32,
     pub delta: ChunkDelta,
@@ -79,6 +115,14 @@ pub struct ChunkDelta {
     pub role: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CompletionChunkChoice {
+    pub text: String,
+    pub index: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<&'static str>,
 }
 
 // --- Models endpoint ---
@@ -109,10 +153,14 @@ pub struct EngineRequest {
 #[derive(Debug, Clone)]
 pub enum TokenEvent {
     FirstToken,
-    Token { text: String },
+    Token {
+        text: String,
+    },
     Done {
         prompt_tokens: u32,
         completion_tokens: u32,
     },
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }

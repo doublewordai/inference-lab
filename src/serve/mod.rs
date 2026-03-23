@@ -60,6 +60,7 @@ pub async fn start_server(
         .route("/health", get(handlers::health))
         .route("/v1/models", get(handlers::list_models))
         .route("/v1/chat/completions", post(handlers::chat_completions))
+        .route("/v1/completions", post(handlers::completions))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
