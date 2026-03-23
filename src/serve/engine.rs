@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use tokio::sync::mpsc;
 
-use crate::compute::ComputeEngine;
 use crate::config::Config;
+use crate::compute::ComputeEngine;
 use crate::kv_cache::KVCacheManager;
 use crate::request::Request;
 use crate::scheduler::Scheduler;
@@ -10,10 +10,11 @@ use crate::scheduler::Scheduler;
 use super::types::{EngineRequest, TokenEvent};
 
 const PLACEHOLDER_WORDS: &[&str] = &[
-    "the", "of", "and", "to", "in", "a", "is", "that", "for", "it", "was", "on", "are", "be",
-    "with", "as", "at", "this", "have", "from", "or", "an", "by", "not", "but", "what", "all",
-    "were", "when", "we", "there", "can", "which", "their", "if", "do", "will", "each", "about",
-    "how", "up", "out", "them", "then", "she", "many", "some", "so", "these", "would",
+    "the", "of", "and", "to", "in", "a", "is", "that", "for", "it",
+    "was", "on", "are", "be", "with", "as", "at", "this", "have", "from",
+    "or", "an", "by", "not", "but", "what", "all", "were", "when", "we",
+    "there", "can", "which", "their", "if", "do", "will", "each", "about", "how",
+    "up", "out", "them", "then", "she", "many", "some", "so", "these", "would",
 ];
 
 struct LiveRequest {
@@ -47,7 +48,10 @@ impl RealtimeEngine {
             kv_cache_manager,
         )?;
 
-        let compute_engine = ComputeEngine::new(config.hardware.clone(), config.model.clone());
+        let compute_engine = ComputeEngine::new(
+            config.hardware.clone(),
+            config.model.clone(),
+        );
 
         Ok(Self {
             scheduler,
@@ -73,9 +77,7 @@ impl RealtimeEngine {
                     Err(mpsc::error::TryRecvError::Disconnected) => {
                         // All senders dropped - shut down if no live requests
                         if self.live_requests.is_empty() {
-                            log::info!(
-                                "RealtimeEngine shutting down: no senders, no live requests"
-                            );
+                            log::info!("RealtimeEngine shutting down: no senders, no live requests");
                             return;
                         }
                         break;
@@ -125,9 +127,10 @@ impl RealtimeEngine {
                 tokens_per_request.push(decision.tokens_for_running[i]);
             }
 
-            let iteration_time = self
-                .compute_engine
-                .calculate_iteration_time(&batch_requests, &tokens_per_request);
+            let iteration_time = self.compute_engine.calculate_iteration_time(
+                &batch_requests,
+                &tokens_per_request,
+            );
 
             // 5. Sleep for real-time pacing
             tokio::time::sleep(std::time::Duration::from_secs_f64(iteration_time)).await;
@@ -173,6 +176,7 @@ impl RealtimeEngine {
                     }
                 }
             }
+
         }
     }
 

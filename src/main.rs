@@ -1,5 +1,5 @@
 use clap::Parser;
-use inference_lab::{BatchTokenizerFn, Config, Message, PromptInput, Simulator};
+use inference_lab::{BatchTokenizerFn, Config, Message, Simulator};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -196,24 +196,21 @@ fn load_tokenizer(
         None => None,
     };
 
-    Ok(Box::new(move |prompt_inputs: &[PromptInput]| {
+    Ok(Box::new(move |message_batches: &[&[Message]]| {
         // Apply chat template and collect all texts
-        let texts: Result<Vec<String>, String> = prompt_inputs
+        let texts: Result<Vec<String>, String> = message_batches
             .iter()
-            .map(|prompt_input| match prompt_input {
-                PromptInput::Messages(messages) => {
-                    if let Some(ref tmpl) = template {
-                        apply_chat_template(tmpl, messages)
-                    } else {
-                        // Simple concatenation fallback
-                        Ok(messages
-                            .iter()
-                            .map(|m| format!("{}: {}", m.role, m.content))
-                            .collect::<Vec<_>>()
-                            .join("\n"))
-                    }
+            .map(|messages| {
+                if let Some(ref tmpl) = template {
+                    apply_chat_template(tmpl, messages)
+                } else {
+                    // Simple concatenation fallback
+                    Ok(messages
+                        .iter()
+                        .map(|m| format!("{}: {}", m.role, m.content))
+                        .collect::<Vec<_>>()
+                        .join("\n"))
                 }
-                PromptInput::Prompt(prompt) => Ok(prompt.clone()),
             })
             .collect();
 

@@ -243,12 +243,11 @@ input_len_dist = { type = "fixed", value = 100 }  # Ignored
 output_len_dist = { type = "fixed", value = 50 }  # Samples EOS
 ```
 
-**Dataset Format:** JSONL file in OpenAI batch API format. Each line may target either `/v1/chat/completions` with a `messages` array or `/v1/completions` with a string `prompt`.
+**Dataset Format:** JSONL file in OpenAI batch API format. Each line should be a JSON object with a `messages` field containing an array of message objects.
 
 Example:
 ```json
-{"custom_id": "req-1", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "gpt-3.5-turbo", "messages": [{"role": "user", "content": "Hello!"}], "max_tokens": 100}}
-{"custom_id": "req-2", "method": "POST", "url": "/v1/completions", "body": {"model": "gpt-3.5-turbo-instruct", "prompt": "Write a haiku about Rust.", "max_tokens": 80}}
+{"custom_id": "req-1", "messages": [{"role": "user", "content": "Hello!"}], "max_tokens": 100}
 ```
 
 **Tokenizer:** Dataset mode requires a tokenizer file to convert text to tokens. You'll need to provide this via the `--tokenizer` flag:
@@ -258,11 +257,10 @@ inference-lab -c config.toml --tokenizer tokenizer.json
 
 The tokenizer should be a HuggingFace tokenizers JSON file (typically `tokenizer.json` from the model repository).
 
-**Chat Template:** You'll also need to specify how to format chat-style requests via `--chat-template`:
+**Chat Template:** You'll also need to specify how to format messages via `--chat-template`:
 - Use `"None"` for simple concatenation of messages
 - Use a Jinja2 template string for custom formatting (e.g., `"{{user}}\n{{assistant}}"`)
 - Most models have their own chat template format
-- Plain `/v1/completions` prompts are tokenized directly and do not use the chat template
 
 Example with no template:
 ```bash
