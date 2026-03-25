@@ -89,7 +89,7 @@ impl ModelConfig {
         // Use num_kv_heads if specified (GQA/MQA), otherwise use num_heads (MHA)
         let kv_heads = self.num_kv_heads.unwrap_or(self.num_heads);
         let head_dim = self.hidden_dim / self.num_heads;
-        let bytes_per_token_per_layer = 2 * kv_heads as u64 * head_dim as u64 * 1; // Assuming bytes_per_param
+        let bytes_per_token_per_layer = 2 * kv_heads as u64 * head_dim as u64; // Assuming bytes_per_param
 
         // No sliding window: simple linear growth
         if self.sliding_window.is_none() || self.num_sliding_layers.is_none() {

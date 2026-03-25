@@ -153,7 +153,7 @@ impl DatasetLoader {
         let reader = BufReader::new(file);
         let count = reader
             .lines()
-            .filter_map(|line| line.ok())
+            .map_while(Result::ok)
             .filter(|line| !line.trim().is_empty())
             .count();
         Ok(count)

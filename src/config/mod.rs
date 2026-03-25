@@ -50,7 +50,7 @@ impl Config {
     /// Get a default configuration for testing
     #[cfg(test)]
     pub fn test_default() -> Self {
-        let mut hardware = HardwareConfig {
+        let hardware = HardwareConfig {
             name: "Test GPU".to_string(),
             compute_flops: 1e15,
             memory_bandwidth: 1e12,

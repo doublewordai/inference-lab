@@ -2,7 +2,7 @@ use crate::compute::ComputeEngine;
 use crate::config::Config;
 use crate::dataset::{BatchTokenizerFn, DatasetLoader};
 use crate::kv_cache::KVCacheManager;
-use crate::metrics::MetricsCollector;
+use crate::metrics::{LatencySampleTriplet, MetricsCollector};
 use crate::request::RequestGenerator;
 use crate::scheduler::Scheduler;
 
@@ -32,11 +32,7 @@ pub struct ProgressInfo<'a> {
     pub kv_cache_util: f64,
     pub time_series: Option<&'a [TimeSeriesPoint]>,
     pub metrics: Option<crate::metrics::MetricsSummary>,
-    pub latency_samples: Option<(
-        (&'a [f64], &'a [f64]),
-        (&'a [f64], &'a [f64]),
-        (&'a [f64], &'a [f64]),
-    )>,
+    pub latency_samples: Option<LatencySampleTriplet<'a>>,
     pub distribution_samples: Option<(&'a [u32], &'a [u32])>, // (input_lengths, output_lengths)
 }
 
@@ -459,13 +455,7 @@ impl Simulator {
         self.current_time
     }
 
-    pub fn get_latency_samples(
-        &self,
-    ) -> (
-        (&[f64], &[f64]), // (ttft_samples, ttft_timestamps)
-        (&[f64], &[f64]), // (e2e_samples, e2e_timestamps)
-        (&[f64], &[f64]), // (tpot_samples, tpot_timestamps)
-    ) {
+    pub fn get_latency_samples(&self) -> LatencySampleTriplet<'_> {
         self.metrics.get_latency_samples()
     }
 
