@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.1](https://github.com/doublewordai/inference-lab/compare/inference-lab-v0.6.0...inference-lab-v0.6.1) (2026-03-25)
+
+
+### Bug Fixes
+
+* streaming usage reporting ([#40](https://github.com/doublewordai/inference-lab/issues/40)) ([088cf34](https://github.com/doublewordai/inference-lab/commit/088cf34cf8301abc73694780549fcee8917e904a))
+
 ## [0.6.0](https://github.com/doublewordai/inference-lab/compare/inference-lab-v0.5.0...inference-lab-v0.6.0) (2026-03-23)
 
 
