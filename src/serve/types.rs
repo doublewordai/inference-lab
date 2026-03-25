@@ -10,6 +10,8 @@ pub struct ChatCompletionRequest {
     pub stream: bool,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
+    #[serde(default)]
+    pub stream_options: Option<StreamOptions>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -20,6 +22,8 @@ pub struct CompletionRequest {
     pub stream: bool,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
+    #[serde(default)]
+    pub stream_options: Option<StreamOptions>,
 }
 
 fn default_max_tokens() -> u32 {
@@ -30,6 +34,12 @@ fn default_max_tokens() -> u32 {
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct StreamOptions {
+    #[serde(default)]
+    pub include_usage: bool,
 }
 
 // --- Non-streaming response ---

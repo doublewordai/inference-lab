@@ -53,6 +53,11 @@ pub async fn chat_completions(
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let prompt_tokens = count_prompt_tokens(&state, &req.messages);
+    let include_usage = req
+        .stream_options
+        .as_ref()
+        .map(|options| options.include_usage)
+        .unwrap_or(false);
     let (request_id, mut rx) = submit_engine_request(
         &state,
         &req.model,
@@ -142,7 +147,7 @@ pub async fn chat_completions(
                                 },
                                 finish_reason: Some("stop"),
                             }],
-                            usage: Some(Usage {
+                            usage: include_usage.then_some(Usage {
                                 prompt_tokens,
                                 completion_tokens,
                                 total_tokens: prompt_tokens + completion_tokens,
@@ -233,6 +238,11 @@ pub async fn completions(
     Json(req): Json<CompletionRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let prompt_tokens = count_text_prompt_tokens(&state, &req.prompt);
+    let include_usage = req
+        .stream_options
+        .as_ref()
+        .map(|options| options.include_usage)
+        .unwrap_or(false);
     let (request_id, mut rx) =
         submit_engine_request(&state, &req.model, prompt_tokens, req.max_tokens, "cmpl").await?;
 
@@ -283,7 +293,7 @@ pub async fn completions(
                                 index: 0,
                                 finish_reason: Some("stop"),
                             }],
-                            usage: Some(Usage {
+                            usage: include_usage.then_some(Usage {
                                 prompt_tokens,
                                 completion_tokens,
                                 total_tokens: prompt_tokens + completion_tokens,
@@ -499,6 +509,7 @@ mod tests {
                 prompt: "hello world".to_string(),
                 stream: false,
                 max_tokens: 4,
+                stream_options: None,
             }),
         )
         .await
@@ -557,6 +568,7 @@ mod tests {
                 }],
                 stream: false,
                 max_tokens: 4,
+                stream_options: None,
             }),
         )
         .await
@@ -603,6 +615,9 @@ mod tests {
                 prompt: "hello world".to_string(),
                 stream: true,
                 max_tokens: 4,
+                stream_options: Some(StreamOptions {
+                    include_usage: true,
+                }),
             }),
         )
         .await
@@ -659,6 +674,9 @@ mod tests {
                 }],
                 stream: true,
                 max_tokens: 4,
+                stream_options: Some(StreamOptions {
+                    include_usage: true,
+                }),
             }),
         )
         .await
@@ -682,6 +700,196 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn streaming_completions_omit_usage_when_stream_options_missing() {
+        let (engine_tx, mut engine_rx) = mpsc::channel::<EngineRequest>(1);
+        let state = test_state(engine_tx);
+
+        tokio::spawn(async move {
+            let engine_req = engine_rx.recv().await.unwrap();
+            let _ = engine_req.tx.send(TokenEvent::FirstToken).await;
+            let _ = engine_req
+                .tx
+                .send(TokenEvent::Done {
+                    prompt_tokens: 3,
+                    completion_tokens: 1,
+                })
+                .await;
+        });
+
+        let response = completions(
+            State(state),
+            Json(CompletionRequest {
+                model: "test-model".to_string(),
+                prompt: "hello world".to_string(),
+                stream: true,
+                max_tokens: 4,
+                stream_options: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+
+        let events = response_sse_events(response).await;
+        let final_chunk: serde_json::Value = serde_json::from_str(
+            events
+                .iter()
+                .rev()
+                .find(|event| *event != "[DONE]")
+                .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(final_chunk["choices"][0]["finish_reason"], "stop");
+        assert!(final_chunk.get("usage").is_none());
+    }
+
+    #[tokio::test]
+    async fn streaming_completions_omit_usage_when_include_usage_false() {
+        let (engine_tx, mut engine_rx) = mpsc::channel::<EngineRequest>(1);
+        let state = test_state(engine_tx);
+
+        tokio::spawn(async move {
+            let engine_req = engine_rx.recv().await.unwrap();
+            let _ = engine_req.tx.send(TokenEvent::FirstToken).await;
+            let _ = engine_req
+                .tx
+                .send(TokenEvent::Done {
+                    prompt_tokens: 3,
+                    completion_tokens: 1,
+                })
+                .await;
+        });
+
+        let response = completions(
+            State(state),
+            Json(CompletionRequest {
+                model: "test-model".to_string(),
+                prompt: "hello world".to_string(),
+                stream: true,
+                max_tokens: 4,
+                stream_options: Some(StreamOptions {
+                    include_usage: false,
+                }),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+
+        let events = response_sse_events(response).await;
+        let final_chunk: serde_json::Value = serde_json::from_str(
+            events
+                .iter()
+                .rev()
+                .find(|event| *event != "[DONE]")
+                .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(final_chunk["choices"][0]["finish_reason"], "stop");
+        assert!(final_chunk.get("usage").is_none());
+    }
+
+    #[tokio::test]
+    async fn streaming_chat_completions_omit_usage_when_stream_options_missing() {
+        let (engine_tx, mut engine_rx) = mpsc::channel::<EngineRequest>(1);
+        let state = test_state(engine_tx);
+
+        tokio::spawn(async move {
+            let engine_req = engine_rx.recv().await.unwrap();
+            let _ = engine_req.tx.send(TokenEvent::FirstToken).await;
+            let _ = engine_req
+                .tx
+                .send(TokenEvent::Done {
+                    prompt_tokens: 5,
+                    completion_tokens: 1,
+                })
+                .await;
+        });
+
+        let response = chat_completions(
+            State(state),
+            Json(ChatCompletionRequest {
+                model: "test-model".to_string(),
+                messages: vec![ChatMessage {
+                    role: "user".to_string(),
+                    content: "hello world".to_string(),
+                }],
+                stream: true,
+                max_tokens: 4,
+                stream_options: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+
+        let events = response_sse_events(response).await;
+        let final_chunk: serde_json::Value = serde_json::from_str(
+            events
+                .iter()
+                .rev()
+                .find(|event| *event != "[DONE]")
+                .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(final_chunk["choices"][0]["finish_reason"], "stop");
+        assert!(final_chunk.get("usage").is_none());
+    }
+
+    #[tokio::test]
+    async fn streaming_chat_completions_omit_usage_when_include_usage_false() {
+        let (engine_tx, mut engine_rx) = mpsc::channel::<EngineRequest>(1);
+        let state = test_state(engine_tx);
+
+        tokio::spawn(async move {
+            let engine_req = engine_rx.recv().await.unwrap();
+            let _ = engine_req.tx.send(TokenEvent::FirstToken).await;
+            let _ = engine_req
+                .tx
+                .send(TokenEvent::Done {
+                    prompt_tokens: 5,
+                    completion_tokens: 1,
+                })
+                .await;
+        });
+
+        let response = chat_completions(
+            State(state),
+            Json(ChatCompletionRequest {
+                model: "test-model".to_string(),
+                messages: vec![ChatMessage {
+                    role: "user".to_string(),
+                    content: "hello world".to_string(),
+                }],
+                stream: true,
+                max_tokens: 4,
+                stream_options: Some(StreamOptions {
+                    include_usage: false,
+                }),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+
+        let events = response_sse_events(response).await;
+        let final_chunk: serde_json::Value = serde_json::from_str(
+            events
+                .iter()
+                .rev()
+                .find(|event| *event != "[DONE]")
+                .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(final_chunk["choices"][0]["finish_reason"], "stop");
+        assert!(final_chunk.get("usage").is_none());
+    }
+
+    #[tokio::test]
     async fn completions_returns_model_not_found_error() {
         let state = Arc::new(AppState {
             engines: HashMap::new(),
@@ -696,6 +904,7 @@ mod tests {
                 prompt: "hello".to_string(),
                 stream: false,
                 max_tokens: 4,
+                stream_options: None,
             }),
         )
         .await
