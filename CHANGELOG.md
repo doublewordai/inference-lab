@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.2](https://github.com/doublewordai/inference-lab/compare/inference-lab-v0.6.1...inference-lab-v0.6.2) (2026-03-25)
+
+
+### Bug Fixes
+
+* gate streaming usage on include_usage ([#42](https://github.com/doublewordai/inference-lab/issues/42)) ([320af44](https://github.com/doublewordai/inference-lab/commit/320af446bb327e9a63e1f3a1785aab56980bcccf))
+
 ## [0.6.1](https://github.com/doublewordai/inference-lab/compare/inference-lab-v0.6.0...inference-lab-v0.6.1) (2026-03-25)
 
 
