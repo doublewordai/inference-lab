@@ -89,6 +89,7 @@ pub async fn chat_completions(
                     },
                     finish_reason: None,
                 }],
+                usage: None,
             };
             let _ = stream_tx
                 .send(Ok(
@@ -116,6 +117,7 @@ pub async fn chat_completions(
                                 },
                                 finish_reason: None,
                             }],
+                            usage: None,
                         };
                         let _ = stream_tx
                             .send(Ok(
@@ -123,7 +125,10 @@ pub async fn chat_completions(
                             ))
                             .await;
                     }
-                    TokenEvent::Done { .. } => {
+                    TokenEvent::Done {
+                        prompt_tokens,
+                        completion_tokens,
+                    } => {
                         let chunk = ChatCompletionChunk {
                             id: id.clone(),
                             object: "chat.completion.chunk",
@@ -137,6 +142,11 @@ pub async fn chat_completions(
                                 },
                                 finish_reason: Some("stop"),
                             }],
+                            usage: Some(Usage {
+                                prompt_tokens,
+                                completion_tokens,
+                                total_tokens: prompt_tokens + completion_tokens,
+                            }),
                         };
                         let _ = stream_tx
                             .send(Ok(
@@ -251,6 +261,7 @@ pub async fn completions(
                                 index: 0,
                                 finish_reason: None,
                             }],
+                            usage: None,
                         };
                         let _ = stream_tx
                             .send(Ok(
@@ -258,7 +269,10 @@ pub async fn completions(
                             ))
                             .await;
                     }
-                    TokenEvent::Done { .. } => {
+                    TokenEvent::Done {
+                        prompt_tokens,
+                        completion_tokens,
+                    } => {
                         let chunk = CompletionChunk {
                             id: id.clone(),
                             object: "text_completion",
@@ -269,6 +283,11 @@ pub async fn completions(
                                 index: 0,
                                 finish_reason: Some("stop"),
                             }],
+                            usage: Some(Usage {
+                                prompt_tokens,
+                                completion_tokens,
+                                total_tokens: prompt_tokens + completion_tokens,
+                            }),
                         };
                         let _ = stream_tx
                             .send(Ok(
@@ -416,6 +435,7 @@ fn estimate_tokens_from_chars(text: &str) -> u32 {
 mod tests {
     use super::*;
     use axum::body::to_bytes;
+    use axum::response::Response;
 
     fn test_state(engine_tx: mpsc::Sender<EngineRequest>) -> Arc<AppState> {
         Arc::new(AppState {
@@ -423,6 +443,20 @@ mod tests {
             model_names: vec!["test-model".to_string()],
             tokenizer: None,
         })
+    }
+
+    async fn response_json(response: Response) -> serde_json::Value {
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    async fn response_sse_events(response: Response) -> Vec<String> {
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        String::from_utf8(body.to_vec())
+            .unwrap()
+            .split("\n\n")
+            .filter_map(|chunk| chunk.strip_prefix("data: ").map(str::to_string))
+            .collect()
     }
 
     #[tokio::test]
@@ -473,8 +507,7 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
 
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let json = response_json(response).await;
 
         assert_eq!(json["object"], "text_completion");
         assert_eq!(json["model"], "test-model");
@@ -486,6 +519,166 @@ mod tests {
 
         let id = json["id"].as_str().unwrap();
         assert!(id.starts_with("cmpl-"));
+    }
+
+    #[tokio::test]
+    async fn chat_completions_returns_usage() {
+        let (engine_tx, mut engine_rx) = mpsc::channel::<EngineRequest>(1);
+        let state = test_state(engine_tx);
+
+        tokio::spawn(async move {
+            let engine_req = engine_rx.recv().await.unwrap();
+            assert_eq!(engine_req.prompt_tokens, 5);
+            assert!(engine_req.request_id.starts_with("chatcmpl-"));
+
+            let _ = engine_req.tx.send(TokenEvent::FirstToken).await;
+            let _ = engine_req
+                .tx
+                .send(TokenEvent::Token {
+                    text: "Hello".to_string(),
+                })
+                .await;
+            let _ = engine_req
+                .tx
+                .send(TokenEvent::Done {
+                    prompt_tokens: 5,
+                    completion_tokens: 1,
+                })
+                .await;
+        });
+
+        let response = chat_completions(
+            State(state),
+            Json(ChatCompletionRequest {
+                model: "test-model".to_string(),
+                messages: vec![ChatMessage {
+                    role: "user".to_string(),
+                    content: "hello world".to_string(),
+                }],
+                stream: false,
+                max_tokens: 4,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+
+        let json = response_json(response).await;
+
+        assert_eq!(json["object"], "chat.completion");
+        assert_eq!(json["choices"][0]["message"]["content"], "Hello");
+        assert_eq!(json["usage"]["prompt_tokens"], 5);
+        assert_eq!(json["usage"]["completion_tokens"], 1);
+        assert_eq!(json["usage"]["total_tokens"], 6);
+    }
+
+    #[tokio::test]
+    async fn streaming_completions_include_usage_in_final_chunk() {
+        let (engine_tx, mut engine_rx) = mpsc::channel::<EngineRequest>(1);
+        let state = test_state(engine_tx);
+
+        tokio::spawn(async move {
+            let engine_req = engine_rx.recv().await.unwrap();
+
+            let _ = engine_req.tx.send(TokenEvent::FirstToken).await;
+            let _ = engine_req
+                .tx
+                .send(TokenEvent::Token {
+                    text: "Hello".to_string(),
+                })
+                .await;
+            let _ = engine_req
+                .tx
+                .send(TokenEvent::Done {
+                    prompt_tokens: 3,
+                    completion_tokens: 1,
+                })
+                .await;
+        });
+
+        let response = completions(
+            State(state),
+            Json(CompletionRequest {
+                model: "test-model".to_string(),
+                prompt: "hello world".to_string(),
+                stream: true,
+                max_tokens: 4,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+
+        let events = response_sse_events(response).await;
+        let final_chunk: serde_json::Value = serde_json::from_str(
+            events
+                .iter()
+                .rev()
+                .find(|event| *event != "[DONE]")
+                .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(final_chunk["choices"][0]["finish_reason"], "stop");
+        assert_eq!(final_chunk["usage"]["prompt_tokens"], 3);
+        assert_eq!(final_chunk["usage"]["completion_tokens"], 1);
+        assert_eq!(final_chunk["usage"]["total_tokens"], 4);
+    }
+
+    #[tokio::test]
+    async fn streaming_chat_completions_include_usage_in_final_chunk() {
+        let (engine_tx, mut engine_rx) = mpsc::channel::<EngineRequest>(1);
+        let state = test_state(engine_tx);
+
+        tokio::spawn(async move {
+            let engine_req = engine_rx.recv().await.unwrap();
+
+            let _ = engine_req.tx.send(TokenEvent::FirstToken).await;
+            let _ = engine_req
+                .tx
+                .send(TokenEvent::Token {
+                    text: "Hello".to_string(),
+                })
+                .await;
+            let _ = engine_req
+                .tx
+                .send(TokenEvent::Done {
+                    prompt_tokens: 5,
+                    completion_tokens: 1,
+                })
+                .await;
+        });
+
+        let response = chat_completions(
+            State(state),
+            Json(ChatCompletionRequest {
+                model: "test-model".to_string(),
+                messages: vec![ChatMessage {
+                    role: "user".to_string(),
+                    content: "hello world".to_string(),
+                }],
+                stream: true,
+                max_tokens: 4,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+
+        let events = response_sse_events(response).await;
+        let final_chunk: serde_json::Value = serde_json::from_str(
+            events
+                .iter()
+                .rev()
+                .find(|event| *event != "[DONE]")
+                .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(final_chunk["choices"][0]["finish_reason"], "stop");
+        assert_eq!(final_chunk["usage"]["prompt_tokens"], 5);
+        assert_eq!(final_chunk["usage"]["completion_tokens"], 1);
+        assert_eq!(final_chunk["usage"]["total_tokens"], 6);
     }
 
     #[tokio::test]

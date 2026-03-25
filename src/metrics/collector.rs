@@ -2,6 +2,9 @@ use super::quantile::StreamingQuantiles;
 use super::summary::MetricsSummary;
 use crate::request::Request;
 
+pub type LatencySeries<'a> = (&'a [f64], &'a [f64]);
+pub type LatencySampleTriplet<'a> = (LatencySeries<'a>, LatencySeries<'a>, LatencySeries<'a>);
+
 pub struct MetricsCollector {
     // Latency metrics (in seconds) - keep recent samples with timestamps for windowing
     ttft_samples: Vec<f64>,
@@ -141,13 +144,7 @@ impl MetricsCollector {
     }
 
     /// Get latency samples with timestamps
-    pub fn get_latency_samples(
-        &self,
-    ) -> (
-        (&[f64], &[f64]), // (ttft_samples, ttft_timestamps)
-        (&[f64], &[f64]), // (e2e_samples, e2e_timestamps)
-        (&[f64], &[f64]), // (tpot_samples, tpot_timestamps)
-    ) {
+    pub fn get_latency_samples(&self) -> LatencySampleTriplet<'_> {
         (
             (&self.ttft_samples, &self.ttft_timestamps),
             (&self.e2e_latency_samples, &self.e2e_timestamps),

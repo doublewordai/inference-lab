@@ -9,6 +9,12 @@ pub struct StreamingQuantiles {
     count: usize,
 }
 
+impl Default for StreamingQuantiles {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl StreamingQuantiles {
     pub fn new() -> Self {
         Self {

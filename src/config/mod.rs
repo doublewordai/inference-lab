@@ -50,7 +50,7 @@ impl Config {
     /// Get a default configuration for testing
     #[cfg(test)]
     pub fn test_default() -> Self {
-        let mut hardware = HardwareConfig {
+        let hardware = HardwareConfig {
             name: "Test GPU".to_string(),
             compute_flops: 1e15,
             memory_bandwidth: 1e12,
@@ -144,5 +144,26 @@ mod tests {
     fn test_config_creation() {
         let config = Config::test_default();
         assert!(config.model.kv_cache_bytes_per_token > 0);
+    }
+
+    #[test]
+    fn test_sliding_window_kv_cache_uses_byte_units() {
+        let mut model = ModelConfig {
+            name: "Sliding".to_string(),
+            num_parameters: 7_000_000_000,
+            num_active_parameters: None,
+            num_layers: 4,
+            hidden_dim: 16,
+            num_heads: 4,
+            num_kv_heads: Some(2),
+            max_seq_len: 2048,
+            sliding_window: Some(8),
+            num_sliding_layers: Some(2),
+            kv_cache_bytes_per_token: 0,
+        };
+        model.compute_kv_cache_size(2);
+
+        let size = model.kv_cache_size_for_sequence(10);
+        assert_eq!(size, 1_152);
     }
 }

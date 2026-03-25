@@ -22,6 +22,12 @@ pub struct ScheduleDecision {
     pub tokens_for_running: Vec<u32>,
 }
 
+impl Default for ScheduleDecision {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ScheduleDecision {
     pub fn new() -> Self {
         Self {

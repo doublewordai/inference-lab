@@ -85,11 +85,7 @@ impl RequestGenerator {
             }
         };
 
-        let next_arrival_time = if is_closed_loop && !pending_closed_loop_requests.is_empty() {
-            0.0
-        } else {
-            0.0 // First request arrives at t=0
-        };
+        let next_arrival_time = 0.0; // First dataset request arrives at t=0
 
         // Spawn background thread to load and batch-tokenize entries
         // Buffer size: 5000 entries (~10-50MB depending on token counts)
@@ -108,13 +104,12 @@ impl RequestGenerator {
                         batch.push(unparsed);
 
                         // Process batch when full
-                        if batch.len() >= batch_size {
-                            if let Err(_) =
-                                Self::tokenize_and_send_batch(&mut batch, &tokenizer, &sender)
-                            {
-                                // Receiver dropped, simulation ended early
-                                break;
-                            }
+                        if batch.len() >= batch_size
+                            && Self::tokenize_and_send_batch(&mut batch, &tokenizer, &sender)
+                                .is_err()
+                        {
+                            // Receiver dropped, simulation ended early
+                            break;
                         }
                     }
                     Ok(None) => {

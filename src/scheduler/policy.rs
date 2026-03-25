@@ -1,3 +1,5 @@
+use std::str::FromStr;
+
 /// Scheduling policy for request ordering
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchedulingPolicy {
@@ -25,8 +27,10 @@ pub enum SchedulingPolicy {
     LTF,
 }
 
-impl SchedulingPolicy {
-    pub fn from_str(s: &str) -> Result<Self, String> {
+impl FromStr for SchedulingPolicy {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "fcfs" => Ok(SchedulingPolicy::FCFS),
             "priority" => Ok(SchedulingPolicy::Priority),
@@ -50,74 +54,74 @@ mod tests {
     #[test]
     fn test_policy_from_str() {
         assert_eq!(
-            SchedulingPolicy::from_str("fcfs").unwrap(),
+            "fcfs".parse::<SchedulingPolicy>().unwrap(),
             SchedulingPolicy::FCFS
         );
         assert_eq!(
-            SchedulingPolicy::from_str("FCFS").unwrap(),
+            "FCFS".parse::<SchedulingPolicy>().unwrap(),
             SchedulingPolicy::FCFS
         );
         assert_eq!(
-            SchedulingPolicy::from_str("priority").unwrap(),
+            "priority".parse::<SchedulingPolicy>().unwrap(),
             SchedulingPolicy::Priority
         );
         assert_eq!(
-            SchedulingPolicy::from_str("sif").unwrap(),
+            "sif".parse::<SchedulingPolicy>().unwrap(),
             SchedulingPolicy::SIF
         );
         assert_eq!(
-            SchedulingPolicy::from_str("SIF").unwrap(),
+            "SIF".parse::<SchedulingPolicy>().unwrap(),
             SchedulingPolicy::SIF
         );
         assert_eq!(
-            SchedulingPolicy::from_str("lif").unwrap(),
+            "lif".parse::<SchedulingPolicy>().unwrap(),
             SchedulingPolicy::LIF
         );
         assert_eq!(
-            SchedulingPolicy::from_str("LIF").unwrap(),
+            "LIF".parse::<SchedulingPolicy>().unwrap(),
             SchedulingPolicy::LIF
         );
         assert_eq!(
-            SchedulingPolicy::from_str("sof").unwrap(),
+            "sof".parse::<SchedulingPolicy>().unwrap(),
             SchedulingPolicy::SOF
         );
         assert_eq!(
-            SchedulingPolicy::from_str("SOF").unwrap(),
+            "SOF".parse::<SchedulingPolicy>().unwrap(),
             SchedulingPolicy::SOF
         );
         assert_eq!(
-            SchedulingPolicy::from_str("lof").unwrap(),
+            "lof".parse::<SchedulingPolicy>().unwrap(),
             SchedulingPolicy::LOF
         );
         assert_eq!(
-            SchedulingPolicy::from_str("LOF").unwrap(),
+            "LOF".parse::<SchedulingPolicy>().unwrap(),
             SchedulingPolicy::LOF
         );
         assert_eq!(
-            SchedulingPolicy::from_str("stf").unwrap(),
+            "stf".parse::<SchedulingPolicy>().unwrap(),
             SchedulingPolicy::STF
         );
         assert_eq!(
-            SchedulingPolicy::from_str("STF").unwrap(),
+            "STF".parse::<SchedulingPolicy>().unwrap(),
             SchedulingPolicy::STF
         );
         assert_eq!(
-            SchedulingPolicy::from_str("ltf").unwrap(),
+            "ltf".parse::<SchedulingPolicy>().unwrap(),
             SchedulingPolicy::LTF
         );
         assert_eq!(
-            SchedulingPolicy::from_str("LTF").unwrap(),
+            "LTF".parse::<SchedulingPolicy>().unwrap(),
             SchedulingPolicy::LTF
         );
         // Test backward compatibility
         assert_eq!(
-            SchedulingPolicy::from_str("sjf").unwrap(),
+            "sjf".parse::<SchedulingPolicy>().unwrap(),
             SchedulingPolicy::SOF
         );
         assert_eq!(
-            SchedulingPolicy::from_str("SJF").unwrap(),
+            "SJF".parse::<SchedulingPolicy>().unwrap(),
             SchedulingPolicy::SOF
         );
-        assert!(SchedulingPolicy::from_str("unknown").is_err());
+        assert!("unknown".parse::<SchedulingPolicy>().is_err());
     }
 }

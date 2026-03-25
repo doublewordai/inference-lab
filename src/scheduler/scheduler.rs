@@ -33,7 +33,7 @@ impl Scheduler {
         model: ModelConfig,
         kv_cache_manager: KVCacheManager,
     ) -> Result<Self, String> {
-        let policy = SchedulingPolicy::from_str(&config.policy)?;
+        let policy = config.policy.parse::<SchedulingPolicy>()?;
 
         Ok(Self {
             config,
@@ -170,10 +170,10 @@ impl Scheduler {
                 let mut request = self.waiting.get(selected_idx).unwrap().clone();
 
                 // In preemption-free mode, check if we can safely admit this request
-                if self.config.enable_preemption_free {
-                    if !self.can_admit_without_preemption(&request) {
-                        break; // Can't admit without risking future preemption need
-                    }
+                if self.config.enable_preemption_free
+                    && !self.can_admit_without_preemption(&request)
+                {
+                    break; // Can't admit without risking future preemption need
                 }
 
                 // Check for prefix cache hits (peek doesn't increment any prefix cache stats)
