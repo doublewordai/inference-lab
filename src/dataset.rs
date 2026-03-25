@@ -147,16 +147,21 @@ impl<R: BufRead> Iterator for DatasetIterator<R> {
 pub struct DatasetLoader;
 
 impl DatasetLoader {
+    fn count_non_empty_lines<R: BufRead>(reader: R) -> Result<usize, std::io::Error> {
+        let mut count = 0;
+        for line in reader.lines() {
+            if !line?.trim().is_empty() {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
     /// Count the number of non-empty lines in a JSONL file (fast approximation of entry count)
     pub fn count_entries<P: AsRef<Path>>(path: P) -> Result<usize, std::io::Error> {
         let file = File::open(path)?;
         let reader = BufReader::new(file);
-        let count = reader
-            .lines()
-            .map_while(Result::ok)
-            .filter(|line| !line.trim().is_empty())
-            .count();
-        Ok(count)
+        Self::count_non_empty_lines(reader)
     }
 
     /// Create an iterator from a JSONL file in OpenAI batch API format
@@ -181,6 +186,7 @@ impl DatasetLoader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{self, Read};
 
     #[test]
     fn test_parse_batch_request() {
@@ -258,5 +264,43 @@ mod tests {
             RequestInput::Chat { .. } => panic!("expected completion request"),
         }
         assert_eq!(batch_request.body.max_tokens, Some(32));
+    }
+
+    #[test]
+    fn test_count_entries_propagates_read_errors() {
+        struct FailingReader {
+            bytes: Vec<u8>,
+            pos: usize,
+            fail_after: usize,
+        }
+
+        impl Read for FailingReader {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.pos >= self.fail_after {
+                    return Err(io::Error::other("forced read failure"));
+                }
+
+                let remaining_until_failure = self.fail_after.saturating_sub(self.pos);
+                let remaining_bytes = self.bytes.len().saturating_sub(self.pos);
+                let to_copy = buf.len().min(remaining_until_failure).min(remaining_bytes);
+
+                if to_copy == 0 {
+                    return Ok(0);
+                }
+
+                buf[..to_copy].copy_from_slice(&self.bytes[self.pos..self.pos + to_copy]);
+                self.pos += to_copy;
+                Ok(to_copy)
+            }
+        }
+
+        let reader = BufReader::new(FailingReader {
+            bytes: b"first\nsecond\n".to_vec(),
+            pos: 0,
+            fail_after: 7,
+        });
+
+        let err = DatasetLoader::count_non_empty_lines(reader).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Other);
     }
 }
