@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.0](https://github.com/doublewordai/inference-lab/compare/inference-lab-v0.6.2...inference-lab-v0.7.0) (2026-04-28)
+
+
+### Features
+
+* model KV cache hierarchy, cascade attention, and async promotions ([#44](https://github.com/doublewordai/inference-lab/issues/44)) ([59e7ac1](https://github.com/doublewordai/inference-lab/commit/59e7ac1aad90dd9782bd7271cc7cd7be52af23d7))
+
 ## [0.6.2](https://github.com/doublewordai/inference-lab/compare/inference-lab-v0.6.1...inference-lab-v0.6.2) (2026-03-25)
 
 
