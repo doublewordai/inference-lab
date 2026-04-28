@@ -34,6 +34,15 @@ impl Block {
         std::mem::replace(&mut self.content_hash, content_hash)
     }
 
+    /// Take an additional reference on a block that already holds the
+    /// content the caller wants. Used when a request's prompt prefix
+    /// matches a cached or in-flight block and we want to share the
+    /// physical copy instead of allocating a fresh one.
+    pub fn reference(&mut self) {
+        self.ref_count += 1;
+        self.is_free = false;
+    }
+
     /// Release this block (decrement ref count, mark as free if ref count reaches 0)
     pub fn release(&mut self) {
         if self.ref_count > 0 {

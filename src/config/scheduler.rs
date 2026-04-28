@@ -31,6 +31,12 @@ pub struct SchedulerConfig {
     /// When enabled, uses conservative admission control to guarantee zero preemptions
     #[serde(default)]
     pub enable_preemption_free: bool,
+
+    /// Enable cascade attention. When a batch contains requests with a shared
+    /// prompt prefix, the shared portion of the KV cache is loaded once per
+    /// batch instead of once per request, reducing memory bandwidth.
+    #[serde(default)]
+    pub enable_cascade_attention: bool,
 }
 
 fn default_max_num_partial_prefills() -> u32 {
