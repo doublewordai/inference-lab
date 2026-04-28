@@ -6,11 +6,28 @@ use crate::request::Request;
 pub struct ComputeEngine {
     hardware: HardwareConfig,
     model: ModelConfig,
+    block_size: u32,
+    enable_cascade_attention: bool,
 }
 
 impl ComputeEngine {
     pub fn new(hardware: HardwareConfig, model: ModelConfig) -> Self {
-        Self { hardware, model }
+        Self {
+            hardware,
+            model,
+            block_size: 0,
+            enable_cascade_attention: false,
+        }
+    }
+
+    /// Enable cascade attention modeling. When a scheduled batch shares a
+    /// prompt prefix, the shared KV is counted once per iteration rather than
+    /// once per request. `block_size` is the KV cache block size in tokens
+    /// (matches the scheduler's block size).
+    pub fn with_cascade_attention(mut self, enabled: bool, block_size: u32) -> Self {
+        self.enable_cascade_attention = enabled;
+        self.block_size = block_size;
+        self
     }
 
     /// Calculate time to process an iteration (in seconds)
@@ -85,15 +102,26 @@ impl ComputeEngine {
         // Model weights (constant per iteration)
         let weight_bytes = arithmetic::model_weight_bytes(&self.model, &self.hardware);
 
+        // With cascade attention, the KV bytes for the shared prompt prefix
+        // are loaded once per iteration instead of once per request.
+        let shared_prefix_tokens = if self.enable_cascade_attention && self.block_size > 0 {
+            arithmetic::shared_prefix_blocks(batch_requests) * self.block_size
+        } else {
+            0
+        };
+        let shared_kv_bytes = arithmetic::kv_cache_bytes(shared_prefix_tokens, &self.model);
+
         // KV cache bytes (depends on sequence lengths)
         let mut kv_cache_bytes = 0.0;
         for (req, &tokens) in batch_requests.iter().zip(tokens_per_request) {
             // Average sequence length during this iteration
             let avg_seq_len = req.num_computed_tokens + tokens / 2;
-            kv_cache_bytes += arithmetic::kv_cache_bytes(avg_seq_len, &self.model);
+            // Subtract the shared portion that's accounted for once at batch level.
+            let unshared = avg_seq_len.saturating_sub(shared_prefix_tokens);
+            kv_cache_bytes += arithmetic::kv_cache_bytes(unshared, &self.model);
         }
 
-        weight_bytes + kv_cache_bytes
+        weight_bytes + shared_kv_bytes + kv_cache_bytes
     }
 }
 
@@ -183,6 +211,69 @@ mod tests {
         // Test with zero time
         let util = engine.calculate_flops_utilization(&requests, &tokens, 0.0);
         assert_eq!(util, 0.0);
+    }
+
+    #[test]
+    fn test_cascade_attention_reduces_bytes_transferred() {
+        let config = Config::test_default();
+        let block_size = config.scheduler.block_size;
+
+        let plain = ComputeEngine::new(config.hardware.clone(), config.model.clone());
+        let cascade = ComputeEngine::new(config.hardware.clone(), config.model.clone())
+            .with_cascade_attention(true, block_size);
+
+        // Two decode-step requests sharing the first 8 prompt blocks.
+        let mut req_a = create_test_request("a", 200, 200);
+        let mut req_b = create_test_request("b", 200, 200);
+        let shared: Vec<u64> = (0..8).map(|i| 1000 + i as u64).collect();
+        req_a.prompt_block_hashes = shared
+            .iter()
+            .copied()
+            .chain(std::iter::once(99_001))
+            .collect();
+        req_b.prompt_block_hashes = shared
+            .iter()
+            .copied()
+            .chain(std::iter::once(99_002))
+            .collect();
+
+        let requests = vec![&req_a, &req_b];
+        let tokens = vec![1, 1]; // single decode step each
+
+        let bytes_plain = plain.calculate_bytes_transferred(&requests, &tokens);
+        let bytes_cascade = cascade.calculate_bytes_transferred(&requests, &tokens);
+
+        // Cascade should load the shared 8*block_size tokens of KV once
+        // instead of twice; expected saving is exactly that.
+        let expected_saving =
+            arithmetic::kv_cache_bytes(8 * block_size, &cascade.model);
+        let actual_saving = bytes_plain - bytes_cascade;
+        assert!(
+            (actual_saving - expected_saving).abs() < 1e-6,
+            "expected saving {expected_saving}, got {actual_saving}"
+        );
+    }
+
+    #[test]
+    fn test_cascade_attention_no_shared_prefix_no_change() {
+        let config = Config::test_default();
+        let block_size = config.scheduler.block_size;
+
+        let plain = ComputeEngine::new(config.hardware.clone(), config.model.clone());
+        let cascade = ComputeEngine::new(config.hardware.clone(), config.model.clone())
+            .with_cascade_attention(true, block_size);
+
+        let mut req_a = create_test_request("a", 200, 200);
+        let mut req_b = create_test_request("b", 200, 200);
+        req_a.prompt_block_hashes = vec![1, 2, 3];
+        req_b.prompt_block_hashes = vec![4, 5, 6];
+
+        let requests = vec![&req_a, &req_b];
+        let tokens = vec![1, 1];
+
+        let bytes_plain = plain.calculate_bytes_transferred(&requests, &tokens);
+        let bytes_cascade = cascade.calculate_bytes_transferred(&requests, &tokens);
+        assert!((bytes_plain - bytes_cascade).abs() < 1e-6);
     }
 
     #[test]

@@ -16,6 +16,12 @@ pub struct Scheduler {
     /// Running requests
     running: Vec<Request>,
 
+    /// Requests holding HBM blocks while their KV cache is being promoted
+    /// from a slower tier. They re-enter `waiting` once `current_time >=
+    /// ready_at`. Blocks reserved during the wait are not freed until the
+    /// transfer completes (or the request is preempted).
+    pending_transfers: Vec<Request>,
+
     /// Scheduling policy
     policy: SchedulingPolicy,
 
@@ -41,16 +47,64 @@ impl Scheduler {
             _model: model,
             waiting: VecDeque::new(),
             running: Vec::new(),
+            pending_transfers: Vec::new(),
             policy,
             kv_cache_manager,
             iteration: 0,
         })
     }
 
+    /// Promote any pending KV-transfer requests whose transfer has finished
+    /// back to the waiting queue so they can be scheduled normally. On
+    /// promotion the request's computed-token count is bumped to the cached
+    /// prefix length, mirroring vLLM's behaviour (in v1's scheduler.py:653,
+    /// resumed-from-remote-KVs requests have num_computed_tokens > 0).
+    ///
+    /// Also advances the bandwidth-shared transfer simulation: in-flight
+    /// transfers split each tier's bandwidth equally, so adding more in-flight
+    /// promotions slows everyone down.
+    fn promote_finished_transfers(&mut self, current_time: f64) {
+        let completed = self.kv_cache_manager.advance_transfers(current_time);
+        let mut still_pending = Vec::with_capacity(self.pending_transfers.len());
+        for mut req in self.pending_transfers.drain(..) {
+            if completed.contains(&req.request_id) {
+                // Publish the now-resident blocks to the HBM prefix cache so
+                // subsequent same-prefix requests get a clean HBM hit.
+                let cached_blocks = (req.num_cached_tokens as usize)
+                    .div_ceil(self.config.block_size as usize);
+                let hashes: Vec<u64> = req
+                    .get_prompt_block_hashes()
+                    .iter()
+                    .copied()
+                    .take(cached_blocks)
+                    .collect();
+                let blocks: Vec<u32> =
+                    req.kv_blocks.iter().copied().take(cached_blocks).collect();
+                self.kv_cache_manager
+                    .publish_transferred_blocks(&hashes, &blocks);
+                req.status = RequestStatus::Waiting;
+                req.ready_at = None;
+                req.num_computed_tokens = req.num_cached_tokens;
+                self.waiting.push_back(req);
+            } else {
+                let remaining = self
+                    .kv_cache_manager
+                    .estimate_remaining_time(&req.request_id);
+                req.ready_at = Some(current_time + remaining);
+                still_pending.push(req);
+            }
+        }
+        self.pending_transfers = still_pending;
+    }
+
     /// Main scheduling function - called each iteration
     /// Returns a ScheduleDecision with all scheduling actions
     pub fn schedule(&mut self, current_time: f64) -> ScheduleDecision {
         self.iteration += 1;
+
+        // Promote any pending KV transfers whose deadline has passed; their
+        // KV is now resident in HBM and they can be scheduled normally.
+        self.promote_finished_transfers(current_time);
 
         let mut decision = ScheduleDecision::new();
         let mut token_budget = self.config.max_num_batched_tokens;
@@ -176,9 +230,74 @@ impl Scheduler {
                     break; // Can't admit without risking future preemption need
                 }
 
-                // Check for prefix cache hits (peek doesn't increment any prefix cache stats)
-                let cached_tokens = self.kv_cache_manager.peek_prefix_cache(&request);
+                // Check for prefix cache hits (peek doesn't increment any prefix cache stats).
+                let lookup = self.kv_cache_manager.peek_prefix_cache(&request);
+                let cached_tokens = lookup.total_cached_tokens;
                 request.num_cached_tokens = cached_tokens;
+
+                // If part of the prefix lives in a slower tier, kick off an
+                // async promotion: reserve HBM blocks for the cached portion,
+                // park the request in `pending_transfers` until the transfer
+                // completes. The running batch is unaffected (PCIe runs in
+                // parallel with HBM).
+                if (lookup.needs_promotion() || lookup.needs_join()) && cached_tokens > 0 {
+                    // Always reserve our own HBM blocks for the cached
+                    // prefix (the simulator's block model isn't ref-counted,
+                    // so each request keeps its own copy). Bytes/PCIe cost
+                    // is only paid for the spillover portion; the in-flight
+                    // portion is joined.
+                    let blocks_needed = self.calculate_blocks_needed(&request, cached_tokens);
+                    if self.kv_cache_manager.num_free_blocks() < blocks_needed {
+                        break;
+                    }
+                    let allocated = self
+                        .kv_cache_manager
+                        .reserve_blocks_for_transfer(&request, cached_tokens)
+                        .expect("blocks_needed already verified against capacity");
+                    request.kv_blocks.extend(allocated);
+
+                    // Two paths, possibly both: start a transfer for the
+                    // spillover portion, and/or join an existing one for
+                    // the in-flight portion.
+                    let new_transfer_tokens: u32 =
+                        lookup.promote_tokens_per_tier.iter().sum();
+                    if new_transfer_tokens > 0 {
+                        let hashes: Vec<u64> =
+                            request.get_prompt_block_hashes().to_vec();
+                        self.kv_cache_manager.start_transfer(
+                            request.request_id.clone(),
+                            &hashes,
+                            &lookup,
+                            current_time,
+                        );
+                    } else if lookup.needs_join() {
+                        self.kv_cache_manager
+                            .join_transfer(request.request_id.clone(), &lookup);
+                    }
+
+                    let new_remaining = if new_transfer_tokens > 0 {
+                        self.kv_cache_manager
+                            .estimate_remaining_time(&request.request_id)
+                    } else {
+                        0.0
+                    };
+                    let join_remaining = if lookup.needs_join() {
+                        // Look up the leader's projection.
+                        if let Some(leader) = lookup.join_leader.as_deref() {
+                            self.kv_cache_manager.estimate_remaining_time(leader)
+                        } else {
+                            0.0
+                        }
+                    } else {
+                        0.0
+                    };
+                    let remaining = new_remaining.max(join_remaining);
+                    request.ready_at = Some(current_time + remaining);
+                    request.status = RequestStatus::WaitingOnTransfer;
+                    self.waiting.remove(selected_idx);
+                    self.pending_transfers.push(request);
+                    continue;
+                }
                 // Note: We don't advance num_computed_tokens here!
                 // Cached tokens save COMPUTE time but we still need to allocate KV blocks
                 // num_computed_tokens is advanced after we process the tokens
@@ -448,6 +567,11 @@ impl Scheduler {
         &mut self.running
     }
 
+    /// Snapshot of requests currently waiting on a KV-cache promotion.
+    pub fn pending_transfers(&self) -> &[Request] {
+        &self.pending_transfers
+    }
+
     /// Get reference to KV cache manager
     pub fn kv_cache_manager(&self) -> &KVCacheManager {
         &self.kv_cache_manager
@@ -493,6 +617,134 @@ mod tests {
 
         scheduler.add_request(req);
         assert_eq!(scheduler.num_waiting(), 1);
+    }
+
+    #[test]
+    fn test_waiting_on_transfer_then_promoted() {
+        use crate::config::KVTier;
+        let config = Config::test_default();
+        let block_size = config.scheduler.block_size;
+        let kv_cache = KVCacheManager::new(
+            config.hardware.kv_cache_capacity,
+            block_size,
+            config.model.kv_cache_bytes_per_token,
+            true,
+        )
+        .with_tiers(&[KVTier {
+            name: "host_ram".into(),
+            // Plenty of host RAM.
+            capacity_bytes: 10 * 1024 * 1024 * 1024,
+            // 1 GB/s, very slow on purpose so the transfer time is observable.
+            bandwidth_to_hbm: 1e9,
+        }]);
+        let mut scheduler =
+            Scheduler::new(config.scheduler, config.hardware, config.model, kv_cache).unwrap();
+
+        // Seed the host-RAM tier by running a request through HBM and then
+        // forcing eviction. Easiest approach: poke the manager directly.
+        let prefix_hash = 0xCAFE_u64;
+        let mgr = scheduler.kv_cache_manager_mut();
+        // Allocate then free a block carrying our prefix hash; then evict by
+        // allocating enough new blocks to recycle it.
+        let mut seed = create_test_request("seed", block_size, 1);
+        seed.prompt_block_hashes = vec![prefix_hash];
+        let blocks = mgr.allocate_blocks(&seed, block_size).unwrap();
+        mgr.free_blocks(&blocks);
+        // Now allocate a fresh request with a different hash to recycle the
+        // free block and demote `prefix_hash` into host RAM.
+        let mut churn = create_test_request("churn", block_size, 1);
+        churn.prompt_block_hashes = vec![0xDEAD_u64];
+        mgr.allocate_blocks(&churn, block_size).unwrap();
+
+        // Now submit a real request whose prompt starts with the prefix hash.
+        let mut req = create_test_request("req", block_size * 2, 1);
+        req.prompt_block_hashes = vec![prefix_hash, 0xBEEF_u64];
+        scheduler.add_request(req);
+
+        // Schedule at t=0: should detect host-RAM hit and park the request
+        // in pending_transfers, not running.
+        let decision = scheduler.schedule(0.0);
+        assert_eq!(decision.scheduled_new.len(), 0);
+        assert_eq!(scheduler.num_waiting(), 0);
+        assert_eq!(scheduler.pending_transfers.len(), 1);
+        let ready_at = scheduler.pending_transfers[0].ready_at.unwrap();
+        assert!(ready_at > 0.0);
+
+        // Schedule again before the transfer completes: still pending.
+        let decision = scheduler.schedule(ready_at / 2.0);
+        assert_eq!(decision.scheduled_new.len(), 0);
+        assert_eq!(scheduler.pending_transfers.len(), 1);
+
+        // After the transfer completes, the request promotes back and runs.
+        let decision = scheduler.schedule(ready_at + 1e-9);
+        assert_eq!(scheduler.pending_transfers.len(), 0);
+        assert_eq!(decision.scheduled_new.len(), 1);
+        assert_eq!(scheduler.num_running(), 1);
+        // num_computed_tokens should reflect the cached prefix length.
+        assert_eq!(scheduler.running()[0].num_computed_tokens, block_size);
+    }
+
+    #[test]
+    fn test_concurrent_same_prefix_join_one_transfer() {
+        use crate::config::KVTier;
+        let config = Config::test_default();
+        let block_size = config.scheduler.block_size;
+        // Constrained HBM so a model that didn't share blocks would fail.
+        let small_hbm = 2 * 16 * (config.model.kv_cache_bytes_per_token as u64);
+        let kv_cache = KVCacheManager::new(
+            small_hbm,
+            block_size,
+            config.model.kv_cache_bytes_per_token,
+            true,
+        )
+        .with_tiers(&[KVTier {
+            name: "host_ram".into(),
+            capacity_bytes: 16 * 16 * config.model.kv_cache_bytes_per_token,
+            bandwidth_to_hbm: 1e9,
+        }]);
+        let mut scheduler =
+            Scheduler::new(config.scheduler, config.hardware, config.model, kv_cache).unwrap();
+
+        // Pre-warm the prefix into host RAM.
+        let prefix_hash = 0xABCDu64;
+        {
+            let mgr = scheduler.kv_cache_manager_mut();
+            let mut seed = create_test_request("seed", block_size, 1);
+            seed.prompt_block_hashes = vec![prefix_hash];
+            let blocks = mgr.allocate_blocks(&seed, block_size).unwrap();
+            mgr.free_blocks(&blocks);
+            // Churn HBM to evict prefix_hash to host RAM.
+            let mut churn = create_test_request("churn", block_size * 2, 1);
+            churn.prompt_block_hashes = vec![0xDEAD, 0xBEEF];
+            let cb = mgr.allocate_blocks(&churn, block_size * 2).unwrap();
+            mgr.free_blocks(&cb);
+        }
+
+        // Three requests share the prefix.
+        for i in 0..3 {
+            let mut req = create_test_request(&format!("req-{i}"), block_size * 2, 1);
+            req.prompt_block_hashes = vec![prefix_hash, 0x1000 + i as u64];
+            scheduler.add_request(req);
+        }
+
+        // First scheduling tick: leader starts transfer; followers join.
+        let _ = scheduler.schedule(0.0);
+        assert_eq!(scheduler.pending_transfers().len(), 3);
+        // All three should reference the same leader's blocks: HBM only used
+        // once even though three requests reserved.
+        let mgr = scheduler.kv_cache_manager();
+        let leader_block = scheduler.pending_transfers()[0].kv_blocks[0];
+        for r in scheduler.pending_transfers().iter() {
+            assert_eq!(r.kv_blocks[0], leader_block);
+        }
+        assert_eq!(mgr.block_ref_count(leader_block), 3);
+
+        // Step past completion. The leader's transfer time alone (single
+        // host_ram entry, 1 block of bytes) should be tiny; pick t large
+        // enough to cover it.
+        let _ = scheduler.schedule(10.0);
+        assert_eq!(scheduler.pending_transfers().len(), 0);
+        assert_eq!(scheduler.num_running(), 3);
     }
 
     #[test]

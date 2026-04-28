@@ -73,7 +73,8 @@ impl Simulator {
             config.scheduler.block_size,
             config.model.kv_cache_bytes_per_token,
             true, // enable_prefix_caching
-        );
+        )
+        .with_tiers(&config.hardware.kv_tiers);
 
         let scheduler = Scheduler::new(
             config.scheduler.clone(),
@@ -82,7 +83,11 @@ impl Simulator {
             kv_cache_manager,
         )?;
 
-        let compute_engine = ComputeEngine::new(config.hardware.clone(), config.model.clone());
+        let compute_engine = ComputeEngine::new(config.hardware.clone(), config.model.clone())
+            .with_cascade_attention(
+                config.scheduler.enable_cascade_attention,
+                config.scheduler.block_size,
+            );
 
         // Create request generator - use dataset if provided
         let request_generator = if let Some(dataset_path) = &config.workload.dataset_path {

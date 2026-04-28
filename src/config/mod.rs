@@ -4,7 +4,7 @@ pub mod scheduler;
 pub mod simulation;
 pub mod workload;
 
-pub use hardware::HardwareConfig;
+pub use hardware::{HardwareConfig, KVTier};
 pub use model::ModelConfig;
 pub use scheduler::SchedulerConfig;
 pub use simulation::SimulationConfig;
@@ -58,6 +58,7 @@ impl Config {
             kv_cache_capacity: 60_000_000_000,
             gpu_memory_utilization: 0.9,
             bytes_per_param: 2,
+            kv_tiers: Vec::new(),
         };
 
         let mut model = ModelConfig {
@@ -84,6 +85,7 @@ impl Config {
             max_num_partial_prefills: 1,
             block_size: 16,
             enable_preemption_free: false,
+            enable_cascade_attention: false,
         };
         scheduler.set_default_prefill_threshold(model.max_seq_len);
 

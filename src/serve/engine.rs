@@ -38,7 +38,8 @@ impl RealtimeEngine {
             config.scheduler.block_size,
             config.model.kv_cache_bytes_per_token,
             false, // no prefix caching for serve mode
-        );
+        )
+        .with_tiers(&config.hardware.kv_tiers);
 
         let scheduler = Scheduler::new(
             config.scheduler.clone(),
@@ -47,7 +48,11 @@ impl RealtimeEngine {
             kv_cache_manager,
         )?;
 
-        let compute_engine = ComputeEngine::new(config.hardware.clone(), config.model.clone());
+        let compute_engine = ComputeEngine::new(config.hardware.clone(), config.model.clone())
+            .with_cascade_attention(
+                config.scheduler.enable_cascade_attention,
+                config.scheduler.block_size,
+            );
 
         Ok(Self {
             scheduler,

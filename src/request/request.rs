@@ -65,6 +65,12 @@ pub struct Request {
 
     /// Last preemption start time
     pub last_preempted_at: Option<f64>,
+
+    /// Earliest simulation time at which this request becomes runnable.
+    /// Set when the request is in `WaitingOnTransfer` state and an in-flight
+    /// promotion of its KV cache from a slower tier is in progress; cleared
+    /// once the request returns to `Waiting`.
+    pub ready_at: Option<f64>,
 }
 
 impl Request {
@@ -97,6 +103,7 @@ impl Request {
             token_generation_times: Vec::new(),
             preempted_time: 0.0,
             last_preempted_at: None,
+            ready_at: None,
         }
     }
 

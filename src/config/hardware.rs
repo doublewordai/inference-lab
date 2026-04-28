@@ -4,6 +4,20 @@ fn default_gpu_memory_utilization() -> f64 {
     0.9
 }
 
+/// A spillover tier of the KV cache hierarchy. Tier ordering is implicit in
+/// the enclosing `Vec<KVTier>` — earlier tiers are conceptually closer to
+/// HBM. HBM itself is implicit (driven by `kv_cache_capacity`); tiers in
+/// this list represent host RAM, NVMe, remote storage, and so on.
+#[derive(Debug, Clone, Deserialize)]
+pub struct KVTier {
+    /// Human-readable tier name (e.g. "host_ram", "nvme").
+    pub name: String,
+    /// Capacity of this tier in bytes.
+    pub capacity_bytes: u64,
+    /// Promotion bandwidth from this tier to HBM, in bytes/sec.
+    pub bandwidth_to_hbm: f64,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct HardwareConfig {
     /// Accelerator name (e.g., "H100", "A100")
@@ -30,6 +44,11 @@ pub struct HardwareConfig {
 
     /// Number of bytes per parameter (1 for fp8, 2 for bf16)
     pub bytes_per_param: u32,
+
+    /// Spillover KV cache tiers below HBM, ordered by distance from HBM.
+    /// Empty means single-tier (HBM only) — current behaviour.
+    #[serde(default)]
+    pub kv_tiers: Vec<KVTier>,
 }
 
 impl HardwareConfig {
