@@ -28,12 +28,18 @@ impl RequestGenerator {
         let mut rng = StdRng::seed_from_u64(workload.seed);
         let is_closed_loop = workload.arrival_pattern.to_lowercase() == "closed_loop";
 
-        // For closed-loop, initialize with N requests at time 0
+        // For closed-loop, seed the N initial arrivals. With
+        // `closed_loop_jitter_secs > 0`, stagger them uniformly across
+        // [0, jitter) to break synchronization. After warmup, fixed ISL/OSL
+        // keeps the stagger in place — replenishment happens immediately at
+        // completion (so effective concurrency stays at N).
         let mut pending_closed_loop_requests = Vec::new();
         if is_closed_loop {
             if let Some(num_users) = workload.num_concurrent_users {
-                // Generate initial requests for all concurrent users
-                pending_closed_loop_requests = vec![0.0; num_users]
+                let jitter = workload.closed_loop_jitter_secs.unwrap_or(0.0);
+                pending_closed_loop_requests = (0..num_users)
+                    .map(|_| if jitter > 0.0 { rng.gen_range(0.0..jitter) } else { 0.0 })
+                    .collect();
             }
         };
 
@@ -74,14 +80,16 @@ impl RequestGenerator {
             + Send
             + 'static,
     {
-        let rng = StdRng::seed_from_u64(workload.seed);
+        let mut rng = StdRng::seed_from_u64(workload.seed);
         let is_closed_loop = workload.arrival_pattern.to_lowercase() == "closed_loop";
 
-        // For closed-loop, initialize with N requests at time 0
         let mut pending_closed_loop_requests = Vec::new();
         if is_closed_loop {
             if let Some(num_users) = workload.num_concurrent_users {
-                pending_closed_loop_requests = vec![0.0; num_users]
+                let jitter = workload.closed_loop_jitter_secs.unwrap_or(0.0);
+                pending_closed_loop_requests = (0..num_users)
+                    .map(|_| if jitter > 0.0 { rng.gen_range(0.0..jitter) } else { 0.0 })
+                    .collect();
             }
         };
 
@@ -536,7 +544,9 @@ impl RequestGenerator {
             }
         }
 
-        // Add a new pending request at the completion time
+        // Replenish immediately at completion. The stagger established at
+        // init time persists, since fixed ISL/OSL means each user has the
+        // same cycle time — once unsynchronized, they stay that way.
         self.pending_closed_loop_requests.push(completion_time);
     }
 
@@ -567,6 +577,7 @@ mod tests {
             num_requests: Some(num_requests),
             duration_secs: None,
             seed: 42,
+            closed_loop_jitter_secs: None,
         }
     }
 

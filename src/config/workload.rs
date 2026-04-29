@@ -33,6 +33,13 @@ pub struct WorkloadConfig {
     #[serde(default)]
     pub num_concurrent_users: Option<usize>,
 
+    /// Optional uniform jitter (in seconds) added to closed-loop request
+    /// arrivals. Each replenished request arrives at `completion_time +
+    /// Uniform(0, jitter)`. Used to break the synchronized-arrival regime
+    /// that closed-loop with fixed ISL/OSL otherwise produces.
+    #[serde(default)]
+    pub closed_loop_jitter_secs: Option<f64>,
+
     /// Simulation duration in seconds (None = run until num_requests)
     pub duration_secs: Option<f64>,
 
