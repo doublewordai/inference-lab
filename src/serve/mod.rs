@@ -10,7 +10,7 @@ use axum::{routing::get, routing::post, Router};
 use tokio::sync::mpsc;
 use tower_http::cors::CorsLayer;
 
-use crate::config::Config;
+use crate::config::{Config, ModelCosts};
 use engine::RealtimeEngine;
 use handlers::AppState;
 
@@ -34,7 +34,7 @@ pub async fn start_server(
     let mut model_names: Vec<String> = Vec::new();
 
     for config in configs {
-        let model_name = config.model.name.clone();
+        let model_name = config.model.name().to_string();
 
         // Create engine channel
         let (engine_tx, engine_rx) = mpsc::channel::<types::EngineRequest>(256);

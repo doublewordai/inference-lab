@@ -15,7 +15,7 @@ pub mod serve;
 
 // Re-export key types
 pub use compute::ComputeEngine;
-pub use config::Config;
+pub use config::{Config, ModelConfig, ModelCosts};
 pub use dataset::{
     BatchTokenizerFn, DatasetEntry, DatasetLoader, Message, PromptInput, TokenizerFn,
 };

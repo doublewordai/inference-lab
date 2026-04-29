@@ -1,5 +1,5 @@
 use super::status::RequestStatus;
-use crate::config::ModelConfig;
+use crate::config::{ModelConfig, ModelCosts};
 
 pub type BlockId = u32;
 
@@ -164,7 +164,7 @@ impl Request {
 
     /// Calculate KV cache requirement for this request
     pub fn kv_cache_size(&self, model: &ModelConfig) -> u64 {
-        model.kv_cache_size_for_sequence(self.num_tokens)
+        model.kv_storage_bytes(self.num_tokens)
     }
 
     /// Record that tokens were generated (update output token count and total)

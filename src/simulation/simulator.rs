@@ -1,5 +1,5 @@
 use crate::compute::ComputeEngine;
-use crate::config::Config;
+use crate::config::{Config, ModelCosts};
 use crate::dataset::{BatchTokenizerFn, DatasetLoader};
 use crate::kv_cache::KVCacheManager;
 use crate::metrics::{LatencySampleTriplet, MetricsCollector};
@@ -71,7 +71,7 @@ impl Simulator {
         let kv_cache_manager = KVCacheManager::new(
             config.hardware.kv_cache_capacity,
             config.scheduler.block_size,
-            config.model.kv_cache_bytes_per_token,
+            config.model.kv_storage_bytes(1),
             true, // enable_prefix_caching
         )
         .with_tiers(&config.hardware.kv_tiers);

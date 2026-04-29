@@ -6,7 +6,7 @@
 //! (the example doesn't need the CLI feature)
 
 use inference_lab::compute::ComputeEngine;
-use inference_lab::config::{HardwareConfig, ModelConfig};
+use inference_lab::config::{DenseModel, HardwareConfig, ModelConfig};
 use inference_lab::request::Request;
 
 fn main() {
@@ -19,9 +19,10 @@ fn main() {
         kv_cache_capacity: 0,
         gpu_memory_utilization: 0.9,
         bytes_per_param: 1,
+        kv_tiers: Vec::new(),
     };
 
-    let mut model = ModelConfig {
+    let model = ModelConfig::Dense(DenseModel {
         name: "Llama-3-70B".into(),
         num_parameters: 70_000_000_000,
         num_active_parameters: None,
@@ -30,11 +31,8 @@ fn main() {
         num_heads: 64,
         num_kv_heads: Some(8),
         max_seq_len: 8192,
-        sliding_window: None,
-        num_sliding_layers: None,
-        kv_cache_bytes_per_token: 0,
-    };
-    model.compute_kv_cache_size(hardware.bytes_per_param);
+        bytes_per_param: Some(1),
+    });
 
     let block_size: u32 = 16;
     let shared_prefix_tokens: u32 = 2048; // shared system prompt

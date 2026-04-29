@@ -1,5 +1,5 @@
 use clap::Parser;
-use inference_lab::{BatchTokenizerFn, Config, Message, PromptInput, Simulator};
+use inference_lab::{BatchTokenizerFn, Config, Message, ModelCosts, PromptInput, Simulator};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -393,7 +393,7 @@ fn run_sim(args: SimArgs) {
             println!("Configuration:");
         }
         println!("  Hardware: {}", config.hardware.name);
-        println!("  Model: {}", config.model.name);
+        println!("  Model: {}", config.model.name());
         println!(
             "  Max batched tokens: {}",
             config.scheduler.max_num_batched_tokens
