@@ -10,6 +10,7 @@ memory_capacity = 85899345920   # 80 GB HBM3
 bytes_per_param = 1             # FP8
 
 [model]
+type = "dense"
 name = "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8"
 num_parameters = 30500000000
 num_active_parameters = 3340000000

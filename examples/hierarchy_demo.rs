@@ -7,7 +7,7 @@
 //!
 //! Run with: `cargo run --example hierarchy_demo --no-default-features`
 
-use inference_lab::config::{HardwareConfig, KVTier, ModelConfig, SchedulerConfig};
+use inference_lab::config::{DenseModel, HardwareConfig, KVTier, ModelConfig, ModelCosts, SchedulerConfig};
 use inference_lab::kv_cache::KVCacheManager;
 use inference_lab::request::Request;
 use inference_lab::scheduler::Scheduler;
@@ -31,7 +31,7 @@ fn run_for_batch(num_concurrent: usize, share_prefix: bool) -> Vec<f64> {
             bandwidth_to_hbm: 1e9,
         }],
     };
-    let mut model = ModelConfig {
+    let model = ModelConfig::Dense(DenseModel {
         name: "demo".into(),
         num_parameters: 7_000_000_000,
         num_active_parameters: None,
@@ -40,11 +40,8 @@ fn run_for_batch(num_concurrent: usize, share_prefix: bool) -> Vec<f64> {
         num_heads: 32,
         num_kv_heads: None,
         max_seq_len: 8192,
-        sliding_window: None,
-        num_sliding_layers: None,
-        kv_cache_bytes_per_token: 0,
-    };
-    model.compute_kv_cache_size(hardware.bytes_per_param);
+        bytes_per_param: Some(hardware.bytes_per_param),
+    });
     let scheduler_cfg = SchedulerConfig {
         max_num_batched_tokens: 8192,
         max_num_seqs: 256,
@@ -64,7 +61,7 @@ fn run_for_batch(num_concurrent: usize, share_prefix: bool) -> Vec<f64> {
     let kv_cache_manager = KVCacheManager::new(
         config_hardware.kv_cache_capacity,
         block_size,
-        config_model.kv_cache_bytes_per_token,
+        config_model.kv_storage_bytes(1),
         true,
     )
     .with_tiers(&config_hardware.kv_tiers);

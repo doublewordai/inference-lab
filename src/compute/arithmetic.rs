@@ -1,48 +1,38 @@
-/// Core inference arithmetic formulas based on the inference-arithmetic.mdx blog post
-use crate::config::{HardwareConfig, ModelConfig};
+/// Core inference arithmetic. All architecture-specific behaviour is hidden
+/// behind `ModelCosts`; this module just composes those costs across batches.
+use crate::config::{HardwareConfig, ModelConfig, ModelCosts};
 
-/// Calculate FLOPS for a given number of tokens
-/// Formula: FLOPS = 2 * num_tokens * active_parameters + attention_flops
-/// For MoE models, uses active_parameters (not total) since only some experts are activated
-/// Includes both matmul and attention FLOPs
+/// Total FLOPs for processing a batch — matmul share scales with total tokens
+/// processed, attention share is per-request because it depends on each
+/// request's attended-token count.
 pub fn flops_for_tokens(
     total_tokens: u32,
     model: &ModelConfig,
     requests: &[&crate::request::Request],
     tokens_per_request: &[u32],
 ) -> f64 {
-    // MatMul FLOPs: 2 * num_tokens * active_parameters
-    // For MoE: only counts activated expert parameters, not all experts
-    let matmul_flops = 2.0 * total_tokens as f64 * model.active_parameters() as f64;
+    let matmul_flops = total_tokens as f64 * model.matmul_flops_per_token() as f64;
 
-    // Attention FLOPs: 4 * L * B * S * T * D
-    // where L = num_layers, B = batch size, S = new tokens, T = attended tokens, D = hidden_dim
     let mut attention_flops = 0.0;
     for (req, &num_new_tokens) in requests.iter().zip(tokens_per_request) {
-        let batch_size = 1.0; // Each request is one sequence
-        let s = num_new_tokens as f64; // New tokens being processed
-        let t = (req.num_computed_tokens + num_new_tokens) as f64; // Total attended tokens
-        let d = model.hidden_dim as f64;
-        let l = model.num_layers as f64;
-
-        // 4LBSTD FLOPs for attention across all layers
-        // Note: Causal masking zeros out some values, but the matmul still computes them
-        attention_flops += 4.0 * l * batch_size * s * t * d;
+        let attended = req.num_computed_tokens + num_new_tokens;
+        attention_flops += model.attention_flops(num_new_tokens, attended) as f64;
     }
 
     matmul_flops + attention_flops
 }
 
-/// Calculate memory transfer bytes for model weights
-/// Formula: weight_bytes = num_parameters * bytes_per_param
-pub fn model_weight_bytes(model: &ModelConfig, hardware: &HardwareConfig) -> f64 {
-    model.num_parameters as f64 * hardware.bytes_per_param as f64
+/// Bytes transferred for model weights in one forward pass. For MoE this is
+/// active params * effective bytes/param; for dense it's all of them. The
+/// `_hardware` argument is kept for API symmetry — bytes-per-param now lives
+/// on the model.
+pub fn model_weight_bytes(model: &ModelConfig, _hardware: &HardwareConfig) -> f64 {
+    model.weight_transfer_bytes_per_step() as f64
 }
 
-/// Calculate memory transfer bytes for KV cache for a given sequence length
-/// Formula: kv_bytes = kv_cache_bytes_per_token * seq_len
+/// Bytes of KV cache read per decode step for a sequence of `seq_len` tokens.
 pub fn kv_cache_bytes(seq_len: u32, model: &ModelConfig) -> f64 {
-    model.kv_cache_bytes_per_token as f64 * seq_len as f64
+    model.kv_bytes_read_per_decode_step(seq_len) as f64
 }
 
 /// Number of leading prompt blocks shared by every request in the batch.
@@ -120,21 +110,17 @@ mod tests {
 
     #[test]
     fn test_kv_cache_bytes() {
-        let mut config = Config::test_default();
-        config.model.kv_cache_bytes_per_token = 524_288; // 512KB per token
-
+        // Default test config: 32 layers * 32 kv_heads * 128 head_dim * 2 bytes * 2 (K+V)
+        // = 524,288 bytes per token.
+        let config = Config::test_default();
         let bytes = kv_cache_bytes(100, &config.model);
-
-        // 524_288 * 100 = 52,428,800
         assert_eq!(bytes, 52_428_800.0);
     }
 
     #[test]
     fn test_total_memory_transfer() {
-        let mut config = Config::test_default();
-        config.model.kv_cache_bytes_per_token = 524_288;
+        let config = Config::test_default();
 
-        // 3 requests with sequence lengths 50, 100, 150
         let seq_lens = vec![50, 100, 150];
         let total = total_memory_transfer(&config.model, &config.hardware, &seq_lens);
 

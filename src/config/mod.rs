@@ -5,7 +5,7 @@ pub mod simulation;
 pub mod workload;
 
 pub use hardware::{HardwareConfig, KVTier};
-pub use model::ModelConfig;
+pub use model::{DenseModel, DeepseekV4Model, ModelConfig, ModelCosts, SlidingWindowModel};
 pub use scheduler::SchedulerConfig;
 pub use simulation::SimulationConfig;
 pub use workload::{LengthDistribution, WorkloadConfig};
@@ -30,21 +30,18 @@ impl Config {
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error>> {
         let contents = fs::read_to_string(path)?;
         let mut config: Config = toml::from_str(&contents)?;
-
-        // Compute derived fields
-        config
-            .model
-            .compute_kv_cache_size(config.hardware.bytes_per_param);
-
-        // Compute KV cache capacity if not explicitly set
-        let model_size_bytes = config.model.num_parameters * config.hardware.bytes_per_param as u64;
-        config.hardware.compute_kv_cache_capacity(model_size_bytes);
-
-        config
-            .scheduler
-            .set_default_prefill_threshold(config.model.max_seq_len);
-
+        config.finalize();
         Ok(config)
+    }
+
+    /// Fill in derived fields after deserialization. Public so wasm.rs can
+    /// call it after `serde_json::from_str`.
+    pub fn finalize(&mut self) {
+        self.model.finalize(&self.hardware);
+        let model_size_bytes = self.model.weight_residency_bytes();
+        self.hardware.compute_kv_cache_capacity(model_size_bytes);
+        self.scheduler
+            .set_default_prefill_threshold(self.model.max_seq_len());
     }
 
     /// Get a default configuration for testing
@@ -61,7 +58,7 @@ impl Config {
             kv_tiers: Vec::new(),
         };
 
-        let mut model = ModelConfig {
+        let model = ModelConfig::Dense(DenseModel {
             name: "Test Model".to_string(),
             num_parameters: 7_000_000_000,
             num_active_parameters: None,
@@ -70,11 +67,8 @@ impl Config {
             num_heads: 32,
             num_kv_heads: None,
             max_seq_len: 2048,
-            sliding_window: None,
-            num_sliding_layers: None,
-            kv_cache_bytes_per_token: 0,
-        };
-        model.compute_kv_cache_size(hardware.bytes_per_param);
+            bytes_per_param: Some(2),
+        });
 
         let mut scheduler = SchedulerConfig {
             max_num_batched_tokens: 2048,
@@ -87,7 +81,7 @@ impl Config {
             enable_preemption_free: false,
             enable_cascade_attention: false,
         };
-        scheduler.set_default_prefill_threshold(model.max_seq_len);
+        scheduler.set_default_prefill_threshold(model.max_seq_len());
 
         let workload = WorkloadConfig {
             dataset_path: None,
@@ -99,6 +93,7 @@ impl Config {
             num_requests: Some(10),
             duration_secs: None,
             seed: 42,
+            closed_loop_jitter_secs: None,
         };
 
         let simulation = SimulationConfig::default();
@@ -118,8 +113,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_model_kv_cache_calculation() {
-        let mut model = ModelConfig {
+    fn test_dense_kv_storage_matches_formula() {
+        let model = ModelConfig::Dense(DenseModel {
             name: "Test".to_string(),
             num_parameters: 7_000_000_000,
             num_active_parameters: None,
@@ -128,29 +123,24 @@ mod tests {
             num_heads: 32,
             num_kv_heads: None,
             max_seq_len: 2048,
-            sliding_window: None,
-            num_sliding_layers: None,
-            kv_cache_bytes_per_token: 0,
-        };
-        model.compute_kv_cache_size(2); // bf16
+            bytes_per_param: Some(2),
+        });
 
-        // 2 (K+V) * 4096 (hidden) * 2 (bytes) * 32 (layers) = 524,288 bytes per token
-        assert_eq!(model.kv_cache_bytes_per_token, 524_288);
-
-        // For a 100-token sequence
-        let size = model.kv_cache_size_for_sequence(100);
-        assert_eq!(size, 52_428_800); // 524,288 * 100
+        // 2 (K+V) * 4096 (hidden) * 2 (bytes) * 32 (layers) = 524,288 per token.
+        // For seq_len=100: 52,428,800.
+        assert_eq!(model.kv_storage_bytes(100), 52_428_800);
+        assert_eq!(model.kv_bytes_read_per_decode_step(100), 52_428_800);
     }
 
     #[test]
     fn test_config_creation() {
         let config = Config::test_default();
-        assert!(config.model.kv_cache_bytes_per_token > 0);
+        assert!(config.model.kv_storage_bytes(1) > 0);
     }
 
     #[test]
-    fn test_sliding_window_kv_cache_uses_byte_units() {
-        let mut model = ModelConfig {
+    fn test_sliding_window_kv_cache_caps_at_window() {
+        let model = ModelConfig::Sliding(SlidingWindowModel {
             name: "Sliding".to_string(),
             num_parameters: 7_000_000_000,
             num_active_parameters: None,
@@ -159,13 +149,15 @@ mod tests {
             num_heads: 4,
             num_kv_heads: Some(2),
             max_seq_len: 2048,
-            sliding_window: Some(8),
-            num_sliding_layers: Some(2),
-            kv_cache_bytes_per_token: 0,
-        };
-        model.compute_kv_cache_size(2);
+            sliding_window: 8,
+            num_sliding_layers: 2,
+            bytes_per_param: Some(2),
+        });
 
-        let size = model.kv_cache_size_for_sequence(10);
-        assert_eq!(size, 1_152);
+        // per layer: 2 * 2 * 4 * 2 = 32 bytes/token.
+        // 2 full layers @ seq_len=10: 32 * 2 * 10 = 640
+        // 2 sliding layers @ min(10,8)=8: 32 * 2 * 8 = 512
+        // total 1,152
+        assert_eq!(model.kv_storage_bytes(10), 1_152);
     }
 }

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use tokio::sync::mpsc;
 
 use crate::compute::ComputeEngine;
-use crate::config::Config;
+use crate::config::{Config, ModelCosts};
 use crate::kv_cache::KVCacheManager;
 use crate::request::Request;
 use crate::scheduler::Scheduler;
@@ -36,7 +36,7 @@ impl RealtimeEngine {
         let kv_cache_manager = KVCacheManager::new(
             config.hardware.kv_cache_capacity,
             config.scheduler.block_size,
-            config.model.kv_cache_bytes_per_token,
+            config.model.kv_storage_bytes(1),
             false, // no prefix caching for serve mode
         )
         .with_tiers(&config.hardware.kv_tiers);

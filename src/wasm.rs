@@ -36,19 +36,7 @@ pub fn run_simulation(config_json: &str) -> Result<JsValue, JsValue> {
 
     let mut config: crate::Config = serde_json::from_str(config_json)
         .map_err(|e| JsValue::from_str(&format!("Config parse error: {}", e)))?;
-
-    // Compute derived fields (same as from_file)
-    config
-        .model
-        .compute_kv_cache_size(config.hardware.bytes_per_param);
-
-    // Compute KV cache capacity if not explicitly set
-    let model_size_bytes = config.model.num_parameters * config.hardware.bytes_per_param as u64;
-    config.hardware.compute_kv_cache_capacity(model_size_bytes);
-
-    config
-        .scheduler
-        .set_default_prefill_threshold(config.model.max_seq_len);
+    config.finalize();
 
     let mut simulator = crate::Simulator::new(config)
         .map_err(|e| JsValue::from_str(&format!("Simulator error: {}", e)))?;
@@ -141,19 +129,7 @@ pub fn run_simulation_streaming(
 
     let mut config: crate::Config = serde_json::from_str(config_json)
         .map_err(|e| JsValue::from_str(&format!("Config parse error: {}", e)))?;
-
-    // Compute derived fields (same as from_file)
-    config
-        .model
-        .compute_kv_cache_size(config.hardware.bytes_per_param);
-
-    // Compute KV cache capacity if not explicitly set
-    let model_size_bytes = config.model.num_parameters * config.hardware.bytes_per_param as u64;
-    config.hardware.compute_kv_cache_capacity(model_size_bytes);
-
-    config
-        .scheduler
-        .set_default_prefill_threshold(config.model.max_seq_len);
+    config.finalize();
 
     let mut simulator = crate::Simulator::new(config)
         .map_err(|e| JsValue::from_str(&format!("Simulator error: {}", e)))?;

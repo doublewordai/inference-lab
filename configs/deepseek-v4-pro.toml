@@ -1,0 +1,50 @@
+# DeepSeek-V4-Pro
+# 1.6T-param MoE with 49B active, MLA, hybrid sparse + sliding-window attention,
+# mixed FP4/FP8 weights. Deployed on 8x B200 (TP=8).
+
+[hardware]
+name = "8xB200"
+compute_flops = 80.0e15          # 10 PFLOPS FP8 per B200, x8 for TP=8
+memory_bandwidth = 64.0e12       # 8 TB/s per B200, x8
+memory_capacity = 1649267441664  # 192 GB per B200, x8 = 1.5 TB
+bytes_per_param = 1              # default; DeepseekV4 has its own mixed-precision fields
+
+[model]
+type = "deepseek_v4"
+name = "DeepSeek-V4-Pro"
+num_parameters = 1600000000000           # total resident
+num_active_parameters = 49000000000      # active per token
+num_layers = 61
+hidden_dim = 7168
+num_heads = 128
+max_seq_len = 1048576                    # 1M context
+kv_latent_dim = 512                      # MLA shared latent
+kv_bytes_per_value = 1                   # FP8 KV
+effective_bytes_per_active_param = 0.625 # weighted FP4/FP8 over active params
+effective_bytes_per_resident_param = 0.625
+attention_topk = 2048                    # sparse top-k cap on non-sliding layers
+sliding_window = 4096
+num_sliding_layers = 30                  # ~half of 61
+
+[scheduler]
+max_num_batched_tokens = 16384
+max_num_seqs = 256
+policy = "fcfs"
+enable_chunked_prefill = true
+block_size = 64
+
+[workload]
+arrival_pattern = "poisson"
+arrival_rate = 2.0
+num_requests = 200
+seed = 42
+
+[workload.input_len_dist]
+type = "lognormal"
+mean = 8.0
+std_dev = 1.0
+
+[workload.output_len_dist]
+type = "lognormal"
+mean = 6.5
+std_dev = 0.9

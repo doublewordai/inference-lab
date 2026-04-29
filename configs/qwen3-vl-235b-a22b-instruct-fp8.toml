@@ -11,6 +11,7 @@ memory_capacity = 412316860416  # 192 GB per B200, x2 = 384 GB
 bytes_per_param = 1             # FP8
 
 [model]
+type = "dense"
 name = "Qwen/Qwen3-VL-235B-A22B-Instruct-FP8"
 num_parameters = 235000000000
 num_active_parameters = 22000000000

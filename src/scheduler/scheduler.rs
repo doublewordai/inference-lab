@@ -586,14 +586,14 @@ impl Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::config::{Config, ModelCosts};
 
     fn create_test_scheduler() -> Scheduler {
         let config = Config::test_default();
         let kv_cache = KVCacheManager::new(
             config.hardware.kv_cache_capacity,
             config.scheduler.block_size,
-            config.model.kv_cache_bytes_per_token,
+            config.model.kv_storage_bytes(1),
             false,
         );
         Scheduler::new(config.scheduler, config.hardware, config.model, kv_cache).unwrap()
@@ -627,7 +627,7 @@ mod tests {
         let kv_cache = KVCacheManager::new(
             config.hardware.kv_cache_capacity,
             block_size,
-            config.model.kv_cache_bytes_per_token,
+            config.model.kv_storage_bytes(1),
             true,
         )
         .with_tiers(&[KVTier {
@@ -690,16 +690,16 @@ mod tests {
         let config = Config::test_default();
         let block_size = config.scheduler.block_size;
         // Constrained HBM so a model that didn't share blocks would fail.
-        let small_hbm = 2 * 16 * (config.model.kv_cache_bytes_per_token as u64);
+        let small_hbm = 2 * 16 * (config.model.kv_storage_bytes(1) as u64);
         let kv_cache = KVCacheManager::new(
             small_hbm,
             block_size,
-            config.model.kv_cache_bytes_per_token,
+            config.model.kv_storage_bytes(1),
             true,
         )
         .with_tiers(&[KVTier {
             name: "host_ram".into(),
-            capacity_bytes: 16 * 16 * config.model.kv_cache_bytes_per_token,
+            capacity_bytes: 16 * 16 * config.model.kv_storage_bytes(1),
             bandwidth_to_hbm: 1e9,
         }]);
         let mut scheduler =
@@ -814,7 +814,7 @@ mod tests {
         let kv_cache = KVCacheManager::new(
             config.hardware.kv_cache_capacity,
             config.scheduler.block_size,
-            config.model.kv_cache_bytes_per_token,
+            config.model.kv_storage_bytes(1),
             false,
         );
         Scheduler::new(config.scheduler, config.hardware, config.model, kv_cache).unwrap()
@@ -1018,7 +1018,7 @@ mod tests {
         let kv_cache = KVCacheManager::new(
             config.hardware.kv_cache_capacity,
             config.scheduler.block_size,
-            config.model.kv_cache_bytes_per_token,
+            config.model.kv_storage_bytes(1),
             false,
         );
         Scheduler::new(config.scheduler, config.hardware, config.model, kv_cache).unwrap()
@@ -1033,7 +1033,7 @@ mod tests {
         let kv_cache = KVCacheManager::new(
             config.hardware.kv_cache_capacity,
             config.scheduler.block_size,
-            config.model.kv_cache_bytes_per_token,
+            config.model.kv_storage_bytes(1),
             false,
         );
         let mut scheduler =
