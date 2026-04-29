@@ -7,6 +7,11 @@ pub struct StreamingQuantiles {
     positions: [f64; 11],         // Marker positions (count-based)
     desired_positions: [f64; 11], // Desired positions based on quantiles
     count: usize,
+    /// Running sum of all observed samples — used for the true mean.
+    /// (Quantile markers can't approximate the mean of a heavy-tailed
+    /// distribution: averaging the 11 markers is the mean of the quantile
+    /// spread, not of the samples.)
+    sum: f64,
 }
 
 impl Default for StreamingQuantiles {
@@ -22,10 +27,12 @@ impl StreamingQuantiles {
             positions: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0],
             desired_positions: [0.0; 11],
             count: 0,
+            sum: 0.0,
         }
     }
 
     pub fn add(&mut self, value: f64) {
+        self.sum += value;
         if self.count < 11 {
             // Initial phase: collect first 11 samples
             self.markers[self.count] = value;
@@ -182,12 +189,7 @@ impl StreamingQuantiles {
         if self.count == 0 {
             return 0.0;
         }
-        if self.count < 11 {
-            self.markers[..self.count].iter().sum::<f64>() / self.count as f64
-        } else {
-            // Approximate mean from markers
-            self.markers.iter().sum::<f64>() / 11.0
-        }
+        self.sum / self.count as f64
     }
 }
 
