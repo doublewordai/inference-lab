@@ -51,11 +51,11 @@ impl ComputeEngine {
             batch_requests,
             tokens_per_request,
         );
-        let compute_time = flops / self.hardware.compute_flops;
+        let compute_time = flops / self.hardware.aggregate_compute_flops();
 
         // Calculate memory time: bytes transferred / memory bandwidth
         let bytes = self.calculate_bytes_transferred(batch_requests, tokens_per_request);
-        let memory_time = bytes / self.hardware.memory_bandwidth;
+        let memory_time = bytes / self.hardware.aggregate_memory_bandwidth();
 
         // We're limited by whichever takes longer
         compute_time.max(memory_time)
@@ -79,7 +79,7 @@ impl ComputeEngine {
             batch_requests,
             tokens_per_request,
         );
-        let theoretical_time = flops / self.hardware.compute_flops;
+        let theoretical_time = flops / self.hardware.aggregate_compute_flops();
         (theoretical_time / actual_time).min(1.0)
     }
 
@@ -89,7 +89,7 @@ impl ComputeEngine {
             return 0.0;
         }
 
-        let theoretical_time = bytes_transferred / self.hardware.memory_bandwidth;
+        let theoretical_time = bytes_transferred / self.hardware.aggregate_memory_bandwidth();
         (theoretical_time / actual_time).min(1.0)
     }
 
@@ -198,7 +198,7 @@ mod tests {
         let tokens = vec![1000];
 
         let flops = arithmetic::flops_for_tokens(1000, &engine.model, &requests, &tokens);
-        let theoretical_time = flops / engine.hardware.compute_flops;
+        let theoretical_time = flops / engine.hardware.aggregate_compute_flops();
 
         // If actual time equals theoretical, utilization should be 100%
         let util = engine.calculate_flops_utilization(&requests, &tokens, theoretical_time);
@@ -281,7 +281,7 @@ mod tests {
         let engine = create_test_engine();
 
         let bytes = 1e12; // 1 TB
-        let theoretical_time = bytes / engine.hardware.memory_bandwidth;
+        let theoretical_time = bytes / engine.hardware.aggregate_memory_bandwidth();
 
         // If actual time equals theoretical, utilization should be 100%
         let util = engine.calculate_bandwidth_utilization(bytes, theoretical_time);

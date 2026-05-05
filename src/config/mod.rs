@@ -2,12 +2,14 @@ pub mod hardware;
 pub mod model;
 pub mod scheduler;
 pub mod simulation;
+pub mod topology;
 pub mod workload;
 
 pub use hardware::{HardwareConfig, KVTier};
 pub use model::{DenseModel, DeepseekV4Model, ModelConfig, ModelCosts, SlidingWindowModel};
 pub use scheduler::SchedulerConfig;
 pub use simulation::SimulationConfig;
+pub use topology::{ClusterSpec, DisaggTopology, Node};
 pub use workload::{LengthDistribution, WorkloadConfig};
 
 use serde::Deserialize;
@@ -52,6 +54,7 @@ impl Config {
             compute_flops: 1e15,
             memory_bandwidth: 1e12,
             memory_capacity: 80_000_000_000,
+            tp: 1,
             kv_cache_capacity: 60_000_000_000,
             gpu_memory_utilization: 0.9,
             bytes_per_param: 2,

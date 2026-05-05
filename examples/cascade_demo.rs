@@ -16,6 +16,7 @@ fn main() {
         compute_flops: 1.979e15,
         memory_bandwidth: 3.35e12,
         memory_capacity: 85_899_345_920,
+        tp: 1,
         kv_cache_capacity: 0,
         gpu_memory_utilization: 0.9,
         bytes_per_param: 1,

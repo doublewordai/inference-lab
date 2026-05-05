@@ -4,10 +4,11 @@
 # Deployed on 2x B200 (TP=2)
 
 [hardware]
-name = "2xB200"
-compute_flops = 20.0e15         # 10 PFLOPS FP8 per B200 (liquid cooled), x2 for TP=2
-memory_bandwidth = 16.0e12      # 8 TB/s per B200, x2 for TP=2
-memory_capacity = 412316860416  # 192 GB per B200, x2 = 384 GB
+name = "B200"
+compute_flops = 10.0e15         # 10 PFLOPS FP8 per B200 (liquid cooled)
+memory_bandwidth = 8.0e12       # 8 TB/s per B200
+memory_capacity = 206158430208  # 192 GB per B200
+tp = 2
 bytes_per_param = 1             # FP8
 
 [model]
