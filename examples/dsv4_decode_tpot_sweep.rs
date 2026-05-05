@@ -5,17 +5,16 @@
 //! Run with: `cargo run --example dsv4_decode_tpot_sweep --no-default-features`
 
 use inference_lab::config::{
-    ClusterSpec, DeepseekV4Model, HardwareConfig, ModelConfig, SchedulerConfig,
+    ClusterSpec, DeepseekV4Model, HardwareConfig, ModelConfig, ParallelConfig, SchedulerConfig,
 };
 use inference_lab::simulation::predict_decode_tpot;
 
-fn b300_per_gpu(tp: u32) -> HardwareConfig {
+fn b300_per_gpu() -> HardwareConfig {
     HardwareConfig {
         name: "B300".into(),
         compute_flops: 1.5e16,
         memory_bandwidth: 8.0e12,
         memory_capacity: 309_237_645_312,
-        tp,
         kv_cache_capacity: 0,
         gpu_memory_utilization: 0.9,
         bytes_per_param: 1,
@@ -46,12 +45,16 @@ fn dsv4_pro() -> ModelConfig {
         index_n_heads: 64,
         index_head_dim: 128,
         index_kv_bytes_per_value: None,
+        num_experts_per_tok: 6,
+        num_moe_layers: 61,
     })
 }
 
 fn cluster(decode_tp: u32) -> ClusterSpec {
     ClusterSpec {
-        hardware: b300_per_gpu(decode_tp),
+        hardware: b300_per_gpu(),
+        parallel: ParallelConfig { tp: decode_tp, ep: 1 },
+        comms: None,
         num_workers: 1,
         node: 0,
     }

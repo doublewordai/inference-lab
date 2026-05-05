@@ -71,14 +71,14 @@ impl Worker {
         model: ModelConfig,
         scheduler_config: SchedulerConfig,
     ) -> Result<Self, String> {
-        let mut hardware = cluster.hardware.clone();
+        let mut cluster = cluster.clone();
         // The single-cluster KV cache sizing assumes finalize() has run; for
         // the disagg simulator we own the lifecycle, so do it locally.
         let model_size_bytes = model.weight_residency_bytes();
-        hardware.compute_kv_cache_capacity(model_size_bytes);
+        cluster.compute_kv_cache_capacity(model_size_bytes);
 
         let kv_cache_manager = KVCacheManager::new(
-            hardware.kv_cache_capacity,
+            cluster.hardware.kv_cache_capacity,
             scheduler_config.block_size,
             model.kv_storage_bytes(1),
             true,
@@ -86,11 +86,18 @@ impl Worker {
 
         let scheduler = Scheduler::new(
             scheduler_config,
-            hardware.clone(),
+            cluster.hardware.clone(),
             model.clone(),
             kv_cache_manager,
         )?;
-        let compute_engine = ComputeEngine::new(hardware, model);
+        let mut compute_engine = ComputeEngine::new(
+            cluster.hardware.clone(),
+            cluster.parallel.clone(),
+            model,
+        );
+        if let Some(comms) = cluster.comms {
+            compute_engine = compute_engine.with_comms(comms);
+        }
         Ok(Self {
             scheduler,
             compute_engine,
@@ -287,10 +294,17 @@ pub fn predict_decode_tpot(
     batch_size: u32,
     avg_seq_len: u32,
 ) -> f64 {
-    let mut hardware = decode_cluster.hardware.clone();
+    let mut cluster = decode_cluster.clone();
     let model_size_bytes = model.weight_residency_bytes();
-    hardware.compute_kv_cache_capacity(model_size_bytes);
-    let engine = ComputeEngine::new(hardware, model.clone());
+    cluster.compute_kv_cache_capacity(model_size_bytes);
+    let mut engine = ComputeEngine::new(
+        cluster.hardware.clone(),
+        cluster.parallel.clone(),
+        model.clone(),
+    );
+    if let Some(comms) = cluster.comms {
+        engine = engine.with_comms(comms);
+    }
 
     // Construct `batch_size` decode-phase requests. num_computed_tokens is
     // already at num_prompt_tokens so each is fully prefilled and asks for
@@ -421,7 +435,7 @@ pub fn predict_single_request_aggregated(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ClusterSpec, HardwareConfig, Node, SchedulerConfig};
+    use crate::config::{ClusterSpec, HardwareConfig, Node, ParallelConfig, SchedulerConfig};
 
     fn b300_per_gpu() -> HardwareConfig {
         HardwareConfig {
@@ -431,7 +445,6 @@ mod tests {
             compute_flops: 1.5e16,
             memory_bandwidth: 8.0e12,
             memory_capacity: 309_237_645_312, // 288 GB
-            tp: 4,
             kv_cache_capacity: 0,
             gpu_memory_utilization: 0.9,
             bytes_per_param: 1,
@@ -460,6 +473,8 @@ mod tests {
     fn small_topology() -> DisaggTopology {
         let cluster = ClusterSpec {
             hardware: b300_per_gpu(),
+            parallel: ParallelConfig { tp: 4, ep: 1 },
+            comms: None,
             num_workers: 1,
             node: 0,
         };

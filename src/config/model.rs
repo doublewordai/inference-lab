@@ -10,6 +10,20 @@ pub trait ModelCosts {
     fn name(&self) -> &str;
     fn max_seq_len(&self) -> u32;
 
+    /// Residual-stream dimension. Surfaced on the trait because the comms
+    /// model needs it to size collective volumes.
+    fn hidden_dim(&self) -> u32;
+
+    /// Number of transformer layers. Needed by the comms model to count
+    /// per-layer collectives.
+    fn num_layers(&self) -> u32;
+
+    /// Bytes per activation element on the wire. Defaults to 2 (bf16);
+    /// override to 1 when collectives run at FP8.
+    fn activation_bytes(&self) -> u32 {
+        2
+    }
+
     /// Matmul FLOPs for one forward pass over a single token.
     /// For MoE this counts only active expert params.
     fn matmul_flops_per_token(&self) -> u64;
@@ -35,6 +49,32 @@ pub trait ModelCosts {
 
     /// Bytes of resident KV cache for a sequence of `seq_len` tokens.
     fn kv_storage_bytes(&self, seq_len: u32) -> u64;
+
+    /// Activation bytes per token transferred in a single TP all-reduce.
+    /// Default = `hidden_dim × activation_bytes`. The caller multiplies by
+    /// the per-rank ring factor `2(tp-1)/tp` and divides by link bandwidth.
+    fn allreduce_bytes_per_token(&self) -> u64 {
+        self.hidden_dim() as u64 * self.activation_bytes() as u64
+    }
+
+    /// Number of TP all-reduces per forward pass. Default = `2 × num_layers`
+    /// (post-attention + post-MLP per layer).
+    fn num_tp_allreduces_per_pass(&self) -> u32 {
+        2 * self.num_layers()
+    }
+
+    /// Activation bytes per token transferred in one direction of an EP
+    /// all-to-all. Zero for dense / non-MoE models. The caller multiplies by
+    /// the per-rank factor `(ep-1)/ep` and divides by link bandwidth.
+    fn alltoall_bytes_per_token(&self) -> u64 {
+        0
+    }
+
+    /// Number of EP all-to-alls per forward pass (= `2 × num_moe_layers`
+    /// for standard MoE — dispatch and combine). Zero for dense models.
+    fn num_ep_alltoalls_per_pass(&self) -> u32 {
+        0
+    }
 }
 
 /// Tagged-enum dispatch over architectures. The `type` field in TOML/JSON
@@ -116,6 +156,41 @@ impl ModelCosts for ModelConfig {
             Self::DeepseekV4(m) => m.kv_storage_bytes(seq_len),
         }
     }
+    fn hidden_dim(&self) -> u32 {
+        match self {
+            Self::Dense(m) => m.hidden_dim(),
+            Self::Sliding(m) => m.hidden_dim(),
+            Self::DeepseekV4(m) => m.hidden_dim(),
+        }
+    }
+    fn num_layers(&self) -> u32 {
+        match self {
+            Self::Dense(m) => m.num_layers(),
+            Self::Sliding(m) => m.num_layers(),
+            Self::DeepseekV4(m) => m.num_layers(),
+        }
+    }
+    fn activation_bytes(&self) -> u32 {
+        match self {
+            Self::Dense(m) => m.activation_bytes(),
+            Self::Sliding(m) => m.activation_bytes(),
+            Self::DeepseekV4(m) => m.activation_bytes(),
+        }
+    }
+    fn alltoall_bytes_per_token(&self) -> u64 {
+        match self {
+            Self::Dense(m) => m.alltoall_bytes_per_token(),
+            Self::Sliding(m) => m.alltoall_bytes_per_token(),
+            Self::DeepseekV4(m) => m.alltoall_bytes_per_token(),
+        }
+    }
+    fn num_ep_alltoalls_per_pass(&self) -> u32 {
+        match self {
+            Self::Dense(m) => m.num_ep_alltoalls_per_pass(),
+            Self::Sliding(m) => m.num_ep_alltoalls_per_pass(),
+            Self::DeepseekV4(m) => m.num_ep_alltoalls_per_pass(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -171,6 +246,12 @@ impl ModelCosts for DenseModel {
     }
     fn max_seq_len(&self) -> u32 {
         self.max_seq_len
+    }
+    fn hidden_dim(&self) -> u32 {
+        self.hidden_dim
+    }
+    fn num_layers(&self) -> u32 {
+        self.num_layers
     }
     fn matmul_flops_per_token(&self) -> u64 {
         2 * self.active_params()
@@ -248,6 +329,12 @@ impl ModelCosts for SlidingWindowModel {
     }
     fn max_seq_len(&self) -> u32 {
         self.max_seq_len
+    }
+    fn hidden_dim(&self) -> u32 {
+        self.hidden_dim
+    }
+    fn num_layers(&self) -> u32 {
+        self.num_layers
     }
     fn matmul_flops_per_token(&self) -> u64 {
         2 * self.active_params()
@@ -347,6 +434,13 @@ pub struct DeepseekV4Model {
     /// unset.
     #[serde(default)]
     pub index_kv_bytes_per_value: Option<u32>,
+    /// MoE: number of experts each token is routed to. Used by the EP
+    /// all-to-all cost model.
+    pub num_experts_per_tok: u32,
+    /// MoE: number of layers that perform expert-parallel routing. For
+    /// DSv4-Pro this is every layer (the dense compress_ratio=0 layer also
+    /// runs MoE).
+    pub num_moe_layers: u32,
 }
 
 impl DeepseekV4Model {
@@ -385,6 +479,23 @@ impl ModelCosts for DeepseekV4Model {
     }
     fn max_seq_len(&self) -> u32 {
         self.max_seq_len
+    }
+    fn hidden_dim(&self) -> u32 {
+        self.hidden_dim
+    }
+    fn num_layers(&self) -> u32 {
+        self.num_layers
+    }
+    fn alltoall_bytes_per_token(&self) -> u64 {
+        // Each token is dispatched to `num_experts_per_tok` experts; each
+        // dispatch sends one full hidden_dim-wide activation.
+        self.num_experts_per_tok as u64
+            * self.hidden_dim as u64
+            * self.activation_bytes() as u64
+    }
+    fn num_ep_alltoalls_per_pass(&self) -> u32 {
+        // Dispatch + combine per MoE layer.
+        2 * self.num_moe_layers
     }
     fn matmul_flops_per_token(&self) -> u64 {
         2 * self.num_active_parameters

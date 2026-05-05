@@ -11,7 +11,7 @@
 
 use serde::Deserialize;
 
-use super::HardwareConfig;
+use super::{CommsConfig, HardwareConfig, ParallelConfig};
 
 /// A uniform-bandwidth domain. All GPUs in a `Node` see the same all-to-all
 /// bandwidth via `intra_node_link_bw`. NVL72 = one Node with 72 GPUs and an
@@ -27,13 +27,18 @@ pub struct Node {
 }
 
 /// A worker pool: one or more identically-shaped workers running the same
-/// hardware spec. For step 1's conc=1 path each `ClusterSpec` is a single
-/// worker; multi-worker pools land in step 1d when we add the prefill router.
+/// hardware spec and parallelism layout.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ClusterSpec {
-    /// Per-GPU hardware spec for the cluster (FLOPs, BW, capacity, tp).
-    /// `hardware.tp` is the TP group size per worker.
+    /// Per-GPU hardware spec.
     pub hardware: HardwareConfig,
+    /// TP / EP layout across the cluster.
+    #[serde(default)]
+    pub parallel: ParallelConfig,
+    /// Optional collective-comms cost model for this cluster's TP / EP
+    /// fabric. None = no collective term in `ComputeEngine`.
+    #[serde(default)]
+    pub comms: Option<CommsConfig>,
     /// Number of identical workers in this pool. Defaults to 1.
     #[serde(default = "default_num_workers")]
     pub num_workers: u32,
@@ -46,6 +51,35 @@ pub struct ClusterSpec {
 
 fn default_num_workers() -> u32 {
     1
+}
+
+impl ClusterSpec {
+    /// Aggregate compute across the TP group, in FLOPS.
+    pub fn aggregate_compute_flops(&self) -> f64 {
+        self.hardware.compute_flops * self.parallel.tp as f64
+    }
+
+    /// Aggregate memory bandwidth across the TP group, in bytes/sec.
+    pub fn aggregate_memory_bandwidth(&self) -> f64 {
+        self.hardware.memory_bandwidth * self.parallel.tp as f64
+    }
+
+    /// Aggregate memory capacity across the TP group, in bytes.
+    pub fn aggregate_memory_capacity(&self) -> u64 {
+        self.hardware.memory_capacity.saturating_mul(self.parallel.tp as u64)
+    }
+
+    /// Fill in `hardware.kv_cache_capacity` from `aggregate_memory_capacity *
+    /// gpu_memory_utilization - model_size_bytes` if it's still at the
+    /// sentinel 0. Matches vLLM's behaviour: requested_memory minus
+    /// non-KV-cache memory (approximated as just the model weights).
+    pub fn compute_kv_cache_capacity(&mut self, model_size_bytes: u64) {
+        if self.hardware.kv_cache_capacity == 0 {
+            let requested = (self.aggregate_memory_capacity() as f64
+                * self.hardware.gpu_memory_utilization) as u64;
+            self.hardware.kv_cache_capacity = requested.saturating_sub(model_size_bytes);
+        }
+    }
 }
 
 /// A disaggregated topology: prefill and decode pools plus the link they
@@ -87,22 +121,29 @@ name = "B300"
 compute_flops = 1.5e16
 memory_bandwidth = 8.0e12
 memory_capacity = 309237645312
-tp = 4
 bytes_per_param = 1
+
+[prefill.parallel]
+tp = 4
+ep = 1
 
 [decode.hardware]
 name = "B300"
 compute_flops = 1.5e16
 memory_bandwidth = 8.0e12
 memory_capacity = 309237645312
-tp = 4
 bytes_per_param = 1
+
+[decode.parallel]
+tp = 4
+ep = 1
 "#;
         let topo: DisaggTopology = toml::from_str(toml_src).unwrap();
         assert_eq!(topo.nodes.len(), 1);
         assert_eq!(topo.nodes[0].num_gpus, 72);
-        assert_eq!(topo.prefill.hardware.tp, 4);
-        assert_eq!(topo.decode.hardware.tp, 4);
+        assert_eq!(topo.prefill.parallel.tp, 4);
+        assert_eq!(topo.decode.parallel.tp, 4);
+        assert_eq!(topo.prefill.parallel.ep, 1);
         assert_eq!(topo.prefill.num_workers, 1);
         assert_eq!(topo.decode.num_workers, 1);
         assert!(topo.inter_node_link_bw.is_none());

@@ -13,8 +13,8 @@
 //!   `cargo run --example dsv4_disagg_conc1 --no-default-features`
 
 use inference_lab::config::{
-    ClusterSpec, DeepseekV4Model, DisaggTopology, HardwareConfig, ModelConfig, Node,
-    SchedulerConfig,
+    ClusterSpec, CommsConfig, DeepseekV4Model, DisaggTopology, HardwareConfig, ModelConfig, Node,
+    ParallelConfig, SchedulerConfig,
 };
 use inference_lab::simulation::{
     predict_single_request, predict_single_request_aggregated, RequestTiming,
@@ -30,7 +30,6 @@ fn b300_per_gpu() -> HardwareConfig {
         compute_flops: 1.5e16,            // 15 PFLOPS FP4 per GPU
         memory_bandwidth: 8.0e12,         // 8 TB/s per GPU HBM3e
         memory_capacity: 309_237_645_312, // 288 GB per GPU
-        tp: 4,
         kv_cache_capacity: 0,
         gpu_memory_utilization: 0.9,
         bytes_per_param: 1, // overridden by DeepseekV4Model's mixed-precision fields
@@ -61,12 +60,16 @@ fn dsv4_pro() -> ModelConfig {
         index_n_heads: 64,
         index_head_dim: 128,
         index_kv_bytes_per_value: None,
+        num_experts_per_tok: 6,
+        num_moe_layers: 61,
     })
 }
 
 fn topology() -> DisaggTopology {
     let cluster = ClusterSpec {
         hardware: b300_per_gpu(),
+        parallel: ParallelConfig { tp: 4, ep: 1 },
+        comms: Some(nvlink5_comms()),
         num_workers: 1,
         node: 0,
     };
@@ -123,12 +126,23 @@ fn print_breakdown(name: &str, t: &RequestTiming) {
 }
 
 fn aggregated_cluster() -> ClusterSpec {
-    let mut hw = b300_per_gpu();
-    hw.tp = 8;
     ClusterSpec {
-        hardware: hw,
+        hardware: b300_per_gpu(),
+        parallel: ParallelConfig { tp: 8, ep: 1 },
+        comms: Some(nvlink5_comms()),
         num_workers: 1,
         node: 0,
+    }
+}
+
+fn nvlink5_comms() -> CommsConfig {
+    // NVLink5 per-GPU bidirectional bandwidth ~900 GB/s; NCCL launch latency
+    // on NVLink is typically 5–10 μs per call. Numbers are deliberately
+    // round — refine when we have measured calibration.
+    CommsConfig {
+        link_bw: 9.0e11,
+        allreduce_latency: 5.0e-6,
+        alltoall_latency: 8.0e-6,
     }
 }
 

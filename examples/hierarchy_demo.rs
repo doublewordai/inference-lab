@@ -18,7 +18,6 @@ fn run_for_batch(num_concurrent: usize, share_prefix: bool) -> Vec<f64> {
         compute_flops: 1e15,
         memory_bandwidth: 3e12,
         memory_capacity: 80_000_000_000,
-        tp: 1,
         // Modest HBM. With block-ref sharing, batches that all share the
         // same prefix only need one physical copy regardless of N.
         kv_cache_capacity: 2_000_000_000,

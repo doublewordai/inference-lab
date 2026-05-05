@@ -1,23 +1,80 @@
 /// Compute engine for calculating inference timing
 use super::arithmetic;
-use crate::config::{HardwareConfig, ModelConfig};
+use crate::config::{CommsConfig, HardwareConfig, ModelConfig, ModelCosts, ParallelConfig};
 use crate::request::Request;
 
 pub struct ComputeEngine {
     hardware: HardwareConfig,
+    parallel: ParallelConfig,
     model: ModelConfig,
+    comms: Option<CommsConfig>,
     block_size: u32,
     enable_cascade_attention: bool,
 }
 
 impl ComputeEngine {
-    pub fn new(hardware: HardwareConfig, model: ModelConfig) -> Self {
+    pub fn new(hardware: HardwareConfig, parallel: ParallelConfig, model: ModelConfig) -> Self {
         Self {
             hardware,
+            parallel,
             model,
+            comms: None,
             block_size: 0,
             enable_cascade_attention: false,
         }
+    }
+
+    /// Enable the collective-comms time term. Without this, `calculate_iteration_time`
+    /// contributes zero for TP all-reduce / EP all-to-all (the previous default).
+    pub fn with_comms(mut self, comms: CommsConfig) -> Self {
+        self.comms = Some(comms);
+        self
+    }
+
+    fn aggregate_compute_flops(&self) -> f64 {
+        self.hardware.compute_flops * self.parallel.tp as f64
+    }
+
+    fn aggregate_memory_bandwidth(&self) -> f64 {
+        self.hardware.memory_bandwidth * self.parallel.tp as f64
+    }
+
+    /// Estimated time spent in TP all-reduce + EP all-to-all collectives for a
+    /// batch of `total_tokens` tokens. Returns 0 if no `CommsConfig` is set or
+    /// `link_bw` is non-positive. Each collective is modelled as
+    /// `latency + bytes / link_bw`, summed over all calls in a forward pass.
+    /// The result is added to `max(compute_time, memory_time)` — i.e., we
+    /// assume collectives do not overlap with compute/memory work.
+    fn collective_time(&self, total_tokens: u32) -> f64 {
+        let Some(comms) = &self.comms else { return 0.0 };
+        if comms.link_bw <= 0.0 {
+            return 0.0;
+        }
+
+        let tokens = total_tokens as f64;
+        let mut total = 0.0;
+
+        // TP all-reduce: per-rank ring traffic = 2(tp-1)/tp × volume.
+        let tp = self.parallel.tp;
+        if tp > 1 {
+            let ring_factor = 2.0 * (tp - 1) as f64 / tp as f64;
+            let bytes_per_call =
+                ring_factor * tokens * self.model.allreduce_bytes_per_token() as f64;
+            let calls = self.model.num_tp_allreduces_per_pass() as f64;
+            total += calls * (comms.allreduce_latency + bytes_per_call / comms.link_bw);
+        }
+
+        // EP all-to-all: per-rank traffic = (ep-1)/ep × volume.
+        let ep = self.parallel.ep;
+        if ep > 1 {
+            let factor = (ep - 1) as f64 / ep as f64;
+            let bytes_per_call =
+                factor * tokens * self.model.alltoall_bytes_per_token() as f64;
+            let calls = self.model.num_ep_alltoalls_per_pass() as f64;
+            total += calls * (comms.alltoall_latency + bytes_per_call / comms.link_bw);
+        }
+
+        total
     }
 
     /// Enable cascade attention modeling. When a scheduled batch shares a
@@ -51,14 +108,15 @@ impl ComputeEngine {
             batch_requests,
             tokens_per_request,
         );
-        let compute_time = flops / self.hardware.aggregate_compute_flops();
+        let compute_time = flops / self.aggregate_compute_flops();
 
         // Calculate memory time: bytes transferred / memory bandwidth
         let bytes = self.calculate_bytes_transferred(batch_requests, tokens_per_request);
-        let memory_time = bytes / self.hardware.aggregate_memory_bandwidth();
+        let memory_time = bytes / self.aggregate_memory_bandwidth();
 
-        // We're limited by whichever takes longer
-        compute_time.max(memory_time)
+        // Compute and memory overlap; collectives are added on top
+        // (assumed serial with the kernel timeline).
+        compute_time.max(memory_time) + self.collective_time(total_tokens)
     }
 
     /// Calculate FLOPS utilization for this iteration (0.0 to 1.0)
@@ -79,7 +137,7 @@ impl ComputeEngine {
             batch_requests,
             tokens_per_request,
         );
-        let theoretical_time = flops / self.hardware.aggregate_compute_flops();
+        let theoretical_time = flops / self.aggregate_compute_flops();
         (theoretical_time / actual_time).min(1.0)
     }
 
@@ -89,7 +147,7 @@ impl ComputeEngine {
             return 0.0;
         }
 
-        let theoretical_time = bytes_transferred / self.hardware.aggregate_memory_bandwidth();
+        let theoretical_time = bytes_transferred / self.aggregate_memory_bandwidth();
         (theoretical_time / actual_time).min(1.0)
     }
 
@@ -133,7 +191,7 @@ mod tests {
 
     fn create_test_engine() -> ComputeEngine {
         let config = Config::test_default();
-        ComputeEngine::new(config.hardware, config.model)
+        ComputeEngine::new(config.hardware, config.parallel, config.model)
     }
 
     fn create_test_request(id: &str, computed: u32, prompt: u32) -> Request {
@@ -198,7 +256,7 @@ mod tests {
         let tokens = vec![1000];
 
         let flops = arithmetic::flops_for_tokens(1000, &engine.model, &requests, &tokens);
-        let theoretical_time = flops / engine.hardware.aggregate_compute_flops();
+        let theoretical_time = flops / engine.aggregate_compute_flops();
 
         // If actual time equals theoretical, utilization should be 100%
         let util = engine.calculate_flops_utilization(&requests, &tokens, theoretical_time);
@@ -218,8 +276,8 @@ mod tests {
         let config = Config::test_default();
         let block_size = config.scheduler.block_size;
 
-        let plain = ComputeEngine::new(config.hardware.clone(), config.model.clone());
-        let cascade = ComputeEngine::new(config.hardware.clone(), config.model.clone())
+        let plain = ComputeEngine::new(config.hardware.clone(), config.parallel.clone(), config.model.clone());
+        let cascade = ComputeEngine::new(config.hardware.clone(), config.parallel.clone(), config.model.clone())
             .with_cascade_attention(true, block_size);
 
         // Two decode-step requests sharing the first 8 prompt blocks.
@@ -259,8 +317,8 @@ mod tests {
         let config = Config::test_default();
         let block_size = config.scheduler.block_size;
 
-        let plain = ComputeEngine::new(config.hardware.clone(), config.model.clone());
-        let cascade = ComputeEngine::new(config.hardware.clone(), config.model.clone())
+        let plain = ComputeEngine::new(config.hardware.clone(), config.parallel.clone(), config.model.clone());
+        let cascade = ComputeEngine::new(config.hardware.clone(), config.parallel.clone(), config.model.clone())
             .with_cascade_attention(true, block_size);
 
         let mut req_a = create_test_request("a", 200, 200);
@@ -281,7 +339,7 @@ mod tests {
         let engine = create_test_engine();
 
         let bytes = 1e12; // 1 TB
-        let theoretical_time = bytes / engine.hardware.aggregate_memory_bandwidth();
+        let theoretical_time = bytes / engine.aggregate_memory_bandwidth();
 
         // If actual time equals theoretical, utilization should be 100%
         let util = engine.calculate_bandwidth_utilization(bytes, theoretical_time);
