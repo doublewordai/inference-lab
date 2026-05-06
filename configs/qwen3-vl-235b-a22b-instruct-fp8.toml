@@ -5,16 +5,17 @@
 
 [hardware]
 name = "B200"
-compute_flops = 10.0e15         # 10 PFLOPS FP8 per B200 (liquid cooled)
+flops_fp8 = 10.0e15        # 10 PFLOPS FP8 per B200 (liquid cooled)
+flops_bf16 = 5.000e+15    # half FP8 rate
 memory_bandwidth = 8.0e12       # 8 TB/s per B200
 memory_capacity = 206158430208  # 192 GB per B200
-bytes_per_param = 1             # FP8
 
 [parallel]
 tp = 2
 ep = 1
 
 [model]
+precision = "fp8"
 type = "dense"
 name = "Qwen/Qwen3-VL-235B-A22B-Instruct-FP8"
 num_parameters = 235000000000

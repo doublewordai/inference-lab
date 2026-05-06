@@ -6,19 +6,21 @@
 //! (the example doesn't need the CLI feature)
 
 use inference_lab::compute::ComputeEngine;
-use inference_lab::config::{DenseModel, HardwareConfig, ModelConfig, ParallelConfig};
+use inference_lab::config::{DenseModel, HardwareConfig, ModelConfig, ParallelConfig, Precision};
 use inference_lab::request::Request;
 
 fn main() {
-    // H100 FP8, Llama-3-70B (matches examples/quick_test.toml).
+    // H100 FP8, Llama-3-70B.
     let hardware = HardwareConfig {
         name: "H100".into(),
-        compute_flops: 1.979e15,
+        flops_fp4: None,
+        flops_fp8: Some(1.979e15),
+        flops_bf16: Some(0.989e15),
+        flops_fp16: Some(0.989e15),
         memory_bandwidth: 3.35e12,
         memory_capacity: 85_899_345_920,
         kv_cache_capacity: 0,
         gpu_memory_utilization: 0.9,
-        bytes_per_param: 1,
         kv_tiers: Vec::new(),
     };
     let parallel = ParallelConfig::default();
@@ -32,7 +34,7 @@ fn main() {
         num_heads: 64,
         num_kv_heads: Some(8),
         max_seq_len: 8192,
-        bytes_per_param: Some(1),
+        precision: Precision::Fp8,
     });
 
     let block_size: u32 = 16;

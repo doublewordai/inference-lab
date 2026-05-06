@@ -13,13 +13,14 @@
 
 [hardware]
 name = "H100"
-compute_flops = 1.513e15        # 1513 TFLOPS bf16
+flops_bf16 = 1.513e15       # 1513 TFLOPS bf16
 memory_bandwidth = 3.35e12      # 3.35 TB/s
 memory_capacity = 85899345920   # 80 GB
 kv_cache_capacity = 68719476736 # 64 GB
-bytes_per_param = 2             # bf16
 
 [model]
+type = "dense"
+precision = "bf16"
 name = "Qwen3-30B-A3B"
 num_parameters = 30500000000       # ~30.5B total params (all 128 experts)
 num_active_parameters = 3340000000 # ~3.34B active params (8 out of 128 experts)

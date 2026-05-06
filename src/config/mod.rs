@@ -6,7 +6,7 @@ pub mod simulation;
 pub mod topology;
 pub mod workload;
 
-pub use hardware::{HardwareConfig, KVTier};
+pub use hardware::{HardwareConfig, KVTier, Precision};
 pub use model::{DenseModel, DeepseekV4Model, ModelConfig, ModelCosts, SlidingWindowModel};
 pub use parallel::{CommsConfig, ParallelConfig};
 pub use scheduler::SchedulerConfig;
@@ -65,12 +65,14 @@ impl Config {
     pub fn test_default() -> Self {
         let hardware = HardwareConfig {
             name: "Test GPU".to_string(),
-            compute_flops: 1e15,
+            flops_fp4: None,
+            flops_fp8: None,
+            flops_bf16: Some(1e15),
+            flops_fp16: Some(1e15),
             memory_bandwidth: 1e12,
             memory_capacity: 80_000_000_000,
             kv_cache_capacity: 60_000_000_000,
             gpu_memory_utilization: 0.9,
-            bytes_per_param: 2,
             kv_tiers: Vec::new(),
         };
         let parallel = ParallelConfig::default();
@@ -84,7 +86,7 @@ impl Config {
             num_heads: 32,
             num_kv_heads: None,
             max_seq_len: 2048,
-            bytes_per_param: Some(2),
+            precision: crate::config::Precision::Bf16,
         });
 
         let mut scheduler = SchedulerConfig {
@@ -141,7 +143,7 @@ mod tests {
             num_heads: 32,
             num_kv_heads: None,
             max_seq_len: 2048,
-            bytes_per_param: Some(2),
+            precision: crate::config::Precision::Bf16,
         });
 
         // 2 (K+V) * 4096 (hidden) * 2 (bytes) * 32 (layers) = 524,288 per token.
@@ -169,7 +171,7 @@ mod tests {
             max_seq_len: 2048,
             sliding_window: 8,
             num_sliding_layers: 2,
-            bytes_per_param: Some(2),
+            precision: crate::config::Precision::Bf16,
         });
 
         // per layer: 2 * 2 * 4 * 2 = 32 bytes/token.

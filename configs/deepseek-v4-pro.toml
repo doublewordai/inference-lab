@@ -1,13 +1,15 @@
 # DeepSeek-V4-Pro
 # 1.6T-param MoE with 49B active, MLA, hybrid sparse + sliding-window attention,
-# mixed FP4/FP8 weights. Deployed on 8x B200 (TP=8).
+# mixed FP4/FP8 weights. Param split: ~28.2B FP4 expert / ~20.8B FP8 non-expert
+# active, ~1.547T FP4 / ~53B FP8 resident. Deployed on 8x B200 (TP=8).
 
 [hardware]
 name = "B200"
-compute_flops = 10.0e15          # 10 PFLOPS FP8 per B200
-memory_bandwidth = 8.0e12        # 8 TB/s per B200
-memory_capacity = 206158430208   # 192 GB per B200
-bytes_per_param = 1              # default; DeepseekV4 has its own mixed-precision fields
+flops_fp4 = 20.0e15           # FP4 dense Tensor Core peak
+flops_fp8 = 10.0e15           # FP8 dense Tensor Core peak (half of FP4)
+flops_bf16 = 5.0e15
+memory_bandwidth = 8.0e12     # 8 TB/s per B200
+memory_capacity = 206158430208 # 192 GB per B200
 
 [parallel]
 tp = 8
@@ -16,16 +18,23 @@ ep = 1
 [model]
 type = "deepseek_v4"
 name = "DeepSeek-V4-Pro"
-num_parameters = 1600000000000           # total resident
-num_active_parameters = 49000000000      # active per token
 num_layers = 61
 hidden_dim = 7168
 num_heads = 128
 max_seq_len = 1048576                    # 1M context
 kv_latent_dim = 512                      # MLA latent (= upstream head_dim)
-kv_bytes_per_value = 1                   # FP8 KV
-effective_bytes_per_active_param = 0.625 # weighted FP4/FP8 over active params
-effective_bytes_per_resident_param = 0.625
+qk_rope_head_dim = 64                    # un-compressed RoPE'd K dimension
+kv_precision = "fp8"                     # KV cache precision
+# Active-param split per token (from HF config arithmetic):
+#   experts: 7 active × 3 GEMMs × hidden × moe_intermediate × 61 ≈ 28.2B at FP4
+#   non-experts: attention QKVO + indexer + MTP + LM head ≈ 20.8B at FP8
+num_active_expert_params = 28200000000
+num_active_non_expert_params = 20800000000
+# Resident: 385 experts × per-expert × 61 layers + non-expert.
+num_resident_expert_params = 1547000000000
+num_resident_non_expert_params = 53000000000
+expert_precision = "fp4"
+non_expert_precision = "fp8"
 window_size = 128                        # sliding window in every layer
 # Per-layer-class counts (from upstream compress_ratios = [128,128,4,128,...,4,0]).
 num_dense_layers = 1                     # compress_ratio = 0 (final layer)

@@ -2,13 +2,14 @@
 
 [hardware]
 name = "H100"
-compute_flops = 1.513e15        # bf16 TFLOPS
+flops_bf16 = 1.513e15       # bf16 TFLOPS
 memory_bandwidth = 3.35e12      # bytes/sec
 memory_capacity = 85899345920   # 80 GB
 kv_cache_capacity = 68719476736 # 64 GB for KV cache
-bytes_per_param = 2             # bf16 = 2 bytes
 
 [model]
+type = "dense"
+precision = "bf16"
 name = "Llama-3-70B"
 num_parameters = 70000000000
 num_layers = 80
