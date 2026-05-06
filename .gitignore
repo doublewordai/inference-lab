@@ -16,3 +16,6 @@ qwen_chat_template.txt
 
 # mdBook output
 docs/book/
+
+# Personal pareto sweep — kept locally, not tracked
+examples/dsv4_decode_tpot_sweep.rs
