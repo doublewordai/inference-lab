@@ -54,11 +54,6 @@ fn default_num_workers() -> u32 {
 }
 
 impl ClusterSpec {
-    /// Aggregate compute across the TP group, in FLOPS.
-    pub fn aggregate_compute_flops(&self) -> f64 {
-        self.hardware.compute_flops * self.parallel.tp as f64
-    }
-
     /// Aggregate memory bandwidth across the TP group, in bytes/sec.
     pub fn aggregate_memory_bandwidth(&self) -> f64 {
         self.hardware.memory_bandwidth * self.parallel.tp as f64
@@ -118,10 +113,10 @@ intra_node_link_bw = 9.0e11
 
 [prefill.hardware]
 name = "B300"
-compute_flops = 1.5e16
+flops_fp4 = 1.5e16
+flops_fp8 = 7.5e15
 memory_bandwidth = 8.0e12
 memory_capacity = 309237645312
-bytes_per_param = 1
 
 [prefill.parallel]
 tp = 4
@@ -129,10 +124,10 @@ ep = 1
 
 [decode.hardware]
 name = "B300"
-compute_flops = 1.5e16
+flops_fp4 = 1.5e16
+flops_fp8 = 7.5e15
 memory_bandwidth = 8.0e12
 memory_capacity = 309237645312
-bytes_per_param = 1
 
 [decode.parallel]
 tp = 4

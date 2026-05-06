@@ -4,12 +4,13 @@
 
 [hardware]
 name = "H100"
-compute_flops = 1.979e15        # H100 SXM5 FP8 dense tensor core TFLOPS
+flops_fp8 = 1.979e15        # H100 SXM5 FP8 dense tensor core TFLOPS
+flops_bf16 = 9.895e+14    # half FP8 rate
 memory_bandwidth = 3.35e12      # 3.35 TB/s
 memory_capacity = 85899345920   # 80 GB HBM3
-bytes_per_param = 1             # FP8
 
 [model]
+precision = "fp8"
 type = "dense"
 name = "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8"
 num_parameters = 30500000000

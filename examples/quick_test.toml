@@ -3,13 +3,15 @@
 
 [hardware]
 name = "H100"
-compute_flops = 1.979e15       # 1979 TFLOPS FP8
+flops_fp8 = 1.979e15        # 1979 TFLOPS FP8
+flops_bf16 = 9.895e+14    # half FP8 rate
 memory_bandwidth = 3.35e12     # 3.35 TB/s
 memory_capacity = 85899345920  # 80 GB
 gpu_memory_utilization = 0.9
-bytes_per_param = 1            # FP8
 
 [model]
+type = "dense"
+precision = "fp8"
 name = "Llama-3-70B"
 num_parameters = 70000000000
 num_layers = 80

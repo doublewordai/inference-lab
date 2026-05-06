@@ -7,7 +7,9 @@
 //!
 //! Run with: `cargo run --example hierarchy_demo --no-default-features`
 
-use inference_lab::config::{DenseModel, HardwareConfig, KVTier, ModelConfig, ModelCosts, SchedulerConfig};
+use inference_lab::config::{
+    DenseModel, HardwareConfig, KVTier, ModelConfig, ModelCosts, Precision, SchedulerConfig,
+};
 use inference_lab::kv_cache::KVCacheManager;
 use inference_lab::request::Request;
 use inference_lab::scheduler::Scheduler;
@@ -15,14 +17,16 @@ use inference_lab::scheduler::Scheduler;
 fn run_for_batch(num_concurrent: usize, share_prefix: bool) -> Vec<f64> {
     let hardware = HardwareConfig {
         name: "demo".into(),
-        compute_flops: 1e15,
+        flops_fp4: None,
+        flops_fp8: None,
+        flops_bf16: Some(1e15),
+        flops_fp16: Some(1e15),
         memory_bandwidth: 3e12,
         memory_capacity: 80_000_000_000,
         // Modest HBM. With block-ref sharing, batches that all share the
         // same prefix only need one physical copy regardless of N.
         kv_cache_capacity: 2_000_000_000,
         gpu_memory_utilization: 0.9,
-        bytes_per_param: 2,
         // Single host-RAM tier, plenty of capacity, 1 GB/s PCIe so wait
         // time is observable.
         kv_tiers: vec![KVTier {
@@ -40,7 +44,7 @@ fn run_for_batch(num_concurrent: usize, share_prefix: bool) -> Vec<f64> {
         num_heads: 32,
         num_kv_heads: None,
         max_seq_len: 8192,
-        bytes_per_param: Some(hardware.bytes_per_param),
+        precision: Precision::Bf16,
     });
     let scheduler_cfg = SchedulerConfig {
         max_num_batched_tokens: 8192,
