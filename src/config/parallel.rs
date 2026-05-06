@@ -17,11 +17,19 @@ pub struct ParallelConfig {
     /// replicated across the TP group rather than sharded).
     #[serde(default = "default_dim")]
     pub ep: u32,
+    /// DP-attention layout (sglang's `--enable-dp-attention`). When true, the
+    /// `tp` ranks run attention in data-parallel mode — each rank holds full
+    /// attention weights and a 1/tp shard of sequences, so there is no TP
+    /// all-reduce in the per-layer hot path. The `tp` value is then really a
+    /// world-size knob, not a tensor-parallel group. EP collectives are
+    /// unaffected. Defaults to false (classic TP).
+    #[serde(default)]
+    pub dp_attention: bool,
 }
 
 impl Default for ParallelConfig {
     fn default() -> Self {
-        Self { tp: 1, ep: 1 }
+        Self { tp: 1, ep: 1, dp_attention: false }
     }
 }
 

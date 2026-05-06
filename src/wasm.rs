@@ -38,7 +38,7 @@ pub fn run_simulation(config_json: &str) -> Result<JsValue, JsValue> {
         .map_err(|e| JsValue::from_str(&format!("Config parse error: {}", e)))?;
     config.finalize();
 
-    let mut simulator = crate::Simulator::new(config)
+    let (mut simulator, _) = crate::simulation::Simulator::new(config, None)
         .map_err(|e| JsValue::from_str(&format!("Simulator error: {}", e)))?;
 
     // Run simulation with no-op callback
@@ -131,7 +131,7 @@ pub fn run_simulation_streaming(
         .map_err(|e| JsValue::from_str(&format!("Config parse error: {}", e)))?;
     config.finalize();
 
-    let mut simulator = crate::Simulator::new(config)
+    let (mut simulator, _) = crate::simulation::Simulator::new(config, None)
         .map_err(|e| JsValue::from_str(&format!("Simulator error: {}", e)))?;
 
     // Run simulation with progress callback

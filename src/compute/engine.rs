@@ -55,8 +55,10 @@ impl ComputeEngine {
         let mut total = 0.0;
 
         // TP all-reduce: per-rank ring traffic = 2(tp-1)/tp × volume.
+        // Skipped under DP-attention — each rank owns its sequence shard and
+        // needs no per-layer allreduce.
         let tp = self.parallel.tp;
-        if tp > 1 {
+        if tp > 1 && !self.parallel.dp_attention {
             let ring_factor = 2.0 * (tp - 1) as f64 / tp as f64;
             let bytes_per_call =
                 ring_factor * tokens * self.model.allreduce_bytes_per_token() as f64;
@@ -64,10 +66,13 @@ impl ComputeEngine {
             total += calls * (comms.allreduce_latency + bytes_per_call / comms.link_bw);
         }
 
-        // EP all-to-all: per-rank traffic = (ep-1)/ep × volume.
+        // EP all-to-all: per-rank send = (ep-1)/ep × per-rank-data, where
+        // per-rank-data = V_global / ep (tokens distributed across ranks).
+        // So per-rank send = (ep-1)/ep² × V_global. Without the extra /ep we'd
+        // be charging the global cross-rank volume at the per-rank link rate.
         let ep = self.parallel.ep;
         if ep > 1 {
-            let factor = (ep - 1) as f64 / ep as f64;
+            let factor = (ep - 1) as f64 / (ep as f64 * ep as f64);
             let bytes_per_call =
                 factor * tokens * self.model.alltoall_bytes_per_token() as f64;
             let calls = self.model.num_ep_alltoalls_per_pass() as f64;

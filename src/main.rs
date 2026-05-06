@@ -1,5 +1,7 @@
 use clap::Parser;
-use inference_lab::{BatchTokenizerFn, Config, Message, ModelCosts, PromptInput, Simulator};
+use inference_lab::config::{Config, ModelCosts};
+use inference_lab::dataset::{BatchTokenizerFn, Message, PromptInput};
+use inference_lab::simulation::Simulator;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -377,7 +379,7 @@ fn run_sim(args: SimArgs) {
     let tokenizer = None;
 
     // Create simulator (returns updated config with counted dataset entries if applicable)
-    let (mut simulator, config) = match Simulator::new_with_tokenizer(config, tokenizer) {
+    let (mut simulator, config) = match Simulator::new(config, tokenizer) {
         Ok((sim, cfg)) => (sim, cfg),
         Err(e) => {
             eprintln!("Error creating simulator: {}", e);
