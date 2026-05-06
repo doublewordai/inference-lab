@@ -36,10 +36,11 @@ num_resident_non_expert_params = 53000000000
 expert_precision = "fp4"
 non_expert_precision = "fp8"
 window_size = 128                        # sliding window in every layer
-# Per-layer-class counts (from upstream compress_ratios = [128,128,4,128,...,4,0]).
-num_dense_layers = 1                     # compress_ratio = 0 (final layer)
+# Per-layer-class counts (from upstream compress_ratios array). The single
+# compress_ratio=0 entry sits on the MTP head, not in the 61-layer backbone.
+num_dense_layers = 0
 num_near_layers = 30                     # compress_ratio = 4 with Indexer
-num_far_layers = 30                      # compress_ratio = 128 (no Indexer)
+num_far_layers = 31                      # compress_ratio = 128 (no Indexer)
 near_compress_ratio = 4
 far_compress_ratio = 128
 index_topk = 1024                        # Indexer top-k cap on compressed history
