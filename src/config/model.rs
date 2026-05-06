@@ -10,6 +10,20 @@ pub trait ModelCosts {
     fn name(&self) -> &str;
     fn max_seq_len(&self) -> u32;
 
+    /// Residual-stream dimension. Surfaced on the trait because the comms
+    /// model needs it to size collective volumes.
+    fn hidden_dim(&self) -> u32;
+
+    /// Number of transformer layers. Needed by the comms model to count
+    /// per-layer collectives.
+    fn num_layers(&self) -> u32;
+
+    /// Bytes per activation element on the wire. Defaults to 2 (bf16);
+    /// override to 1 when collectives run at FP8.
+    fn activation_bytes(&self) -> u32 {
+        2
+    }
+
     /// Matmul FLOPs for one forward pass over a single token.
     /// For MoE this counts only active expert params.
     fn matmul_flops_per_token(&self) -> u64;
@@ -35,6 +49,32 @@ pub trait ModelCosts {
 
     /// Bytes of resident KV cache for a sequence of `seq_len` tokens.
     fn kv_storage_bytes(&self, seq_len: u32) -> u64;
+
+    /// Activation bytes per token transferred in a single TP all-reduce.
+    /// Default = `hidden_dim × activation_bytes`. The caller multiplies by
+    /// the per-rank ring factor `2(tp-1)/tp` and divides by link bandwidth.
+    fn allreduce_bytes_per_token(&self) -> u64 {
+        self.hidden_dim() as u64 * self.activation_bytes() as u64
+    }
+
+    /// Number of TP all-reduces per forward pass. Default = `2 × num_layers`
+    /// (post-attention + post-MLP per layer).
+    fn num_tp_allreduces_per_pass(&self) -> u32 {
+        2 * self.num_layers()
+    }
+
+    /// Activation bytes per token transferred in one direction of an EP
+    /// all-to-all. Zero for dense / non-MoE models. The caller multiplies by
+    /// the per-rank factor `(ep-1)/ep` and divides by link bandwidth.
+    fn alltoall_bytes_per_token(&self) -> u64 {
+        0
+    }
+
+    /// Number of EP all-to-alls per forward pass (= `2 × num_moe_layers`
+    /// for standard MoE — dispatch and combine). Zero for dense models.
+    fn num_ep_alltoalls_per_pass(&self) -> u32 {
+        0
+    }
 }
 
 /// Tagged-enum dispatch over architectures. The `type` field in TOML/JSON
@@ -116,6 +156,41 @@ impl ModelCosts for ModelConfig {
             Self::DeepseekV4(m) => m.kv_storage_bytes(seq_len),
         }
     }
+    fn hidden_dim(&self) -> u32 {
+        match self {
+            Self::Dense(m) => m.hidden_dim(),
+            Self::Sliding(m) => m.hidden_dim(),
+            Self::DeepseekV4(m) => m.hidden_dim(),
+        }
+    }
+    fn num_layers(&self) -> u32 {
+        match self {
+            Self::Dense(m) => m.num_layers(),
+            Self::Sliding(m) => m.num_layers(),
+            Self::DeepseekV4(m) => m.num_layers(),
+        }
+    }
+    fn activation_bytes(&self) -> u32 {
+        match self {
+            Self::Dense(m) => m.activation_bytes(),
+            Self::Sliding(m) => m.activation_bytes(),
+            Self::DeepseekV4(m) => m.activation_bytes(),
+        }
+    }
+    fn alltoall_bytes_per_token(&self) -> u64 {
+        match self {
+            Self::Dense(m) => m.alltoall_bytes_per_token(),
+            Self::Sliding(m) => m.alltoall_bytes_per_token(),
+            Self::DeepseekV4(m) => m.alltoall_bytes_per_token(),
+        }
+    }
+    fn num_ep_alltoalls_per_pass(&self) -> u32 {
+        match self {
+            Self::Dense(m) => m.num_ep_alltoalls_per_pass(),
+            Self::Sliding(m) => m.num_ep_alltoalls_per_pass(),
+            Self::DeepseekV4(m) => m.num_ep_alltoalls_per_pass(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -171,6 +246,12 @@ impl ModelCosts for DenseModel {
     }
     fn max_seq_len(&self) -> u32 {
         self.max_seq_len
+    }
+    fn hidden_dim(&self) -> u32 {
+        self.hidden_dim
+    }
+    fn num_layers(&self) -> u32 {
+        self.num_layers
     }
     fn matmul_flops_per_token(&self) -> u64 {
         2 * self.active_params()
@@ -249,6 +330,12 @@ impl ModelCosts for SlidingWindowModel {
     fn max_seq_len(&self) -> u32 {
         self.max_seq_len
     }
+    fn hidden_dim(&self) -> u32 {
+        self.hidden_dim
+    }
+    fn num_layers(&self) -> u32 {
+        self.num_layers
+    }
     fn matmul_flops_per_token(&self) -> u64 {
         2 * self.active_params()
     }
@@ -286,8 +373,21 @@ impl ModelCosts for SlidingWindowModel {
 }
 
 // ---------------------------------------------------------------------------
-// DeepSeek-V4-Pro: MoE + MLA + sparse / sliding hybrid attention
+// DeepSeek-V4-Pro: MoE + MLA + per-layer compressed-history attention
 // ---------------------------------------------------------------------------
+//
+// Every layer reads a small `window_size` of recent tokens (always dense).
+// On top of that, each layer is one of three classes:
+//   - dense (`compress_ratio = 0`): window only, no compressed history
+//   - near  (`compress_ratio = near_compress_ratio`, e.g. 4): window
+//           plus an `Indexer` that picks `index_topk` of the
+//           `seq_len / near_compress_ratio` compressed positions
+//   - far   (`compress_ratio = far_compress_ratio`, e.g. 128): window
+//           plus the entire stride-compressed history
+// The Indexer is itself a small attention-like scoring module
+// (`index_n_heads` × `index_head_dim`) running over every compressed
+// candidate on each near layer, with its own KV cache. Its cost is
+// non-negligible at high concurrency.
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeepseekV4Model {
@@ -301,7 +401,8 @@ pub struct DeepseekV4Model {
     pub num_heads: u32,
     pub max_seq_len: u32,
     /// Width of the MLA latent vector stored per token per layer (K and V
-    /// share this single vector in V4 — no factor of 2).
+    /// share this single vector in V4 — no factor of 2). Matches `head_dim`
+    /// in the upstream config.
     pub kv_latent_dim: u32,
     /// Bytes per stored KV value (typically FP8 = 1).
     pub kv_bytes_per_value: u32,
@@ -311,17 +412,35 @@ pub struct DeepseekV4Model {
     /// Effective bytes per *resident* parameter (for HBM accounting, since
     /// total params dominate residency for MoE).
     pub effective_bytes_per_resident_param: f32,
-    /// Sparse attention cap: number of historical tokens read per decode
-    /// step in non-sliding layers. `None` = full attention.
+    /// Sliding window of recent tokens, present in every layer.
+    pub window_size: u32,
+    /// Layers with no compressed history (`compress_ratio = 0`).
+    pub num_dense_layers: u32,
+    /// Layers with `compress_ratio = near_compress_ratio` and an Indexer.
+    pub num_near_layers: u32,
+    /// Layers with `compress_ratio = far_compress_ratio` and no Indexer.
+    pub num_far_layers: u32,
+    /// Compression stride for near layers.
+    pub near_compress_ratio: u32,
+    /// Compression stride for far layers.
+    pub far_compress_ratio: u32,
+    /// Indexer top-k cap on near layers' compressed history.
+    pub index_topk: u32,
+    /// Indexer scoring head count (per near layer).
+    pub index_n_heads: u32,
+    /// Indexer scoring head dim (per near layer).
+    pub index_head_dim: u32,
+    /// Bytes per indexer KV value. Defaults to `kv_bytes_per_value` if
+    /// unset.
     #[serde(default)]
-    pub attention_topk: Option<u32>,
-    /// Sliding window for sliding layers (`None` = no sliding layers).
-    #[serde(default)]
-    pub sliding_window: Option<u32>,
-    /// Number of sliding layers; the remainder use sparse-or-full per
-    /// `attention_topk`.
-    #[serde(default)]
-    pub num_sliding_layers: Option<u32>,
+    pub index_kv_bytes_per_value: Option<u32>,
+    /// MoE: number of experts each token is routed to. Used by the EP
+    /// all-to-all cost model.
+    pub num_experts_per_tok: u32,
+    /// MoE: number of layers that perform expert-parallel routing. For
+    /// DSv4-Pro this is every layer (the dense compress_ratio=0 layer also
+    /// runs MoE).
+    pub num_moe_layers: u32,
 }
 
 impl DeepseekV4Model {
@@ -329,25 +448,28 @@ impl DeepseekV4Model {
         // Single shared latent — no factor of 2 for K/V.
         self.kv_latent_dim as u64 * self.kv_bytes_per_value as u64
     }
-    fn num_sliding(&self) -> u32 {
-        self.num_sliding_layers.unwrap_or(0)
+    fn index_kv_bpp(&self) -> u64 {
+        self.index_kv_bytes_per_value.unwrap_or(self.kv_bytes_per_value) as u64
     }
-    fn num_non_sliding(&self) -> u32 {
-        self.num_layers.saturating_sub(self.num_sliding())
+    fn window_attended(&self, seq_len: u32) -> u32 {
+        seq_len.min(self.window_size)
     }
-    /// Tokens read per decode step in non-sliding layers (sparse top-k cap).
-    fn non_sliding_attended(&self, seq_len: u32) -> u32 {
-        match self.attention_topk {
-            Some(k) => seq_len.min(k),
-            None => seq_len,
-        }
+    /// Compressed-history tokens attended per decode step in near layers.
+    fn near_compressed_attended(&self, seq_len: u32) -> u32 {
+        (seq_len / self.near_compress_ratio).min(self.index_topk)
     }
-    /// Tokens read per decode step in sliding layers.
-    fn sliding_attended(&self, seq_len: u32) -> u32 {
-        match self.sliding_window {
-            Some(w) => seq_len.min(w),
-            None => seq_len,
-        }
+    /// Compressed-history tokens attended per decode step in far layers
+    /// (no top-k cap; reads the entire stride-compressed history).
+    fn far_compressed_attended(&self, seq_len: u32) -> u32 {
+        seq_len / self.far_compress_ratio
+    }
+    /// Compressed positions held in a near layer's auxiliary KV cache
+    /// (used both for storage and for the Indexer's scoring KV cache).
+    fn near_compressed_positions(&self, seq_len: u32) -> u32 {
+        seq_len / self.near_compress_ratio
+    }
+    fn far_compressed_positions(&self, seq_len: u32) -> u32 {
+        seq_len / self.far_compress_ratio
     }
 }
 
@@ -358,42 +480,99 @@ impl ModelCosts for DeepseekV4Model {
     fn max_seq_len(&self) -> u32 {
         self.max_seq_len
     }
+    fn hidden_dim(&self) -> u32 {
+        self.hidden_dim
+    }
+    fn num_layers(&self) -> u32 {
+        self.num_layers
+    }
+    fn alltoall_bytes_per_token(&self) -> u64 {
+        // Each token is dispatched to `num_experts_per_tok` experts; each
+        // dispatch sends one full hidden_dim-wide activation.
+        self.num_experts_per_tok as u64
+            * self.hidden_dim as u64
+            * self.activation_bytes() as u64
+    }
+    fn num_ep_alltoalls_per_pass(&self) -> u32 {
+        // Dispatch + combine per MoE layer.
+        2 * self.num_moe_layers
+    }
     fn matmul_flops_per_token(&self) -> u64 {
         2 * self.num_active_parameters
     }
     fn attention_flops(&self, s: u32, t: u32) -> u64 {
         let d = self.hidden_dim as u64;
         let s = s as u64;
-        // Non-sliding layers attend over min(t, topk) tokens.
-        let t_non = self.non_sliding_attended(t) as u64;
-        let t_sld = self.sliding_attended(t) as u64;
-        4 * d
+        let win_t = self.window_attended(t) as u64;
+        let near_t = self.near_compressed_attended(t) as u64;
+        let far_t = self.far_compressed_attended(t) as u64;
+
+        // Window attention: every layer reads min(t, window_size) recent tokens.
+        let window_flops = 4 * d * s * (self.num_layers as u64) * win_t;
+        // Near layers also attend top-k of compressed history (Indexer-selected).
+        let near_flops = 4 * d * s * (self.num_near_layers as u64) * near_t;
+        // Far layers attend the entire stride-compressed history.
+        let far_flops = 4 * d * s * (self.num_far_layers as u64) * far_t;
+
+        // Indexer scoring on each near layer: scores every compressed candidate
+        // (t / near_ratio of them) with `index_n_heads` heads of `index_head_dim`.
+        // Per (query, candidate, head): 2 × index_head_dim FLOPs.
+        let indexer_candidates = self.near_compressed_positions(t) as u64;
+        let indexer_flops = 2
+            * (self.index_n_heads as u64)
+            * (self.index_head_dim as u64)
             * s
-            * (self.num_non_sliding() as u64 * t_non + self.num_sliding() as u64 * t_sld)
+            * (self.num_near_layers as u64)
+            * indexer_candidates;
+
+        window_flops + near_flops + far_flops + indexer_flops
     }
     fn weight_transfer_bytes_per_step(&self) -> u64 {
         (self.num_active_parameters as f64 * self.effective_bytes_per_active_param as f64) as u64
     }
     fn kv_bytes_read_per_decode_step(&self, seq_len: u32) -> u64 {
         let per = self.kv_bytes_per_token_per_layer();
-        let n_non = self.num_non_sliding() as u64;
-        let n_sld = self.num_sliding() as u64;
-        let t_non = self.non_sliding_attended(seq_len) as u64;
-        let t_sld = self.sliding_attended(seq_len) as u64;
-        per * (n_non * t_non + n_sld * t_sld)
+        let win = self.window_attended(seq_len) as u64;
+        let near_compressed = self.near_compressed_attended(seq_len) as u64;
+        let far_compressed = self.far_compressed_attended(seq_len) as u64;
+
+        // Sliding window in every layer.
+        let window_total = (self.num_layers as u64) * win;
+        // Near and far compressed history reads.
+        let near_total = (self.num_near_layers as u64) * near_compressed;
+        let far_total = (self.num_far_layers as u64) * far_compressed;
+
+        // Indexer reads its full compressed-position KV cache on every near
+        // layer to score candidates (head_dim_idx × bytes per position).
+        let indexer_per_position = self.index_head_dim as u64 * self.index_kv_bpp();
+        let indexer_total = (self.num_near_layers as u64)
+            * (self.near_compressed_positions(seq_len) as u64)
+            * indexer_per_position;
+
+        per * (window_total + near_total + far_total) + indexer_total
     }
     fn weight_residency_bytes(&self) -> u64 {
         (self.num_parameters as f64 * self.effective_bytes_per_resident_param as f64) as u64
     }
     fn kv_storage_bytes(&self, seq_len: u32) -> u64 {
-        // Storage isn't capped by topk — only the *read* per step is.
-        // Sliding layers do cap storage at the window, since older tokens
-        // are evicted.
         let per = self.kv_bytes_per_token_per_layer();
-        let n_non = self.num_non_sliding() as u64;
-        let n_sld = self.num_sliding() as u64;
-        let s_non = seq_len as u64;
-        let s_sld = self.sliding_attended(seq_len) as u64;
-        per * (n_non * s_non + n_sld * s_sld)
+        let win = self.window_attended(seq_len) as u64;
+
+        // Dense layers store only the rolling window.
+        let dense_total = (self.num_dense_layers as u64) * win;
+        // Near layers store window + every compressed position.
+        let near_total = (self.num_near_layers as u64)
+            * (win + self.near_compressed_positions(seq_len) as u64);
+        // Far layers store window + every (more aggressively) compressed position.
+        let far_total = (self.num_far_layers as u64)
+            * (win + self.far_compressed_positions(seq_len) as u64);
+
+        // Indexer's auxiliary KV: one entry per compressed position, head_dim_idx wide.
+        let indexer_per_position = self.index_head_dim as u64 * self.index_kv_bpp();
+        let indexer_total = (self.num_near_layers as u64)
+            * (self.near_compressed_positions(seq_len) as u64)
+            * indexer_per_position;
+
+        per * (dense_total + near_total + far_total) + indexer_total
     }
 }

@@ -1,20 +1,8 @@
 use super::block::Block;
+use super::link::Link;
 use crate::config::KVTier;
 use crate::request::{BlockId, Request};
 use std::collections::{HashMap, HashSet, VecDeque};
-
-/// State of a single in-flight KV-cache promotion. Tracks per-tier bytes
-/// still needing to be moved, the last simulation time at which the progress
-/// counter was advanced, and any other requests that joined this transfer
-/// (because they share the same prefix). Joiners do not contribute bytes;
-/// they piggyback on the leader's transfer and become ready at the same
-/// time. Modelled after vLLM's block-ref-count sharing of in-flight prefixes.
-#[derive(Debug, Clone)]
-struct TransferState {
-    bytes_remaining_per_tier: Vec<u64>,
-    last_update: f64,
-    joiners: Vec<String>,
-}
 
 #[derive(Debug, Clone)]
 struct InFlightEntry {
@@ -25,26 +13,32 @@ struct InFlightEntry {
 /// A spillover tier in the KV cache hierarchy. Tracks block content hashes
 /// that have been evicted from a closer tier; a hash present here can be
 /// "promoted" back to HBM by paying the tier's transfer bandwidth, instead
-/// of being recomputed via prefill.
+/// of being recomputed via prefill. The actual byte-pumping (bandwidth
+/// sharing across concurrent transfers, time advance) lives on the embedded
+/// `Link`.
 #[derive(Debug)]
 struct SpilloverTier {
     capacity_blocks: u32,
-    bandwidth_to_hbm: f64,
     members: HashSet<u64>,
     /// Insertion order; front is oldest.
     order: VecDeque<u64>,
     pub num_evictions: u64,
+    link: Link,
 }
 
 impl SpilloverTier {
     fn new(capacity_blocks: u32, bandwidth_to_hbm: f64) -> Self {
         Self {
             capacity_blocks,
-            bandwidth_to_hbm,
             members: HashSet::new(),
             order: VecDeque::new(),
             num_evictions: 0,
+            link: Link::new(bandwidth_to_hbm),
         }
+    }
+
+    fn bandwidth_to_hbm(&self) -> f64 {
+        self.link.bandwidth()
     }
 
     fn contains(&self, hash: u64) -> bool {
@@ -140,14 +134,19 @@ pub struct KVCacheManager {
     prefix_cache: HashMap<u64, BlockId>,
 
     /// Spillover tiers, ordered closest-to-HBM first (tier 0 = host RAM).
+    /// Each tier owns the bandwidth-sharing state for its own promotion
+    /// transfers via an embedded `Link`.
     tiers: Vec<SpilloverTier>,
 
-    /// In-flight promotion transfers, keyed by leader request id.
-    in_flight: HashMap<String, TransferState>,
+    /// For each leader currently being promoted, the count of tiers that
+    /// still have bytes in flight for it. A leader is fully done when this
+    /// hits zero across every tier.
+    leader_active_tiers: HashMap<String, u32>,
 
-    /// Number of in-flight transfers actively using each tier's link.
-    /// Bandwidth on a tier is divided equally among its in-flight transfers.
-    tier_in_flight_counts: Vec<u32>,
+    /// Joiners piggybacking on each leader, keyed by leader id. Joiners
+    /// contribute no bandwidth load and become ready when the leader does.
+    /// Modelled after vLLM's block-ref-count sharing of in-flight prefixes.
+    leader_joiners: HashMap<String, Vec<String>>,
 
     /// Hashes currently being promoted; maps each in-flight hash to the
     /// leader request that owns the transfer and the HBM block reserved
@@ -193,8 +192,8 @@ impl KVCacheManager {
             enable_prefix_caching,
             prefix_cache: HashMap::new(),
             tiers: Vec::new(),
-            in_flight: HashMap::new(),
-            tier_in_flight_counts: Vec::new(),
+            leader_active_tiers: HashMap::new(),
+            leader_joiners: HashMap::new(),
             in_flight_cache: HashMap::new(),
             joiner_to_leader: HashMap::new(),
             kv_cache_bytes_per_token,
@@ -219,7 +218,6 @@ impl KVCacheManager {
                 SpilloverTier::new(capacity_blocks, t.bandwidth_to_hbm)
             })
             .collect();
-        self.tier_in_flight_counts = vec![0u32; self.tiers.len()];
         self
     }
 
@@ -493,7 +491,7 @@ impl KVCacheManager {
                 continue;
             }
             let bytes = tokens as u64 * self.kv_cache_bytes_per_token;
-            let bw = self.tiers[idx].bandwidth_to_hbm;
+            let bw = self.tiers[idx].bandwidth_to_hbm();
             if bw > 0.0 {
                 t += bytes as f64 / bw;
             }
@@ -502,12 +500,11 @@ impl KVCacheManager {
     }
 
     /// Begin tracking an in-flight transfer for `request_id`. Per-tier byte
-    /// counts come from `lookup.promote_tokens_per_tier`. Each non-zero tier
-    /// increments its in-flight counter, which dynamically reduces every
-    /// in-flight transfer's bandwidth share on subsequent `advance_transfers`
-    /// calls. The first `lookup.promote_tokens_per_tier` worth of the
-    /// request's prompt block hashes are registered in `in_flight_cache` so
-    /// later requests with the same prefix can join this transfer.
+    /// counts come from `lookup.promote_tokens_per_tier`; each non-zero tier
+    /// gets a submission on its `Link` (which divides bandwidth across all
+    /// its in-flight transfers). The `in_flight_cache` entries are populated
+    /// at reservation time by `reserve_blocks_for_transfer`; this method only
+    /// kicks off the byte-pumping side.
     pub fn start_transfer(
         &mut self,
         request_id: String,
@@ -515,24 +512,21 @@ impl KVCacheManager {
         lookup: &PrefixCacheLookup,
         current_time: f64,
     ) {
-        // The in_flight_cache entries were populated at reservation time
-        // by `reserve_blocks_for_transfer`; this method only sets up the
-        // bandwidth-tracking state for `advance_transfers`.
-        let mut bytes_per_tier = vec![0u64; self.tiers.len()];
+        let mut active_tiers = 0u32;
         for (i, &tokens) in lookup.promote_tokens_per_tier.iter().enumerate() {
-            if tokens > 0 {
-                bytes_per_tier[i] = tokens as u64 * self.kv_cache_bytes_per_token;
-                self.tier_in_flight_counts[i] += 1;
+            if tokens == 0 {
+                continue;
             }
+            let bytes = tokens as u64 * self.kv_cache_bytes_per_token;
+            self.tiers[i]
+                .link
+                .submit(request_id.clone(), bytes, current_time);
+            active_tiers += 1;
         }
-        self.in_flight.insert(
-            request_id,
-            TransferState {
-                bytes_remaining_per_tier: bytes_per_tier,
-                last_update: current_time,
-                joiners: Vec::new(),
-            },
-        );
+        if active_tiers > 0 {
+            self.leader_active_tiers.insert(request_id.clone(), active_tiers);
+            self.leader_joiners.insert(request_id, Vec::new());
+        }
     }
 
     /// Register `joiner_id` as piggybacking on the transfer that owns the
@@ -542,77 +536,36 @@ impl KVCacheManager {
         let Some(leader) = lookup.join_leader.clone() else {
             return;
         };
-        if let Some(state) = self.in_flight.get_mut(&leader) {
-            state.joiners.push(joiner_id.clone());
+        if let Some(joiners) = self.leader_joiners.get_mut(&leader) {
+            joiners.push(joiner_id.clone());
         }
         self.joiner_to_leader.insert(joiner_id, leader);
     }
 
-    /// Advance all in-flight transfers to `current_time`, charging each one
-    /// the bandwidth share appropriate to its tier's contention during the
-    /// elapsed interval. Returns the set of request ids whose transfer has
-    /// completed.
+    /// Advance all in-flight transfers to `current_time`, with each tier's
+    /// `Link` charging its bandwidth share appropriate to its contention.
+    /// Returns the set of request ids whose transfer has completed (leaders
+    /// plus their joiners).
     pub fn advance_transfers(&mut self, current_time: f64) -> HashSet<String> {
-        // Snapshot tier counts at start of interval; share bandwidth equally
-        // among all in-flight users of a tier for the whole `dt`. This
-        // slightly under-estimates progress when transfers complete mid-step
-        // (others would've sped up) but matches the simulator's
-        // iteration-discrete time model.
-        let n_tiers = self.tiers.len();
-        let mut tier_share_bw = vec![0.0f64; n_tiers];
-        for (i, tier) in self.tiers.iter().enumerate() {
-            let count = self.tier_in_flight_counts[i];
-            if count > 0 {
-                tier_share_bw[i] = tier.bandwidth_to_hbm / count as f64;
-            }
-        }
-
-        let mut completed_leaders: Vec<String> = Vec::new();
-        let mut tier_decrements = vec![0u32; n_tiers];
-
-        for (id, state) in self.in_flight.iter_mut() {
-            let dt = current_time - state.last_update;
-            if dt > 0.0 {
-                for (i, bytes) in state.bytes_remaining_per_tier.iter_mut().enumerate() {
-                    if *bytes == 0 {
-                        continue;
-                    }
-                    let share = tier_share_bw[i];
-                    if share <= 0.0 {
-                        continue;
-                    }
-                    let consumed = (share * dt) as u64;
-                    if consumed >= *bytes {
-                        *bytes = 0;
-                        tier_decrements[i] += 1;
-                    } else {
-                        *bytes -= consumed;
-                    }
-                }
-            }
-            state.last_update = current_time;
-            if state.bytes_remaining_per_tier.iter().all(|&b| b == 0) {
-                completed_leaders.push(id.clone());
-            }
-        }
-
-        for (i, dec) in tier_decrements.iter().enumerate() {
-            self.tier_in_flight_counts[i] = self.tier_in_flight_counts[i].saturating_sub(*dec);
-        }
-
-        // Build the completed set: each leader plus its joiners. Leaders'
-        // entries get removed; joiner_to_leader entries get cleaned up.
         let mut completed: HashSet<String> = HashSet::new();
-        for leader in completed_leaders {
-            if let Some(state) = self.in_flight.remove(&leader) {
-                for joiner in &state.joiners {
-                    self.joiner_to_leader.remove(joiner);
-                    completed.insert(joiner.clone());
+        for tier in &mut self.tiers {
+            let done_on_tier = tier.link.advance(current_time);
+            for leader in done_on_tier {
+                if let Some(active) = self.leader_active_tiers.get_mut(&leader) {
+                    *active = active.saturating_sub(1);
+                    if *active == 0 {
+                        self.leader_active_tiers.remove(&leader);
+                        if let Some(joiners) = self.leader_joiners.remove(&leader) {
+                            for joiner in joiners {
+                                self.joiner_to_leader.remove(&joiner);
+                                completed.insert(joiner);
+                            }
+                        }
+                        completed.insert(leader);
+                    }
                 }
             }
-            completed.insert(leader);
         }
-
         completed
     }
 
@@ -625,28 +578,20 @@ impl KVCacheManager {
             .get(request_id)
             .map(String::as_str)
             .unwrap_or(request_id);
-        let Some(state) = self.in_flight.get(leader) else {
+        if !self.leader_active_tiers.contains_key(leader) {
             return 0.0;
-        };
+        }
+        // Tiers are modelled as serial in the cost projection: the request
+        // must drain on each tier it has bytes on, and we sum those times.
         let mut t = 0.0;
-        for (i, &bytes) in state.bytes_remaining_per_tier.iter().enumerate() {
-            if bytes == 0 {
-                continue;
-            }
-            let count = self.tier_in_flight_counts[i];
-            if count == 0 {
-                continue;
-            }
-            let share = self.tiers[i].bandwidth_to_hbm / count as f64;
-            if share > 0.0 {
-                t += bytes as f64 / share;
-            }
+        for tier in &self.tiers {
+            t += tier.link.estimate_remaining(leader);
         }
         t
     }
 
     pub fn num_in_flight_transfers(&self) -> usize {
-        self.in_flight.len()
+        self.leader_active_tiers.len()
     }
 
     /// Inspect a block's current ref count. Primarily for tests.

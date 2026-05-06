@@ -6,7 +6,7 @@
 //! (the example doesn't need the CLI feature)
 
 use inference_lab::compute::ComputeEngine;
-use inference_lab::config::{DenseModel, HardwareConfig, ModelConfig};
+use inference_lab::config::{DenseModel, HardwareConfig, ModelConfig, ParallelConfig};
 use inference_lab::request::Request;
 
 fn main() {
@@ -21,6 +21,7 @@ fn main() {
         bytes_per_param: 1,
         kv_tiers: Vec::new(),
     };
+    let parallel = ParallelConfig::default();
 
     let model = ModelConfig::Dense(DenseModel {
         name: "Llama-3-70B".into(),
@@ -39,8 +40,8 @@ fn main() {
     let suffix_tokens: u32 = 64;          // per-request suffix already prefilled
     let total_prompt = shared_prefix_tokens + suffix_tokens;
 
-    let plain = ComputeEngine::new(hardware.clone(), model.clone());
-    let cascade = ComputeEngine::new(hardware.clone(), model.clone())
+    let plain = ComputeEngine::new(hardware.clone(), parallel.clone(), model.clone());
+    let cascade = ComputeEngine::new(hardware.clone(), parallel.clone(), model.clone())
         .with_cascade_attention(true, block_size);
 
     println!(

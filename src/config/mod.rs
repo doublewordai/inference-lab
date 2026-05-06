@@ -1,13 +1,17 @@
 pub mod hardware;
 pub mod model;
+pub mod parallel;
 pub mod scheduler;
 pub mod simulation;
+pub mod topology;
 pub mod workload;
 
 pub use hardware::{HardwareConfig, KVTier};
 pub use model::{DenseModel, DeepseekV4Model, ModelConfig, ModelCosts, SlidingWindowModel};
+pub use parallel::{CommsConfig, ParallelConfig};
 pub use scheduler::SchedulerConfig;
 pub use simulation::SimulationConfig;
+pub use topology::{ClusterSpec, DisaggTopology, Node};
 pub use workload::{LengthDistribution, WorkloadConfig};
 
 use serde::Deserialize;
@@ -18,6 +22,8 @@ use std::path::Path;
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     pub hardware: HardwareConfig,
+    #[serde(default)]
+    pub parallel: ParallelConfig,
     pub model: ModelConfig,
     pub scheduler: SchedulerConfig,
     pub workload: WorkloadConfig,
@@ -39,7 +45,17 @@ impl Config {
     pub fn finalize(&mut self) {
         self.model.finalize(&self.hardware);
         let model_size_bytes = self.model.weight_residency_bytes();
-        self.hardware.compute_kv_cache_capacity(model_size_bytes);
+        // Re-use ClusterSpec's helper for KV-cache capacity sizing so the
+        // single-cluster path agrees with the disagg path.
+        let mut cluster = ClusterSpec {
+            hardware: self.hardware.clone(),
+            parallel: self.parallel.clone(),
+            comms: None,
+            num_workers: 1,
+            node: 0,
+        };
+        cluster.compute_kv_cache_capacity(model_size_bytes);
+        self.hardware.kv_cache_capacity = cluster.hardware.kv_cache_capacity;
         self.scheduler
             .set_default_prefill_threshold(self.model.max_seq_len());
     }
@@ -57,6 +73,7 @@ impl Config {
             bytes_per_param: 2,
             kv_tiers: Vec::new(),
         };
+        let parallel = ParallelConfig::default();
 
         let model = ModelConfig::Dense(DenseModel {
             name: "Test Model".to_string(),
@@ -100,6 +117,7 @@ impl Config {
 
         Config {
             hardware,
+            parallel,
             model,
             scheduler,
             workload,

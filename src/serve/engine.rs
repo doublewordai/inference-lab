@@ -1,11 +1,14 @@
+//! Realtime OpenAI-compatible serve driver. Wraps the unified
+//! [`crate::simulation::Engine`] with a tokio loop that paces sim-time to
+//! wall-time and forwards per-iter token generation back to HTTP clients.
+
 use std::collections::HashMap;
 use tokio::sync::mpsc;
+use tokio::time::Duration;
 
-use crate::compute::ComputeEngine;
-use crate::config::{Config, ModelCosts};
-use crate::kv_cache::KVCacheManager;
+use crate::config::{ClusterSpec, Config};
 use crate::request::Request;
-use crate::scheduler::Scheduler;
+use crate::simulation::{Engine, StepKind, Topology};
 
 use super::types::{EngineRequest, TokenEvent};
 
@@ -23,61 +26,48 @@ struct LiveRequest {
 }
 
 pub struct RealtimeEngine {
-    scheduler: Scheduler,
-    compute_engine: ComputeEngine,
+    engine: Engine,
     config: Config,
     rx: mpsc::Receiver<EngineRequest>,
     live_requests: HashMap<String, LiveRequest>,
-    current_time: f64,
+    /// Wall-clock-anchored offset from sim-time to real-time. Set on the
+    /// first event we process. We use it to translate engine event-times
+    /// back into `tokio::time::Instant`s for `sleep_until`.
+    epoch: Option<tokio::time::Instant>,
 }
 
 impl RealtimeEngine {
     pub fn new(config: Config, rx: mpsc::Receiver<EngineRequest>) -> Result<Self, String> {
-        let kv_cache_manager = KVCacheManager::new(
-            config.hardware.kv_cache_capacity,
-            config.scheduler.block_size,
-            config.model.kv_storage_bytes(1),
-            false, // no prefix caching for serve mode
-        )
-        .with_tiers(&config.hardware.kv_tiers);
-
-        let scheduler = Scheduler::new(
-            config.scheduler.clone(),
-            config.hardware.clone(),
-            config.model.clone(),
-            kv_cache_manager,
-        )?;
-
-        let compute_engine = ComputeEngine::new(config.hardware.clone(), config.model.clone())
-            .with_cascade_attention(
-                config.scheduler.enable_cascade_attention,
-                config.scheduler.block_size,
-            );
-
+        let cluster = ClusterSpec {
+            hardware: config.hardware.clone(),
+            parallel: config.parallel.clone(),
+            comms: None,
+            num_workers: 1,
+            node: 0,
+        };
+        let topology =
+            Topology::aggregated(cluster, config.model.clone(), config.scheduler.clone())?;
         Ok(Self {
-            scheduler,
-            compute_engine,
+            engine: Engine::new(topology),
             config,
             rx,
             live_requests: HashMap::new(),
-            current_time: 0.0,
+            epoch: None,
         })
     }
 
     pub async fn run(mut self) {
         log::info!("RealtimeEngine started");
+        self.epoch = Some(tokio::time::Instant::now());
 
         loop {
-            // 1. Drain new requests from channel (non-blocking)
+            // 1. Drain any pending HTTP arrivals into the engine.
             loop {
                 match self.rx.try_recv() {
-                    Ok(engine_req) => {
-                        self.admit_request(engine_req);
-                    }
+                    Ok(req) => self.admit_request(req),
                     Err(mpsc::error::TryRecvError::Empty) => break,
                     Err(mpsc::error::TryRecvError::Disconnected) => {
-                        // All senders dropped - shut down if no live requests
-                        if self.live_requests.is_empty() {
+                        if self.live_requests.is_empty() && self.engine.is_idle() {
                             log::info!(
                                 "RealtimeEngine shutting down: no senders, no live requests"
                             );
@@ -88,88 +78,68 @@ impl RealtimeEngine {
                 }
             }
 
-            // 2. If idle (nothing running/waiting), sleep briefly and continue
-            if self.scheduler.num_running() == 0 && self.scheduler.num_waiting() == 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                continue;
-            }
-
-            // 3. Schedule
-            let decision = self.scheduler.schedule(self.current_time);
-
-            // 4. Handle completed requests (before batch check, since completed
-            //    requests cause num_scheduled==0)
-            for completed in &decision.completed {
-                let request_id = &completed.request_id;
-                if let Some(live) = self.live_requests.remove(request_id) {
-                    let _ = live.tx.try_send(TokenEvent::Done {
-                        prompt_tokens: completed.num_prompt_tokens,
-                        completion_tokens: completed.num_output_tokens,
-                    });
+            // 2. Decide what to do next: wait for the next sim event, OR for
+            //    a new HTTP request, whichever fires first. If nothing is in
+            //    flight at all, just block on the receiver.
+            let next_ev = self.engine.next_event_time();
+            match next_ev {
+                None => {
+                    // Engine fully idle. Block until a request arrives or
+                    // senders drop.
+                    match self.rx.recv().await {
+                        Some(req) => self.admit_request(req),
+                        None => {
+                            log::info!("RealtimeEngine shutting down: receiver closed");
+                            return;
+                        }
+                    }
+                }
+                Some(t_sim) => {
+                    let wake = self.sim_to_wall(t_sim);
+                    tokio::select! {
+                        biased;
+                        Some(req) = self.rx.recv() => {
+                            self.admit_request(req);
+                            // Loop and re-evaluate.
+                        }
+                        _ = tokio::time::sleep_until(wake) => {
+                            self.advance_one_step();
+                        }
+                    }
                 }
             }
+        }
+    }
 
-            // 5. Build batch and compute iteration time
-            let batch_size = decision.num_scheduled();
-            if batch_size == 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                continue;
+    fn advance_one_step(&mut self) {
+        let outcome = match self.engine.step() {
+            Ok(o) => o,
+            Err(e) => {
+                log::error!("engine step failed: {e}");
+                return;
             }
+        };
 
-            // Collect references to scheduled requests and their token counts
-            let running = self.scheduler.running();
-            let mut batch_requests: Vec<&Request> = Vec::new();
-            let mut tokens_per_request: Vec<u32> = Vec::new();
+        if matches!(outcome.kind, StepKind::Iteration) {
+            if let Some(iter) = outcome.iteration {
+                for prog in &iter.progress {
+                    let live = match self.live_requests.get_mut(&prog.request_id) {
+                        Some(l) => l,
+                        None => continue,
+                    };
 
-            for (i, &idx) in decision.scheduled_new.iter().enumerate() {
-                batch_requests.push(&running[idx]);
-                tokens_per_request.push(decision.tokens_for_new[i]);
-            }
-            for (i, &idx) in decision.scheduled_running.iter().enumerate() {
-                batch_requests.push(&running[idx]);
-                tokens_per_request.push(decision.tokens_for_running[i]);
-            }
-
-            let iteration_time = self
-                .compute_engine
-                .calculate_iteration_time(&batch_requests, &tokens_per_request);
-
-            // 5. Sleep for real-time pacing
-            tokio::time::sleep(std::time::Duration::from_secs_f64(iteration_time)).await;
-
-            // 6. Advance simulated time
-            self.current_time += iteration_time;
-
-            // 7. Update request states and emit tokens
-            // Collect token updates to apply
-            let mut token_updates: Vec<(usize, u32)> = Vec::new();
-            for (i, &idx) in decision.scheduled_new.iter().enumerate() {
-                token_updates.push((idx, decision.tokens_for_new[i]));
-            }
-            for (i, &idx) in decision.scheduled_running.iter().enumerate() {
-                token_updates.push((idx, decision.tokens_for_running[i]));
-            }
-
-            // Apply token generation and emit events
-            for (idx, num_tokens) in &token_updates {
-                let request = &mut self.scheduler.running_mut()[*idx];
-                let was_prefill = request.is_prefill();
-                request.record_generated_tokens(*num_tokens, self.current_time);
-
-                let request_id = request.request_id.clone();
-
-                if let Some(live) = self.live_requests.get_mut(&request_id) {
-                    // Detect first token (prefill → decode transition)
-                    if !live.first_token_sent && request.first_token_time.is_some() {
+                    // First token marks prefill→decode boundary.
+                    if !live.first_token_sent && !prog.was_prefill {
                         live.first_token_sent = true;
                         let _ = live.tx.try_send(TokenEvent::FirstToken);
                     }
 
-                    // Emit tokens only for decode iterations (scheduler never
-                    // crosses prefill/decode boundary in a single iteration)
-                    if !was_prefill {
-                        for _ in 0..*num_tokens {
-                            let word = PLACEHOLDER_WORDS[live.word_index % PLACEHOLDER_WORDS.len()];
+                    // Emit decode tokens only. Prefill iterations advance
+                    // num_computed_tokens but don't yield user-visible text.
+                    if !prog.was_prefill {
+                        for _ in 0..prog.num_tokens {
+                            let word =
+                                PLACEHOLDER_WORDS[live.word_index % PLACEHOLDER_WORDS.len()];
                             live.word_index += 1;
                             let _ = live.tx.try_send(TokenEvent::Token {
                                 text: format!("{} ", word),
@@ -179,10 +149,18 @@ impl RealtimeEngine {
                 }
             }
         }
+
+        for done in outcome.completions {
+            if let Some(live) = self.live_requests.remove(&done.request_id) {
+                let _ = live.tx.try_send(TokenEvent::Done {
+                    prompt_tokens: done.num_prompt_tokens,
+                    completion_tokens: done.num_output_tokens,
+                });
+            }
+        }
     }
 
     fn admit_request(&mut self, engine_req: EngineRequest) {
-        // Sample target output tokens from config distribution
         let mut rng = rand::thread_rng();
         let target_output_tokens = self
             .config
@@ -191,10 +169,11 @@ impl RealtimeEngine {
             .sample(&mut rng)
             .min(engine_req.max_output_tokens);
 
+        let now = self.engine.current_time();
         let request = Request::new_with_target(
             engine_req.request_id.clone(),
-            0, // priority
-            self.current_time,
+            0,
+            now,
             engine_req.prompt_tokens,
             engine_req.max_output_tokens,
             target_output_tokens,
@@ -209,6 +188,13 @@ impl RealtimeEngine {
             },
         );
 
-        self.scheduler.add_request(request);
+        self.engine.submit(request);
+    }
+
+    /// Convert a simulated time-since-epoch into a wall-clock Instant.
+    fn sim_to_wall(&self, t_sim: f64) -> tokio::time::Instant {
+        let epoch = self.epoch.expect("epoch set in run()");
+        epoch + Duration::from_secs_f64(t_sim.max(0.0))
     }
 }
+
