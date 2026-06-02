@@ -649,61 +649,35 @@ impl Engine {
             }
         }
 
-        // Speculative decoding: a decode step *verifies* `gamma + 1` tokens (the
-        // cost) but *advances* by `accepted + 1` (the progress). Prefill and
-        // chunked-prefill continuations (was_prefill) are not speculated.
+        // Speculative decoding (vLLM-faithful). Each decode request's draft
+        // length was decided at the END of the previous iteration and stored as
+        // `pending_draft_len`; the scheduler has already reserved a `1 + draft`
+        // verify pass in the token budget and KV (trimming `draft` to fit if
+        // capacity was tight), which is exactly what `tokens_for_running` now
+        // carries. So here we only realise the *outcome*: sample how many of the
+        // reserved draft tokens are accepted and advance by `accepted + 1`. The
+        // verify pass itself (`1 + draft` tokens) is the cost. Prefill and
+        // chunked-prefill continuations (was_prefill) are never speculated.
         let n_new = decision.scheduled_new.len();
-        let mut cost_tokens = tokens_per_request.clone();
+        let cost_tokens = tokens_per_request.clone(); // verify width per request
         let mut accepted_extra = vec![0u32; batch_size];
-        let mut step_gamma = 0u32; // chosen draft length this step (0 = none)
+        let mut step_gamma_max = 0u32; // widest draft this step (for drafter overhead)
         if let Some(spec) = self.spec.clone() {
-            // Choose the draft length for this step. GoodputGreedy evaluates each
-            // candidate g via the cost model on the current batch (so it sees the
-            // roofline + MoE coupon) and picks the one maximising expected goodput.
-            step_gamma = match spec.policy {
-                GammaPolicy::Fixed => spec.gamma,
-                GammaPolicy::GoodputGreedy => {
-                    // Price the choice on the DECODE sub-batch only. Pricing on
-                    // the full (prefill-mixed) batch lets a big prefill chunk mask
-                    // the verify cost, so the myopic ratio over-credits speculation
-                    // and picks too-large gamma on prefill-mixed steps.
-                    let running = w.scheduler.running();
-                    let dec: Vec<&Request> = (0..batch_size)
-                        .filter(|&j| !progress[j].was_prefill)
-                        .map(|j| &running[batch_indices[j]])
-                        .collect();
-                    if dec.is_empty() {
-                        0
-                    } else {
-                        let mut best_g = 0u32;
-                        let mut best_gp = f64::MIN;
-                        for g in 0..=spec.gamma {
-                            let toks = vec![g + 1; dec.len()];
-                            let c = w.compute_engine.calculate_iteration_time(&dec, &toks)
-                                * (1.0 + spec.draft_cost_frac * g as f64);
-                            let committed = spec.acceptance.expected_accepted(g) + 1.0;
-                            let gp = committed / c.max(1e-12);
-                            if gp > best_gp {
-                                best_gp = gp;
-                                best_g = g;
-                            }
-                        }
-                        best_g
-                    }
+            for j in 0..batch_size {
+                if progress[j].was_prefill {
+                    continue;
                 }
-            };
-            if step_gamma > 0 {
-                for j in 0..batch_size {
-                    if !progress[j].was_prefill {
-                        let accepted = match self.spec_rng.as_mut() {
-                            Some(rng) => spec.acceptance.sample_accepted(step_gamma, rng),
-                            None => spec.acceptance.expected_accepted(step_gamma).round() as u32,
-                        };
-                        cost_tokens[j] = step_gamma + 1; // verify pass
-                        accepted_extra[j] = accepted; // bonus (+1) added at progress
-                        progress[j].num_tokens = accepted + 1; // tokens generated this step
-                    }
+                let draft = cost_tokens[j].saturating_sub(1);
+                step_gamma_max = step_gamma_max.max(draft);
+                if draft == 0 {
+                    continue;
                 }
+                let accepted = match self.spec_rng.as_mut() {
+                    Some(rng) => spec.acceptance.sample_accepted(draft, rng),
+                    None => spec.acceptance.expected_accepted(draft).round() as u32,
+                };
+                accepted_extra[j] = accepted; // bonus (+1) added at progress
+                progress[j].num_tokens = accepted + 1; // tokens generated this step
             }
         }
 
@@ -726,10 +700,11 @@ impl Engine {
             );
             (iter_time, bw, flops)
         };
-        // Drafter overhead on speculated steps (per draft token).
-        if step_gamma > 0 {
+        // Drafter overhead on speculated steps: the drafter runs `draft`
+        // sequential passes, so the batch pays for the widest draft present.
+        if step_gamma_max > 0 {
             if let Some(spec) = &self.spec {
-                iter_time *= 1.0 + spec.draft_cost_frac * step_gamma as f64;
+                iter_time *= 1.0 + spec.draft_cost_frac * step_gamma_max as f64;
             }
         }
         let end_time = now + iter_time;
@@ -741,7 +716,15 @@ impl Engine {
         }
         for (i, &idx) in decision.scheduled_running.iter().enumerate() {
             if let Some(req) = w.scheduler.running_mut().get_mut(idx) {
-                let adv = decision.tokens_for_running[i] + accepted_extra[n_new + i];
+                let j = n_new + i;
+                // Decode: advance by the verified tokens (bonus + accepted), NOT
+                // the verify width (`tokens_for_running` = 1 + draft, the cost).
+                // Chunked prefill: advance by the scheduled prefill chunk.
+                let adv = if progress[j].was_prefill {
+                    decision.tokens_for_running[i]
+                } else {
+                    1 + accepted_extra[j]
+                };
                 req.record_generated_tokens(adv, end_time);
             }
         }
@@ -769,6 +752,51 @@ impl Engine {
         } else {
             Vec::new()
         };
+
+        // Decide each decode request's draft length for its NEXT step
+        // (vLLM-faithful: drafting happens at the end of a step, so the next
+        // scheduler pass reads `pending_draft_len` and reserves `1 + draft` of
+        // token budget + KV, trimming if tight). `Fixed` is the constant draft;
+        // `GoodputGreedy` prices candidate draft lengths on the current decode
+        // sub-batch via the cost model (so it is roofline- and MoE-coupon-aware)
+        // and picks the one maximising expected goodput `(E[accepted|g]+1)/C(g)`.
+        // Pricing on the decode sub-batch only (not the prefill-mixed batch)
+        // avoids a big prefill chunk masking the verify cost and inflating g.
+        if let Some(spec) = self.spec.clone() {
+            let g_next = match spec.policy {
+                GammaPolicy::Fixed => spec.gamma,
+                GammaPolicy::GoodputGreedy => {
+                    let running = w.scheduler.running();
+                    let dec: Vec<&Request> = running
+                        .iter()
+                        .filter(|r| !r.is_prefill() && !r.is_finished())
+                        .collect();
+                    if dec.is_empty() {
+                        0
+                    } else {
+                        let mut best_g = 0u32;
+                        let mut best_gp = f64::MIN;
+                        for g in 0..=spec.gamma {
+                            let toks = vec![g + 1; dec.len()];
+                            let c = w.compute_engine.calculate_iteration_time(&dec, &toks)
+                                * (1.0 + spec.draft_cost_frac * g as f64);
+                            let committed = spec.acceptance.expected_accepted(g) + 1.0;
+                            let gp = committed / c.max(1e-12);
+                            if gp > best_gp {
+                                best_gp = gp;
+                                best_g = g;
+                            }
+                        }
+                        best_g
+                    }
+                }
+            };
+            for req in w.scheduler.running_mut().iter_mut() {
+                if !req.is_prefill() {
+                    req.pending_draft_len = g_next;
+                }
+            }
+        }
 
         // Time-weighted batch accumulator.
         let dt = (end_time - now).max(0.0);

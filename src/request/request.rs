@@ -71,6 +71,15 @@ pub struct Request {
     /// promotion of its KV cache from a slower tier is in progress; cleared
     /// once the request returns to `Waiting`.
     pub ready_at: Option<f64>,
+
+    /// Speculative decoding: draft length to verify on this request's NEXT
+    /// decode step. Decided at the end of the iteration that produced the last
+    /// token (the simulator's analogue of vLLM proposing draft tokens at the
+    /// end of a step). The scheduler reads this to reserve a
+    /// `1 + pending_draft_len` verify pass in the token budget and KV, trimming
+    /// it if capacity is tight. 0 means no speculation (and is always 0 when
+    /// speculative decoding is disabled).
+    pub pending_draft_len: u32,
 }
 
 impl Request {
@@ -104,6 +113,7 @@ impl Request {
             preempted_time: 0.0,
             last_preempted_at: None,
             ready_at: None,
+            pending_draft_len: 0,
         }
     }
 

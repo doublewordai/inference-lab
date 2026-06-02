@@ -144,8 +144,13 @@ impl Scheduler {
                         tokens_to_schedule.min(self.config.long_prefill_token_threshold);
                 }
             } else {
-                // During decode phase, limit to 1 token per iteration (autoregressive generation)
-                tokens_to_schedule = tokens_to_schedule.min(1);
+                // Decode phase: one bonus token plus the speculative verify pass.
+                // `pending_draft_len` (decided last iteration; 0 if speculation is
+                // off) makes the step process `1 + draft` tokens, so the token
+                // budget and KV are reserved for the verify cost. The earlier
+                // `.min(token_budget)` already trims `draft` to fit the budget.
+                let verify_width = 1 + self.running[idx].pending_draft_len;
+                tokens_to_schedule = tokens_to_schedule.min(verify_width);
             }
 
             // Try to allocate KV cache blocks if needed
@@ -318,8 +323,10 @@ impl Scheduler {
                             tokens_to_schedule.min(self.config.long_prefill_token_threshold);
                     }
                 } else {
-                    // During decode phase, limit to 1 token per iteration (autoregressive generation)
-                    tokens_to_schedule = tokens_to_schedule.min(1);
+                    // Decode phase: bonus token + speculative verify pass (see
+                    // the running-request loop above).
+                    let verify_width = 1 + request.pending_draft_len;
+                    tokens_to_schedule = tokens_to_schedule.min(verify_width);
                 }
 
                 if tokens_to_schedule == 0 {
