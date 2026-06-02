@@ -12,7 +12,8 @@ use rand::SeedableRng;
 
 use crate::compute::ComputeEngine;
 use crate::config::{
-    ClusterSpec, DisaggTopology, ModelConfig, ModelCosts, SchedulerConfig, SpeculativeConfig,
+    ClusterSpec, DisaggTopology, GammaPolicy, ModelConfig, ModelCosts, SchedulerConfig,
+    SpeculativeConfig,
 };
 use crate::kv_cache::{KVCacheManager, Link};
 use crate::request::Request;
@@ -654,18 +655,54 @@ impl Engine {
         let n_new = decision.scheduled_new.len();
         let mut cost_tokens = tokens_per_request.clone();
         let mut accepted_extra = vec![0u32; batch_size];
-        let mut speculated = false;
+        let mut step_gamma = 0u32; // chosen draft length this step (0 = none)
         if let Some(spec) = self.spec.clone() {
-            for j in 0..batch_size {
-                if !progress[j].was_prefill {
-                    let accepted = match self.spec_rng.as_mut() {
-                        Some(rng) => spec.acceptance.sample_accepted(spec.gamma, rng),
-                        None => spec.acceptance.expected_accepted(spec.gamma).round() as u32,
-                    };
-                    cost_tokens[j] = spec.gamma + 1; // verify pass
-                    accepted_extra[j] = accepted; // bonus (+1) added at progress
-                    progress[j].num_tokens = accepted + 1; // tokens generated this step
-                    speculated = true;
+            // Choose the draft length for this step. GoodputGreedy evaluates each
+            // candidate g via the cost model on the current batch (so it sees the
+            // roofline + MoE coupon) and picks the one maximising expected goodput.
+            step_gamma = match spec.policy {
+                GammaPolicy::Fixed => spec.gamma,
+                GammaPolicy::GoodputGreedy => {
+                    // Price the choice on the DECODE sub-batch only. Pricing on
+                    // the full (prefill-mixed) batch lets a big prefill chunk mask
+                    // the verify cost, so the myopic ratio over-credits speculation
+                    // and picks too-large gamma on prefill-mixed steps.
+                    let running = w.scheduler.running();
+                    let dec: Vec<&Request> = (0..batch_size)
+                        .filter(|&j| !progress[j].was_prefill)
+                        .map(|j| &running[batch_indices[j]])
+                        .collect();
+                    if dec.is_empty() {
+                        0
+                    } else {
+                        let mut best_g = 0u32;
+                        let mut best_gp = f64::MIN;
+                        for g in 0..=spec.gamma {
+                            let toks = vec![g + 1; dec.len()];
+                            let c = w.compute_engine.calculate_iteration_time(&dec, &toks)
+                                * (1.0 + spec.draft_cost_frac * g as f64);
+                            let committed = spec.acceptance.expected_accepted(g) + 1.0;
+                            let gp = committed / c.max(1e-12);
+                            if gp > best_gp {
+                                best_gp = gp;
+                                best_g = g;
+                            }
+                        }
+                        best_g
+                    }
+                }
+            };
+            if step_gamma > 0 {
+                for j in 0..batch_size {
+                    if !progress[j].was_prefill {
+                        let accepted = match self.spec_rng.as_mut() {
+                            Some(rng) => spec.acceptance.sample_accepted(step_gamma, rng),
+                            None => spec.acceptance.expected_accepted(step_gamma).round() as u32,
+                        };
+                        cost_tokens[j] = step_gamma + 1; // verify pass
+                        accepted_extra[j] = accepted; // bonus (+1) added at progress
+                        progress[j].num_tokens = accepted + 1; // tokens generated this step
+                    }
                 }
             }
         }
@@ -689,10 +726,10 @@ impl Engine {
             );
             (iter_time, bw, flops)
         };
-        // Drafter overhead on speculated steps (a fraction of the verify step).
-        if speculated {
+        // Drafter overhead on speculated steps (per draft token).
+        if step_gamma > 0 {
             if let Some(spec) = &self.spec {
-                iter_time *= 1.0 + spec.draft_cost_frac;
+                iter_time *= 1.0 + spec.draft_cost_frac * step_gamma as f64;
             }
         }
         let end_time = now + iter_time;

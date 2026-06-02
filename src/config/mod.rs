@@ -11,7 +11,7 @@ pub use hardware::{HardwareConfig, KVTier, Precision};
 pub use model::{DenseModel, DeepseekV4Model, ModelConfig, ModelCosts, SlidingWindowModel};
 pub use parallel::{CommsConfig, ParallelConfig};
 pub use scheduler::SchedulerConfig;
-pub use speculative::{AcceptanceModel, SpeculativeConfig};
+pub use speculative::{AcceptanceModel, GammaPolicy, SpeculativeConfig};
 pub use simulation::SimulationConfig;
 pub use topology::{ClusterSpec, DisaggTopology, Node};
 pub use workload::{LengthDistribution, WorkloadConfig};

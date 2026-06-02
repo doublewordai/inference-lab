@@ -58,16 +58,32 @@ impl AcceptanceModel {
 /// When present, each decode step verifies `gamma + 1` tokens per sequence (the
 /// cost) and advances by `accepted + 1` tokens (the progress), with `accepted`
 /// drawn from `acceptance`.
+/// How the draft length is chosen each step.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GammaPolicy {
+    /// Always use `gamma`.
+    #[default]
+    Fixed,
+    /// Load-aware: each step pick g in 0..=gamma that maximises expected goodput
+    /// `(E[accepted|g]+1) / C(state, g)` using the cost model (so it is roofline-
+    /// and MoE-coupon-aware). g=0 means "don't speculate this step".
+    GoodputGreedy,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct SpeculativeConfig {
-    /// Draft length: tokens proposed per step. The verify pass processes
-    /// `gamma + 1` positions per sequence.
+    /// Draft length under `Fixed`; the maximum candidate under `GoodputGreedy`.
+    /// The verify pass processes `gamma + 1` positions per sequence.
     pub gamma: u32,
     /// Acceptance model (the quantity to vary).
     pub acceptance: AcceptanceModel,
-    /// Drafter overhead as a fraction of the verify-step time, charged on each
-    /// speculated decode step. ~0.05-0.1 for a small MTP head; larger for a
-    /// separate draft model. Defaults to 0 (free drafter).
+    /// Draft-length policy. Defaults to `Fixed`.
+    #[serde(default)]
+    pub policy: GammaPolicy,
+    /// Drafter overhead as a fraction of the verify step *per draft token*,
+    /// charged on each speculated decode step (total overhead = frac × gamma).
+    /// ~0.0 for our validation (free MTP head). Defaults to 0.
     #[serde(default)]
     pub draft_cost_frac: f64,
 }
