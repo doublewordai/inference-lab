@@ -495,10 +495,12 @@ pub struct DeepseekV4Model {
 
 impl DeepseekV4Model {
     /// Distinct routed-expert weights that must be resident for a step over
-    /// `num_tokens` tokens, in params. Models expert loading as a uniform-
-    /// routing coupon-collector over `num_tokens × num_experts_per_tok` draws:
-    /// the expected number of distinct routed experts grows from the active
-    /// (single-token) footprint toward all-experts-resident as the batch grows.
+    /// `num_tokens` tokens, in params. Each token routes to `k` *distinct*
+    /// experts (top-k), so under uniform routing a given expert is missed by one
+    /// token with probability `1 - k/E`, and the expected number of distinct
+    /// routed experts hit by `N` independent tokens is `E·(1 - (1 - k/E)^N)`.
+    /// That grows from exactly the active (single-token) footprint toward
+    /// all-experts-resident as the batch grows.
     /// This is what gives MoE its shallow intensity-vs-batch slope, distant
     /// knee, and low-batch "expert tax". Falls back to the constant active
     /// footprint when `num_routed_experts` is unset (0) or not above per-tok.
@@ -517,8 +519,9 @@ impl DeepseekV4Model {
             as f64)
             / (ef - kf);
         let shared = (self.num_active_expert_params as f64 - kf * w).max(0.0);
-        // Expected distinct routed experts hit by N tokens each routing to k.
-        let loaded = ef * (1.0 - (1.0 - 1.0 / ef).powf(num_tokens as f64 * kf));
+        // Expected distinct routed experts hit by N tokens, each selecting k
+        // distinct experts: P(a given expert missed by one token) = 1 - k/E.
+        let loaded = ef * (1.0 - (1.0 - kf / ef).powf(num_tokens as f64));
         (shared + loaded * w).round() as u64
     }
 
@@ -719,8 +722,9 @@ mod tests {
         let m = moe(256);
         let one = m.expert_params_resident_per_step(1);
         let many = m.expert_params_resident_per_step(100_000);
-        // ~active at a single token, ~all-experts-resident at large batch.
-        assert!((one as i64 - 9000).abs() < 500, "single-token ≈ active, got {one}");
+        // exactly the active footprint at a single token (k distinct experts),
+        // all experts resident at large batch.
+        assert!((one as i64 - 9000).abs() <= 1, "single-token == active, got {one}");
         assert_eq!(many, 257_000, "large batch loads every expert");
         // monotonically non-decreasing in batch.
         let mut prev = 0;
