@@ -126,8 +126,9 @@ impl ComputeEngine {
             streams.entry(prec).or_default().flops += total_tokens as f64 * fpt as f64;
         }
 
-        // Weight bytes per forward pass, also per precision.
-        for (prec, b) in self.model.weight_bytes_per_step_by_prec() {
+        // Weight bytes per forward pass, also per precision. For MoE this grows
+        // with the step's token count (coupon-collector expert loading).
+        for (prec, b) in self.model.weight_bytes_per_step_by_prec(total_tokens) {
             streams.entry(prec).or_default().weight_bytes += b as f64;
         }
 

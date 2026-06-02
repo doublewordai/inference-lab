@@ -51,7 +51,7 @@ pub trait ModelCosts {
     /// Bytes transferred HBM -> SM for model weights in one forward pass,
     /// broken down by precision. Multiple entries can share a precision; the
     /// engine sums them.
-    fn weight_bytes_per_step_by_prec(&self) -> Vec<(Precision, u64)>;
+    fn weight_bytes_per_step_by_prec(&self, num_tokens: u32) -> Vec<(Precision, u64)>;
 
     /// Bytes of KV read per decode step for a sequence of `seq_len` tokens.
     /// Captures sliding window, sparse top-k, etc. KV is always charged
@@ -146,11 +146,11 @@ impl ModelCosts for ModelConfig {
             Self::DeepseekV4(m) => m.attention_precision(),
         }
     }
-    fn weight_bytes_per_step_by_prec(&self) -> Vec<(Precision, u64)> {
+    fn weight_bytes_per_step_by_prec(&self, num_tokens: u32) -> Vec<(Precision, u64)> {
         match self {
-            Self::Dense(m) => m.weight_bytes_per_step_by_prec(),
-            Self::Sliding(m) => m.weight_bytes_per_step_by_prec(),
-            Self::DeepseekV4(m) => m.weight_bytes_per_step_by_prec(),
+            Self::Dense(m) => m.weight_bytes_per_step_by_prec(num_tokens),
+            Self::Sliding(m) => m.weight_bytes_per_step_by_prec(num_tokens),
+            Self::DeepseekV4(m) => m.weight_bytes_per_step_by_prec(num_tokens),
         }
     }
     fn kv_bytes_read_per_decode_step(&self, seq_len: u32) -> u64 {
@@ -278,7 +278,7 @@ impl ModelCosts for DenseModel {
     fn attention_precision(&self) -> Precision {
         self.precision
     }
-    fn weight_bytes_per_step_by_prec(&self) -> Vec<(Precision, u64)> {
+    fn weight_bytes_per_step_by_prec(&self, _num_tokens: u32) -> Vec<(Precision, u64)> {
         let bytes = (self.active_params() as f64 * self.precision.bytes_per_value()) as u64;
         vec![(self.precision, bytes)]
     }
@@ -363,7 +363,7 @@ impl ModelCosts for SlidingWindowModel {
     fn attention_precision(&self) -> Precision {
         self.precision
     }
-    fn weight_bytes_per_step_by_prec(&self) -> Vec<(Precision, u64)> {
+    fn weight_bytes_per_step_by_prec(&self, _num_tokens: u32) -> Vec<(Precision, u64)> {
         let bytes = (self.active_params() as f64 * self.precision.bytes_per_value()) as u64;
         vec![(self.precision, bytes)]
     }
@@ -480,6 +480,13 @@ pub struct DeepseekV4Model {
     /// MoE: number of experts each token is routed to. Used by the EP
     /// all-to-all cost model.
     pub num_experts_per_tok: u32,
+    /// MoE: total number of routed experts in the pool. When set (and greater
+    /// than `num_experts_per_tok`), per-step expert weight traffic follows the
+    /// coupon-collector growth with the step's token count, interpolating
+    /// between the active (single-token) footprint and all-experts-resident.
+    /// Left 0 (default) preserves the old constant active-expert behaviour.
+    #[serde(default)]
+    pub num_routed_experts: u32,
     /// MoE: number of layers that perform expert-parallel routing. For
     /// DSv4-Pro this is every layer (the dense compress_ratio=0 layer also
     /// runs MoE).
@@ -487,6 +494,34 @@ pub struct DeepseekV4Model {
 }
 
 impl DeepseekV4Model {
+    /// Distinct routed-expert weights that must be resident for a step over
+    /// `num_tokens` tokens, in params. Models expert loading as a uniform-
+    /// routing coupon-collector over `num_tokens × num_experts_per_tok` draws:
+    /// the expected number of distinct routed experts grows from the active
+    /// (single-token) footprint toward all-experts-resident as the batch grows.
+    /// This is what gives MoE its shallow intensity-vs-batch slope, distant
+    /// knee, and low-batch "expert tax". Falls back to the constant active
+    /// footprint when `num_routed_experts` is unset (0) or not above per-tok.
+    fn expert_params_resident_per_step(&self, num_tokens: u32) -> u64 {
+        let e = self.num_routed_experts;
+        let k = self.num_experts_per_tok;
+        if e <= k || num_tokens == 0 {
+            return self.num_active_expert_params;
+        }
+        let ef = e as f64;
+        let kf = k as f64;
+        // Per-routed-expert params `w` and always-resident shared params,
+        // recovered from the active (k routed + shared) and resident (all
+        // routed + shared) footprints: active = k·w + shared, resident = E·w + shared.
+        let w = (self.num_resident_expert_params.saturating_sub(self.num_active_expert_params)
+            as f64)
+            / (ef - kf);
+        let shared = (self.num_active_expert_params as f64 - kf * w).max(0.0);
+        // Expected distinct routed experts hit by N tokens each routing to k.
+        let loaded = ef * (1.0 - (1.0 - 1.0 / ef).powf(num_tokens as f64 * kf));
+        (shared + loaded * w).round() as u64
+    }
+
     /// Per-token-per-layer KV bytes: latent + RoPE head, both at kv_precision.
     fn kv_bytes_per_token_per_layer(&self) -> f64 {
         (self.kv_latent_dim as f64 + self.qk_rope_head_dim as f64)
@@ -582,8 +617,8 @@ impl ModelCosts for DeepseekV4Model {
     fn attention_precision(&self) -> Precision {
         self.non_expert_precision
     }
-    fn weight_bytes_per_step_by_prec(&self) -> Vec<(Precision, u64)> {
-        let exp_bytes = (self.num_active_expert_params as f64
+    fn weight_bytes_per_step_by_prec(&self, num_tokens: u32) -> Vec<(Precision, u64)> {
+        let exp_bytes = (self.expert_params_resident_per_step(num_tokens) as f64
             * self.expert_precision.bytes_per_value()) as u64;
         let non_exp_bytes = (self.num_active_non_expert_params as f64
             * self.non_expert_precision.bytes_per_value()) as u64;
@@ -640,5 +675,75 @@ impl ModelCosts for DeepseekV4Model {
             * indexer_per_position;
 
         (per * (dense_total + near_total + far_total) + indexer_total) as u64
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Minimal MoE model: 256 routed experts, 8 active per token, one shared
+    // expert, 1000 params per expert. active = (8+1)*1000, resident = (256+1)*1000.
+    fn moe(num_routed_experts: u32) -> DeepseekV4Model {
+        let toml = format!(
+            r#"
+            name = "test-moe"
+            num_layers = 4
+            hidden_dim = 1024
+            num_heads = 8
+            max_seq_len = 4096
+            kv_latent_dim = 512
+            num_active_expert_params = 9000
+            num_active_non_expert_params = 1000
+            num_resident_expert_params = 257000
+            num_resident_non_expert_params = 1000
+            window_size = 0
+            num_dense_layers = 4
+            num_near_layers = 0
+            num_far_layers = 0
+            near_compress_ratio = 1
+            far_compress_ratio = 1
+            index_topk = 0
+            index_n_heads = 0
+            index_head_dim = 0
+            num_experts_per_tok = 8
+            num_routed_experts = {num_routed_experts}
+            num_moe_layers = 4
+            "#
+        );
+        toml::from_str(&toml).unwrap()
+    }
+
+    #[test]
+    fn expert_loading_grows_from_active_to_resident_with_batch() {
+        let m = moe(256);
+        let one = m.expert_params_resident_per_step(1);
+        let many = m.expert_params_resident_per_step(100_000);
+        // ~active at a single token, ~all-experts-resident at large batch.
+        assert!((one as i64 - 9000).abs() < 500, "single-token ≈ active, got {one}");
+        assert_eq!(many, 257_000, "large batch loads every expert");
+        // monotonically non-decreasing in batch.
+        let mut prev = 0;
+        for n in [1u32, 8, 32, 128, 512, 2048, 8192] {
+            let v = m.expert_params_resident_per_step(n);
+            assert!(v >= prev, "expert load must not shrink with batch");
+            prev = v;
+        }
+    }
+
+    #[test]
+    fn unset_routed_experts_falls_back_to_constant() {
+        let m = moe(0);
+        // No coupon model: constant active footprint regardless of batch.
+        assert_eq!(m.expert_params_resident_per_step(1), 9000);
+        assert_eq!(m.expert_params_resident_per_step(100_000), 9000);
+    }
+
+    #[test]
+    fn weight_bytes_per_step_scales_with_batch_for_moe() {
+        let m = ModelConfig::DeepseekV4(moe(256));
+        let small: u64 = m.weight_bytes_per_step_by_prec(1).iter().map(|(_, b)| b).sum();
+        let large: u64 = m.weight_bytes_per_step_by_prec(100_000).iter().map(|(_, b)| b).sum();
+        assert!(large > small, "MoE weight traffic must grow with batch tokens");
     }
 }
