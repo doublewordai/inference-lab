@@ -3,6 +3,7 @@ pub mod model;
 pub mod parallel;
 pub mod scheduler;
 pub mod simulation;
+pub mod speculative;
 pub mod topology;
 pub mod workload;
 
@@ -10,6 +11,7 @@ pub use hardware::{HardwareConfig, KVTier, Precision};
 pub use model::{DenseModel, DeepseekV4Model, ModelConfig, ModelCosts, SlidingWindowModel};
 pub use parallel::{CommsConfig, ParallelConfig};
 pub use scheduler::SchedulerConfig;
+pub use speculative::{AcceptanceModel, SpeculativeConfig};
 pub use simulation::SimulationConfig;
 pub use topology::{ClusterSpec, DisaggTopology, Node};
 pub use workload::{LengthDistribution, WorkloadConfig};
@@ -29,6 +31,10 @@ pub struct Config {
     pub workload: WorkloadConfig,
     #[serde(default)]
     pub simulation: SimulationConfig,
+    /// Optional speculative decoding. When set, decode steps verify `gamma + 1`
+    /// tokens and advance by `accepted + 1` per the acceptance model.
+    #[serde(default)]
+    pub speculative: Option<SpeculativeConfig>,
 }
 
 impl Config {
@@ -124,6 +130,7 @@ impl Config {
             scheduler,
             workload,
             simulation,
+            speculative: None,
         }
     }
 }

@@ -7,8 +7,13 @@
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 
+use rand::rngs::StdRng;
+use rand::SeedableRng;
+
 use crate::compute::ComputeEngine;
-use crate::config::{ClusterSpec, DisaggTopology, ModelConfig, ModelCosts, SchedulerConfig};
+use crate::config::{
+    ClusterSpec, DisaggTopology, ModelConfig, ModelCosts, SchedulerConfig, SpeculativeConfig,
+};
 use crate::kv_cache::{KVCacheManager, Link};
 use crate::request::Request;
 use crate::scheduler::Scheduler;
@@ -331,6 +336,9 @@ pub struct Engine {
     pool_batch_acc: Vec<(f64, f64)>,
     current_time: f64,
     seq_counter: u64,
+    /// Speculative decoding config + RNG. `None` = no speculation.
+    spec: Option<SpeculativeConfig>,
+    spec_rng: Option<StdRng>,
 }
 
 impl Engine {
@@ -349,7 +357,16 @@ impl Engine {
             pool_batch_acc,
             current_time: 0.0,
             seq_counter: 0,
+            spec: None,
+            spec_rng: None,
         }
+    }
+
+    /// Enable speculative decoding. Decode steps then verify `gamma + 1` tokens
+    /// (cost) and advance by `accepted + 1` (progress) per the acceptance model.
+    pub fn enable_speculative(&mut self, cfg: SpeculativeConfig, seed: u64) {
+        self.spec_rng = Some(StdRng::seed_from_u64(seed));
+        self.spec = Some(cfg);
     }
 
     pub fn current_time(&self) -> f64 {
@@ -631,25 +648,53 @@ impl Engine {
             }
         }
 
-        let (iter_time, bandwidth_util, flops_util) = {
+        // Speculative decoding: a decode step *verifies* `gamma + 1` tokens (the
+        // cost) but *advances* by `accepted + 1` (the progress). Prefill and
+        // chunked-prefill continuations (was_prefill) are not speculated.
+        let n_new = decision.scheduled_new.len();
+        let mut cost_tokens = tokens_per_request.clone();
+        let mut accepted_extra = vec![0u32; batch_size];
+        let mut speculated = false;
+        if let Some(spec) = self.spec.clone() {
+            for j in 0..batch_size {
+                if !progress[j].was_prefill {
+                    let accepted = match self.spec_rng.as_mut() {
+                        Some(rng) => spec.acceptance.sample_accepted(spec.gamma, rng),
+                        None => spec.acceptance.expected_accepted(spec.gamma).round() as u32,
+                    };
+                    cost_tokens[j] = spec.gamma + 1; // verify pass
+                    accepted_extra[j] = accepted; // bonus (+1) added at progress
+                    progress[j].num_tokens = accepted + 1; // tokens generated this step
+                    speculated = true;
+                }
+            }
+        }
+
+        let (mut iter_time, bandwidth_util, flops_util) = {
             let running = w.scheduler.running();
             let batch_refs: Vec<&Request> = batch_indices.iter().map(|&i| &running[i]).collect();
             let iter_time = w
                 .compute_engine
-                .calculate_iteration_time(&batch_refs, &tokens_per_request);
+                .calculate_iteration_time(&batch_refs, &cost_tokens);
             let bytes = w
                 .compute_engine
-                .calculate_bytes_transferred(&batch_refs, &tokens_per_request);
+                .calculate_bytes_transferred(&batch_refs, &cost_tokens);
             let bw = w
                 .compute_engine
                 .calculate_bandwidth_utilization(bytes, iter_time);
             let flops = w.compute_engine.calculate_flops_utilization(
                 &batch_refs,
-                &tokens_per_request,
+                &cost_tokens,
                 iter_time,
             );
             (iter_time, bw, flops)
         };
+        // Drafter overhead on speculated steps (a fraction of the verify step).
+        if speculated {
+            if let Some(spec) = &self.spec {
+                iter_time *= 1.0 + spec.draft_cost_frac;
+            }
+        }
         let end_time = now + iter_time;
 
         for (i, &idx) in decision.scheduled_new.iter().enumerate() {
@@ -659,7 +704,8 @@ impl Engine {
         }
         for (i, &idx) in decision.scheduled_running.iter().enumerate() {
             if let Some(req) = w.scheduler.running_mut().get_mut(idx) {
-                req.record_generated_tokens(decision.tokens_for_running[i], end_time);
+                let adv = decision.tokens_for_running[i] + accepted_extra[n_new + i];
+                req.record_generated_tokens(adv, end_time);
             }
         }
 

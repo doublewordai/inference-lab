@@ -116,8 +116,13 @@ impl Simulator {
             RequestGenerator::new(config.workload.clone())
         };
 
+        let mut engine = Engine::new(topology);
+        if let Some(spec) = &config.speculative {
+            engine.enable_speculative(spec.clone(), config.workload.seed);
+        }
+
         let simulator = Self {
-            engine: Engine::new(topology),
+            engine,
             request_generator,
             metrics: MetricsCollector::new(0.0),
             time_series: Vec::new(),

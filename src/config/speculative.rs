@@ -1,0 +1,103 @@
+use rand::Rng;
+use serde::Deserialize;
+
+/// How the target accepts a draft. The acceptance model is the knob you vary to
+/// study the simulated benefit of speculation under different draft qualities.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AcceptanceModel {
+    /// i.i.d. per-position acceptance probability `alpha`. The classic Leviathan
+    /// model: E[accepted] = (1 - alpha^(gamma+1)) / (1 - alpha) - 1 over the
+    /// draft, geometric in depth.
+    Constant { alpha: f64 },
+    /// Empirical per-position conditional acceptance `a[d]` = P(accept the draft
+    /// token at depth d | reached depth d). Index 0 is the first draft token.
+    /// This is the shape measured for real MTP drafters; depths beyond `a.len()`
+    /// are treated as never accepted.
+    PerPosition { a: Vec<f64> },
+}
+
+impl AcceptanceModel {
+    /// Conditional acceptance at draft depth `d` (0-based).
+    fn a_d(&self, d: usize) -> f64 {
+        match self {
+            AcceptanceModel::Constant { alpha } => *alpha,
+            AcceptanceModel::PerPosition { a } => a.get(d).copied().unwrap_or(0.0),
+        }
+    }
+
+    /// Expected number of *accepted draft* tokens (excluding the always-emitted
+    /// bonus token) for a draft of length `gamma`:
+    /// `E[L] = sum_{d=0}^{gamma-1} prod_{i<=d} a_i`.
+    pub fn expected_accepted(&self, gamma: u32) -> f64 {
+        let mut prefix = 1.0;
+        let mut e = 0.0;
+        for d in 0..gamma as usize {
+            prefix *= self.a_d(d);
+            e += prefix;
+        }
+        e
+    }
+
+    /// Sample the number of accepted draft tokens in `[0, gamma]`: accept depth
+    /// `d` with probability `a_d`, stop at the first rejection.
+    pub fn sample_accepted(&self, gamma: u32, rng: &mut impl Rng) -> u32 {
+        let mut n = 0;
+        for d in 0..gamma as usize {
+            if rng.gen::<f64>() < self.a_d(d) {
+                n += 1;
+            } else {
+                break;
+            }
+        }
+        n
+    }
+}
+
+/// Speculative decoding configuration. Top-level (a serving-strategy choice).
+/// When present, each decode step verifies `gamma + 1` tokens per sequence (the
+/// cost) and advances by `accepted + 1` tokens (the progress), with `accepted`
+/// drawn from `acceptance`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SpeculativeConfig {
+    /// Draft length: tokens proposed per step. The verify pass processes
+    /// `gamma + 1` positions per sequence.
+    pub gamma: u32,
+    /// Acceptance model (the quantity to vary).
+    pub acceptance: AcceptanceModel,
+    /// Drafter overhead as a fraction of the verify-step time, charged on each
+    /// speculated decode step. ~0.05-0.1 for a small MTP head; larger for a
+    /// separate draft model. Defaults to 0 (free drafter).
+    #[serde(default)]
+    pub draft_cost_frac: f64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::{rngs::StdRng, SeedableRng};
+
+    #[test]
+    fn constant_matches_geometric_expectation() {
+        let m = AcceptanceModel::Constant { alpha: 0.8 };
+        // sum_{d=1}^{4} 0.8^d = 0.8+0.64+0.512+0.4096
+        let expected = 0.8 + 0.64 + 0.512 + 0.4096;
+        assert!((m.expected_accepted(4) - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn per_position_expectation_and_sampling() {
+        let m = AcceptanceModel::PerPosition {
+            a: vec![0.84, 0.67, 0.54, 0.45],
+        };
+        // 0.84 + 0.84*0.67 + 0.84*0.67*0.54 + ...
+        let e = m.expected_accepted(4);
+        assert!(e > 1.8 && e < 1.9, "got {e}");
+        // sample mean converges to expectation
+        let mut rng = StdRng::seed_from_u64(0);
+        let n = 200_000;
+        let mean: f64 =
+            (0..n).map(|_| m.sample_accepted(4, &mut rng) as f64).sum::<f64>() / n as f64;
+        assert!((mean - e).abs() < 0.02, "sample mean {mean} vs {e}");
+    }
+}
