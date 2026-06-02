@@ -291,8 +291,12 @@ impl Simulator {
         // Per-token timestamps: we lost individual times, so synthesise an
         // even decode cadence between first_token and completion. This
         // preserves the per-token-latency mean and percentiles to within
-        // sample_interval but loses jitter detail. Acceptable trade-off
-        // given the engine doesn't carry per-token samples.
+        // sample_interval but loses jitter detail. Under speculative decoding
+        // the real emission is bursty (a clump of accepted tokens per verify
+        // step, then a gap), so the even cadence is a coarser approximation
+        // there: the mean/median per-token latency stay correct (span /
+        // num_output_tokens), but inter-token jitter and ITL tails are not
+        // represented. Acceptable while nothing consumes spec ITL tails.
         if timing.num_output_tokens > 0 {
             let n = timing.num_output_tokens as usize;
             let span = (timing.completion_time - timing.first_token_time).max(0.0);
