@@ -14,7 +14,7 @@ pub use scheduler::SchedulerConfig;
 pub use speculative::{AcceptanceModel, GammaPolicy, SpeculativeConfig};
 pub use simulation::SimulationConfig;
 pub use topology::{ClusterSpec, DisaggTopology, Node};
-pub use workload::{LengthDistribution, WorkloadConfig};
+pub use workload::{LengthDistribution, RateSchedule, WorkloadConfig};
 
 use serde::Deserialize;
 use std::fs;
@@ -112,6 +112,7 @@ impl Config {
             dataset_path: None,
             arrival_pattern: "poisson".to_string(),
             arrival_rate: 1.0,
+            rate_schedule: None,
             num_concurrent_users: None,
             input_len_dist: LengthDistribution::Fixed { value: 100 },
             output_len_dist: LengthDistribution::Fixed { value: 50 },
