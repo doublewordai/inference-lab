@@ -67,8 +67,16 @@ pub enum GammaPolicy {
     Fixed,
     /// Load-aware: each step pick g in 0..=gamma that maximises expected goodput
     /// `(E[accepted|g]+1) / C(state, g)` using the cost model (so it is roofline-
-    /// and MoE-coupon-aware). g=0 means "don't speculate this step".
+    /// and MoE-coupon-aware). g=0 means "don't speculate this step". The whole
+    /// decode batch gets the same g (homogeneous).
     GoodputGreedy,
+    /// Like `GoodputGreedy`, but distributes a *fractional* total draft budget
+    /// across the decode sub-batch as an even floor/ceil split (optimal for equal
+    /// alpha), so the average draft length can take non-integer values. Each
+    /// candidate budget is priced exactly with the cost model on the realised
+    /// per-sequence verify widths. Removes the integer-g quantisation that forces
+    /// the homogeneous policy to over- or under-shoot at large batch.
+    GoodputGreedyFractional,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -753,47 +753,103 @@ impl Engine {
             Vec::new()
         };
 
-        // Decide each decode request's draft length for its NEXT step
-        // (vLLM-faithful: drafting happens at the end of a step, so the next
+        // Decide each decode request's per-sequence draft length for its NEXT
+        // step (vLLM-faithful: drafting happens at the end of a step, so the next
         // scheduler pass reads `pending_draft_len` and reserves `1 + draft` of
-        // token budget + KV, trimming if tight). `Fixed` is the constant draft;
-        // `GoodputGreedy` prices candidate draft lengths on the current decode
-        // sub-batch via the cost model (so it is roofline- and MoE-coupon-aware)
-        // and picks the one maximising expected goodput `(E[accepted|g]+1)/C(g)`.
-        // Pricing on the decode sub-batch only (not the prefill-mixed batch)
-        // avoids a big prefill chunk masking the verify cost and inflating g.
+        // token budget + KV per sequence, trimming if tight). All policies price
+        // candidates on the decode sub-batch only (not the prefill-mixed batch),
+        // so a big prefill chunk can't mask the verify cost and inflate g.
+        //   Fixed                  -> constant draft on every sequence.
+        //   GoodputGreedy          -> one g in 0..=gamma maximising goodput
+        //                             `(E[accepted|g]+1)/C(g)`, same g for all.
+        //   GoodputGreedyFractional-> spread a fractional total budget as an even
+        //                             floor/ceil split; price each candidate
+        //                             exactly via the cost model on the realised
+        //                             per-seq verify widths.
         if let Some(spec) = self.spec.clone() {
-            let g_next = match spec.policy {
-                GammaPolicy::Fixed => spec.gamma,
-                GammaPolicy::GoodputGreedy => {
-                    let running = w.scheduler.running();
-                    let dec: Vec<&Request> = running
-                        .iter()
-                        .filter(|r| !r.is_prefill() && !r.is_finished())
-                        .collect();
-                    if dec.is_empty() {
-                        0
-                    } else {
-                        let mut best_g = 0u32;
-                        let mut best_gp = f64::MIN;
-                        for g in 0..=spec.gamma {
-                            let toks = vec![g + 1; dec.len()];
-                            let c = w.compute_engine.calculate_iteration_time(&dec, &toks)
-                                * (1.0 + spec.draft_cost_frac * g as f64);
-                            let committed = spec.acceptance.expected_accepted(g) + 1.0;
-                            let gp = committed / c.max(1e-12);
-                            if gp > best_gp {
-                                best_gp = gp;
-                                best_g = g;
+            let drafts: Vec<u32> = {
+                let dec: Vec<&Request> = w
+                    .scheduler
+                    .running()
+                    .iter()
+                    .filter(|r| !r.is_prefill() && !r.is_finished())
+                    .collect();
+                let n = dec.len();
+                if n == 0 {
+                    Vec::new()
+                } else {
+                    match spec.policy {
+                        GammaPolicy::Fixed => vec![spec.gamma; n],
+                        GammaPolicy::GoodputGreedy => {
+                            let mut best_g = 0u32;
+                            let mut best_gp = f64::MIN;
+                            for g in 0..=spec.gamma {
+                                let toks = vec![g + 1; n];
+                                let c = w.compute_engine.calculate_iteration_time(&dec, &toks)
+                                    * (1.0 + spec.draft_cost_frac * g as f64);
+                                let committed = spec.acceptance.expected_accepted(g) + 1.0;
+                                let gp = committed / c.max(1e-12);
+                                if gp > best_gp {
+                                    best_gp = gp;
+                                    best_g = g;
+                                }
                             }
+                            vec![best_g; n]
                         }
-                        best_g
+                        GammaPolicy::GoodputGreedyFractional => {
+                            // Total draft budget Γ in [0, gamma·n], realised as an
+                            // even floor/ceil split: `rem` sequences draft base+1,
+                            // the rest base. Cost is the exact cost model on those
+                            // per-seq verify widths; the drafter term uses the
+                            // deepest draft in the batch. Candidates include every
+                            // homogeneous breakpoint Γ = m·n (so this can never lose
+                            // to GoodputGreedy) plus a fine sweep filling the gaps,
+                            // capped near MAX_EVALS cost-model calls.
+                            const MAX_EVALS: u32 = 192;
+                            let nb = n as u32;
+                            let gamma_total_max = spec.gamma * nb;
+                            let mut candidates: Vec<u32> = (0..=spec.gamma).map(|m| m * nb).collect();
+                            let step = (gamma_total_max / MAX_EVALS).max(1);
+                            let mut t = 0u32;
+                            while t < gamma_total_max {
+                                candidates.push(t);
+                                t += step;
+                            }
+                            candidates.sort_unstable();
+                            candidates.dedup();
+                            let mut best_drafts = vec![0u32; n];
+                            let mut best_gp = f64::MIN;
+                            for total in candidates {
+                                let base = total / nb;
+                                let rem = (total % nb) as usize;
+                                let toks: Vec<u32> = (0..n)
+                                    .map(|i| if i < rem { base + 2 } else { base + 1 })
+                                    .collect();
+                                let max_g = if rem > 0 { base + 1 } else { base };
+                                let c = w.compute_engine.calculate_iteration_time(&dec, &toks)
+                                    * (1.0 + spec.draft_cost_frac * max_g as f64);
+                                let committed = (spec.acceptance.expected_accepted(base) + 1.0)
+                                    * (n - rem) as f64
+                                    + (spec.acceptance.expected_accepted(base + 1) + 1.0)
+                                        * rem as f64;
+                                let gp = committed / c.max(1e-12);
+                                if gp > best_gp {
+                                    best_gp = gp;
+                                    best_drafts = (0..n)
+                                        .map(|i| if i < rem { base + 1 } else { base })
+                                        .collect();
+                                }
+                            }
+                            best_drafts
+                        }
                     }
                 }
             };
+            let mut k = 0usize;
             for req in w.scheduler.running_mut().iter_mut() {
-                if !req.is_prefill() {
-                    req.pending_draft_len = g_next;
+                if !req.is_prefill() && !req.is_finished() {
+                    req.pending_draft_len = drafts.get(k).copied().unwrap_or(0);
+                    k += 1;
                 }
             }
         }
