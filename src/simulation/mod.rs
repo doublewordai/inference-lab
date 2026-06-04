@@ -20,12 +20,15 @@ pub use engine::{
 pub use roofline::{predict_decode_tpot, predict_prefill_time};
 pub use simulator::{ProgressInfo, Simulator, TimeSeriesPoint};
 
+use crate::config::SpeculativeConfig;
 use crate::request::Request;
 
 /// Run a closed-loop workload of `conc` users issuing fixed-shape requests
 /// (`isl` prompt tokens, `osl` output tokens) through `topology`. Stops once
 /// `num_completions` requests have finished. The first `warmup_completions`
 /// are dropped from the returned set (so the steady state is what's reported).
+/// `spec` optionally enables speculative decoding (applies only to decode
+/// steps, so on a disagg topology it affects only the decode pool).
 pub fn simulate_closed_loop(
     topology: Topology,
     conc: u32,
@@ -33,12 +36,28 @@ pub fn simulate_closed_loop(
     osl: u32,
     num_completions: u32,
     warmup_completions: u32,
+    spec: Option<SpeculativeConfig>,
+    seed: u64,
+    skip_prefill: bool,
 ) -> Result<ClosedLoopResult, String> {
     let mut engine = Engine::new(topology);
+    if let Some(s) = spec {
+        engine.enable_speculative(s, seed);
+    }
+    // `skip_prefill` makes requests arrive already prefilled (num_computed = isl),
+    // i.e. as pure-decode work -- the disaggregated decode pool in isolation, no
+    // prefill compute sharing the GPU. Pair with lifted KV caps to sweep the
+    // compute roofline.
+    let mk = |id: u32, arrival: f64| {
+        let mut req = Request::new(format!("req-{id}"), 0, arrival, isl, osl);
+        if skip_prefill {
+            req.num_computed_tokens = isl;
+        }
+        req
+    };
     // Seed initial conc users at t=0.
     for i in 0..conc {
-        let req = Request::new(format!("req-{i}"), 0, 0.0, isl, osl);
-        engine.submit(req);
+        engine.submit(mk(i, 0.0));
     }
     let mut next_id: u32 = conc;
     let mut all = Vec::with_capacity(num_completions as usize);
@@ -51,8 +70,7 @@ pub fn simulate_closed_loop(
             let now = timing.completion_time;
             all.push(timing);
             if next_id < num_completions + conc {
-                let req = Request::new(format!("req-{next_id}"), 0, now, isl, osl);
-                engine.submit(req);
+                engine.submit(mk(next_id, now));
                 next_id += 1;
             }
         }
