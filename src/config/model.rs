@@ -615,7 +615,12 @@ impl ModelCosts for DeepseekV4Model {
         window_flops + near_flops + far_flops + indexer_flops
     }
     fn attention_precision(&self) -> Precision {
-        self.non_expert_precision
+        // FlashMLA runs the attention score/AV matmul in bf16 for numerical
+        // reasons, even though the KV cache is stored (and its bytes counted) in
+        // `kv_precision` (fp8). The KV-read byte count is computed separately
+        // from `kv_precision`; this only sets the FLOP rate the attention matmul
+        // is charged at, which is the bf16 ridge, not the fp8 projection ridge.
+        Precision::Bf16
     }
     fn weight_bytes_per_step_by_prec(&self, num_tokens: u32) -> Vec<(Precision, u64)> {
         let exp_bytes = (self.expert_params_resident_per_step(num_tokens) as f64
