@@ -753,19 +753,19 @@ impl Engine {
             Vec::new()
         };
 
-        // Decide each decode request's per-sequence draft length for its NEXT
-        // step (vLLM-faithful: drafting happens at the end of a step, so the next
-        // scheduler pass reads `pending_draft_len` and reserves `1 + draft` of
-        // token budget + KV per sequence, trimming if tight). All policies price
-        // candidates on the decode sub-batch only (not the prefill-mixed batch),
-        // so a big prefill chunk can't mask the verify cost and inflate g.
-        //   Fixed                  -> constant draft on every sequence.
-        //   GoodputGreedy          -> one g in 0..=gamma maximising goodput
-        //                             `(E[accepted|g]+1)/C(g)`, same g for all.
-        //   GoodputGreedyFractional-> spread a fractional total budget as an even
-        //                             floor/ceil split; price each candidate
-        //                             exactly via the cost model on the realised
-        //                             per-seq verify widths.
+        // Decide the decode batch's draft depth for its NEXT step. Drafting
+        // happens here, at the end of the step -- the one instant when the
+        // drafter is about to run AND N's survivors (the carry-over decode set)
+        // and the waiting prefill queue are both known. The next scheduler pass
+        // reads `pending_draft_len` and reserves `1 + draft` of budget + KV.
+        //   Fixed         -> constant draft on every decode.
+        //   GoodputBudget -> one homogeneous G in 0..=gamma, chosen by pricing
+        //                    each candidate against the batch that will actually
+        //                    co-occur: the decode sub-batch at width 1+G plus the
+        //                    prefill that backfills the leftover token budget. So
+        //                    deeper G loses when prefill demands the budget. The
+        //                    drafter is charged for G passes; G is the planned
+        //                    verify depth, so there is no over-generation.
         if let Some(spec) = self.spec.clone() {
             let drafts: Vec<u32> = {
                 let dec: Vec<&Request> = w
@@ -780,7 +780,27 @@ impl Engine {
                 } else {
                     match spec.policy {
                         GammaPolicy::Fixed => vec![spec.gamma; n],
-                        GammaPolicy::GoodputGreedy => {
+                        GammaPolicy::GoodputBudget => {
+                            // Decide one homogeneous draft depth G for the decode
+                            // batch by maximising committed decode / step time,
+                            // priced through the real roofline cost model (MoE-
+                            // coupon- and MLA-aware), drafter charged for G passes.
+                            // G is sized from the previous iteration's decode batch
+                            // (vLLM-faithful: drafting happens at step end).
+                            //
+                            // It prices the decode sub-batch only -- prefill is
+                            // ignored. That is deliberate, not a TODO: a single-step
+                            // prefill term cannot price G correctly (the mandatory
+                            // prefill is proportional to committed output, so it
+                            // cancels in the argmax; and routing prefill tokens
+                            // through the cost model lights up the MoE coupon and
+                            // makes verify look free). Measured behaviour (chunked
+                            // prefill on, the vLLM-V1 target): within +/-0.5% of the
+                            // best fixed gamma when ISL ~ OSL, with a bounded
+                            // over-speculation tail (up to ~6%) only at large batch
+                            // when ISL >> OSL. That residual is a gamma-dependent
+                            // intra-step prefill effect that needs phase-level
+                            // modelling; not worth the complexity at this accuracy.
                             let mut best_g = 0u32;
                             let mut best_gp = f64::MIN;
                             for g in 0..=spec.gamma {
@@ -795,52 +815,6 @@ impl Engine {
                                 }
                             }
                             vec![best_g; n]
-                        }
-                        GammaPolicy::GoodputGreedyFractional => {
-                            // Total draft budget Γ in [0, gamma·n], realised as an
-                            // even floor/ceil split: `rem` sequences draft base+1,
-                            // the rest base. Cost is the exact cost model on those
-                            // per-seq verify widths; the drafter term uses the
-                            // deepest draft in the batch. Candidates include every
-                            // homogeneous breakpoint Γ = m·n (so this can never lose
-                            // to GoodputGreedy) plus a fine sweep filling the gaps,
-                            // capped near MAX_EVALS cost-model calls.
-                            const MAX_EVALS: u32 = 192;
-                            let nb = n as u32;
-                            let gamma_total_max = spec.gamma * nb;
-                            let mut candidates: Vec<u32> = (0..=spec.gamma).map(|m| m * nb).collect();
-                            let step = (gamma_total_max / MAX_EVALS).max(1);
-                            let mut t = 0u32;
-                            while t < gamma_total_max {
-                                candidates.push(t);
-                                t += step;
-                            }
-                            candidates.sort_unstable();
-                            candidates.dedup();
-                            let mut best_drafts = vec![0u32; n];
-                            let mut best_gp = f64::MIN;
-                            for total in candidates {
-                                let base = total / nb;
-                                let rem = (total % nb) as usize;
-                                let toks: Vec<u32> = (0..n)
-                                    .map(|i| if i < rem { base + 2 } else { base + 1 })
-                                    .collect();
-                                let max_g = if rem > 0 { base + 1 } else { base };
-                                let c = w.compute_engine.calculate_iteration_time(&dec, &toks)
-                                    * (1.0 + spec.draft_cost_frac * max_g as f64);
-                                let committed = (spec.acceptance.expected_accepted(base) + 1.0)
-                                    * (n - rem) as f64
-                                    + (spec.acceptance.expected_accepted(base + 1) + 1.0)
-                                        * rem as f64;
-                                let gp = committed / c.max(1e-12);
-                                if gp > best_gp {
-                                    best_gp = gp;
-                                    best_drafts = (0..n)
-                                        .map(|i| if i < rem { base + 1 } else { base })
-                                        .collect();
-                                }
-                            }
-                            best_drafts
                         }
                     }
                 }

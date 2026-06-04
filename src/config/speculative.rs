@@ -65,23 +65,28 @@ pub enum GammaPolicy {
     /// Always use `gamma`.
     #[default]
     Fixed,
-    /// Load-aware: each step pick g in 0..=gamma that maximises expected goodput
-    /// `(E[accepted|g]+1) / C(state, g)` using the cost model (so it is roofline-
-    /// and MoE-coupon-aware). g=0 means "don't speculate this step". The whole
-    /// decode batch gets the same g (homogeneous).
-    GoodputGreedy,
-    /// Like `GoodputGreedy`, but distributes a *fractional* total draft budget
-    /// across the decode sub-batch as an even floor/ceil split (optimal for equal
-    /// alpha), so the average draft length can take non-integer values. Each
-    /// candidate budget is priced exactly with the cost model on the realised
-    /// per-sequence verify widths. Removes the integer-g quantisation that forces
-    /// the homogeneous policy to over- or under-shoot at large batch.
-    GoodputGreedyFractional,
+    /// Load-aware homogeneous draft depth `G`. At the end of a step (the instant
+    /// the drafter is about to run, vLLM-faithful), pick one `G in 0..=gamma` for
+    /// the whole decode batch that maximises goodput `(E[accepted|G]+1) / C(G)`,
+    /// where `C` is the real roofline cost (MoE-coupon- and MLA-aware) of the
+    /// decode sub-batch at verify width `1 + G`, and the drafter is charged for
+    /// `G` passes. `G` is sized from the current decode batch, so it tracks the
+    /// load (small at the expert-tax shoulder, deep in the memory-bound middle,
+    /// back down once compute-bound).
+    ///
+    /// It prices the decode sub-batch only. Pricing prefill into the same step
+    /// does not help: the mandatory prefill is proportional to committed output
+    /// so it cancels in the argmax, and routing prefill tokens through the cost
+    /// model trips the MoE coupon (verify looks free). Measured against the best
+    /// fixed gamma with chunked prefill on (the vLLM-V1 target): within +/-0.5%
+    /// when ISL ~ OSL, with a bounded over-speculation tail (up to ~6%) only at
+    /// large batch when ISL >> OSL.
+    GoodputBudget,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SpeculativeConfig {
-    /// Draft length under `Fixed`; the maximum candidate under `GoodputGreedy`.
+    /// Draft length under `Fixed`; the maximum candidate `G` under `GoodputBudget`.
     /// The verify pass processes `gamma + 1` positions per sequence.
     pub gamma: u32,
     /// Acceptance model (the quantity to vary).

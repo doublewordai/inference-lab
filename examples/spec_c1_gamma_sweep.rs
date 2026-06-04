@@ -1,28 +1,24 @@
 //! C1: the auto-tuner sanity check.
 //!
 //! Claim under test: a load-aware policy that prices γ through the real cost
-//! model (`GoodputGreedy`) lands on the best fixed γ at *every* operating point,
-//! with no per-point tuning. If true, the GREEDY goodput curve traces the upper
+//! model (`GoodputBudget`) lands on the best fixed γ at *every* operating point,
+//! with no per-point tuning. If true, the BUDGET goodput curve traces the upper
 //! envelope of the fixed-γ family across the whole batch sweep. This is a
 //! validation of the policy+cost-model coupling (and, implicitly, of the cost
 //! model itself), not a win claim -- the wins are C2 (mistuning).
 //!
 //! Method (one variable: the decode batch):
 //!   * Single aggregated pool, closed-loop at concurrency `conc` (= operating
-//!     point). Short ISL, longer OSL, so the step is decode-dominated and the
-//!     decode batch ≈ conc.
-//!   * Held fixed: model, hardware, acceptance (constant α), ISL/OSL, seed.
-//!   * Swept: `conc` (the batch) × policy ∈ { nospec, fixed γ∈{2,4,8}, GREEDY }.
+//!     point), chunked prefill on (the vLLM-V1 target).
+//!   * Held fixed: model, hardware, acceptance (constant α), ISL/OSL, c_draft, seed.
+//!   * Swept: `conc` (the batch) × policy ∈ { nospec, fixed γ∈1..=8, BUDGET }.
 //!   * Oracle-best-fixed = max goodput over the fixed-γ family at each conc.
 //!   * Readout: goodput = `output_tokens_per_sec` (lossless spec ⇒ committed
-//!     output tokens/s). Also TPOT and bandwidth/flops util to show the regime.
-//!   * Pass iff GREEDY ≈ max-over-fixed-γ at every conc.
+//!     output tokens/s), plus bandwidth util to show the regime.
+//!   * Pass iff BUDGET ≈ max-over-fixed-γ at every conc.
 //!
-//! NOTE ON MODEL: this uses the DSv4-Pro + B300 config already validated against
-//! real pareto data in `dsv4_decode_tpot_sweep`. The blog is grounded in
-//! V4-Flash on B200; the C1 *claim* is model-agnostic, so we smoke-test on the
-//! vetted config and re-point to a vetted Flash/B200 config before any number is
-//! quoted in the post.
+//! MODEL: DeepSeek-V4-Flash on B200, params derived from the HF config +
+//! safetensors shapes (see `deepseek_v4_flash` below).
 //!
 //! Run: `cargo run --release --example spec_c1_gamma_sweep --no-default-features`
 
@@ -96,9 +92,9 @@ fn base_config(conc: usize, isl: u32, osl: u32) -> Config {
         parallel: ParallelConfig { tp: 1, ep: 1, dp_attention: false },
         model: deepseek_v4_flash(),
         scheduler: SchedulerConfig {
-            max_num_batched_tokens: 32768,
+            max_num_batched_tokens: 8192,
             max_num_seqs: 32768,
-            enable_chunked_prefill: false,
+            enable_chunked_prefill: true,
             long_prefill_token_threshold: 0,
             max_num_partial_prefills: 1,
             block_size: 64,
@@ -131,17 +127,10 @@ fn base_config(conc: usize, isl: u32, osl: u32) -> Config {
 enum Policy {
     NoSpec,
     Fixed(u32),
-    Greedy(u32),
+    Budget(u32),
 }
 
 impl Policy {
-    fn label(&self) -> String {
-        match self {
-            Policy::NoSpec => "nospec".into(),
-            Policy::Fixed(g) => format!("fix γ{g}"),
-            Policy::Greedy(g) => format!("GREEDY≤{g}"),
-        }
-    }
     fn spec(&self, alpha: f64, c_draft: f64) -> Option<SpeculativeConfig> {
         let acceptance = AcceptanceModel::Constant { alpha };
         match *self {
@@ -152,10 +141,10 @@ impl Policy {
                 policy: GammaPolicy::Fixed,
                 draft_cost_frac: c_draft,
             }),
-            Policy::Greedy(g) => Some(SpeculativeConfig {
+            Policy::Budget(g) => Some(SpeculativeConfig {
                 gamma: g,
                 acceptance,
-                policy: GammaPolicy::GoodputGreedy,
+                policy: GammaPolicy::GoodputBudget,
                 draft_cost_frac: c_draft,
             }),
         }
@@ -190,7 +179,7 @@ fn main() {
     let gamma_max = 8u32;
 
     println!("C1 auto-tuner sanity check  (V4-Flash, B200 TP1/EP1, closed-loop, ISL={isl} OSL={osl}, α={alpha}, c_draft={c_draft})");
-    println!("goodput = committed output tokens/s. GREEDY should trace max-over-fixed-γ at every batch.\n");
+    println!("goodput = committed output tokens/s. BUDGET should trace max-over-fixed-γ at every batch.\n");
 
     // header
     print!("{:>6}", "conc");
@@ -199,12 +188,12 @@ fn main() {
         print!("  {:>10}", format!("fix γ{g}"));
     }
     print!("  {:>10}", "best-fix");
-    print!("  {:>10}", format!("GREEDY≤{gamma_max}"));
-    print!("  {:>8}", "Δ%");
+    print!("  {:>10}", format!("BUDGET≤{gamma_max}"));
+    print!("  {:>7}", "Δ%");
     print!("  {:>7}", "argmax");
     print!("  {:>6}", "bw%");
     println!();
-    println!("{}", "-".repeat(6 + (3 + fixed.len() + 3) * 12 + 8 + 7 + 6));
+    println!("{}", "-".repeat(6 + (3 + fixed.len() + 2) * 12 + 7 + 7 + 6));
 
     for &conc in &concs {
         let (ns, _, _, _) = run_point(conc, isl, osl, alpha, c_draft, Policy::NoSpec);
@@ -219,8 +208,8 @@ fn main() {
             }
             fixed_gp.push(gp);
         }
-        let (greedy, _tpot, bw, _fl) = run_point(conc, isl, osl, alpha, c_draft, Policy::Greedy(gamma_max));
-        let delta = 100.0 * (greedy - best_fixed) / best_fixed;
+        let (budget, _tpot, bw, _fl) = run_point(conc, isl, osl, alpha, c_draft, Policy::Budget(gamma_max));
+        let d_budget = 100.0 * (budget - best_fixed) / best_fixed;
 
         print!("{conc:>6}");
         print!("  {ns:>10.0}");
@@ -228,14 +217,14 @@ fn main() {
             print!("  {gp:>10.0}");
         }
         print!("  {best_fixed:>10.0}");
-        print!("  {greedy:>10.0}");
-        print!("  {delta:>+8.2}");
+        print!("  {budget:>10.0}");
+        print!("  {d_budget:>+7.2}");
         let argmax = if best_g == 0 { "nospec".to_string() } else { format!("γ{best_g}") };
         print!("  {argmax:>7}");
         print!("  {:>5.0}%", bw * 100.0);
         println!();
     }
 
-    println!("\nPass criterion: Δ% ≈ 0 (GREEDY matches best fixed γ) at every conc, with the");
+    println!("\nPass criterion: Δ% ≈ 0 (BUDGET matches best fixed γ) at every conc, with the");
     println!("winning fixed γ (argmax) shifting across the sweep -- that shift is what C2 exploits.");
 }
