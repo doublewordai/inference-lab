@@ -18,8 +18,8 @@ performance modeling.
 
 ## How does it work?
 
-`inference-lab` uses discrete-event simulation to model the behavior of a
-multi-GPU node serving LLM inference requests with the vLLM library. It
+`inference-lab` uses discrete-event simulation to model the behavior of multiple multi-GPU nodes
+serving LLM inference requests with the vLLM library. It
 contains a facsimile of the vLLM queueing, scheduling, and execution logic,
 with only the actual model inference replaced by a performance model based on
 the supplied GPU specs and model architecture.
@@ -33,13 +33,6 @@ Within each simulation step, the simulator:
 the workload on the specified hardware.
 4. Increments the simulation time by the calculated execution time, updating the
    state of all requests accordingly.
-
-Caveats:
-
-1. This assumes perfectly optimized GPU execution, ignoring kernel launch
-   overheads, poorly optimized kernels, application overhead, thermals, etc.
-2. We simulate tensor parallel execution, but don't model multi-GPU
-   communication overheads.
 
 ## Installation
 
