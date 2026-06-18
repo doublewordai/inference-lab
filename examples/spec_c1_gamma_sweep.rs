@@ -140,12 +140,18 @@ impl Policy {
                 acceptance,
                 policy: GammaPolicy::Fixed,
                 draft_cost_frac: c_draft,
+                measured_cost: None,
+                switch: Default::default(),
+                drafter: None,
             }),
             Policy::Budget(g) => Some(SpeculativeConfig {
                 gamma: g,
                 acceptance,
                 policy: GammaPolicy::GoodputBudget,
                 draft_cost_frac: c_draft,
+                measured_cost: None,
+                switch: Default::default(),
+                drafter: None,
             }),
         }
     }

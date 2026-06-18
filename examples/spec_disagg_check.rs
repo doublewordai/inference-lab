@@ -19,6 +19,8 @@ use inference_lab::config::{
 };
 use inference_lab::config::DisaggTopology;
 use inference_lab::simulation::{simulate_closed_loop, Topology};
+use rayon::prelude::*;
+use std::collections::BTreeMap;
 
 fn b200() -> HardwareConfig {
     HardwareConfig {
@@ -104,9 +106,11 @@ fn spec_for(p: Policy, alpha: f64, c_draft: f64) -> Option<SpeculativeConfig> {
         Policy::NoSpec => None,
         Policy::Fixed(g) => Some(SpeculativeConfig {
             gamma: g, acceptance, policy: GammaPolicy::Fixed, draft_cost_frac: c_draft,
+            measured_cost: None, switch: Default::default(), drafter: None,
         }),
         Policy::Budget(g) => Some(SpeculativeConfig {
             gamma: g, acceptance, policy: GammaPolicy::GoodputBudget, draft_cost_frac: c_draft,
+            measured_cost: None, switch: Default::default(), drafter: None,
         }),
     }
 }
@@ -138,8 +142,37 @@ fn main() {
     let gamma_max = 8u32;
     let fixed = [1u32, 2, 3, 4, 5, 6, 7, 8];
     // One dedicated prefill worker per user -> prefill never queues, decode batch
-    // fills toward conc (verified by the `dbatch` column).
-    let concs = [64u32, 128, 256, 512];
+    // fills toward conc (verified by the `dbatch` column) until the single decode
+    // worker saturates. Low concs probe the no-spec/shallow shoulder; high concs
+    // probe decode-pool saturation.
+    let concs = [1u32, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096];
+
+    // Column layout per conc: 0 = nospec, 1..=8 = fixed g1..g8, 9 = BUDGET.
+    // Build a flat task list over (conc, col, policy) and run every sim in parallel;
+    // the decode pool is a single worker so per-sim live state stays small.
+    let mut tasks: Vec<(u32, usize, Policy)> = Vec::new();
+    for &conc in &concs {
+        tasks.push((conc, 0, Policy::NoSpec));
+        for (i, &g) in fixed.iter().enumerate() {
+            tasks.push((conc, 1 + i, Policy::Fixed(g)));
+        }
+        tasks.push((conc, 9, Policy::Budget(gamma_max)));
+    }
+    let results: Vec<(u32, usize, f64, f64)> = tasks
+        .par_iter()
+        .map(|&(conc, col, p)| {
+            let p_workers = conc; // dedicated prefill per user
+            let (gp, db) = run(conc, isl, osl, p_workers, p, alpha, c_draft);
+            (conc, col, gp, db)
+        })
+        .collect();
+
+    let mut gp: BTreeMap<u32, [f64; 10]> = BTreeMap::new();
+    let mut dbatch: BTreeMap<u32, f64> = BTreeMap::new();
+    for (conc, col, g, db) in results {
+        gp.entry(conc).or_insert([0.0; 10])[col] = g;
+        if col == 0 { dbatch.insert(conc, db); }
+    }
 
     println!("Disagg control: V4-Flash, B200, decode pool TP1, prefill pool = conc workers");
     println!("ISL={isl} OSL={osl} alpha={alpha} c_draft={c_draft}. goodput = committed tok/s.\n");
@@ -150,19 +183,17 @@ fn main() {
     println!();
 
     for &conc in &concs {
-        let p_workers = conc; // dedicated prefill per user
-        let (ns, db) = run(conc, isl, osl, p_workers, Policy::NoSpec, alpha, c_draft);
-        let mut best = ns; let mut bestg = 0u32; let mut cols = Vec::new();
-        for &g in &fixed {
-            let (gp, _) = run(conc, isl, osl, p_workers, Policy::Fixed(g), alpha, c_draft);
-            if gp > best { best = gp; bestg = g; }
-            cols.push(gp);
+        let row = gp[&conc];
+        let ns = row[0];
+        let bud = row[9];
+        let mut best = ns; let mut bestg = 0u32;
+        for (i, &g) in fixed.iter().enumerate() {
+            if row[1 + i] > best { best = row[1 + i]; bestg = g; }
         }
-        let (bud, _) = run(conc, isl, osl, p_workers, Policy::Budget(gamma_max), alpha, c_draft);
         let d = 100.0 * (bud - best) / best;
-        print!("{conc:>5} {db:>8.1}");
+        print!("{conc:>5} {:>8.1}", dbatch[&conc]);
         print!(" {ns:>9.0}");
-        for gp in &cols { print!(" {gp:>9.0}"); }
+        for i in 0..8 { print!(" {:>9.0}", row[1 + i]); }
         let argmax = if bestg == 0 { "nospec".into() } else { format!("g{bestg}") };
         print!(" {best:>9.0} {bud:>9.0} {argmax:>7} {d:>+7.2}");
         println!();

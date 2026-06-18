@@ -80,6 +80,13 @@ pub struct Request {
     /// it if capacity is tight. 0 means no speculation (and is always 0 when
     /// speculative decoding is disabled).
     pub pending_draft_len: u32,
+
+    /// Speculative decoding with `TraceRounds` acceptance: the full-depth
+    /// committed-draft count of the trace round drawn for this request's NEXT
+    /// decode step. The verify realises `min(pending_round_commits, draft)`
+    /// accepted tokens, so a scheduler-trimmed draft stays consistent. `None`
+    /// when no round is pending (non-trace acceptance, or prefill).
+    pub pending_round_commits: Option<u32>,
 }
 
 impl Request {
@@ -114,6 +121,7 @@ impl Request {
             last_preempted_at: None,
             ready_at: None,
             pending_draft_len: 0,
+            pending_round_commits: None,
         }
     }
 

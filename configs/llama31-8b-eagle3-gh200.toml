@@ -1,0 +1,93 @@
+# Llama-3.1-8B-Instruct + EAGLE3 drafter on a single GH200 (96 GB HBM3).
+# Dense GQA transformer modeled by the generic `dense` variant:
+#   32 layers, hidden 4096, 32 q / 8 kv heads, head_dim 128, 8.03B params, bf16.
+#   matmul flops = 2 * params / token; weights = params * 2 B per step (no MoE);
+#   KV = 2 * layers * kv_heads * head_dim * seq_len * 2 B.
+# This is the engine target for the measured-cost-table work: a benchmarked
+# (batch_size, num_draft_tokens) -> step_seconds grid ([speculative.measured_cost]
+# below) prices both the policy's C(g) and pure-decode step wall time; the
+# analytic roofline is the off-grid fallback.
+
+[hardware]
+name = "GH200-96"
+# H100-class SXM compute. No native FP4.
+flops_fp8 = 1.979e15
+flops_bf16 = 0.989e15
+flops_fp16 = 0.989e15
+memory_bandwidth = 4.0e12        # HBM3, ~4 TB/s on the 96 GB GH200
+memory_capacity = 96000000000
+kv_cache_capacity = 0            # auto: mem * util - weights
+gpu_memory_utilization = 0.9
+
+[parallel]
+tp = 1
+ep = 1
+
+[model]
+type = "dense"
+name = "Llama-3.1-8B-Instruct"
+num_parameters = 8030000000
+num_layers = 32
+hidden_dim = 4096
+num_heads = 32
+num_kv_heads = 8
+head_dim = 128
+max_seq_len = 131072
+precision = "bf16"
+
+[scheduler]
+max_num_batched_tokens = 8192
+max_num_seqs = 1024
+policy = "fcfs"
+enable_chunked_prefill = true
+block_size = 16
+
+[workload]
+arrival_pattern = "closed_loop"
+num_concurrent_users = 64
+closed_loop_jitter_secs = 0.05
+num_requests = 2000
+seed = 7
+
+[workload.input_len_dist]
+type = "lognormal"
+mean = 7.0
+std_dev = 0.5
+
+[workload.output_len_dist]
+type = "lognormal"
+mean = 5.5
+std_dev = 0.8
+
+[speculative]
+gamma = 8
+policy = "gated_aggregate"       # engine-realizable: one batch-uniform width
+# 0.0 because the measured step-cost table below embodies the full engine
+# step, drafter included: the (1 + draft_cost_frac * g) multiplier would
+# double-count it on table-priced steps. Use ~0.05 (EAGLE3 single-layer
+# drafter, ~5% of target/pass) only when pricing purely via the analytic
+# roofline without a table.
+draft_cost_frac = 0.0
+
+# Real EAGLE3 ShareGPT per-round (a_hat, commits) traces measured on
+# sglang/GH200 on Llama-3.1-8B (calib 2026-06-12).
+[speculative.acceptance]
+kind = "trace_rounds"
+path = "data/llama31_eagle3_gh200_rounds.csv"
+
+# Measured (batch_size, num_draft_tokens, step_seconds) grid benchmarked on
+# the target engine. num_draft_tokens is the per-sequence verify width
+# (ndt = 1 is plain decode, ndt = g + 1 a g-token draft). Prices the policy's
+# C(g) and pure-decode step wall time (nearest batch, exact draft length),
+# roofline fallback off-grid. Coverage caveat: the grid is still being
+# filled in; lookups outside a column's measured batch range clamp
+# nearest-neighbor, and the sweep example flags the affected cells.
+[speculative.measured_cost]
+path = "data/llama31_eagle3_gh200_costs.csv"
+# Mean KV context per sequence in the calibration runs the table was fitted
+# from (random prompts, --random-input-len 1024 --random-range-ratio 0.8 ->
+# mean prompt ~920 tokens, plus ~OSL/2 = 128 of decode progress, ~1050; the
+# nospec ndt=1 rows come from the same boots). Enables the bandwidth-roofline
+# KV-read recontextualisation when simulated sequences are shorter/longer
+# (e.g. ShareGPT validation at ~300-500 tokens of context).
+ref_seq_len = 1050

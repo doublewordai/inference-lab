@@ -163,6 +163,10 @@ pub struct KVCacheManager {
     /// Bytes of KV per token (used to size tiers and compute promotion cost).
     kv_cache_bytes_per_token: u64,
 
+    /// Fixed blocks reserved per running sequence for length-independent state
+    /// (Mamba/GatedDeltaNet recurrent state). Zero for pure-attention models.
+    state_blocks: usize,
+
     /// Metrics
     pub num_prefix_cache_hits: u64,
     pub num_prefix_cache_misses: u64,
@@ -176,10 +180,18 @@ impl KVCacheManager {
         kv_cache_capacity: u64,
         block_size: u32,
         kv_cache_bytes_per_token: u64,
+        per_seq_state_bytes: u64,
         enable_prefix_caching: bool,
     ) -> Self {
         let bytes_per_block = block_size as u64 * kv_cache_bytes_per_token;
         let total_blocks = (kv_cache_capacity / bytes_per_block) as u32;
+        // Fixed per-sequence state (Mamba/GDN) padded up to a whole number of
+        // attention-sized blocks, vLLM-style. Held for the sequence's lifetime.
+        let state_blocks = if bytes_per_block == 0 {
+            0
+        } else {
+            per_seq_state_bytes.div_ceil(bytes_per_block) as usize
+        };
 
         let blocks = (0..total_blocks).map(Block::new).collect();
         let free_blocks = (0..total_blocks).collect();
@@ -197,11 +209,17 @@ impl KVCacheManager {
             in_flight_cache: HashMap::new(),
             joiner_to_leader: HashMap::new(),
             kv_cache_bytes_per_token,
+            state_blocks,
             num_prefix_cache_hits: 0,
             num_prefix_cache_misses: 0,
             hit_size_count: 0,
             hit_size_sum: 0,
         }
+    }
+
+    /// Fixed blocks reserved per running sequence for length-independent state.
+    pub fn state_blocks(&self) -> usize {
+        self.state_blocks
     }
 
     /// Attach a spillover hierarchy. Tier ordering is closest-to-HBM first.
@@ -382,7 +400,12 @@ impl KVCacheManager {
     /// Calculate how many new blocks are needed for a request
     fn calculate_blocks_needed(&self, request: &Request, num_new_tokens: u32) -> usize {
         let total_tokens = request.num_computed_tokens + num_new_tokens;
-        let total_blocks_needed = total_tokens.div_ceil(self.block_size) as usize;
+        // Growing attention blocks + a fixed per-sequence state reservation
+        // (zero for pure-attention models). The state term is constant in
+        // sequence length, so once reserved it cancels against kv_blocks.len()
+        // on subsequent (incremental) calls and only attention blocks grow.
+        let total_blocks_needed =
+            self.state_blocks + total_tokens.div_ceil(self.block_size) as usize;
         total_blocks_needed.saturating_sub(request.kv_blocks.len())
     }
 
@@ -620,7 +643,7 @@ mod tests {
 
     #[test]
     fn test_kv_cache_manager_creation() {
-        let manager = KVCacheManager::new(16000, 16, 100, false);
+        let manager = KVCacheManager::new(16000, 16, 100, 0, false);
         assert_eq!(manager.block_size, 16);
         assert_eq!(manager.total_blocks, 10);
         assert_eq!(manager.num_free_blocks(), 10);
@@ -629,7 +652,7 @@ mod tests {
 
     #[test]
     fn test_block_allocation() {
-        let mut manager = KVCacheManager::new(16000, 16, 100, false);
+        let mut manager = KVCacheManager::new(16000, 16, 100, 0, false);
         let mut request = create_test_request("req-1", 32);
 
         let allocated = manager.allocate_blocks(&request, 32);
@@ -650,7 +673,7 @@ mod tests {
 
     #[test]
     fn test_block_allocation_failure() {
-        let mut manager = KVCacheManager::new(1600, 16, 100, false);
+        let mut manager = KVCacheManager::new(1600, 16, 100, 0, false);
         assert_eq!(manager.total_blocks, 1);
 
         let request = create_test_request("req-1", 32);
@@ -660,7 +683,7 @@ mod tests {
 
     #[test]
     fn test_block_free() {
-        let mut manager = KVCacheManager::new(16000, 16, 100, false);
+        let mut manager = KVCacheManager::new(16000, 16, 100, 0, false);
         let request = create_test_request("req-1", 32);
 
         let blocks = manager.allocate_blocks(&request, 32).unwrap();
@@ -673,7 +696,7 @@ mod tests {
 
     #[test]
     fn test_utilization() {
-        let mut manager = KVCacheManager::new(16000, 16, 100, false);
+        let mut manager = KVCacheManager::new(16000, 16, 100, 0, false);
         assert_eq!(manager.utilization(), 0.0);
 
         let request = create_test_request("req-1", 32);
@@ -688,7 +711,7 @@ mod tests {
 
     #[test]
     fn test_prefix_caching() {
-        let mut manager = KVCacheManager::new(16000, 16, 100, true);
+        let mut manager = KVCacheManager::new(16000, 16, 100, 0, true);
 
         let mut request1 = create_test_request("req-1", 16);
         request1.prompt_block_hashes = vec![12345];
@@ -716,7 +739,7 @@ mod tests {
     #[test]
     fn test_spillover_demotion_on_eviction() {
         // 2 HBM blocks, 1 host-RAM tier of 2 blocks.
-        let mut manager = KVCacheManager::new(2 * 16 * 100, 16, 100, true).with_tiers(&[KVTier {
+        let mut manager = KVCacheManager::new(2 * 16 * 100, 16, 100, 0, true).with_tiers(&[KVTier {
             name: "host_ram".into(),
             capacity_bytes: 2 * 16 * 100,
             bandwidth_to_hbm: 64e9,
@@ -754,7 +777,7 @@ mod tests {
 
     #[test]
     fn test_promotion_time() {
-        let manager = KVCacheManager::new(16000, 16, 100, true).with_tiers(&[
+        let manager = KVCacheManager::new(16000, 16, 100, 0, true).with_tiers(&[
             KVTier {
                 name: "host_ram".into(),
                 capacity_bytes: 1_000_000,
@@ -786,7 +809,7 @@ mod tests {
     fn test_concurrent_transfers_share_bandwidth() {
         // 1 GB/s tier; one transfer of 1 GB should take 1.0s alone, but two
         // concurrent equal-size transfers should each take ~2.0s.
-        let mut manager = KVCacheManager::new(16_000, 16, 100, true).with_tiers(&[KVTier {
+        let mut manager = KVCacheManager::new(16_000, 16, 100, 0, true).with_tiers(&[KVTier {
             name: "host_ram".into(),
             capacity_bytes: 10_000_000_000,
             bandwidth_to_hbm: 1e9,
@@ -832,7 +855,7 @@ mod tests {
     fn test_hbm_hit_ref_bumps_existing_block() {
         // Two requests with the same prefix. The second should ref-bump
         // the first one's blocks rather than allocating fresh ones.
-        let mut manager = KVCacheManager::new(16_000, 16, 100, true);
+        let mut manager = KVCacheManager::new(16_000, 16, 100, 0, true);
         let mut a = create_test_request("a", 32);
         a.prompt_block_hashes = vec![1, 2];
         let blocks_a = manager.allocate_blocks(&a, 32).unwrap();
@@ -854,7 +877,7 @@ mod tests {
 
     #[test]
     fn test_shared_blocks_outlive_first_releaser() {
-        let mut manager = KVCacheManager::new(16_000, 16, 100, true);
+        let mut manager = KVCacheManager::new(16_000, 16, 100, 0, true);
         let mut a = create_test_request("a", 16);
         a.prompt_block_hashes = vec![42];
         let blocks_a = manager.allocate_blocks(&a, 16).unwrap();
@@ -884,7 +907,7 @@ mod tests {
     #[test]
     fn test_in_flight_join_refs_leader_block() {
         // Set up a host-RAM tier and seed a prefix into it.
-        let mut manager = KVCacheManager::new(2 * 16 * 100, 16, 100, true).with_tiers(&[KVTier {
+        let mut manager = KVCacheManager::new(2 * 16 * 100, 16, 100, 0, true).with_tiers(&[KVTier {
             name: "host_ram".into(),
             capacity_bytes: 8 * 16 * 100,
             bandwidth_to_hbm: 1e9,
@@ -932,7 +955,7 @@ mod tests {
 
     #[test]
     fn test_publish_after_transfer_makes_prefix_hbm_resident() {
-        let mut manager = KVCacheManager::new(16_000, 16, 100, true).with_tiers(&[KVTier {
+        let mut manager = KVCacheManager::new(16_000, 16, 100, 0, true).with_tiers(&[KVTier {
             name: "host_ram".into(),
             capacity_bytes: 16_000,
             bandwidth_to_hbm: 1e9,
@@ -958,7 +981,7 @@ mod tests {
 
     #[test]
     fn test_lookup_hbm_only_when_no_tiers() {
-        let mut manager = KVCacheManager::new(16000, 16, 100, true);
+        let mut manager = KVCacheManager::new(16000, 16, 100, 0, true);
         let mut req = create_test_request("a", 16);
         req.prompt_block_hashes = vec![100];
         let blocks = manager.allocate_blocks(&req, 16).unwrap();

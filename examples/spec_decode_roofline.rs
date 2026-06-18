@@ -17,6 +17,8 @@ use inference_lab::config::{
     ParallelConfig, Precision, SchedulerConfig, SpeculativeConfig,
 };
 use inference_lab::simulation::{simulate_closed_loop, Topology};
+use rayon::prelude::*;
+use std::collections::BTreeMap;
 
 fn b200_unlimited_kv() -> HardwareConfig {
     HardwareConfig {
@@ -98,8 +100,8 @@ fn spec_for(p: Policy, alpha: f64, c_draft: f64) -> Option<SpeculativeConfig> {
     let acceptance = AcceptanceModel::Constant { alpha };
     match p {
         Policy::NoSpec => None,
-        Policy::Fixed(g) => Some(SpeculativeConfig { gamma: g, acceptance, policy: GammaPolicy::Fixed, draft_cost_frac: c_draft }),
-        Policy::Budget(g) => Some(SpeculativeConfig { gamma: g, acceptance, policy: GammaPolicy::GoodputBudget, draft_cost_frac: c_draft }),
+        Policy::Fixed(g) => Some(SpeculativeConfig { gamma: g, acceptance, policy: GammaPolicy::Fixed, draft_cost_frac: c_draft, measured_cost: None, switch: Default::default(), drafter: None }),
+        Policy::Budget(g) => Some(SpeculativeConfig { gamma: g, acceptance, policy: GammaPolicy::GoodputBudget, draft_cost_frac: c_draft, measured_cost: None, switch: Default::default(), drafter: None }),
     }
 }
 
@@ -121,22 +123,54 @@ fn main() {
     let fixed = [1u32, 2, 3, 4, 5, 6, 7, 8];
     let concs = [1u32, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384];
 
+    // Column layout per conc: 0 = nospec, 1..=8 = fixed g1..g8, 9 = BUDGET.
+    let mut tasks: Vec<(u32, usize, Policy)> = Vec::new();
+    for &conc in &concs {
+        tasks.push((conc, 0, Policy::NoSpec));
+        for (i, &g) in fixed.iter().enumerate() {
+            tasks.push((conc, 1 + i, Policy::Fixed(g)));
+        }
+        tasks.push((conc, 9, Policy::Budget(gamma_max)));
+    }
+
+    // Bounded pool: a single conc=16384 sim peaks ~20 GB (live batch = conc, KV caps
+    // lifted), so cap concurrency to keep peak memory well under box RAM. Most of the
+    // wall-clock is the few largest concs anyway, so this still parallelizes the
+    // expensive part. Tune via RAYON_NUM_THREADS; defaults to 8 here.
+    let nthreads = std::env::var("ROOFLINE_THREADS").ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8usize);
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(nthreads).build().expect("pool");
+    let results: Vec<(u32, usize, f64, f64)> = pool.install(|| {
+        tasks.par_iter()
+            .map(|&(conc, col, p)| {
+                let (gp, db) = run(conc, isl, osl, p, alpha, c_draft);
+                (conc, col, gp, db)
+            })
+            .collect()
+    });
+
+    let mut gp: BTreeMap<u32, [f64; 10]> = BTreeMap::new();
+    let mut dbatch: BTreeMap<u32, f64> = BTreeMap::new();
+    for (conc, col, g, db) in results {
+        gp.entry(conc).or_insert([0.0; 10])[col] = g;
+        if col == 0 { dbatch.insert(conc, db); }
+    }
+
     println!("Pure-decode roofline sweep (disagg decode pool in isolation, KV caps lifted)");
     println!("V4-Flash B200 TP1, ISL={isl} OSL={osl} alpha={alpha} c_draft={c_draft}\n");
     print!("{:>7} {:>8} {:>9} {:>9} {:>9} {:>7} {:>7}", "conc", "dbatch", "nospec", "best-fix", "BUDGET", "argmax", "d%");
     println!();
     for &conc in &concs {
-        let (ns, db) = run(conc, isl, osl, Policy::NoSpec, alpha, c_draft);
+        let row = gp[&conc];
+        let ns = row[0];
+        let bud = row[9];
         let mut best = ns; let mut bestg = 0u32;
-        for &g in &fixed {
-            let (gp, _) = run(conc, isl, osl, Policy::Fixed(g), alpha, c_draft);
-            if gp > best { best = gp; bestg = g; }
+        for (i, &g) in fixed.iter().enumerate() {
+            if row[1 + i] > best { best = row[1 + i]; bestg = g; }
         }
-        let (bud, _) = run(conc, isl, osl, Policy::Budget(gamma_max), alpha, c_draft);
         let d = 100.0 * (bud - best) / best;
         let argmax = if bestg == 0 { "nospec".into() } else { format!("g{bestg}") };
-        println!("{conc:>7} {db:>8.0} {ns:>9.0} {best:>9.0} {bud:>9.0} {argmax:>7} {d:>+7.2}");
-        use std::io::Write;
-        let _ = std::io::stdout().flush();
+        println!("{conc:>7} {:>8.0} {ns:>9.0} {best:>9.0} {bud:>9.0} {argmax:>7} {d:>+7.2}", dbatch[&conc]);
     }
 }

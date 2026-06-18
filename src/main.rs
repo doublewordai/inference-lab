@@ -90,6 +90,11 @@ struct SimArgs {
     #[arg(short, long)]
     output: Option<PathBuf>,
 
+    /// Save per-request metrics to a CSV file (arrival, completion, ttft,
+    /// e2e, mean_tpot, prompt_toks, output_toks); times in seconds
+    #[arg(long)]
+    request_csv: Option<PathBuf>,
+
     /// Override the random seed (overrides config file)
     #[arg(long)]
     seed: Option<u64>,
@@ -486,6 +491,37 @@ fn run_sim(args: SimArgs) {
             Err(e) => {
                 eprintln!("Error saving metrics to JSON: {}", e);
             }
+        }
+    }
+
+    // Save per-request CSV if requested (plus a sibling .depth.csv with the
+    // per-second mean chosen draft depth and decode batch, when speculating)
+    if let Some(csv_path) = args.request_csv {
+        let depth = simulator.get_spec_depth_series();
+        if !depth.is_empty() {
+            let mut d = String::from("second,mean_draft,mean_decode_batch\n");
+            for (s, md, mb) in &depth {
+                d.push_str(&format!("{s},{md:.4},{mb:.2}\n"));
+            }
+            let dp = csv_path.with_extension("depth.csv");
+            if let Err(e) = std::fs::write(&dp, d) {
+                eprintln!("Error saving depth CSV: {}", e);
+            }
+        }
+        let mut out =
+            String::from("arrival,completion,ttft,e2e,mean_tpot,prompt_toks,output_toks\n");
+        for (arr, comp, ttft, e2e, tpot, pt, ot) in simulator.get_request_rows() {
+            out.push_str(&format!(
+                "{arr:.4},{comp:.4},{ttft:.5},{e2e:.4},{tpot:.6},{pt},{ot}\n"
+            ));
+        }
+        match std::fs::write(&csv_path, out) {
+            Ok(_) => {
+                if verbosity >= VerbosityLevel::Normal {
+                    println!("Per-request CSV saved to: {:?}", csv_path);
+                }
+            }
+            Err(e) => eprintln!("Error saving request CSV: {}", e),
         }
     }
 }

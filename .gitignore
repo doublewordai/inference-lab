@@ -19,3 +19,6 @@ docs/book/
 
 # Personal pareto sweep — kept locally, not tracked
 examples/dsv4_decode_tpot_sweep.rs
+
+# Experiment data dumps — kept locally, not tracked
+/data/

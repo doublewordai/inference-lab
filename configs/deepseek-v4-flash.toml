@@ -1,0 +1,86 @@
+# DeepSeek-V4-Flash (single B200, TP1).
+# Same model the spec-dec example harnesses (spec_disagg_check / spec_decode_roofline)
+# build programmatically, here as a config-driven workload. Hardware FLOPs match the
+# blog's B200 fp4 ridge (9 PFLOP/s). kv_cache_capacity is set EXPLICITLY (not auto) so a
+# closed-loop workload with long, variable outputs becomes KV-constrained and preempts --
+# the emergent batch-size-vs-time heterogeneity we want to test adaptive gamma against.
+# Override [workload].num_concurrent_users, kv_cache_capacity, and [speculative] per run.
+
+[hardware]
+name = "B200"
+flops_fp4 = 9.0e15
+flops_fp8 = 4.5e15
+flops_bf16 = 2.25e15
+flops_fp16 = 2.25e15
+memory_bandwidth = 8.0e12
+memory_capacity = 206158430208   # 192 GB
+# Small fixed KV budget (~2 GB) so the running batch is KV-bound at moderate conc and the
+# long-output tail displaces other requests. Tune per run.
+kv_cache_capacity = 2000000000
+
+[parallel]
+tp = 1
+ep = 1
+
+[model]
+type = "deepseek_v4"
+name = "DeepSeek-V4-Flash"
+num_layers = 43
+hidden_dim = 4096
+num_heads = 64
+max_seq_len = 1048576
+kv_latent_dim = 512
+qk_rope_head_dim = 64
+kv_precision = "fp8"
+num_active_expert_params = 7574913024
+num_active_non_expert_params = 5660947776
+num_resident_expert_params = 278107521024
+num_resident_non_expert_params = 6225000000
+expert_precision = "fp4"
+non_expert_precision = "fp8"
+window_size = 128
+num_dense_layers = 2
+num_near_layers = 21
+num_far_layers = 20
+near_compress_ratio = 4
+far_compress_ratio = 128
+index_topk = 512
+index_n_heads = 64
+index_head_dim = 128
+num_experts_per_tok = 6
+num_routed_experts = 256
+num_moe_layers = 43
+
+[scheduler]
+max_num_batched_tokens = 16384
+max_num_seqs = 4096
+policy = "fcfs"
+enable_chunked_prefill = true
+block_size = 64
+
+[workload]
+arrival_pattern = "closed_loop"
+num_concurrent_users = 512
+closed_loop_jitter_secs = 0.05
+num_requests = 4000
+seed = 7
+
+# Modest input, long heavy-tailed output: decode dominates and the long tail holds KV.
+[workload.input_len_dist]
+type = "lognormal"
+mean = 6.0      # ~400 tokens median
+std_dev = 0.5
+
+[workload.output_len_dist]
+type = "lognormal"
+mean = 6.0      # ~400 tokens median
+std_dev = 1.0   # heavy tail: a few sequences run very long and pin KV
+
+[speculative]
+gamma = 4
+policy = "goodput_budget"
+draft_cost_frac = 0.0
+
+[speculative.acceptance]
+kind = "constant"
+alpha = 0.75

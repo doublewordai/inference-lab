@@ -49,6 +49,10 @@ pub struct MetricsCollector {
     current_interval_ttft_count: u32,
     current_interval_tpot_sum: f64,
     current_interval_tpot_count: u32,
+
+    /// Per-request rows for the optional `--request-csv` dump:
+    /// (arrival, completion, ttft, e2e, mean_tpot, prompt_toks, output_toks).
+    pub request_rows: Vec<(f64, f64, f64, f64, f64, u32, u32)>,
 }
 
 impl MetricsCollector {
@@ -79,6 +83,7 @@ impl MetricsCollector {
             current_interval_ttft_count: 0,
             current_interval_tpot_sum: 0.0,
             current_interval_tpot_count: 0,
+            request_rows: Vec::new(),
         }
     }
 
@@ -125,6 +130,31 @@ impl MetricsCollector {
         // Preemption tracking
         self.preemptions_per_request.push(request.num_preemptions);
         self.total_preemptions += request.num_preemptions as u64;
+
+        // Per-request row for the optional CSV dump
+        {
+            let ttft = request
+                .first_token_time
+                .map(|t| t - request.arrival_time)
+                .unwrap_or(f64::NAN);
+            let e2e = completion_time - request.arrival_time;
+            let n = request.token_generation_times.len();
+            let mean_tpot = if n > 1 {
+                (request.token_generation_times[n - 1] - request.token_generation_times[0])
+                    / (n - 1) as f64
+            } else {
+                f64::NAN
+            };
+            self.request_rows.push((
+                request.arrival_time,
+                completion_time,
+                ttft,
+                e2e,
+                mean_tpot,
+                request.num_prompt_tokens,
+                request.num_output_tokens,
+            ));
+        }
 
         // Length distributions
         self.input_lengths.push(request.num_prompt_tokens);

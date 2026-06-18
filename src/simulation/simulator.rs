@@ -366,6 +366,17 @@ impl Simulator {
         self.compute_summary_inner()
     }
 
+    /// Per-request rows for the `--request-csv` dump:
+    /// (arrival, completion, ttft, e2e, mean_tpot, prompt_toks, output_toks).
+    pub fn get_request_rows(&self) -> &[(f64, f64, f64, f64, f64, u32, u32)] {
+        &self.metrics.request_rows
+    }
+
+    /// Per-second speculative draft-depth series from the engine.
+    pub fn get_spec_depth_series(&self) -> Vec<(u64, f64, f64)> {
+        self.engine.spec_depth_series()
+    }
+
     pub fn get_time_series_data(&self) -> &[TimeSeriesPoint] {
         &self.time_series
     }

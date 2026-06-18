@@ -33,6 +33,7 @@ fn main() {
         hidden_dim: 8192,
         num_heads: 64,
         num_kv_heads: Some(8),
+        head_dim: None,
         max_seq_len: 8192,
         precision: Precision::Fp8,
     });

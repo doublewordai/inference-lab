@@ -11,7 +11,10 @@ pub use hardware::{HardwareConfig, KVTier, Precision};
 pub use model::{DenseModel, DeepseekV4Model, ModelConfig, ModelCosts, SlidingWindowModel};
 pub use parallel::{CommsConfig, ParallelConfig};
 pub use scheduler::SchedulerConfig;
-pub use speculative::{AcceptanceModel, GammaPolicy, SpeculativeConfig};
+pub use speculative::{
+    AcceptanceModel, DrafterCost, GammaPolicy, MeasuredCostConfig, SpeculativeConfig,
+    SwitchConstraints, TraceBank, TraceRound,
+};
 pub use simulation::SimulationConfig;
 pub use topology::{ClusterSpec, DisaggTopology, Node};
 pub use workload::{LengthDistribution, RateSchedule, WorkloadConfig};
@@ -91,6 +94,7 @@ impl Config {
             hidden_dim: 4096,
             num_heads: 32,
             num_kv_heads: None,
+            head_dim: None,
             max_seq_len: 2048,
             precision: crate::config::Precision::Bf16,
         });
@@ -150,6 +154,7 @@ mod tests {
             hidden_dim: 4096,
             num_heads: 32,
             num_kv_heads: None,
+            head_dim: None,
             max_seq_len: 2048,
             precision: crate::config::Precision::Bf16,
         });

@@ -56,6 +56,20 @@ impl ComputeEngine {
         self.hardware.memory_bandwidth * self.parallel.tp as f64
     }
 
+    /// Aggregate bf16 FLOP rate (the precision the drafter heads stream at),
+    /// falling back to fp16 if bf16 is unset. Exposed to price the drafter
+    /// roofline alongside the verify cost.
+    pub fn bf16_peak_flops(&self) -> f64 {
+        self.aggregate_flop_rate(Precision::Bf16)
+            .or_else(|| self.aggregate_flop_rate(Precision::Fp16))
+            .unwrap_or(f64::INFINITY)
+    }
+
+    /// Aggregate memory bandwidth, exposed for the drafter roofline.
+    pub fn mem_bandwidth(&self) -> f64 {
+        self.aggregate_memory_bandwidth()
+    }
+
     /// Estimated time spent in TP all-reduce + EP all-to-all collectives for a
     /// batch of `total_tokens` tokens. Returns 0 if no `CommsConfig` is set or
     /// `link_bw` is non-positive. Each collective is modelled as
@@ -192,6 +206,29 @@ impl ComputeEngine {
         }
 
         sum_time + self.collective_time(total_tokens)
+    }
+
+    /// Bandwidth-roofline KV-read time delta between the batch's actual KV
+    /// lengths and a hypothetical batch where every sequence holds
+    /// `ref_seq_len` tokens of context: `sum_i (kv_bytes(L_i) -
+    /// kv_bytes(ref)) / mem_bw`. Used to recontextualise a measured
+    /// step-cost table benchmarked at a different sequence length (see
+    /// [`crate::config::MeasuredCostConfig::ref_seq_len`]). Negative when
+    /// the live batch's sequences are shorter than the reference. This is a
+    /// conservative lower-bound correction: it prices only the bandwidth of
+    /// the KV delta at peak, not attention-kernel shape effects.
+    pub fn kv_read_seq_delta_seconds(
+        &self,
+        batch_requests: &[&Request],
+        ref_seq_len: u32,
+    ) -> f64 {
+        let bw = self.aggregate_memory_bandwidth();
+        let ref_bytes = self.model.kv_bytes_read_per_decode_step(ref_seq_len) as f64;
+        batch_requests
+            .iter()
+            .map(|r| self.model.kv_bytes_read_per_decode_step(r.num_computed_tokens) as f64 - ref_bytes)
+            .sum::<f64>()
+            / bw
     }
 
     /// Calculate total bytes transferred for a batch of requests (weights of
