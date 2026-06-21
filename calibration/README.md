@@ -5,7 +5,32 @@ parquet banks for any supported (target model, speculator) combination, on Modal
 
 ## Outputs
 
-Two parquet files per run, both keyed by
+Runs write durable checkpoint parts first, then materialize compact top-level
+outputs when all parts are complete:
+
+```text
+out_dir/
+  run_manifest.json
+  completed_parts.jsonl
+  parts/
+    part-000000/
+      acceptance.parquet
+      speculator.parquet
+      metainfo.json
+      stats.json
+      _SUCCESS
+    ...
+  acceptance.parquet
+  speculator.parquet
+  stats.json
+  metainfo.json
+```
+
+Completed part directories are resumable transaction boundaries. `--resume` skips
+parts with `_SUCCESS`; a mismatched config/prompt manifest is rejected instead of
+mixing banks.
+
+The acceptance/speculator parquet files are keyed by
 `(model, speculator, config, category, prompt_idx, turn, round_idx)` — one row
 per draft round, so they JOIN:
 
@@ -33,7 +58,16 @@ uv run specdec-calibrate export-trace --run-dir ../data/qwen36_mtp_bench \
   --signal confidence --output ../data/qwen36_mtp_conf_rounds.csv
 ```
 
-Flags: `--modal/--local`, `--hooks/--no-hooks` (meta_info only), `--out-dir`, `--dry-run`.
+Flags: `--modal/--local`, `--hooks/--no-hooks` (meta_info only), `--out-dir`,
+`--dry-run`, `--resume/--no-resume`, `--checkpoint-batches`.
+
+Checkpointing is batch-aligned. The target prompt shard size is
+`effective_batch_size * checkpoint_batches`, where `effective_batch_size` is the
+explicit `max_running_requests`, the capture hook's safe scheduler cap, or
+`n_prompts` when neither is set. Full parts therefore contain an integer number
+of scheduler batches; only the final remainder part may be smaller. The default
+`checkpoint_batches` is `4`. Set `max_running_requests` when you want the batch
+size to be explicit.
 
 Prompt sources:
 
@@ -61,8 +95,9 @@ the policy signal:
 - `--signal oracle` writes `a_k = acc{k}` (or derives `accept > k`) for
   perfect-foresight comparisons.
 
-Use `export-trace` on either a run directory containing `acceptance.parquet` and
-`speculator.parquet`, explicit `--acceptance/--speculator` paths, or an older
+Use `export-trace` on either a run directory containing compact
+`acceptance.parquet`/`speculator.parquet`, a run directory with completed
+`parts/part-*/` shards, explicit `--acceptance/--speculator` paths, or an older
 combined `--raw` parquet.
 
 ### Example run matrix (Qwen3.6-35B-A3B)

@@ -93,6 +93,30 @@ def test_engine_kwargs_caps_eagle_conf_capture_batch():
     cfg.validate()
     assert cfg.capture_max_running_requests == 512
     assert cfg.engine_kwargs()["max_running_requests"] == 512
+    assert cfg.effective_batch_size == 512
+    assert cfg.checkpoint_shard_size == 2048
+
+
+def test_checkpoint_shards_are_batch_aligned_when_batch_is_explicit():
+    cfg = RunConfig(
+        target_model="M",
+        speculator=Speculator(algorithm="mtp"),
+        max_running_requests=128,
+        checkpoint_batches=3,
+    )
+    cfg.validate()
+    assert cfg.effective_batch_size == 128
+    assert cfg.checkpoint_shard_size == 384
+
+
+def test_checkpoint_batches_must_be_positive():
+    cfg = RunConfig(
+        target_model="M",
+        speculator=Speculator(algorithm="mtp"),
+        checkpoint_batches=0,
+    )
+    with pytest.raises(ValueError, match="checkpoint_batches must be >= 1"):
+        cfg.validate()
 
 
 def test_engine_kwargs_caps_routing_verify_positions():

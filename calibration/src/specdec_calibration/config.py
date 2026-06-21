@@ -145,6 +145,7 @@ class RunConfig:
     disable_radix_cache: bool = True  # extra_buffer requires this False
     mem_fraction_static: float | None = None  # lower to leave activation headroom (OOM)
     max_running_requests: int | None = None  # cap concurrency to bound KV+activation memory
+    checkpoint_batches: int = 4  # prompt batches per durable output shard
     disable_overlap_schedule: bool = False  # test whether non-overlap lets eager draft
 
     @classmethod
@@ -172,6 +173,8 @@ class RunConfig:
             raise ValueError("n_prompts must be >= 1")
         if self.max_tokens is not None and self.max_tokens < 1:
             raise ValueError("max_tokens must be >= 1 when set")
+        if self.checkpoint_batches < 1:
+            raise ValueError("checkpoint_batches must be >= 1")
         capture_limit = self.capture_max_running_requests
         if (
             capture_limit is not None
@@ -209,6 +212,30 @@ class RunConfig:
             verify_positions = self.speculator.column_width + 1
             limits.append(max(1, ROUTING_CAPTURE_MAX_TOKENS // verify_positions))
         return min(limits) if limits else None
+
+    @property
+    def effective_batch_size(self) -> int:
+        """Prompt batch size used to align checkpoint shards.
+
+        SGLang's offline Engine accepts larger request lists and schedules them up
+        to `max_running_requests`. When the user has not set that explicitly, the
+        capture hooks may still impose a safe scheduler limit, which is the batch
+        size we should align durable prompt shards to.
+        """
+        if self.max_running_requests is not None:
+            return self.max_running_requests
+        if self.capture_max_running_requests is not None:
+            return self.capture_max_running_requests
+        return self.n_prompts
+
+    @property
+    def checkpoint_shard_size(self) -> int:
+        """Target prompt count per checkpoint shard.
+
+        Full shards are always an integer multiple of `effective_batch_size`; only
+        the final remainder shard may be smaller.
+        """
+        return self.effective_batch_size * self.checkpoint_batches
 
     def engine_kwargs(self) -> dict:
         """Map the run config to `sgl.Engine(**kwargs)` / SGLang ServerArgs.

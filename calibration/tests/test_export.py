@@ -71,6 +71,60 @@ def test_export_confidence_from_two_bank_run(tmp_path):
     assert json.loads(meta.read_text())["signal"] == "confidence"
 
 
+def test_export_confidence_from_sharded_run(tmp_path):
+    run = tmp_path / "run"
+    for part_idx, prompt_idx in enumerate([0, 1]):
+        part = run / "parts" / f"part-{part_idx:06d}"
+        part.mkdir(parents=True)
+        schema.write_acceptance(
+            [
+                {
+                    "model": "M",
+                    "speculator": "s",
+                    "config": "qualitative",
+                    "category": "coding",
+                    "prompt_idx": prompt_idx,
+                    "turn": 0,
+                    "round_idx": 0,
+                    "accept": 1,
+                    "acc0": 1,
+                    "acc1": 0,
+                }
+            ],
+            width=2,
+            path=part / "acceptance.parquet",
+        )
+        schema.write_speculator(
+            [
+                {
+                    "model": "M",
+                    "speculator": "s",
+                    "config": "qualitative",
+                    "category": "coding",
+                    "prompt_idx": prompt_idx,
+                    "turn": 0,
+                    "round_idx": 0,
+                    "conf0": 0.9 - prompt_idx * 0.1,
+                    "conf1": 0.1,
+                }
+            ],
+            width=2,
+            path=part / "speculator.parquet",
+        )
+        (part / "_SUCCESS").write_text("ok\n")
+
+    out = tmp_path / "trace.csv"
+    manifest = export_trace_bank(run_dir=run, output_path=out)
+
+    assert manifest.rows == 2
+    assert manifest.depth == 2
+    assert _read_csv(out) == [
+        ["commits", "category", "a0", "a1"],
+        ["1", "coding", "0.9", "0.1"],
+        ["1", "coding", "0.8", "0.1"],
+    ]
+
+
 def test_export_oracle_from_raw_parquet_without_acc_columns(tmp_path):
     raw = tmp_path / "raw.parquet"
     pq.write_table(

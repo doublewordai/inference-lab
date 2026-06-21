@@ -102,3 +102,54 @@ def write_stats(accept_rows: list[dict], speculator_label: str, width: int, path
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     Path(path).write_text(json.dumps(stats, indent=2))
     return stats
+
+
+def write_stats_from_acceptance_parquet(
+    acceptance_path: str | Path,
+    speculator_label: str,
+    width: int,
+    path: str | Path,
+) -> dict:
+    """Streaming equivalent of `write_stats` for compacting sharded runs."""
+    accept_hist: Counter = Counter()
+    grouped: dict[str, Counter] = {"config": Counter(), "category": Counter()}
+    grouped_sum: dict[str, Counter] = {"config": Counter(), "category": Counter()}
+    total = 0
+    commit_sum = 0
+
+    pf = pq.ParquetFile(acceptance_path)
+    for batch in pf.iter_batches(columns=["accept", "config", "category"], batch_size=65536):
+        cols = batch.to_pydict()
+        for accept, config, category in zip(cols["accept"], cols["config"], cols["category"]):
+            if accept is None:
+                continue
+            accept = int(accept)
+            total += 1
+            commit_sum += accept
+            accept_hist[accept] += 1
+            for field, value in (("config", config), ("category", category)):
+                grouped[field][value] += 1
+                grouped_sum[field][value] += accept
+
+    def _grouped(field: str) -> dict:
+        return {
+            k: {"rounds": grouped[field][k], "mean_commits": grouped_sum[field][k] / grouped[field][k]}
+            for k in sorted(grouped[field])
+        }
+
+    stats = {
+        "speculator": speculator_label,
+        "width": width,
+        "total_rounds": total,
+        "accept_hist": {str(k): v for k, v in sorted(accept_hist.items())},
+        "mean_commits_overall": (commit_sum / total) if total else 0.0,
+        "accept_by_position": [
+            (sum(v for c, v in accept_hist.items() if c > k) / total) if total else 0.0
+            for k in range(width)
+        ],
+        "by_config": _grouped("config"),
+        "by_category": _grouped("category"),
+    }
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    Path(path).write_text(json.dumps(stats, indent=2))
+    return stats

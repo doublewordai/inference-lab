@@ -18,6 +18,7 @@ from enum import Enum
 from pathlib import Path
 
 import pyarrow.parquet as pq
+import pyarrow as pa
 
 from .schema import KEY_COLUMNS
 
@@ -63,8 +64,8 @@ def export_trace_bank(
 
     if run_dir is not None:
         run = Path(run_dir)
-        acceptance_path = acceptance_path or run / "acceptance.parquet"
-        speculator_path = speculator_path or run / "speculator.parquet"
+        acceptance_path = acceptance_path or _run_bank_paths(run, "acceptance.parquet")
+        speculator_path = speculator_path or _run_bank_paths(run, "speculator.parquet")
 
     df, key_columns, sources = _load_inputs(
         acceptance_path=acceptance_path,
@@ -128,13 +129,13 @@ def _load_inputs(
 
     acc = _read_parquet(acceptance_path)
     _require_columns(acc, ["accept"])
-    sources = {"acceptance_path": str(acceptance_path)}
+    sources = {"acceptance_path": _source_label(acceptance_path)}
 
-    if speculator_path is None or not Path(speculator_path).exists():
+    if speculator_path is None or not _input_exists(speculator_path):
         return acc, _present_keys(acc), sources
 
     spc = _read_parquet(speculator_path)
-    sources["speculator_path"] = str(speculator_path)
+    sources["speculator_path"] = _source_label(speculator_path)
     keys = [c for c in KEY_COLUMNS if c in acc.columns and c in spc.columns]
     if not keys:
         raise ValueError("acceptance/speculator banks have no shared key columns")
@@ -142,7 +143,39 @@ def _load_inputs(
     return df, keys, sources
 
 
-def _read_parquet(path: str | Path):
+def _run_bank_paths(run: Path, filename: str):
+    top = run / filename
+    if top.exists():
+        return top
+    parts = sorted(p for p in (run / "parts").glob(f"part-*/{filename}") if _part_complete(p.parent))
+    return parts if parts else top
+
+
+def _part_complete(part_dir: Path) -> bool:
+    return (part_dir / "_SUCCESS").exists()
+
+
+def _input_exists(path) -> bool:
+    if isinstance(path, (list, tuple)):
+        return bool(path)
+    return Path(path).exists()
+
+
+def _source_label(path) -> str:
+    if isinstance(path, (list, tuple)):
+        if not path:
+            return ""
+        parent = Path(path[0]).parents[1]
+        return str(parent / "part-*" / Path(path[0]).name)
+    return str(path)
+
+
+def _read_parquet(path):
+    if isinstance(path, (list, tuple)):
+        tables = [pq.read_table(p) for p in path]
+        if not tables:
+            raise FileNotFoundError("no parquet shard paths provided")
+        return pa.concat_tables(tables, promote_options="default").to_pandas()
     return pq.read_table(path).to_pandas()
 
 

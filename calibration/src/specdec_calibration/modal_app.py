@@ -67,7 +67,7 @@ out_vol = modal.Volume.from_name("specdec-outputs", create_if_missing=True)
     volumes={"/cache/huggingface": hf_cache, "/out": out_vol},
     timeout=60 * 60 * 12,
 )
-def _collect_remote(cfg_dict: dict, with_hooks: bool) -> dict:
+def _collect_remote(cfg_dict: dict, with_hooks: bool, resume: bool) -> dict:
     """Build prompts, run the collection, and write ALL outputs to the /out volume
     in-container (parquets can be GB once routing is on), then return only a manifest.
     The caller streams the files down -- nothing large crosses the pickle channel."""
@@ -87,20 +87,28 @@ def _collect_remote(cfg_dict: dict, with_hooks: bool) -> dict:
     )
     mt = sum(1 for p in prompts if p.is_multiturn)
     print(f"built {len(prompts)} prompts in-container ({mt} multi-turn)", flush=True)
-    result = (
-        collect.collect_banks(cfg, prompts)
-        if with_hooks
-        else {"metainfo": collect.run_metainfo(cfg, prompts)}
-    )
     run = os.path.basename(cfg.out_dir.rstrip("/")) or "run"
     outdir = f"/out/{run}"
-    collect.write_result(result, cfg, outdir)
+    cfg.out_dir = outdir
+    collect.run_checkpointed(
+        cfg,
+        prompts,
+        with_hooks=with_hooks,
+        resume=resume,
+        after_part=lambda _part: out_vol.commit(),
+    )
     out_vol.commit()
-    files = [(f, os.path.getsize(os.path.join(outdir, f))) for f in sorted(os.listdir(outdir))]
+    files = []
+    for root, _dirs, names in os.walk(outdir):
+        for name in sorted(names):
+            path = os.path.join(root, name)
+            rel = os.path.relpath(path, outdir)
+            files.append((rel, os.path.getsize(path)))
+    files.sort()
     return {"run": run, "files": files}
 
 
-def launch(cfg: RunConfig, with_hooks: bool = True) -> dict:
+def launch(cfg: RunConfig, with_hooks: bool = True, resume: bool = True) -> dict:
     cfg_dict = cfg.to_dict()
 
     fn = _collect_remote
@@ -108,7 +116,7 @@ def launch(cfg: RunConfig, with_hooks: bool = True) -> dict:
         fn = _collect_remote.with_options(gpu=cfg.gpu)
 
     with modal.enable_output(), app.run():
-        manifest = fn.remote(cfg_dict, with_hooks)
+        manifest = fn.remote(cfg_dict, with_hooks, resume)
 
     # stream each output file down from the volume (routing.npy may be GB)
     from pathlib import Path
@@ -117,7 +125,9 @@ def launch(cfg: RunConfig, with_hooks: bool = True) -> dict:
     out.mkdir(parents=True, exist_ok=True)
     run = manifest["run"]
     for fname, size in manifest["files"]:
-        with open(out / fname, "wb") as f:
+        target = out / fname
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with open(target, "wb") as f:
             for chunk in out_vol.read_file(f"{run}/{fname}"):
                 f.write(chunk)
         print(f"downloaded {fname} ({size/1e6:.1f} MB)")

@@ -28,23 +28,32 @@ def run(
     modal: bool = typer.Option(True, "--modal/--local", help="Run on Modal (default) or locally."),
     hooks: bool = typer.Option(True, "--hooks/--no-hooks", help="Capture banks (on) vs meta_info only."),
     out_dir: str = typer.Option(None, "--out-dir", help="Override config out_dir."),
+    resume: bool = typer.Option(True, "--resume/--no-resume", help="Resume completed checkpoint parts."),
+    checkpoint_batches: int | None = typer.Option(
+        None,
+        "--checkpoint-batches",
+        help="Durable output shard size in scheduler batches.",
+    ),
 ) -> None:
     cfg = RunConfig.from_yaml(config)
     if out_dir:
         cfg.out_dir = out_dir
+    if checkpoint_batches is not None:
+        cfg.checkpoint_batches = checkpoint_batches
     cfg.validate()
 
     typer.echo(
         f"model={cfg.target_model}  speculator={cfg.speculator_label} "
         f"({cfg.speculator.sglang_algorithm}, width={cfg.speculator.column_width})  "
-        f"dataset={cfg.dataset}  routing={cfg.capture_routing}"
+        f"dataset={cfg.dataset}  routing={cfg.capture_routing}  "
+        f"checkpoint={cfg.effective_batch_size}x{cfg.checkpoint_batches}"
     )
 
     if modal and not dry_run:
         # prompts are built in-container (avoids downloading long-context configs locally)
         from .modal_app import launch
 
-        launch(cfg, with_hooks=hooks)
+        launch(cfg, with_hooks=hooks, resume=resume)
         return
 
     # local path (and --dry-run) build prompts here
@@ -65,7 +74,7 @@ def run(
 
     from .collect import run_local
 
-    run_local(cfg, prompts, with_hooks=hooks)
+    run_local(cfg, prompts, with_hooks=hooks, resume=resume)
 
 
 @app.command("export-trace")

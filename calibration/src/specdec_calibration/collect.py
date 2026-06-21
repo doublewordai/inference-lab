@@ -90,7 +90,11 @@ def _sampling_params(cfg: RunConfig) -> dict:
     return params
 
 
-def run_metainfo(cfg: RunConfig, prompts: list[PromptSpec]) -> list[dict]:
+def run_metainfo(
+    cfg: RunConfig,
+    prompts: list[PromptSpec],
+    prompt_offset: int = 0,
+) -> list[dict]:
     """Per-request public meta_info rows. No hooks, same turn loop as captures."""
     eng = build_engine(cfg)
     sp = _sampling_params(cfg)
@@ -110,6 +114,7 @@ def run_metainfo(cfg: RunConfig, prompts: list[PromptSpec]) -> list[dict]:
             if isinstance(outs, dict):
                 outs = [outs]
             for i, out in zip(idxs, outs):
+                prompt_idx = prompt_offset + i
                 mi = out.get("meta_info", {}) or {}
                 histories[i].append({"role": "assistant", "content": out.get("text", "")})
                 row = {
@@ -117,7 +122,7 @@ def run_metainfo(cfg: RunConfig, prompts: list[PromptSpec]) -> list[dict]:
                     "speculator": cfg.speculator_label,
                     "config": prompts[i].config,
                     "category": prompts[i].category,
-                    "prompt_idx": i,
+                    "prompt_idx": prompt_idx,
                     "turn": t,
                     "question_id": prompts[i].question_id,
                     "completion_tokens": mi.get("completion_tokens"),
@@ -130,7 +135,11 @@ def run_metainfo(cfg: RunConfig, prompts: list[PromptSpec]) -> list[dict]:
     return rows
 
 
-def collect_banks(cfg: RunConfig, prompts: list[PromptSpec]) -> dict:
+def collect_banks(
+    cfg: RunConfig,
+    prompts: list[PromptSpec],
+    prompt_offset: int = 0,
+) -> dict:
     """Hook-fed acceptance + speculator banks for the EAGLE/DFLASH families.
 
     SGLang runs the spec worker in a spawned child process, so the hooks are
@@ -202,13 +211,15 @@ def collect_banks(cfg: RunConfig, prompts: list[PromptSpec]) -> dict:
                         break
                     texts, rids = [], []
                     for i in idxs:
+                        prompt_idx = prompt_offset + i
                         histories[i].append({"role": "user", "content": prompts[i].turns[t]})
                         texts.append(_templated_chat(eng.tokenizer, histories[i]))
-                        rids.append(f"{i}:{t}")
+                        rids.append(f"{prompt_idx}:{t}")
                     outs = eng.engine.generate(prompt=texts, sampling_params=sp, rid=rids)
                     if isinstance(outs, dict):
                         outs = [outs]
                     for i, out in zip(idxs, outs):
+                        prompt_idx = prompt_offset + i
                         mi = out.get("meta_info", {}) or {}
                         histories[i].append({"role": "assistant", "content": out.get("text", "")})
                         row = {
@@ -216,7 +227,7 @@ def collect_banks(cfg: RunConfig, prompts: list[PromptSpec]) -> dict:
                             "speculator": cfg.speculator_label,
                             "config": prompts[i].config,
                             "category": prompts[i].category,
-                            "prompt_idx": i,
+                            "prompt_idx": prompt_idx,
                             "turn": t,
                             "question_id": prompts[i].question_id,
                             "completion_tokens": mi.get("completion_tokens"),
@@ -235,7 +246,7 @@ def collect_banks(cfg: RunConfig, prompts: list[PromptSpec]) -> dict:
             finally:
                 eng.shutdown()
 
-            acceptance, speculator = _assemble_captures(str(path), cfg, prompts)
+            acceptance, speculator = _assemble_captures(str(path), cfg, prompts, prompt_offset)
             print(
                 f"  captured {len(acceptance)} acceptance rows, "
                 f"{len(speculator)} speculator rows"
@@ -243,7 +254,7 @@ def collect_banks(cfg: RunConfig, prompts: list[PromptSpec]) -> dict:
             _reconcile(metainfo, acceptance)
             result = {"acceptance": acceptance, "speculator": speculator, "metainfo": metainfo}
             if cfg.capture_routing:
-                arr, meta = _assemble_routing(str(rbin), str(rmeta), cfg, prompts)
+                arr, meta = _assemble_routing(str(rbin), str(rmeta), cfg, prompts, prompt_offset)
                 result["routing_npy"] = arr
                 result["routing_meta"] = meta
                 print(
@@ -255,7 +266,13 @@ def collect_banks(cfg: RunConfig, prompts: list[PromptSpec]) -> dict:
             _restore_env()
 
 
-def _assemble_routing(bin_path: str, meta_path: str, cfg: RunConfig, prompts: list[PromptSpec]):
+def _assemble_routing(
+    bin_path: str,
+    meta_path: str,
+    cfg: RunConfig,
+    prompts: list[PromptSpec],
+    prompt_offset: int = 0,
+):
     """Expand the per-round routing blocks into a uint8 array [N_positions, L, S] and
     per-position metadata rows."""
     import json
@@ -276,7 +293,8 @@ def _assemble_routing(bin_path: str, meta_path: str, cfg: RunConfig, prompts: li
             npos = m["npos"]
             for r, (rid, rnd, acc) in enumerate(zip(m["rids"], m["rounds"], m["accepts"])):
                 pidx, turn = _parse_rid(rid)
-                p = prompts[pidx] if 0 <= pidx < len(prompts) else None
+                local_idx = pidx - prompt_offset
+                p = prompts[local_idx] if 0 <= local_idx < len(prompts) else None
                 for pos in range(npos):
                     meta_rows.append({
                         "model": cfg.target_model,
@@ -309,7 +327,12 @@ def _parse_rid(rid: str) -> tuple[int, int]:
     return (int(s) if s.isdigit() else -1, 0)
 
 
-def _assemble_captures(path: str, cfg: RunConfig, prompts: list[PromptSpec]) -> tuple[list, list]:
+def _assemble_captures(
+    path: str,
+    cfg: RunConfig,
+    prompts: list[PromptSpec],
+    prompt_offset: int = 0,
+) -> tuple[list, list]:
     """Merge the child's JSONL accept/conf rows (keyed by rid=str(prompt_idx), round)
     into acceptance + speculator rows."""
     import json
@@ -336,7 +359,8 @@ def _assemble_captures(path: str, cfg: RunConfig, prompts: list[PromptSpec]) -> 
     acceptance, speculator = [], []
     for (rid, rnd), d in sorted(merged.items(), key=_sort_key):
         pidx, turn = _parse_rid(rid)
-        p = prompts[pidx] if 0 <= pidx < len(prompts) else None
+        local_idx = pidx - prompt_offset
+        p = prompts[local_idx] if 0 <= local_idx < len(prompts) else None
         common = {
             "model": cfg.target_model,
             "speculator": cfg.speculator_label,
@@ -418,7 +442,325 @@ def write_result(result: dict, cfg: RunConfig, out_dir: str) -> None:
               f"{len(result['routing_meta'])} meta rows -> {out}")
 
 
-def run_local(cfg: RunConfig, prompts: list[PromptSpec], with_hooks: bool = True) -> None:
+def run_checkpointed(
+    cfg: RunConfig,
+    prompts: list[PromptSpec],
+    with_hooks: bool = True,
+    resume: bool = True,
+    after_part=None,
+) -> dict:
+    """Run collection in durable prompt shards.
+
+    Full shards are sized as `effective_batch_size * checkpoint_batches`, so the
+    checkpoint boundary does not force partial scheduler batches. The final shard
+    may be smaller when the prompt count is not a multiple of the target size.
+    """
+    import math
+    from pathlib import Path
+
+    out = Path(cfg.out_dir)
+    manifest = _prepare_checkpoint_run(out, cfg, prompts, with_hooks, resume)
+    completed = _completed_parts(out)
+    shard_size = cfg.checkpoint_shard_size
+    n_parts = math.ceil(len(prompts) / shard_size) if prompts else 0
+    print(
+        "checkpointing "
+        f"{len(prompts)} prompts -> {n_parts} part(s) "
+        f"({cfg.effective_batch_size} prompt batch x {cfg.checkpoint_batches})"
+    )
+
+    written = 0
+    skipped = 0
+    for part_idx, start in enumerate(range(0, len(prompts), shard_size)):
+        end = min(start + shard_size, len(prompts))
+        existing = completed.get(part_idx)
+        if existing is not None:
+            if existing.get("start") != start or existing.get("end") != end:
+                raise ValueError(
+                    f"{out}: completed part {part_idx:06d} has range "
+                    f"{existing.get('start')}:{existing.get('end')}, expected {start}:{end}"
+                )
+            print(f"skipping complete part {part_idx:06d} prompts {start}:{end}")
+            skipped += 1
+            continue
+
+        chunk = prompts[start:end]
+        print(f"running part {part_idx:06d} prompts {start}:{end}")
+        result = (
+            collect_banks(cfg, chunk, prompt_offset=start)
+            if with_hooks
+            else {"metainfo": run_metainfo(cfg, chunk, prompt_offset=start)}
+        )
+        part_manifest = _write_part_result(result, cfg, out, part_idx, start, end)
+        written += 1
+        if after_part is not None:
+            after_part(part_manifest)
+
+    final_files = _existing_final_files(out) if written == 0 else []
+    if not final_files:
+        final_files = _materialize_final_outputs(out, cfg)
+    complete = {
+        **manifest,
+        "complete": True,
+        "parts_written": written,
+        "parts_skipped": skipped,
+        "final_files": final_files,
+    }
+    _write_json_atomic(out / "run_complete.json", complete)
+    return complete
+
+
+def _prepare_checkpoint_run(
+    out,
+    cfg: RunConfig,
+    prompts: list[PromptSpec],
+    with_hooks: bool,
+    resume: bool,
+) -> dict:
+    import json
+
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "parts").mkdir(parents=True, exist_ok=True)
+    manifest = _run_manifest(cfg, prompts, with_hooks)
+    path = out / "run_manifest.json"
+    if path.exists():
+        existing = json.loads(path.read_text())
+        for key in ("schema_version", "config_hash", "prompt_hash", "with_hooks"):
+            if existing.get(key) != manifest.get(key):
+                raise ValueError(
+                    f"{out}: existing checkpoint manifest does not match this run "
+                    f"({key}: {existing.get(key)!r} != {manifest.get(key)!r})"
+                )
+    elif _completed_parts(out):
+        raise ValueError(f"{out}: found checkpoint parts but no run_manifest.json")
+    elif _legacy_outputs(out):
+        raise ValueError(f"{out}: existing outputs found but no run_manifest.json; use a clean out_dir")
+    else:
+        _write_json_atomic(path, manifest)
+
+    if not resume and _completed_parts(out):
+        raise ValueError(f"{out}: checkpoint parts already exist; rerun with --resume or clean out_dir")
+    return manifest
+
+
+def _legacy_outputs(out) -> list:
+    names = [
+        "acceptance.parquet",
+        "speculator.parquet",
+        "metainfo.json",
+        "stats.json",
+        "run_complete.json",
+        "completed_parts.jsonl",
+    ]
+    return [out / name for name in names if (out / name).exists()]
+
+
+def _existing_final_files(out) -> list[str]:
+    import json
+
+    complete = out / "run_complete.json"
+    if not complete.exists():
+        return []
+    final_files = json.loads(complete.read_text()).get("final_files") or []
+    return final_files if all((out / name).exists() for name in final_files) else []
+
+
+def _run_manifest(cfg: RunConfig, prompts: list[PromptSpec], with_hooks: bool) -> dict:
+    return {
+        "schema_version": 1,
+        "target_model": cfg.target_model,
+        "speculator": cfg.speculator_label,
+        "with_hooks": with_hooks,
+        "n_prompts": len(prompts),
+        "effective_batch_size": cfg.effective_batch_size,
+        "checkpoint_batches": cfg.checkpoint_batches,
+        "checkpoint_shard_size": cfg.checkpoint_shard_size,
+        "config_hash": _stable_hash(_config_payload(cfg)),
+        "prompt_hash": _stable_hash(_prompt_payload(prompts)),
+    }
+
+
+def _config_payload(cfg: RunConfig) -> dict:
+    payload = cfg.to_dict()
+    payload.pop("out_dir", None)
+    return payload
+
+
+def _prompt_payload(prompts: list[PromptSpec]) -> list[dict]:
+    return [
+        {
+            "config": p.config,
+            "category": p.category,
+            "turns": p.turns,
+            "question_id": p.question_id,
+        }
+        for p in prompts
+    ]
+
+
+def _stable_hash(obj) -> str:
+    import hashlib
+    import json
+
+    raw = json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _write_json_atomic(path, obj) -> None:
+    import json
+
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text(json.dumps(obj, indent=2, sort_keys=True))
+    tmp.replace(path)
+
+
+def _completed_parts(out) -> dict[int, dict]:
+    import json
+
+    completed: dict[int, dict] = {}
+    for part in sorted((out / "parts").glob("part-*")):
+        if not (part / "_SUCCESS").exists():
+            continue
+        meta = part / "part_manifest.json"
+        if meta.exists():
+            row = json.loads(meta.read_text())
+            completed[int(row["part_idx"])] = row
+        else:
+            completed[int(part.name.rsplit("-", 1)[-1])] = {"part_dir": str(part)}
+    return completed
+
+
+def _write_part_result(
+    result: dict,
+    cfg: RunConfig,
+    out,
+    part_idx: int,
+    start: int,
+    end: int,
+) -> dict:
+    import shutil
+
+    parts = out / "parts"
+    final = parts / f"part-{part_idx:06d}"
+    tmp = parts / f".part-{part_idx:06d}.tmp"
+    if final.exists():
+        if (final / "_SUCCESS").exists():
+            raise ValueError(f"{final}: part is already complete")
+        raise ValueError(f"{final}: incomplete non-temporary part directory exists")
+    if tmp.exists():
+        shutil.rmtree(tmp)
+    tmp.mkdir(parents=True)
+
+    write_result(result, cfg, str(tmp))
+    manifest = {
+        "part_idx": part_idx,
+        "start": start,
+        "end": end,
+        "prompt_count": end - start,
+        "metainfo_rows": len(result.get("metainfo") or []),
+        "acceptance_rows": len(result.get("acceptance") or []),
+        "speculator_rows": len(result.get("speculator") or []),
+        "routing_rows": len(result.get("routing_meta") or []),
+    }
+    _write_json_atomic(tmp / "part_manifest.json", manifest)
+    (tmp / "_SUCCESS").write_text("ok\n")
+    tmp.rename(final)
+
+    with (out / "completed_parts.jsonl").open("a") as f:
+        import json
+
+        f.write(json.dumps({**manifest, "part_dir": str(final)}) + "\n")
+    return {**manifest, "part_dir": str(final)}
+
+
+def _materialize_final_outputs(out, cfg: RunConfig) -> list[str]:
+    from . import schema
+
+    final_files: list[str] = []
+    part_dirs = [p for p in sorted((out / "parts").glob("part-*")) if (p / "_SUCCESS").exists()]
+
+    metainfo_paths = [p / "metainfo.json" for p in part_dirs if (p / "metainfo.json").exists()]
+    if metainfo_paths:
+        n = _merge_json_arrays(metainfo_paths, out / "metainfo.json")
+        print(f"materialized {n} meta_info rows -> {out/'metainfo.json'}")
+        final_files.append("metainfo.json")
+
+    acceptance_paths = [p / "acceptance.parquet" for p in part_dirs if (p / "acceptance.parquet").exists()]
+    if acceptance_paths:
+        n = _merge_parquets(acceptance_paths, out / "acceptance.parquet")
+        print(f"materialized {n} rows -> {out/'acceptance.parquet'}")
+        schema.write_stats_from_acceptance_parquet(
+            out / "acceptance.parquet",
+            cfg.speculator_label,
+            cfg.speculator.column_width,
+            out / "stats.json",
+        )
+        print(f"materialized stats -> {out/'stats.json'}")
+        final_files += ["acceptance.parquet", "stats.json"]
+
+    speculator_paths = [p / "speculator.parquet" for p in part_dirs if (p / "speculator.parquet").exists()]
+    if speculator_paths:
+        n = _merge_parquets(speculator_paths, out / "speculator.parquet")
+        print(f"materialized {n} rows -> {out/'speculator.parquet'}")
+        final_files.append("speculator.parquet")
+
+    return final_files
+
+
+def _merge_parquets(paths, output_path) -> int:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    tmp = output_path.with_name(f".{output_path.name}.tmp")
+    if tmp.exists():
+        tmp.unlink()
+    writer = None
+    rows = 0
+    try:
+        for path in paths:
+            pf = pq.ParquetFile(path)
+            if writer is None:
+                writer = pq.ParquetWriter(tmp, pf.schema_arrow, compression="zstd")
+            rows += pf.metadata.num_rows
+            for batch in pf.iter_batches(batch_size=65536):
+                writer.write_table(pa.Table.from_batches([batch], schema=pf.schema_arrow))
+        if writer is None:
+            return 0
+        writer.close()
+        writer = None
+        tmp.replace(output_path)
+        return rows
+    finally:
+        if writer is not None:
+            writer.close()
+
+
+def _merge_json_arrays(paths, output_path) -> int:
+    import json
+
+    tmp = output_path.with_name(f".{output_path.name}.tmp")
+    count = 0
+    first = True
+    with tmp.open("w") as f:
+        f.write("[\n")
+        for path in paths:
+            rows = json.loads(path.read_text())
+            for row in rows:
+                if not first:
+                    f.write(",\n")
+                f.write(json.dumps(row, sort_keys=True))
+                first = False
+                count += 1
+        f.write("\n]\n")
+    tmp.replace(output_path)
+    return count
+
+
+def run_local(
+    cfg: RunConfig,
+    prompts: list[PromptSpec],
+    with_hooks: bool = True,
+    resume: bool = True,
+) -> None:
     """Local (non-Modal) entry: run on this box's GPU and write outputs."""
-    result = collect_banks(cfg, prompts) if with_hooks else {"metainfo": run_metainfo(cfg, prompts)}
-    write_result(result, cfg, cfg.out_dir)
+    run_checkpointed(cfg, prompts, with_hooks=with_hooks, resume=resume)
