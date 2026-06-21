@@ -1,0 +1,40 @@
+[project]
+name = "specdec-calibration"
+version = "0.1.0"
+description = "Collate SGLang speculative-decoding acceptance and speculator parquet banks for any model/speculator combination."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "pyarrow>=15",
+    "pandas>=2",
+    "pyyaml>=6",
+    "typer>=0.12",
+]
+
+# `datasets` (SPEED-Bench loader) and `modal`/`sglang` are heavy and only needed
+# for real runs, not for config/prompt/schema work or tests. Kept out of the base
+# install so the package imports and `pytest` run on a laptop with no GPU.
+[project.optional-dependencies]
+data = ["datasets>=2.18"]
+modal = ["modal>=0.64"]
+
+[project.scripts]
+specdec-calibrate = "specdec_calibration.cli:app"
+
+# SGLang discovers this in the spawned scheduler process and runs register(),
+# which installs the capture hooks where the spec workers actually execute.
+[project.entry-points."sglang.srt.plugins"]
+specdec_capture = "specdec_calibration.plugin:register"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/specdec_calibration"]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

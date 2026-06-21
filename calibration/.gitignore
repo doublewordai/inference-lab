@@ -1,0 +1,13 @@
+# SGLang source dump (pinned-commit reference for hook authoring; not ours to vendor)
+sgl_src/
+
+# Python / uv
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+
+# Run outputs
+data/
+*.parquet

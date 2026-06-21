@@ -1,0 +1,12 @@
+# Qwen3.6-35B-A3B using its own shipped MTP weights (NEXTN path, no draft repo).
+target_model: Qwen/Qwen3.6-35B-A3B
+speculator:
+  algorithm: mtp
+  num_steps: 3
+  eagle_topk: 1
+  num_draft_tokens: 4
+dataset: smoke
+n_prompts: 4
+temperature: 0.6
+gpu: H200
+out_dir: ../data/qwen36_mtp
