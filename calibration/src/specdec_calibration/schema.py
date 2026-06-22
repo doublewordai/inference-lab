@@ -64,7 +64,13 @@ def write_speculator(rows: list[dict], width: int, path: str | Path) -> int:
 def routing_meta_schema() -> pa.Schema:
     return pa.schema(
         _key_fields()
-        + [pa.field("position", pa.int16()), pa.field("accepted", pa.int8())]
+        + [
+            pa.field("routing_idx", pa.int64()),
+            pa.field("routing_block_idx", pa.int64()),
+            pa.field("request_idx", pa.int16()),
+            pa.field("position", pa.int16()),
+            pa.field("accepted", pa.int8()),
+        ]
     )
 
 

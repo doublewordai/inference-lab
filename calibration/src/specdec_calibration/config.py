@@ -22,10 +22,25 @@ VALID_ALGORITHMS = EAGLE_FAMILY | {"dflash"}
 NEEDS_DRAFT_PATH = {"eagle", "eagle3", "standalone", "dflash"}
 TARGET_INTRINSIC = {"mtp", "nextn"}  # speculator weights ship inside the target
 
-# Hook-side fixed buffers. Keep these in config too so launch validation can bound
-# SGLang before the capture hooks see unsupported active batch shapes.
+# Hook-side fixed buffers. The checkpoint default uses the same size so durable
+# parts stay aligned to the largest fully-populated EAGLE confidence batch, but
+# this package does not pass a scheduler request cap to SGLang.
 EAGLE_CONF_CAPTURE_MAX_BATCH = 512
 ROUTING_CAPTURE_MAX_TOKENS = 4096
+MAX_CHECKPOINT_PARALLELISM = 16
+
+# Fields that affect where/how a run executes, but not the prompt set, sampling
+# contract, speculator semantics, or output schema. These are intentionally
+# excluded from the checkpoint config hash so a long run can resume after moving
+# output locations, changing Modal parallelism, or tuning GPU memory placement.
+DATA_HASH_RUNTIME_FIELDS = frozenset(
+    {
+        "out_dir",
+        "gpu",
+        "mem_fraction_static",
+        "checkpoint_parallelism",
+    }
+)
 
 
 @dataclass
@@ -144,8 +159,23 @@ class RunConfig:
     mamba_scheduler_strategy: str | None = None
     disable_radix_cache: bool = True  # extra_buffer requires this False
     mem_fraction_static: float | None = None  # lower to leave activation headroom (OOM)
-    max_running_requests: int | None = None  # cap concurrency to bound KV+activation memory
+    generation_batch_size: int | None = None  # actual prompts per Engine.generate call; None = whole shard
+    mamba_ssm_dtype: str | None = None
+    attention_backend: str | None = None
+    speculative_draft_attention_backend: str | None = None
+    linear_attn_prefill_backend: str | None = None
+    linear_attn_decode_backend: str | None = None
+    cuda_graph_max_bs: int | None = None
+    cuda_graph_max_bs_decode: int | None = None
+    cuda_graph_backend_prefill: str | None = None
+    enforce_piecewise_cuda_graph: bool = False
+    enable_flashinfer_allreduce_fusion: bool = False
+    # Calibration-side shard alignment only; this is not passed to SGLang.
+    checkpoint_batch_size: int = EAGLE_CONF_CAPTURE_MAX_BATCH
     checkpoint_batches: int = 4  # prompt batches per durable output shard
+    # Modal-only bounded shard parallelism. This is runtime scheduling, not part
+    # of the data contract, so resumes may safely change it.
+    checkpoint_parallelism: int = 1
     disable_overlap_schedule: bool = False  # test whether non-overlap lets eager draft
 
     @classmethod
@@ -173,17 +203,17 @@ class RunConfig:
             raise ValueError("n_prompts must be >= 1")
         if self.max_tokens is not None and self.max_tokens < 1:
             raise ValueError("max_tokens must be >= 1 when set")
+        if self.generation_batch_size is not None and self.generation_batch_size < 1:
+            raise ValueError("generation_batch_size must be >= 1 when set")
+        if self.checkpoint_batch_size < 1:
+            raise ValueError("checkpoint_batch_size must be >= 1")
         if self.checkpoint_batches < 1:
             raise ValueError("checkpoint_batches must be >= 1")
-        capture_limit = self.capture_max_running_requests
-        if (
-            capture_limit is not None
-            and self.max_running_requests is not None
-            and self.max_running_requests > capture_limit
-        ):
+        if self.checkpoint_parallelism < 1:
+            raise ValueError("checkpoint_parallelism must be >= 1")
+        if self.checkpoint_parallelism > MAX_CHECKPOINT_PARALLELISM:
             raise ValueError(
-                "max_running_requests must be <= "
-                f"{capture_limit} for this capture shape"
+                f"checkpoint_parallelism must be <= {MAX_CHECKPOINT_PARALLELISM}"
             )
 
     @property
@@ -202,40 +232,13 @@ class RunConfig:
         return cls(speculator=spec, **d)
 
     @property
-    def capture_max_running_requests(self) -> int | None:
-        """Largest active request count that the selected capture hooks can store."""
-        limits: list[int] = []
-        if self.capture_conf and self.speculator.family == "eagle":
-            limits.append(EAGLE_CONF_CAPTURE_MAX_BATCH)
-        if self.capture_routing:
-            # Routing stores verify positions, including the root/bonus position.
-            verify_positions = self.speculator.column_width + 1
-            limits.append(max(1, ROUTING_CAPTURE_MAX_TOKENS // verify_positions))
-        return min(limits) if limits else None
-
-    @property
-    def effective_batch_size(self) -> int:
-        """Prompt batch size used to align checkpoint shards.
-
-        SGLang's offline Engine accepts larger request lists and schedules them up
-        to `max_running_requests`. When the user has not set that explicitly, the
-        capture hooks may still impose a safe scheduler limit, which is the batch
-        size we should align durable prompt shards to.
-        """
-        if self.max_running_requests is not None:
-            return self.max_running_requests
-        if self.capture_max_running_requests is not None:
-            return self.capture_max_running_requests
-        return self.n_prompts
-
-    @property
     def checkpoint_shard_size(self) -> int:
         """Target prompt count per checkpoint shard.
 
-        Full shards are always an integer multiple of `effective_batch_size`; only
-        the final remainder shard may be smaller.
+        Full shards are always an integer multiple of `checkpoint_batch_size`;
+        only the final remainder shard may be smaller.
         """
-        return self.effective_batch_size * self.checkpoint_batches
+        return self.checkpoint_batch_size * self.checkpoint_batches
 
     def engine_kwargs(self) -> dict:
         """Map the run config to `sgl.Engine(**kwargs)` / SGLang ServerArgs.
@@ -259,16 +262,32 @@ class RunConfig:
             kw["disable_radix_cache"] = True
         if self.mem_fraction_static is not None:
             kw["mem_fraction_static"] = self.mem_fraction_static
-        if self.max_running_requests is not None:
-            kw["max_running_requests"] = self.max_running_requests
-        elif self.capture_max_running_requests is not None:
-            kw["max_running_requests"] = self.capture_max_running_requests
         if self.eager:
             # Eager disables CUDA graphs for debugging/comparison. It can degrade
             # acceptance on some targets -- see RunConfig.eager.
             kw["disable_cuda_graph"] = True
         if self.mamba_scheduler_strategy:
             kw["mamba_scheduler_strategy"] = self.mamba_scheduler_strategy
+        if self.mamba_ssm_dtype:
+            kw["mamba_ssm_dtype"] = self.mamba_ssm_dtype
+        if self.attention_backend:
+            kw["attention_backend"] = self.attention_backend
+        if self.speculative_draft_attention_backend:
+            kw["speculative_draft_attention_backend"] = self.speculative_draft_attention_backend
+        if self.linear_attn_prefill_backend:
+            kw["linear_attn_prefill_backend"] = self.linear_attn_prefill_backend
+        if self.linear_attn_decode_backend:
+            kw["linear_attn_decode_backend"] = self.linear_attn_decode_backend
+        if self.cuda_graph_max_bs is not None:
+            kw["cuda_graph_max_bs"] = self.cuda_graph_max_bs
+        if self.cuda_graph_max_bs_decode is not None:
+            kw["cuda_graph_max_bs_decode"] = self.cuda_graph_max_bs_decode
+        if self.cuda_graph_backend_prefill:
+            kw["cuda_graph_backend_prefill"] = self.cuda_graph_backend_prefill
+        if self.enforce_piecewise_cuda_graph:
+            kw["enforce_piecewise_cuda_graph"] = True
+        if self.enable_flashinfer_allreduce_fusion:
+            kw["enable_flashinfer_allreduce_fusion"] = True
         if self.disable_overlap_schedule:
             kw["disable_overlap_schedule"] = True
         if s.draft_model_path:

@@ -32,7 +32,17 @@ def run(
     checkpoint_batches: int | None = typer.Option(
         None,
         "--checkpoint-batches",
-        help="Durable output shard size in scheduler batches.",
+        help="Durable output shard size in checkpoint batches.",
+    ),
+    checkpoint_batch_size: int | None = typer.Option(
+        None,
+        "--checkpoint-batch-size",
+        help="Calibration-only prompt batch multiple for output shards.",
+    ),
+    checkpoint_parallelism: int | None = typer.Option(
+        None,
+        "--checkpoint-parallelism",
+        help="Bounded Modal shard workers for checkpointed runs.",
     ),
 ) -> None:
     cfg = RunConfig.from_yaml(config)
@@ -40,13 +50,18 @@ def run(
         cfg.out_dir = out_dir
     if checkpoint_batches is not None:
         cfg.checkpoint_batches = checkpoint_batches
+    if checkpoint_batch_size is not None:
+        cfg.checkpoint_batch_size = checkpoint_batch_size
+    if checkpoint_parallelism is not None:
+        cfg.checkpoint_parallelism = checkpoint_parallelism
     cfg.validate()
 
     typer.echo(
         f"model={cfg.target_model}  speculator={cfg.speculator_label} "
         f"({cfg.speculator.sglang_algorithm}, width={cfg.speculator.column_width})  "
         f"dataset={cfg.dataset}  routing={cfg.capture_routing}  "
-        f"checkpoint={cfg.effective_batch_size}x{cfg.checkpoint_batches}"
+        f"checkpoint={cfg.checkpoint_batch_size}x{cfg.checkpoint_batches}  "
+        f"parallelism={cfg.checkpoint_parallelism}"
     )
 
     if modal and not dry_run:

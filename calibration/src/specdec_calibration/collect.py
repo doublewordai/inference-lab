@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .config import RunConfig
+from .config import DATA_HASH_RUNTIME_FIELDS, RunConfig
 from .datasets import PromptSpec
 
 # meta_info keys SGLang populates for any speculative run (read defensively: absent
@@ -36,6 +36,13 @@ class _Engine:
             self.engine.shutdown()
         except Exception:
             pass
+
+
+@dataclass(frozen=True)
+class CheckpointPart:
+    part_idx: int
+    start: int
+    end: int
 
 
 def build_engine(cfg: RunConfig) -> _Engine:
@@ -83,11 +90,17 @@ def _templated_chat(tok, history: list[dict]) -> str:
 def _sampling_params(cfg: RunConfig) -> dict:
     params = {
         "temperature": cfg.temperature,
-        "seed": cfg.seed,
     }
     if cfg.max_tokens is not None:
         params["max_new_tokens"] = cfg.max_tokens
     return params
+
+
+def _generation_chunks(idxs: list[int], cfg: RunConfig) -> list[list[int]]:
+    size = cfg.generation_batch_size
+    if size is None or size >= len(idxs):
+        return [idxs]
+    return [idxs[i : i + size] for i in range(0, len(idxs), size)]
 
 
 def run_metainfo(
@@ -106,30 +119,41 @@ def run_metainfo(
             idxs = [i for i, p in enumerate(prompts) if t < len(p.turns)]
             if not idxs:
                 break
-            texts = []
-            for i in idxs:
-                histories[i].append({"role": "user", "content": prompts[i].turns[t]})
-                texts.append(_templated_chat(eng.tokenizer, histories[i]))
-            outs = eng.engine.generate(prompt=texts, sampling_params=sp)
-            if isinstance(outs, dict):
-                outs = [outs]
-            for i, out in zip(idxs, outs):
-                prompt_idx = prompt_offset + i
-                mi = out.get("meta_info", {}) or {}
-                histories[i].append({"role": "assistant", "content": out.get("text", "")})
-                row = {
-                    "model": cfg.target_model,
-                    "speculator": cfg.speculator_label,
-                    "config": prompts[i].config,
-                    "category": prompts[i].category,
-                    "prompt_idx": prompt_idx,
-                    "turn": t,
-                    "question_id": prompts[i].question_id,
-                    "completion_tokens": mi.get("completion_tokens"),
-                }
-                for k in SPEC_META_KEYS:
-                    row[k] = mi.get(k)
-                rows.append(row)
+            for chunk_idxs in _generation_chunks(idxs, cfg):
+                texts = []
+                for i in chunk_idxs:
+                    histories[i].append({"role": "user", "content": prompts[i].turns[t]})
+                    texts.append(_templated_chat(eng.tokenizer, histories[i]))
+                import time
+
+                start_s = time.perf_counter()
+                outs = eng.engine.generate(prompt=texts, sampling_params=sp)
+                elapsed_s = time.perf_counter() - start_s
+                if isinstance(outs, dict):
+                    outs = [outs]
+                batch_completion_tokens = sum(
+                    (out.get("meta_info", {}) or {}).get("completion_tokens") or 0
+                    for out in outs
+                )
+                for i, out in zip(chunk_idxs, outs):
+                    prompt_idx = prompt_offset + i
+                    mi = out.get("meta_info", {}) or {}
+                    histories[i].append({"role": "assistant", "content": out.get("text", "")})
+                    row = {
+                        "model": cfg.target_model,
+                        "speculator": cfg.speculator_label,
+                        "config": prompts[i].config,
+                        "category": prompts[i].category,
+                        "prompt_idx": prompt_idx,
+                        "turn": t,
+                        "question_id": prompts[i].question_id,
+                        "completion_tokens": mi.get("completion_tokens"),
+                        "batch_elapsed_s": elapsed_s,
+                        "batch_completion_tokens": batch_completion_tokens,
+                    }
+                    for k in SPEC_META_KEYS:
+                        row[k] = mi.get(k)
+                    rows.append(row)
     finally:
         eng.shutdown()
     return rows
@@ -209,40 +233,54 @@ def collect_banks(
                     idxs = [i for i, p in enumerate(prompts) if t < len(p.turns)]
                     if not idxs:
                         break
-                    texts, rids = [], []
-                    for i in idxs:
-                        prompt_idx = prompt_offset + i
-                        histories[i].append({"role": "user", "content": prompts[i].turns[t]})
-                        texts.append(_templated_chat(eng.tokenizer, histories[i]))
-                        rids.append(f"{prompt_idx}:{t}")
-                    outs = eng.engine.generate(prompt=texts, sampling_params=sp, rid=rids)
-                    if isinstance(outs, dict):
-                        outs = [outs]
-                    for i, out in zip(idxs, outs):
-                        prompt_idx = prompt_offset + i
-                        mi = out.get("meta_info", {}) or {}
-                        histories[i].append({"role": "assistant", "content": out.get("text", "")})
-                        row = {
-                            "model": cfg.target_model,
-                            "speculator": cfg.speculator_label,
-                            "config": prompts[i].config,
-                            "category": prompts[i].category,
-                            "prompt_idx": prompt_idx,
-                            "turn": t,
-                            "question_id": prompts[i].question_id,
-                            "completion_tokens": mi.get("completion_tokens"),
-                        }
-                        for k in SPEC_META_KEYS:
-                            row[k] = mi.get(k)
-                        metainfo.append(row)
-                    lens = [o.get("meta_info", {}).get("spec_accept_length") for o in outs]
-                    lens = [x for x in lens if x]
-                    print(
-                        f"  turn {t}: {len(idxs)} convs, "
-                        f"mean accept_len={sum(lens)/len(lens):.3f}"
-                        if lens
-                        else f"  turn {t}: {len(idxs)} convs"
-                    )
+                    for chunk_idxs in _generation_chunks(idxs, cfg):
+                        texts, rids = [], []
+                        for i in chunk_idxs:
+                            prompt_idx = prompt_offset + i
+                            histories[i].append({"role": "user", "content": prompts[i].turns[t]})
+                            texts.append(_templated_chat(eng.tokenizer, histories[i]))
+                            rids.append(f"{prompt_idx}:{t}")
+                        import time
+
+                        start_s = time.perf_counter()
+                        outs = eng.engine.generate(prompt=texts, sampling_params=sp, rid=rids)
+                        elapsed_s = time.perf_counter() - start_s
+                        if isinstance(outs, dict):
+                            outs = [outs]
+                        batch_completion_tokens = sum(
+                            (out.get("meta_info", {}) or {}).get("completion_tokens") or 0
+                            for out in outs
+                        )
+                        for i, out in zip(chunk_idxs, outs):
+                            prompt_idx = prompt_offset + i
+                            mi = out.get("meta_info", {}) or {}
+                            histories[i].append({"role": "assistant", "content": out.get("text", "")})
+                            row = {
+                                "model": cfg.target_model,
+                                "speculator": cfg.speculator_label,
+                                "config": prompts[i].config,
+                                "category": prompts[i].category,
+                                "prompt_idx": prompt_idx,
+                                "turn": t,
+                                "question_id": prompts[i].question_id,
+                                "completion_tokens": mi.get("completion_tokens"),
+                                "batch_elapsed_s": elapsed_s,
+                                "batch_completion_tokens": batch_completion_tokens,
+                            }
+                            for k in SPEC_META_KEYS:
+                                row[k] = mi.get(k)
+                            metainfo.append(row)
+                        lens = [o.get("meta_info", {}).get("spec_accept_length") for o in outs]
+                        lens = [x for x in lens if x]
+                        gen_tps = batch_completion_tokens / max(elapsed_s, 1e-9)
+                        msg = f"  turn {t}: {len(chunk_idxs)} convs"
+                        if lens:
+                            msg += f", mean accept_len={sum(lens)/len(lens):.3f}"
+                        msg += (
+                            f", gen={gen_tps:.1f} tok/s "
+                            f"({batch_completion_tokens} tok / {elapsed_s:.2f}s)"
+                        )
+                        print(msg)
             finally:
                 eng.shutdown()
 
@@ -283,7 +321,7 @@ def _assemble_routing(
     with open(meta_path) as f:
         meta_lines = [json.loads(x) for x in f if x.strip()]
     with open(bin_path, "rb") as bf:
-        for m in meta_lines:
+        for block_idx, m in enumerate(meta_lines):
             nt, L, S = m["nt"], m["L"], m["S"]
             raw = bf.read(nt * L * S)
             if len(raw) < nt * L * S:
@@ -291,22 +329,27 @@ def _assemble_routing(
             arr = np.frombuffer(raw, dtype=np.uint8).reshape(nt, L, S)
             blocks.append(arr)
             npos = m["npos"]
-            for r, (rid, rnd, acc) in enumerate(zip(m["rids"], m["rounds"], m["accepts"])):
+            for request_idx, (rid, rnd, acc) in enumerate(zip(m["rids"], m["rounds"], m["accepts"])):
                 pidx, turn = _parse_rid(rid)
                 local_idx = pidx - prompt_offset
                 p = prompts[local_idx] if 0 <= local_idx < len(prompts) else None
                 for pos in range(npos):
-                    meta_rows.append({
-                        "model": cfg.target_model,
-                        "speculator": cfg.speculator_label,
-                        "config": p.config if p else "?",
-                        "category": p.category if p else "?",
-                        "prompt_idx": pidx,
-                        "turn": turn,
-                        "round_idx": rnd,
-                        "position": pos,
-                        "accepted": 1 if pos < acc else 0,
-                    })
+                    meta_rows.append(
+                        {
+                            "model": cfg.target_model,
+                            "speculator": cfg.speculator_label,
+                            "config": p.config if p else "?",
+                            "category": p.category if p else "?",
+                            "prompt_idx": pidx,
+                            "turn": turn,
+                            "round_idx": rnd,
+                            "routing_idx": len(meta_rows),
+                            "routing_block_idx": block_idx,
+                            "request_idx": request_idx,
+                            "position": pos,
+                            "accepted": 1 if pos < acc else 0,
+                        }
+                    )
     full = np.concatenate(blocks, axis=0) if blocks else None
     return full, meta_rows
 
@@ -451,47 +494,43 @@ def run_checkpointed(
 ) -> dict:
     """Run collection in durable prompt shards.
 
-    Full shards are sized as `effective_batch_size * checkpoint_batches`, so the
-    checkpoint boundary does not force partial scheduler batches. The final shard
-    may be smaller when the prompt count is not a multiple of the target size.
+    Full shards are sized as `checkpoint_batch_size * checkpoint_batches`.
+    `checkpoint_batch_size` is a calibration-side shard alignment hint only; it
+    is not forwarded to SGLang. The final shard may be smaller when the prompt
+    count is not a multiple of the target size.
     """
-    import math
+    import time
     from pathlib import Path
 
+    start_perf_s = time.perf_counter()
+    invocation_started_at = _timestamp_fields("invocation_started")
     out = Path(cfg.out_dir)
     manifest = _prepare_checkpoint_run(out, cfg, prompts, with_hooks, resume)
     completed = _completed_parts(out)
-    shard_size = cfg.checkpoint_shard_size
-    n_parts = math.ceil(len(prompts) / shard_size) if prompts else 0
+    parts = checkpoint_parts(cfg, prompts)
+    n_parts = len(parts)
     print(
         "checkpointing "
         f"{len(prompts)} prompts -> {n_parts} part(s) "
-        f"({cfg.effective_batch_size} prompt batch x {cfg.checkpoint_batches})"
+        f"({cfg.checkpoint_batch_size} prompt batch x {cfg.checkpoint_batches})"
     )
 
     written = 0
     skipped = 0
-    for part_idx, start in enumerate(range(0, len(prompts), shard_size)):
-        end = min(start + shard_size, len(prompts))
-        existing = completed.get(part_idx)
+    for part in parts:
+        existing = completed.get(part.part_idx)
         if existing is not None:
-            if existing.get("start") != start or existing.get("end") != end:
+            if existing.get("start") != part.start or existing.get("end") != part.end:
                 raise ValueError(
-                    f"{out}: completed part {part_idx:06d} has range "
-                    f"{existing.get('start')}:{existing.get('end')}, expected {start}:{end}"
+                    f"{out}: completed part {part.part_idx:06d} has range "
+                    f"{existing.get('start')}:{existing.get('end')}, "
+                    f"expected {part.start}:{part.end}"
                 )
-            print(f"skipping complete part {part_idx:06d} prompts {start}:{end}")
+            print(f"skipping complete part {part.part_idx:06d} prompts {part.start}:{part.end}")
             skipped += 1
             continue
 
-        chunk = prompts[start:end]
-        print(f"running part {part_idx:06d} prompts {start}:{end}")
-        result = (
-            collect_banks(cfg, chunk, prompt_offset=start)
-            if with_hooks
-            else {"metainfo": run_metainfo(cfg, chunk, prompt_offset=start)}
-        )
-        part_manifest = _write_part_result(result, cfg, out, part_idx, start, end)
+        part_manifest = run_checkpoint_part(cfg, prompts, part, with_hooks=with_hooks)
         written += 1
         if after_part is not None:
             after_part(part_manifest)
@@ -499,15 +538,79 @@ def run_checkpointed(
     final_files = _existing_final_files(out) if written == 0 else []
     if not final_files:
         final_files = _materialize_final_outputs(out, cfg)
+    _write_completed_parts_index(out)
+    completed_at = _timestamp_fields("completed")
     complete = {
         **manifest,
         "complete": True,
+        **completed_at,
+        "elapsed_s": _elapsed_since_manifest_start(
+            manifest,
+            completed_at["completed_at_unix_s"],
+            fallback_s=time.perf_counter() - start_perf_s,
+        ),
+        **invocation_started_at,
+        "invocation_elapsed_s": max(0.0, time.perf_counter() - start_perf_s),
         "parts_written": written,
         "parts_skipped": skipped,
         "final_files": final_files,
     }
     _write_json_atomic(out / "run_complete.json", complete)
     return complete
+
+
+def checkpoint_parts(cfg: RunConfig, prompts: list[PromptSpec]) -> list[CheckpointPart]:
+    import math
+
+    shard_size = cfg.checkpoint_shard_size
+    n_parts = math.ceil(len(prompts) / shard_size) if prompts else 0
+    return [
+        CheckpointPart(
+            part_idx=part_idx,
+            start=start,
+            end=min(start + shard_size, len(prompts)),
+        )
+        for part_idx, start in enumerate(range(0, len(prompts), shard_size))
+    ][:n_parts]
+
+
+def run_checkpoint_part(
+    cfg: RunConfig,
+    prompts: list[PromptSpec],
+    part: CheckpointPart,
+    with_hooks: bool = True,
+    append_completed: bool = True,
+) -> dict:
+    from pathlib import Path
+
+    out = Path(cfg.out_dir)
+    existing = _completed_parts(out).get(part.part_idx)
+    if existing is not None:
+        if existing.get("start") != part.start or existing.get("end") != part.end:
+            raise ValueError(
+                f"{out}: completed part {part.part_idx:06d} has range "
+                f"{existing.get('start')}:{existing.get('end')}, "
+                f"expected {part.start}:{part.end}"
+            )
+        print(f"skipping complete part {part.part_idx:06d} prompts {part.start}:{part.end}")
+        return {**existing, "part_dir": str(out / "parts" / f"part-{part.part_idx:06d}")}
+
+    chunk = prompts[part.start:part.end]
+    print(f"running part {part.part_idx:06d} prompts {part.start}:{part.end}")
+    result = (
+        collect_banks(cfg, chunk, prompt_offset=part.start)
+        if with_hooks
+        else {"metainfo": run_metainfo(cfg, chunk, prompt_offset=part.start)}
+    )
+    return _write_part_result(
+        result,
+        cfg,
+        out,
+        part.part_idx,
+        part.start,
+        part.end,
+        append_completed=append_completed,
+    )
 
 
 def _prepare_checkpoint_run(
@@ -521,7 +624,7 @@ def _prepare_checkpoint_run(
 
     out.mkdir(parents=True, exist_ok=True)
     (out / "parts").mkdir(parents=True, exist_ok=True)
-    manifest = _run_manifest(cfg, prompts, with_hooks)
+    manifest = {**_run_manifest(cfg, prompts, with_hooks), **_timestamp_fields("started")}
     path = out / "run_manifest.json"
     if path.exists():
         existing = json.loads(path.read_text())
@@ -531,6 +634,7 @@ def _prepare_checkpoint_run(
                     f"{out}: existing checkpoint manifest does not match this run "
                     f"({key}: {existing.get(key)!r} != {manifest.get(key)!r})"
                 )
+        manifest = existing
     elif _completed_parts(out):
         raise ValueError(f"{out}: found checkpoint parts but no run_manifest.json")
     elif _legacy_outputs(out):
@@ -548,6 +652,8 @@ def _legacy_outputs(out) -> list:
         "acceptance.parquet",
         "speculator.parquet",
         "metainfo.json",
+        "routing.npy",
+        "routing_meta.parquet",
         "stats.json",
         "run_complete.json",
         "completed_parts.jsonl",
@@ -572,7 +678,7 @@ def _run_manifest(cfg: RunConfig, prompts: list[PromptSpec], with_hooks: bool) -
         "speculator": cfg.speculator_label,
         "with_hooks": with_hooks,
         "n_prompts": len(prompts),
-        "effective_batch_size": cfg.effective_batch_size,
+        "checkpoint_batch_size": cfg.checkpoint_batch_size,
         "checkpoint_batches": cfg.checkpoint_batches,
         "checkpoint_shard_size": cfg.checkpoint_shard_size,
         "config_hash": _stable_hash(_config_payload(cfg)),
@@ -582,7 +688,8 @@ def _run_manifest(cfg: RunConfig, prompts: list[PromptSpec], with_hooks: bool) -
 
 def _config_payload(cfg: RunConfig) -> dict:
     payload = cfg.to_dict()
-    payload.pop("out_dir", None)
+    for field in DATA_HASH_RUNTIME_FIELDS:
+        payload.pop(field, None)
     return payload
 
 
@@ -614,6 +721,29 @@ def _write_json_atomic(path, obj) -> None:
     tmp.replace(path)
 
 
+def _timestamp_fields(prefix: str) -> dict:
+    import time
+    from datetime import datetime, timezone
+
+    unix_s = time.time()
+    stamp = datetime.fromtimestamp(unix_s, tz=timezone.utc).isoformat()
+    return {
+        f"{prefix}_at": stamp.replace("+00:00", "Z"),
+        f"{prefix}_at_unix_s": unix_s,
+    }
+
+
+def _elapsed_since_manifest_start(
+    manifest: dict,
+    completed_at_unix_s: float,
+    fallback_s: float,
+) -> float:
+    started_at_unix_s = manifest.get("started_at_unix_s")
+    if isinstance(started_at_unix_s, (int, float)):
+        return max(0.0, completed_at_unix_s - float(started_at_unix_s))
+    return max(0.0, fallback_s)
+
+
 def _completed_parts(out) -> dict[int, dict]:
     import json
 
@@ -630,6 +760,19 @@ def _completed_parts(out) -> dict[int, dict]:
     return completed
 
 
+def _write_completed_parts_index(out) -> None:
+    import json
+
+    completed = _completed_parts(out)
+    tmp = out / ".completed_parts.jsonl.tmp"
+    with tmp.open("w") as f:
+        for part_idx in sorted(completed):
+            row = completed[part_idx]
+            part_dir = out / "parts" / f"part-{part_idx:06d}"
+            f.write(json.dumps({**row, "part_dir": str(part_dir)}) + "\n")
+    tmp.replace(out / "completed_parts.jsonl")
+
+
 def _write_part_result(
     result: dict,
     cfg: RunConfig,
@@ -637,6 +780,7 @@ def _write_part_result(
     part_idx: int,
     start: int,
     end: int,
+    append_completed: bool = True,
 ) -> dict:
     import shutil
 
@@ -666,10 +810,11 @@ def _write_part_result(
     (tmp / "_SUCCESS").write_text("ok\n")
     tmp.rename(final)
 
-    with (out / "completed_parts.jsonl").open("a") as f:
-        import json
+    if append_completed:
+        with (out / "completed_parts.jsonl").open("a") as f:
+            import json
 
-        f.write(json.dumps({**manifest, "part_dir": str(final)}) + "\n")
+            f.write(json.dumps({**manifest, "part_dir": str(final)}) + "\n")
     return {**manifest, "part_dir": str(final)}
 
 
@@ -704,7 +849,50 @@ def _materialize_final_outputs(out, cfg: RunConfig) -> list[str]:
         print(f"materialized {n} rows -> {out/'speculator.parquet'}")
         final_files.append("speculator.parquet")
 
+    routing_paths = [p / "routing.npy" for p in part_dirs if (p / "routing.npy").exists()]
+    routing_meta_paths = [
+        p / "routing_meta.parquet" for p in part_dirs if (p / "routing_meta.parquet").exists()
+    ]
+    if routing_paths or routing_meta_paths:
+        if len(routing_paths) != len(routing_meta_paths):
+            raise ValueError(
+                "routing output is incomplete: expected routing.npy and "
+                "routing_meta.parquet in the same completed parts"
+            )
+        rows, shape = _merge_routing_arrays(routing_paths, out / "routing.npy")
+        print(f"materialized routing.npy {shape} -> {out/'routing.npy'}")
+        n = _merge_parquets(routing_meta_paths, out / "routing_meta.parquet")
+        if n != rows:
+            raise ValueError(
+                f"routing rows mismatch: routing.npy has {rows}, "
+                f"routing_meta.parquet has {n}"
+            )
+        print(f"materialized {n} routing meta rows -> {out/'routing_meta.parquet'}")
+        final_files += ["routing.npy", "routing_meta.parquet"]
+
     return final_files
+
+
+def _merge_routing_arrays(paths, output_path) -> tuple[int, tuple[int, ...]]:
+    import numpy as np
+
+    arrays = [np.load(path) for path in paths]
+    if not arrays:
+        return 0, (0,)
+    tail = arrays[0].shape[1:]
+    for path, arr in zip(paths, arrays):
+        if arr.ndim != 3:
+            raise ValueError(f"{path}: expected routing array with shape [N, L, S], got {arr.shape}")
+        if arr.shape[1:] != tail:
+            raise ValueError(
+                f"{path}: routing shape {arr.shape[1:]} does not match first part shape {tail}"
+            )
+    merged = np.concatenate(arrays, axis=0)
+    tmp = output_path.with_name(f".{output_path.name}.tmp")
+    with tmp.open("wb") as f:
+        np.save(f, merged)
+    tmp.replace(output_path)
+    return int(merged.shape[0]), tuple(int(x) for x in merged.shape)
 
 
 def _merge_parquets(paths, output_path) -> int:

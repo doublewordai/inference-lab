@@ -88,25 +88,33 @@ def test_eagle_capture_requires_topk_one():
         spec.validate()
 
 
-def test_engine_kwargs_caps_eagle_conf_capture_batch():
+def test_engine_kwargs_do_not_set_request_scheduler_limit():
     cfg = RunConfig(target_model="M", speculator=Speculator(algorithm="mtp"))
     cfg.validate()
-    assert cfg.capture_max_running_requests == 512
-    assert cfg.engine_kwargs()["max_running_requests"] == 512
-    assert cfg.effective_batch_size == 512
+    assert not any("running" in key for key in cfg.engine_kwargs())
+    assert cfg.checkpoint_batch_size == 512
     assert cfg.checkpoint_shard_size == 2048
 
 
-def test_checkpoint_shards_are_batch_aligned_when_batch_is_explicit():
+def test_checkpoint_shards_are_batch_aligned_when_checkpoint_batch_is_explicit():
     cfg = RunConfig(
         target_model="M",
         speculator=Speculator(algorithm="mtp"),
-        max_running_requests=128,
+        checkpoint_batch_size=128,
         checkpoint_batches=3,
     )
     cfg.validate()
-    assert cfg.effective_batch_size == 128
     assert cfg.checkpoint_shard_size == 384
+
+
+def test_checkpoint_batch_size_must_be_positive():
+    cfg = RunConfig(
+        target_model="M",
+        speculator=Speculator(algorithm="mtp"),
+        checkpoint_batch_size=0,
+    )
+    with pytest.raises(ValueError, match="checkpoint_batch_size must be >= 1"):
+        cfg.validate()
 
 
 def test_checkpoint_batches_must_be_positive():
@@ -119,26 +127,34 @@ def test_checkpoint_batches_must_be_positive():
         cfg.validate()
 
 
-def test_engine_kwargs_caps_routing_verify_positions():
+def test_checkpoint_parallelism_is_bounded():
+    cfg = RunConfig(
+        target_model="M",
+        speculator=Speculator(algorithm="mtp"),
+        checkpoint_parallelism=17,
+    )
+    with pytest.raises(ValueError, match="checkpoint_parallelism must be <= 16"):
+        cfg.validate()
+
+
+def test_checkpoint_parallelism_must_be_positive():
+    cfg = RunConfig(
+        target_model="M",
+        speculator=Speculator(algorithm="mtp"),
+        checkpoint_parallelism=0,
+    )
+    with pytest.raises(ValueError, match="checkpoint_parallelism must be >= 1"):
+        cfg.validate()
+
+
+def test_engine_kwargs_do_not_cap_routing_request_count():
     cfg = RunConfig(
         target_model="M",
         speculator=Speculator(algorithm="dflash", draft_model_path="d", dflash_block_size=16),
         capture_routing=True,
     )
     cfg.validate()
-    assert cfg.capture_max_running_requests == 256
-    assert cfg.engine_kwargs()["max_running_requests"] == 256
-
-
-def test_explicit_max_running_requests_must_fit_capture_shape():
-    cfg = RunConfig(
-        target_model="M",
-        speculator=Speculator(algorithm="dflash", draft_model_path="d", dflash_block_size=16),
-        capture_routing=True,
-        max_running_requests=300,
-    )
-    with pytest.raises(ValueError, match="max_running_requests must be <="):
-        cfg.validate()
+    assert not any("running" in key for key in cfg.engine_kwargs())
 
 
 def test_unknown_algorithm_rejected():

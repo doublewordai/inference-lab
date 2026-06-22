@@ -30,6 +30,12 @@ Completed part directories are resumable transaction boundaries. `--resume` skip
 parts with `_SUCCESS`; a mismatched config/prompt manifest is rejected instead of
 mixing banks.
 
+`run_manifest.json` includes the durable run `started_at` timestamp.
+`run_complete.json` adds `completed_at` and `elapsed_s`, so completed artifacts
+can report wall-clock collection time without relying on Modal logs or file
+mtimes. Resumed runs also record `invocation_started_at` and
+`invocation_elapsed_s` for the final command invocation.
+
 The acceptance/speculator parquet files are keyed by
 `(model, speculator, config, category, prompt_idx, turn, round_idx)` — one row
 per draft round, so they JOIN:
@@ -59,15 +65,25 @@ uv run specdec-calibrate export-trace --run-dir ../data/qwen36_mtp_bench \
 ```
 
 Flags: `--modal/--local`, `--hooks/--no-hooks` (meta_info only), `--out-dir`,
-`--dry-run`, `--resume/--no-resume`, `--checkpoint-batches`.
+`--dry-run`, `--resume/--no-resume`, `--checkpoint-batches`,
+`--checkpoint-batch-size`, `--checkpoint-parallelism`.
 
 Checkpointing is batch-aligned. The target prompt shard size is
-`effective_batch_size * checkpoint_batches`, where `effective_batch_size` is the
-explicit `max_running_requests`, the capture hook's safe scheduler cap, or
-`n_prompts` when neither is set. Full parts therefore contain an integer number
-of scheduler batches; only the final remainder part may be smaller. The default
-`checkpoint_batches` is `4`. Set `max_running_requests` when you want the batch
-size to be explicit.
+`checkpoint_batch_size * checkpoint_batches`. This is only a calibration output
+sharding hint and is not passed into SGLang. Full parts therefore contain an
+integer number of checkpoint batches; only the final remainder part may be
+smaller. The defaults are `checkpoint_batch_size: 512` and
+`checkpoint_batches: 4`.
+
+On Modal, all runs use the checkpoint-part worker path. `checkpoint_parallelism`
+runs pending checkpoint parts with a bounded number of remote shard workers,
+syncs each completed part directory back to the local `out_dir`, then runs one
+final materialization pass. This keeps each shard independently resumable while
+avoiding a long serial chain of model loads/CUDA graph captures.
+`out_dir`, `gpu`, `mem_fraction_static`, and `checkpoint_parallelism` are runtime
+placement/scheduling knobs, so changing them does not invalidate a run's
+config/prompt hash. Sampling, prompt, and speculator fields remain part of the
+hash and are rejected on mismatch.
 
 Prompt sources:
 
@@ -76,8 +92,10 @@ Prompt sources:
   SPEED-Bench configs and `dataset_split` selects the Hugging Face split
   (`test` by default).
 
-Sampling defaults are `temperature: 0.6` and `seed: 0`. `max_tokens` is unset by
-default; set it in a run YAML when you want a bounded calibration run.
+Sampling defaults to `temperature: 0.6`. `max_tokens` is unset by default; set it
+in a run YAML when you want a bounded calibration run. The config keeps `seed`
+for run metadata, but the pinned SGLang `SamplingParams` API does not accept a
+per-request seed field.
 
 ### Simulator export
 
