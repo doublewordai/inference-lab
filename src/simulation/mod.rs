@@ -20,12 +20,15 @@ pub use engine::{
 pub use roofline::{predict_decode_tpot, predict_prefill_time};
 pub use simulator::{ProgressInfo, Simulator, TimeSeriesPoint};
 
+use crate::config::SpeculativeConfig;
 use crate::request::Request;
 
 /// Run a closed-loop workload of `conc` users issuing fixed-shape requests
 /// (`isl` prompt tokens, `osl` output tokens) through `topology`. Stops once
 /// `num_completions` requests have finished. The first `warmup_completions`
 /// are dropped from the returned set (so the steady state is what's reported).
+/// `spec` optionally enables speculative decoding (applies only to decode
+/// steps, so on a disagg topology it affects only the decode pool).
 pub fn simulate_closed_loop(
     topology: Topology,
     conc: u32,
@@ -33,12 +36,28 @@ pub fn simulate_closed_loop(
     osl: u32,
     num_completions: u32,
     warmup_completions: u32,
+    spec: Option<SpeculativeConfig>,
+    seed: u64,
+    skip_prefill: bool,
 ) -> Result<ClosedLoopResult, String> {
     let mut engine = Engine::new(topology);
+    if let Some(s) = spec {
+        engine.enable_speculative(s, seed);
+    }
+    // `skip_prefill` makes requests arrive already prefilled (num_computed = isl),
+    // i.e. as pure-decode work -- the disaggregated decode pool in isolation, no
+    // prefill compute sharing the GPU. Pair with lifted KV caps to sweep the
+    // compute roofline.
+    let mk = |id: u32, arrival: f64| {
+        let mut req = Request::new(format!("req-{id}"), 0, arrival, isl, osl);
+        if skip_prefill {
+            req.num_computed_tokens = isl;
+        }
+        req
+    };
     // Seed initial conc users at t=0.
     for i in 0..conc {
-        let req = Request::new(format!("req-{i}"), 0, 0.0, isl, osl);
-        engine.submit(req);
+        engine.submit(mk(i, 0.0));
     }
     let mut next_id: u32 = conc;
     let mut all = Vec::with_capacity(num_completions as usize);
@@ -51,8 +70,7 @@ pub fn simulate_closed_loop(
             let now = timing.completion_time;
             all.push(timing);
             if next_id < num_completions + conc {
-                let req = Request::new(format!("req-{next_id}"), 0, now, isl, osl);
-                engine.submit(req);
+                engine.submit(mk(next_id, now));
                 next_id += 1;
             }
         }
@@ -119,5 +137,112 @@ fn mean<I: Iterator<Item = f64>>(iter: I) -> f64 {
         0.0
     } else {
         sum / n as f64
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{
+        AcceptanceModel, ClusterSpec, DenseModel, GammaPolicy, HardwareConfig, MeasuredCostConfig,
+        ModelConfig, ParallelConfig, Precision, SchedulerConfig, SpeculativeConfig,
+    };
+
+    fn small_dense_topology() -> Topology {
+        let hardware = HardwareConfig {
+            name: "test".into(),
+            flops_fp4: None,
+            flops_fp8: None,
+            flops_bf16: Some(1e15),
+            flops_fp16: Some(1e15),
+            memory_bandwidth: 1e12,
+            memory_capacity: 80_000_000_000,
+            kv_cache_capacity: 0,
+            gpu_memory_utilization: 0.9,
+            kv_tiers: Vec::new(),
+        };
+        let model = ModelConfig::Dense(DenseModel {
+            name: "test-dense".into(),
+            num_parameters: 1_000_000_000,
+            num_active_parameters: None,
+            num_layers: 8,
+            hidden_dim: 1024,
+            num_heads: 8,
+            num_kv_heads: None,
+            head_dim: None,
+            max_seq_len: 4096,
+            precision: Precision::Bf16,
+        });
+        let sched = SchedulerConfig {
+            max_num_batched_tokens: 8192,
+            max_num_seqs: 256,
+            enable_chunked_prefill: false,
+            long_prefill_token_threshold: 0,
+            max_num_partial_prefills: 1,
+            block_size: 16,
+            policy: "fcfs".into(),
+            enable_preemption_free: false,
+            enable_cascade_attention: false,
+        };
+        let cluster = ClusterSpec {
+            hardware,
+            parallel: ParallelConfig { tp: 1, ep: 1, dp_attention: false },
+            comms: None,
+            num_workers: 1,
+            node: 0,
+        };
+        Topology::aggregated(cluster, model, sched).expect("topo")
+    }
+
+    /// Drive a tiny prefilled closed loop with a measured cost table and
+    /// return the mean chosen draft depth — exercises the table loading and
+    /// the c_curve override in the policy decision path end to end.
+    fn mean_draft_with_table(csv: &str) -> f64 {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("costs.csv");
+        std::fs::write(&path, csv).unwrap();
+        let spec = SpeculativeConfig {
+            gamma: 4,
+            acceptance: AcceptanceModel::Constant { alpha: 0.9 },
+            policy: GammaPolicy::GoodputBudget,
+            draft_cost_frac: 0.0,
+            measured_cost: Some(MeasuredCostConfig {
+                path: path.to_str().unwrap().into(),
+                ref_seq_len: None,
+            }),
+            switch: Default::default(),
+            drafter: None,
+        };
+        let mut engine = Engine::new(small_dense_topology());
+        engine.enable_speculative(spec, 7);
+        for i in 0..4u32 {
+            let mut req = Request::new(format!("r{i}"), 0, 0.0, 64, 32);
+            req.num_computed_tokens = 64; // arrive prefilled: pure decode
+            engine.submit(req);
+        }
+        let mut done = 0usize;
+        while done < 4 {
+            assert!(engine.next_event_time().is_some(), "queue drained");
+            done += engine.step().unwrap().completions.len();
+        }
+        let series = engine.spec_depth_series();
+        let (s, n) = series
+            .iter()
+            .fold((0.0f64, 0.0f64), |(s, n), &(_, md, _)| (s + md, n + 1.0));
+        s / n.max(1.0)
+    }
+
+    #[test]
+    fn measured_cost_table_steers_draft_choice() {
+        // File column is the verify width (ndt = g + 1; ndt=1 = plain decode).
+        // Deep drafts measured as ruinously expensive -> policy stays at 0,
+        // regardless of what the analytic roofline would have said.
+        let spec_off = "batch_size,num_draft_tokens,step_seconds\n\
+                        4,1,0.001\n4,2,1.0\n4,3,1.0\n4,4,1.0\n4,5,1.0\n";
+        // Deep drafts measured as free -> policy pins gamma_max.
+        let spec_on = "batch_size,num_draft_tokens,step_seconds\n\
+                       4,1,0.001\n4,2,0.001\n4,3,0.001\n4,4,0.001\n4,5,0.001\n";
+        assert!(mean_draft_with_table(spec_off) < 0.01);
+        assert!(mean_draft_with_table(spec_on) > 3.9);
     }
 }

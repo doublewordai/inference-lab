@@ -144,8 +144,13 @@ impl Scheduler {
                         tokens_to_schedule.min(self.config.long_prefill_token_threshold);
                 }
             } else {
-                // During decode phase, limit to 1 token per iteration (autoregressive generation)
-                tokens_to_schedule = tokens_to_schedule.min(1);
+                // Decode phase: one bonus token plus the speculative verify pass.
+                // `pending_draft_len` (decided last iteration; 0 if speculation is
+                // off) makes the step process `1 + draft` tokens, so the token
+                // budget and KV are reserved for the verify cost. The earlier
+                // `.min(token_budget)` already trims `draft` to fit the budget.
+                let verify_width = 1 + self.running[idx].pending_draft_len;
+                tokens_to_schedule = tokens_to_schedule.min(verify_width);
             }
 
             // Try to allocate KV cache blocks if needed
@@ -318,8 +323,10 @@ impl Scheduler {
                             tokens_to_schedule.min(self.config.long_prefill_token_threshold);
                     }
                 } else {
-                    // During decode phase, limit to 1 token per iteration (autoregressive generation)
-                    tokens_to_schedule = tokens_to_schedule.min(1);
+                    // Decode phase: bonus token + speculative verify pass (see
+                    // the running-request loop above).
+                    let verify_width = 1 + request.pending_draft_len;
+                    tokens_to_schedule = tokens_to_schedule.min(verify_width);
                 }
 
                 if tokens_to_schedule == 0 {
@@ -365,23 +372,30 @@ impl Scheduler {
     /// Calculate how many new blocks are needed for a request
     fn calculate_blocks_needed(&self, request: &Request, num_new_tokens: u32) -> usize {
         let total_tokens = request.num_computed_tokens + num_new_tokens;
-        let total_blocks_needed = total_tokens.div_ceil(self.config.block_size) as usize;
+        // Mirror KVCacheManager: growing attention blocks + fixed per-sequence
+        // state reservation (zero for pure-attention models).
+        let total_blocks_needed = self.kv_cache_manager.state_blocks()
+            + total_tokens.div_ceil(self.config.block_size) as usize;
         total_blocks_needed.saturating_sub(request.kv_blocks.len())
     }
 
     /// Check if we can admit a new request without risking preemption
     /// Conservative approach: ensure total allocated + needed for all to complete fits
     fn can_admit_without_preemption(&self, request: &Request) -> bool {
-        // Calculate total blocks that will EVER be needed by all running + new
+        // Calculate total blocks that will EVER be needed by all running + new.
+        // Each sequence also holds a fixed state reservation for its whole life.
+        let state_blocks = self.kv_cache_manager.state_blocks();
         let mut max_blocks_needed = 0;
 
         for r in &self.running {
-            let total_needed = r.total_tokens().div_ceil(self.config.block_size) as usize;
+            let total_needed =
+                state_blocks + r.total_tokens().div_ceil(self.config.block_size) as usize;
             max_blocks_needed += total_needed;
         }
 
         // Add new request
-        let new_total = request.total_tokens().div_ceil(self.config.block_size) as usize;
+        let new_total =
+            state_blocks + request.total_tokens().div_ceil(self.config.block_size) as usize;
         max_blocks_needed += new_total;
 
         // Check against total capacity (not just free blocks!)
@@ -594,6 +608,7 @@ mod tests {
             config.hardware.kv_cache_capacity,
             config.scheduler.block_size,
             config.model.kv_storage_bytes(1),
+            config.model.per_sequence_state_bytes(),
             false,
         );
         Scheduler::new(config.scheduler, config.hardware, config.model, kv_cache).unwrap()
@@ -628,6 +643,7 @@ mod tests {
             config.hardware.kv_cache_capacity,
             block_size,
             config.model.kv_storage_bytes(1),
+            config.model.per_sequence_state_bytes(),
             true,
         )
         .with_tiers(&[KVTier {
@@ -695,6 +711,7 @@ mod tests {
             small_hbm,
             block_size,
             config.model.kv_storage_bytes(1),
+            config.model.per_sequence_state_bytes(),
             true,
         )
         .with_tiers(&[KVTier {
@@ -815,6 +832,7 @@ mod tests {
             config.hardware.kv_cache_capacity,
             config.scheduler.block_size,
             config.model.kv_storage_bytes(1),
+            config.model.per_sequence_state_bytes(),
             false,
         );
         Scheduler::new(config.scheduler, config.hardware, config.model, kv_cache).unwrap()
@@ -1019,6 +1037,7 @@ mod tests {
             config.hardware.kv_cache_capacity,
             config.scheduler.block_size,
             config.model.kv_storage_bytes(1),
+            config.model.per_sequence_state_bytes(),
             false,
         );
         Scheduler::new(config.scheduler, config.hardware, config.model, kv_cache).unwrap()
@@ -1034,6 +1053,7 @@ mod tests {
             config.hardware.kv_cache_capacity,
             config.scheduler.block_size,
             config.model.kv_storage_bytes(1),
+            config.model.per_sequence_state_bytes(),
             false,
         );
         let mut scheduler =

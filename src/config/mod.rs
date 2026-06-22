@@ -3,6 +3,7 @@ pub mod model;
 pub mod parallel;
 pub mod scheduler;
 pub mod simulation;
+pub mod speculative;
 pub mod topology;
 pub mod workload;
 
@@ -10,9 +11,13 @@ pub use hardware::{HardwareConfig, KVTier, Precision};
 pub use model::{DenseModel, DeepseekV4Model, ModelConfig, ModelCosts, SlidingWindowModel};
 pub use parallel::{CommsConfig, ParallelConfig};
 pub use scheduler::SchedulerConfig;
+pub use speculative::{
+    AcceptanceModel, DrafterCost, GammaPolicy, MeasuredCostConfig, SpeculativeConfig,
+    SwitchConstraints, TraceBank, TraceRound,
+};
 pub use simulation::SimulationConfig;
 pub use topology::{ClusterSpec, DisaggTopology, Node};
-pub use workload::{LengthDistribution, WorkloadConfig};
+pub use workload::{LengthDistribution, RateSchedule, WorkloadConfig};
 
 use serde::Deserialize;
 use std::fs;
@@ -29,6 +34,10 @@ pub struct Config {
     pub workload: WorkloadConfig,
     #[serde(default)]
     pub simulation: SimulationConfig,
+    /// Optional speculative decoding. When set, decode steps verify `gamma + 1`
+    /// tokens and advance by `accepted + 1` per the acceptance model.
+    #[serde(default)]
+    pub speculative: Option<SpeculativeConfig>,
 }
 
 impl Config {
@@ -85,6 +94,7 @@ impl Config {
             hidden_dim: 4096,
             num_heads: 32,
             num_kv_heads: None,
+            head_dim: None,
             max_seq_len: 2048,
             precision: crate::config::Precision::Bf16,
         });
@@ -106,6 +116,7 @@ impl Config {
             dataset_path: None,
             arrival_pattern: "poisson".to_string(),
             arrival_rate: 1.0,
+            rate_schedule: None,
             num_concurrent_users: None,
             input_len_dist: LengthDistribution::Fixed { value: 100 },
             output_len_dist: LengthDistribution::Fixed { value: 50 },
@@ -124,6 +135,7 @@ impl Config {
             scheduler,
             workload,
             simulation,
+            speculative: None,
         }
     }
 }
@@ -142,6 +154,7 @@ mod tests {
             hidden_dim: 4096,
             num_heads: 32,
             num_kv_heads: None,
+            head_dim: None,
             max_seq_len: 2048,
             precision: crate::config::Precision::Bf16,
         });

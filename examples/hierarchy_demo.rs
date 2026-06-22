@@ -43,6 +43,7 @@ fn run_for_batch(num_concurrent: usize, share_prefix: bool) -> Vec<f64> {
         hidden_dim: 4096,
         num_heads: 32,
         num_kv_heads: None,
+        head_dim: None,
         max_seq_len: 8192,
         precision: Precision::Bf16,
     });
@@ -66,6 +67,7 @@ fn run_for_batch(num_concurrent: usize, share_prefix: bool) -> Vec<f64> {
         config_hardware.kv_cache_capacity,
         block_size,
         config_model.kv_storage_bytes(1),
+        config_model.per_sequence_state_bytes(),
         true,
     )
     .with_tiers(&config_hardware.kv_tiers);

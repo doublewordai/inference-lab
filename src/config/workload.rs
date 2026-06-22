@@ -19,6 +19,14 @@ pub struct WorkloadConfig {
     #[serde(default = "default_arrival_rate")]
     pub arrival_rate: f64,
 
+    /// Optional time-varying arrival rate λ(t). When present, supplies the rate
+    /// at each instant instead of the constant `arrival_rate`. Open-loop
+    /// patterns only (poisson/uniform/fixed_rate); ignored for
+    /// closed_loop/batched. Pair with a large `num_requests` (or
+    /// `duration_secs`) to run whole cycles.
+    #[serde(default)]
+    pub rate_schedule: Option<RateSchedule>,
+
     /// Input sequence length distribution (ignored in dataset mode)
     pub input_len_dist: LengthDistribution,
 
@@ -61,6 +69,82 @@ pub enum LengthDistribution {
 
     #[serde(rename = "lognormal")]
     LogNormal { mean: f64, std_dev: f64 },
+}
+
+/// Time-varying arrival rate λ(t), requests/sec. Set on the workload to drive
+/// the open-loop arrival process through changing load within a single run.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type")]
+pub enum RateSchedule {
+    /// Sinusoid between `min` and `max`, starting in the trough at t=0 and
+    /// peaking at half-period.
+    #[serde(rename = "sine")]
+    Sine { min: f64, max: f64, period_secs: f64 },
+    /// On/off bursts: `high` for the first `duty` fraction of each period,
+    /// `low` for the rest.
+    #[serde(rename = "square")]
+    Square {
+        low: f64,
+        high: f64,
+        period_secs: f64,
+        duty: f64,
+    },
+    /// Piecewise-linear (time_secs, rate) points, linearly interpolated and
+    /// held flat outside the first/last point. Replays a measured load curve.
+    #[serde(rename = "trace")]
+    Trace { points: Vec<[f64; 2]> },
+}
+
+impl RateSchedule {
+    /// Instantaneous arrival rate λ(t) ≥ 0, requests/sec.
+    pub fn rate_at(&self, t: f64) -> f64 {
+        let r = match self {
+            RateSchedule::Sine {
+                min,
+                max,
+                period_secs,
+            } => {
+                let phase = 2.0 * std::f64::consts::PI * t / period_secs.max(1e-9);
+                min + (max - min) * 0.5 * (1.0 - phase.cos())
+            }
+            RateSchedule::Square {
+                low,
+                high,
+                period_secs,
+                duty,
+            } => {
+                let frac = (t / period_secs.max(1e-9)).rem_euclid(1.0);
+                if frac < *duty {
+                    *high
+                } else {
+                    *low
+                }
+            }
+            RateSchedule::Trace { points } => {
+                if points.is_empty() {
+                    return 0.0;
+                }
+                if t <= points[0][0] {
+                    return points[0][1].max(0.0);
+                }
+                let last = points[points.len() - 1];
+                if t >= last[0] {
+                    return last[1].max(0.0);
+                }
+                let mut out = last[1];
+                for w in points.windows(2) {
+                    let (a, b) = (w[0], w[1]);
+                    if t >= a[0] && t <= b[0] {
+                        let f = (t - a[0]) / (b[0] - a[0]).max(1e-9);
+                        out = a[1] + f * (b[1] - a[1]);
+                        break;
+                    }
+                }
+                out
+            }
+        };
+        r.max(0.0)
+    }
 }
 
 impl LengthDistribution {

@@ -1,0 +1,13 @@
+# Qwen3.6-35B-A3B + DFLASH draft, PRE Modal-retrain weights (2026-04-26).
+target_model: Qwen/Qwen3.6-35B-A3B
+speculator:
+  algorithm: dflash
+  draft_model_path: z-lab/Qwen3.6-35B-A3B-DFlash
+  draft_model_revision: 42d3b34d588423cdae7ba8f53a8cf7789346a719  # pre-retrain
+  dflash_block_size: 16
+dataset: smoke
+n_prompts: 4
+temperature: 0.6
+gpu: H200
+out_dir: ../data/qwen36_dflash_before
+mem_fraction_static: 0.92

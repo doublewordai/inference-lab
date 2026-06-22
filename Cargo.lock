@@ -678,6 +678,7 @@ dependencies = [
  "ordered-float",
  "rand 0.8.5",
  "rand_distr",
+ "rayon",
  "serde",
  "serde-wasm-bindgen",
  "serde_json",

@@ -1,5 +1,5 @@
 use super::Request;
-use crate::config::WorkloadConfig;
+use crate::config::{RateSchedule, WorkloadConfig};
 use crate::dataset::{BatchTokenizerFn, DatasetEntry, UnparsedEntry};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use rand_distr::{Distribution, Exp};
@@ -50,6 +50,7 @@ impl RequestGenerator {
                 0.0,
                 &workload.arrival_pattern,
                 workload.arrival_rate,
+                workload.rate_schedule.as_ref(),
                 &mut rng,
             )
         };
@@ -315,14 +316,29 @@ impl RequestGenerator {
             self.next_arrival_time,
             &self.workload.arrival_pattern,
             self.workload.arrival_rate,
+            self.workload.rate_schedule.as_ref(),
             &mut self.rng,
         );
 
         Some(request)
     }
 
-    /// Sample the next arrival time based on the arrival pattern
-    fn sample_next_arrival(current_time: f64, pattern: &str, rate: f64, rng: &mut StdRng) -> f64 {
+    /// Sample the next arrival time based on the arrival pattern. When a
+    /// `schedule` is provided it supplies the instantaneous rate λ(current_time)
+    /// (piecewise-constant non-homogeneous Poisson: λ is frozen at the arrival
+    /// instant, accurate when the schedule period far exceeds the gap scale),
+    /// otherwise the constant `rate_const` is used.
+    fn sample_next_arrival(
+        current_time: f64,
+        pattern: &str,
+        rate_const: f64,
+        schedule: Option<&RateSchedule>,
+        rng: &mut StdRng,
+    ) -> f64 {
+        let rate = schedule
+            .map(|s| s.rate_at(current_time))
+            .unwrap_or(rate_const)
+            .max(1e-9);
         match pattern.to_lowercase().as_str() {
             "poisson" => {
                 // Poisson process: inter-arrival times are exponentially distributed
@@ -485,6 +501,7 @@ impl RequestGenerator {
                 self.next_arrival_time,
                 &self.workload.arrival_pattern,
                 self.workload.arrival_rate,
+                self.workload.rate_schedule.as_ref(),
                 &mut self.rng,
             );
         }
@@ -571,6 +588,7 @@ mod tests {
             dataset_path: None,
             arrival_pattern: pattern.to_string(),
             arrival_rate: rate,
+            rate_schedule: None,
             num_concurrent_users: None,
             input_len_dist: LengthDistribution::Fixed { value: 100 },
             output_len_dist: LengthDistribution::Fixed { value: 50 },

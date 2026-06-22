@@ -41,6 +41,7 @@ console_error_panic_hook = "0.1"
 
 [dev-dependencies]
 tempfile = "3.8"
+rayon = "1"
 
 [features]
 default = ["cli"]

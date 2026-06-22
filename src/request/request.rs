@@ -71,6 +71,22 @@ pub struct Request {
     /// promotion of its KV cache from a slower tier is in progress; cleared
     /// once the request returns to `Waiting`.
     pub ready_at: Option<f64>,
+
+    /// Speculative decoding: draft length to verify on this request's NEXT
+    /// decode step. Decided at the end of the iteration that produced the last
+    /// token (the simulator's analogue of vLLM proposing draft tokens at the
+    /// end of a step). The scheduler reads this to reserve a
+    /// `1 + pending_draft_len` verify pass in the token budget and KV, trimming
+    /// it if capacity is tight. 0 means no speculation (and is always 0 when
+    /// speculative decoding is disabled).
+    pub pending_draft_len: u32,
+
+    /// Speculative decoding with `TraceRounds` acceptance: the full-depth
+    /// committed-draft count of the trace round drawn for this request's NEXT
+    /// decode step. The verify realises `min(pending_round_commits, draft)`
+    /// accepted tokens, so a scheduler-trimmed draft stays consistent. `None`
+    /// when no round is pending (non-trace acceptance, or prefill).
+    pub pending_round_commits: Option<u32>,
 }
 
 impl Request {
@@ -104,6 +120,8 @@ impl Request {
             preempted_time: 0.0,
             last_preempted_at: None,
             ready_at: None,
+            pending_draft_len: 0,
+            pending_round_commits: None,
         }
     }
 
@@ -184,9 +202,13 @@ impl Request {
 
             self.num_output_tokens = new_output_tokens;
             // Note: num_tokens stays fixed at num_prompt_tokens + max_output_tokens
-
-            // Record generation times for each decode token
-            self.token_generation_times.push(current_time);
+            //
+            // Per-token timestamps are NOT recorded here. A speculative step
+            // advances by `num_new_tokens > 1`, so one push per call would
+            // undercount them. The metrics path doesn't rely on it anyway:
+            // `Simulator::handle_completion` rebuilds `token_generation_times`
+            // from `(first_token_time, completion_time, num_output_tokens)` as an
+            // even cadence before the collector reads it.
         }
     }
 
@@ -288,7 +310,6 @@ mod tests {
         assert_eq!(req.num_output_tokens, 1);
         assert_eq!(req.num_tokens, 150); // Stays fixed at prompt(100) + max_output(50)
         assert_eq!(req.first_token_time, Some(2.0));
-        assert_eq!(req.token_generation_times.len(), 1);
 
         // Continue decode
         req.record_generated_tokens(1, 3.0);
@@ -296,7 +317,6 @@ mod tests {
         assert_eq!(req.num_output_tokens, 2);
         assert_eq!(req.num_tokens, 150); // Stays fixed
         assert_eq!(req.first_token_time, Some(2.0)); // Doesn't change
-        assert_eq!(req.token_generation_times.len(), 2);
     }
 
     #[test]
