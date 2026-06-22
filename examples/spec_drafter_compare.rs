@@ -78,7 +78,6 @@ fn qwen36() -> ModelConfig {
 enum Drafter {
     Mtp,
     Dflash,
-    Corpus,
 }
 
 impl Drafter {
@@ -86,14 +85,12 @@ impl Drafter {
         match self {
             Drafter::Mtp => "MTP (autoregressive, D=8)",
             Drafter::Dflash => "DFlash (block-parallel, D=16)",
-            Drafter::Corpus => "SuffixDecoding (corpus, D=16)",
         }
     }
     fn bank_path(&self) -> &'static str {
         match self {
-            Drafter::Mtp => "data/qwen36_nextn_speedbench_rounds.csv",
-            Drafter::Dflash => "data/qwen36_dflash_speedbench_rounds.csv",
-            Drafter::Corpus => "data/qwen36_suffix_speedbench_rounds.csv",
+            Drafter::Mtp => "data/banks/mtp_speedbench_rounds.csv",
+            Drafter::Dflash => "data/banks/dflash_speedbench_rounds.csv",
         }
     }
     fn cost(&self) -> DrafterCost {
@@ -110,16 +107,12 @@ impl Drafter {
             },
             // Eight dense diffusion layers + fusion + tied head, streamed once.
             Drafter::Dflash => DrafterCost::BlockParallel { params: 982_515_712.0, block: 16 },
-            // A suffix-tree lookup: no GEMM, no weight stream, no expert load.
-            // Its GPU draft cost is ~0; only the verify pays for the proposed tree.
-            Drafter::Corpus => DrafterCost::Fraction { frac: 0.0 },
         }
     }
     fn gamma_max(&self) -> u32 {
         match self {
             Drafter::Mtp => 8,
             Drafter::Dflash => 16,
-            Drafter::Corpus => 16,
         }
     }
     fn fixed_grid(&self) -> Vec<u32> {
@@ -239,28 +232,28 @@ fn sweep(d: Drafter, isl: u32, osl: u32, concs: &[usize]) {
 }
 
 /// Head-to-head: each drafter's adaptive (priced-budget) goodput at each batch,
-/// so the crossover is legible. The corpus drafter trades acceptance (lower) for
-/// draft cost (zero); the question is where that trade flips the winner.
+/// so the crossover is legible. MTP's draft cost is linear in γ, DFlash's is flat;
+/// the question is where the cost-shape difference flips the winner.
 fn crossover(isl: u32, osl: u32, concs: &[usize]) {
-    let drafters = [Drafter::Mtp, Drafter::Dflash, Drafter::Corpus];
-    let names = ["MTP", "DFlash", "Corpus"];
+    let drafters = [Drafter::Mtp, Drafter::Dflash];
+    let names = ["MTP", "DFlash"];
     println!("\n=== CROSSOVER: adaptive (priced-budget) goodput by drafter, tok/s ===");
     println!("each drafter priced by its own roofline + acceptance bank; winner = highest goodput.");
     println!(
-        "{:>6}  {:>9}  {:>10}  {:>10}  {:>10}  {:>8}",
-        "conc", "nospec", "MTP", "DFlash", "Corpus", "winner"
+        "{:>6}  {:>9}  {:>10}  {:>10}  {:>8}",
+        "conc", "nospec", "MTP", "DFlash", "winner"
     );
-    println!("{}", "-".repeat(70));
+    println!("{}", "-".repeat(58));
     for &conc in concs {
         let (ns, _, _) = run_point(conc, isl, osl, Drafter::Mtp, Policy::NoSpec);
         let g: Vec<f64> = drafters
             .iter()
             .map(|&d| run_point(conc, isl, osl, d, Policy::Budget(d.gamma_max())).0)
             .collect();
-        let widx = (0..3).max_by(|&a, &b| g[a].partial_cmp(&g[b]).unwrap()).unwrap();
+        let widx = (0..2).max_by(|&a, &b| g[a].partial_cmp(&g[b]).unwrap()).unwrap();
         println!(
-            "{conc:>6}  {ns:>9.0}  {:>10.0}  {:>10.0}  {:>10.0}  {:>8}",
-            g[0], g[1], g[2], names[widx]
+            "{conc:>6}  {ns:>9.0}  {:>10.0}  {:>10.0}  {:>8}",
+            g[0], g[1], names[widx]
         );
     }
 }
@@ -277,7 +270,6 @@ fn main() {
     println!("Same verifier and policies; each drafter priced by its own roofline + acceptance bank.");
     sweep(Drafter::Mtp, isl, osl, &concs);
     sweep(Drafter::Dflash, isl, osl, &concs);
-    sweep(Drafter::Corpus, isl, osl, &concs);
     crossover(isl, osl, &concs);
     println!("\nRead: Δvs-fix is how much a priced policy beats the best fixed γ chosen in hindsight.");
     println!("Hypothesis — MTP's linear cost gives adaptation a draft-depth lever; DFlash's flat");
