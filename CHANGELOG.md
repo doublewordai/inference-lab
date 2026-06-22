@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.7.0](https://github.com/doublewordai/inference-lab/compare/inference-lab-v0.6.2...inference-lab-v0.7.0) (2026-06-22)
+
+
+### Features
+
+* model KV cache hierarchy, cascade attention, and async promotions ([#44](https://github.com/doublewordai/inference-lab/issues/44)) ([59e7ac1](https://github.com/doublewordai/inference-lab/commit/59e7ac1aad90dd9782bd7271cc7cd7be52af23d7))
+* **spec:** speculative-decoding simulator + calibration package + figure tooling ([#53](https://github.com/doublewordai/inference-lab/issues/53)) ([299a718](https://github.com/doublewordai/inference-lab/commit/299a718fad5124c420392eb7a81d3c3de0153f7d))
+
+
+### Bug Fixes
+
+* **deepseek-v4-pro:** correct per-layer-class counts ([#49](https://github.com/doublewordai/inference-lab/issues/49)) ([5ed8b94](https://github.com/doublewordai/inference-lab/commit/5ed8b94621a4498cebaceba0eb93831598534891))
+
 ## [0.6.2](https://github.com/doublewordai/inference-lab/compare/inference-lab-v0.6.1...inference-lab-v0.6.2) (2026-03-25)
 
 
