@@ -78,7 +78,7 @@ enum Drafter {
 impl Drafter {
     fn label(&self) -> &'static str {
         match self {
-            Drafter::Mtp => "MTP (autoregressive, D=8)",
+            Drafter::Mtp => "MTP (autoregressive, D=16)",
             Drafter::Dflash => "DFlash (block-parallel, D=16)",
         }
     }
@@ -103,12 +103,15 @@ impl Drafter {
                 experts_per_tok: 8,
                 shared_experts: 1,
             },
-            Drafter::Dflash => DrafterCost::BlockParallel { params: 982_515_712.0, block: 16 },
+            Drafter::Dflash => DrafterCost::BlockParallel {
+                params: 982_515_712.0,
+                block: 16,
+            },
         }
     }
     fn gamma_max(&self) -> u32 {
         match self {
-            Drafter::Mtp => 8,
+            Drafter::Mtp => 16,
             Drafter::Dflash => 16,
         }
     }
@@ -149,7 +152,11 @@ impl Policy {
 fn base_config(conc: usize, isl: u32, osl: u32) -> Config {
     Config {
         hardware: b200_per_gpu(),
-        parallel: ParallelConfig { tp: 1, ep: 1, dp_attention: false },
+        parallel: ParallelConfig {
+            tp: 1,
+            ep: 1,
+            dp_attention: false,
+        },
         model: qwen36(),
         scheduler: SchedulerConfig {
             max_num_batched_tokens: 16384,
@@ -159,7 +166,11 @@ fn base_config(conc: usize, isl: u32, osl: u32) -> Config {
             max_num_partial_prefills: 1,
             block_size: 64,
             policy: "fcfs".into(),
+            waiting_reorder_window: None,
+            waiting_max_delay_s: None,
             enable_preemption_free: true,
+            enable_swap_preemption: false,
+            swap_bandwidth: 50e9,
             enable_cascade_attention: false,
         },
         workload: WorkloadConfig {
@@ -191,7 +202,10 @@ fn goodput(conc: usize, isl: u32, osl: u32, d: Drafter, p: Policy) -> f64 {
 
 fn sweep(d: Drafter, isl: u32, osl: u32, concs: &[usize]) {
     let g = d.gamma_max();
-    println!("\n=== {}  (Qwen3.6-35B-A3B verifier, B200 TP1/EP1, decode-only) ===", d.label());
+    println!(
+        "\n=== {}  (Qwen3.6-35B-A3B verifier, B200 TP1/EP1, decode-only) ===",
+        d.label()
+    );
     println!("Δ columns are vs the homogeneous priced policy (the envelope).");
     println!(
         "{:>6}  {:>8}  {:>8}  {:>9}  {:>9}  {:>9}",
