@@ -1,12 +1,15 @@
-# Reproducing the adaptive-speculation figures
+# Reproducing the specdec blog figures
 
-How to regenerate the four figures in the
+How to regenerate the figures in the
 [*Adaptive speculative decoding*](https://fergusfinn.com/blog/adaptive-speculation/)
-blog post from the calibration base data. Nothing data-shaped is committed here:
+and [*Width vs. depth*](https://fergusfinn.com/blog/speculating-on-the-margin/)
+blog posts from the calibration base data. Nothing data-shaped is committed here:
 pull the base data from Hugging Face, generate the simulator banks, run the
 example, copy the results into the blog.
 
 ## What reproduces what
+
+Adaptive-speculation post:
 
 | Figure (blog component)        | Generator / source                                  |
 |--------------------------------|-----------------------------------------------------|
@@ -14,6 +17,14 @@ example, copy the results into the blog.
 | `AcceptanceCurve.tsx`          | `accept_by_position` from each run's `stats.json`    |
 | `ParetoFrontier.tsx`           | `drafterGrid.json` ← `examples/spec_drafter_grid.rs` |
 | `PricingEnvelope.tsx`          | the same `drafterGrid.json` (arrays read off it)     |
+
+Width-vs-depth post:
+
+| Figure (blog component)        | Generator / source                                  |
+|--------------------------------|-----------------------------------------------------|
+| `AcceptLengthHist.tsx` / `AcceptJointHeatmap.tsx` | `accept_by_dataset.py` over the acceptance banks → `acceptance-by-dataset.json` |
+| `GatingLadder.tsx`             | `examples/spec_gating_ladder.rs` over the `*_conf_rounds.csv` banks |
+| `ExpertPopularity.tsx` / `WidthVsDepth.tsx` | aggregated from the `routing` captures (per-category run dirs) |
 
 The two charted drafters are the **MTP** head and the **DFlash** head
 (checkpoint `@42d3b34d`).
@@ -30,7 +41,7 @@ The calibration corpus lives as an HF dataset mirroring the local `data/` layout
 (schema documented in [`data/CLAUDE.md`](../../data/CLAUDE.md)):
 
 ```bash
-hf download Doubleword/qwen3.6-specdec-calibration \
+hf download Doubleword/specdec-calibration \
   --repo-type dataset --local-dir data/
 ```
 
