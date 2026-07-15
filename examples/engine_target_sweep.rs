@@ -84,8 +84,13 @@ const MEASURED_TPS: [[f64; 7]; 5] = [
 // Realized per-rung mean (ISL, OSL) of the bench's ShareGPT sample, read
 // from the bench jsonl metadata (total_input_tokens / completed etc. of the
 // k=0 legs). The bench reuses one prompt sample per rung across k.
-const RUNG_LENS: [(f64, f64); 5] =
-    [(304.0, 211.0), (304.0, 211.0), (316.0, 211.0), (289.0, 189.0), (313.0, 190.0)];
+const RUNG_LENS: [(f64, f64); 5] = [
+    (304.0, 211.0),
+    (304.0, 211.0),
+    (316.0, 211.0),
+    (289.0, 189.0),
+    (313.0, 190.0),
+];
 // ShareGPT length spread: sigma of log-length, assumed 1.0 for both ISL and
 // OSL. Cross-checked against the bench's mean/median E2E ratio at conc=1
 // (1183ms/695ms -> sigma_log(OSL) ~ 1.04).
@@ -93,8 +98,14 @@ const SIGMA_LOG: f64 = 1.0;
 // Engine-measured native-k acceptance, EXCLUDING the bonus token: the bench
 // jsonl's accept_length - 1, averaged over the five concurrencies of each
 // static-k leg (same job). Conc-variation is < +/-1%.
-const NATIVE_ACCEPT: [(u32, f64); 6] =
-    [(1, 0.508), (2, 0.763), (3, 0.887), (4, 0.963), (6, 1.035), (8, 1.057)];
+const NATIVE_ACCEPT: [(u32, f64); 6] = [
+    (1, 0.508),
+    (2, 0.763),
+    (3, 0.887),
+    (4, 0.963),
+    (6, 1.035),
+    (8, 1.057),
+];
 
 fn topology(cfg: &Config) -> Topology {
     let cluster = ClusterSpec {
@@ -155,7 +166,12 @@ fn run(cfg: &Config, conc: u32, isl: u32, osl: u32, p: Policy) -> (f64, f64) {
         true, // skip_prefill: pure-decode target, prefill not competing
     )
     .expect("run");
-    let dbatch = res.mean_batch_per_pool.first().copied().flatten().unwrap_or(0.0);
+    let dbatch = res
+        .mean_batch_per_pool
+        .first()
+        .copied()
+        .flatten()
+        .unwrap_or(0.0);
     (res.throughput() * osl as f64, dbatch)
 }
 
@@ -178,7 +194,11 @@ fn run_validation(
     seed: u64,
 ) -> f64 {
     let base = cfg.speculative.as_ref().expect("config has [speculative]");
-    let p = if k == 0 { Policy::NoSpec } else { Policy::Fixed(k) };
+    let p = if k == 0 {
+        Policy::NoSpec
+    } else {
+        Policy::Fixed(k)
+    };
     let mut engine = Engine::new(topology(cfg));
     engine.enable_speculative(spec_for(p, base).expect("spec"), seed);
 
@@ -244,7 +264,10 @@ fn main() {
     let base = cfg.speculative.as_ref().expect("config has [speculative]");
     let gamma_max = base.gamma;
 
-    let mc = base.measured_cost.as_ref().expect("config has measured_cost");
+    let mc = base
+        .measured_cost
+        .as_ref()
+        .expect("config has measured_cost");
     let table = MeasuredCostTable::load(&mc.path).expect("measured cost table");
     let bank_path = match &base.acceptance {
         AcceptanceModel::TraceRounds { path } => path.clone(),
@@ -293,7 +316,10 @@ fn main() {
     // g=8.
     // -----------------------------------------------------------------
     println!("E[accepted | g] (excl. bonus): trace bank vs engine native-k");
-    println!("{:>3} {:>10} {:>10} {:>8}", "g", "bank", "native-k", "d(1+E)%");
+    println!(
+        "{:>3} {:>10} {:>10} {:>8}",
+        "g", "bank", "native-k", "d(1+E)%"
+    );
     // NATIVE_ACCEPT is the default Llama deployment's bench; for other
     // configs only the bank column is meaningful.
     let native: BTreeMap<u32, f64> = if is_default_config {
@@ -518,10 +544,18 @@ fn target_sweep(cfg: &Config, table: &MeasuredCostTable, gamma_max: u32, fixed: 
         }
         let (bud, agg, gat) = (row[col_bud], row[col_agg], row[col_gat]);
         let d = 100.0 * (agg - best) / best;
-        let label = if bestk == 0 { "nospec".into() } else { format!("k{bestk}") };
+        let label = if bestk == 0 {
+            "nospec".into()
+        } else {
+            format!("k{bestk}")
+        };
         let conc_s = format!(
             "{conc}{}",
-            if provisional.contains_key(&conc) { "*" } else { "" }
+            if provisional.contains_key(&conc) {
+                "*"
+            } else {
+                ""
+            }
         );
         println!(
             "{conc_s:>5} {:>7.1} | {ns:>8.0} | {label:>5} {best:>7.0} | {bud:>8.0} {agg:>9.0} {gat:>8.0} | {d:>+7.2}",

@@ -40,7 +40,7 @@ fn main() {
 
     let block_size: u32 = 16;
     let shared_prefix_tokens: u32 = 2048; // shared system prompt
-    let suffix_tokens: u32 = 64;          // per-request suffix already prefilled
+    let suffix_tokens: u32 = 64; // per-request suffix already prefilled
     let total_prompt = shared_prefix_tokens + suffix_tokens;
 
     let plain = ComputeEngine::new(hardware.clone(), parallel.clone(), model.clone());
@@ -68,21 +68,13 @@ fn main() {
 
         let requests: Vec<Request> = (0..batch_size)
             .map(|i| {
-                let mut req = Request::new(
-                    format!("req-{i}"),
-                    0,
-                    0.0,
-                    total_prompt,
-                    1,
-                );
+                let mut req = Request::new(format!("req-{i}"), 0, 0.0, total_prompt, 1);
                 // Already prefilled.
                 req.num_computed_tokens = total_prompt;
                 req.prompt_block_hashes = shared_hashes
                     .iter()
                     .copied()
-                    .chain(
-                        (0..suffix_blocks).map(|b| 0xBEEF_0000 + (i as u64) * 1024 + b),
-                    )
+                    .chain((0..suffix_blocks).map(|b| 0xBEEF_0000 + (i as u64) * 1024 + b))
                     .collect();
                 req
             })

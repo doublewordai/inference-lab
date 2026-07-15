@@ -43,11 +43,7 @@ pub fn predict_decode_tpot(
 
 /// Roofline prefill latency (seconds) for a single ISL-length request running
 /// alone on a prefill-only cluster. One monolithic iteration, no chunking.
-pub fn predict_prefill_time(
-    prefill_cluster: &ClusterSpec,
-    model: &ModelConfig,
-    isl: u32,
-) -> f64 {
+pub fn predict_prefill_time(prefill_cluster: &ClusterSpec, model: &ModelConfig, isl: u32) -> f64 {
     let mut cluster = prefill_cluster.clone();
     let model_size_bytes = model.weight_residency_bytes();
     cluster.compute_kv_cache_capacity(model_size_bytes);

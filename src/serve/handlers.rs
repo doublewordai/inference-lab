@@ -431,7 +431,15 @@ fn count_text_prompt_tokens(state: &AppState, prompt: &str) -> u32 {
 fn messages_to_prompt_text(messages: &[ChatMessage]) -> String {
     messages
         .iter()
-        .map(|m| format!("{}: {}", m.role, m.content))
+        .map(|m| {
+            // Null content (assistant tool-call turns) contributes an empty body.
+            let content = m
+                .content
+                .as_ref()
+                .map(MessageContent::text)
+                .unwrap_or_default();
+            format!("{}: {}", m.role, content)
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -467,6 +475,54 @@ mod tests {
             .split("\n\n")
             .filter_map(|chunk| chunk.strip_prefix("data: ").map(str::to_string))
             .collect()
+    }
+
+    #[test]
+    fn content_accepts_string_array_and_null_shapes() {
+        // Real OpenAI-compatible servers accept all three content shapes; gateways in front
+        // of this server emit array-form content (multimodal parts, single-text-part arrays)
+        // and `content: null` on assistant tool-call turns. Extra fields on a part (e.g. a
+        // gateway's cache_control that slipped through) must be tolerated, and non-text parts
+        // contribute nothing to the prompt.
+        let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "messages": [
+                {"role": "system", "content": "plain"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "part one, ", "cache_control": {"type": "ephemeral"}},
+                    {"type": "image_url", "image_url": {"url": "http://example/img.png"}},
+                    {"type": "text", "text": "part two"}
+                ]},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "t1", "type": "function", "function": {"name": "f", "arguments": "{}"}}
+                ]}
+            ]
+        }))
+        .expect("string, array, and null content all deserialize");
+
+        let text = messages_to_prompt_text(&req.messages);
+        assert_eq!(text, "system: plain\nuser: part one, part two\nassistant: ");
+    }
+
+    #[test]
+    fn single_text_part_array_counts_like_plain_string() {
+        // A single-text-part array must produce byte-identical prompt text to the plain
+        // string form, so token counts (and anything keyed on them) agree across the two
+        // encodings of the same message.
+        let plain = vec![ChatMessage {
+            role: "user".to_string(),
+            content: Some(MessageContent::Text("hello world".to_string())),
+        }];
+        let array: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hello world"}]}]
+        }))
+        .unwrap();
+
+        assert_eq!(
+            messages_to_prompt_text(&plain),
+            messages_to_prompt_text(&array.messages)
+        );
     }
 
     #[tokio::test]
@@ -564,7 +620,7 @@ mod tests {
                 model: "test-model".to_string(),
                 messages: vec![ChatMessage {
                     role: "user".to_string(),
-                    content: "hello world".to_string(),
+                    content: Some(MessageContent::Text("hello world".to_string())),
                 }],
                 stream: false,
                 max_tokens: 4,
@@ -670,7 +726,7 @@ mod tests {
                 model: "test-model".to_string(),
                 messages: vec![ChatMessage {
                     role: "user".to_string(),
-                    content: "hello world".to_string(),
+                    content: Some(MessageContent::Text("hello world".to_string())),
                 }],
                 stream: true,
                 max_tokens: 4,
@@ -814,7 +870,7 @@ mod tests {
                 model: "test-model".to_string(),
                 messages: vec![ChatMessage {
                     role: "user".to_string(),
-                    content: "hello world".to_string(),
+                    content: Some(MessageContent::Text("hello world".to_string())),
                 }],
                 stream: true,
                 max_tokens: 4,
@@ -862,7 +918,7 @@ mod tests {
                 model: "test-model".to_string(),
                 messages: vec![ChatMessage {
                     role: "user".to_string(),
-                    content: "hello world".to_string(),
+                    content: Some(MessageContent::Text("hello world".to_string())),
                 }],
                 stream: true,
                 max_tokens: 4,

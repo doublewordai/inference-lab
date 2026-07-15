@@ -79,7 +79,11 @@ pub enum RateSchedule {
     /// Sinusoid between `min` and `max`, starting in the trough at t=0 and
     /// peaking at half-period.
     #[serde(rename = "sine")]
-    Sine { min: f64, max: f64, period_secs: f64 },
+    Sine {
+        min: f64,
+        max: f64,
+        period_secs: f64,
+    },
     /// On/off bursts: `high` for the first `duty` fraction of each period,
     /// `low` for the rest.
     #[serde(rename = "square")]

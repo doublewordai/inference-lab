@@ -33,7 +33,44 @@ fn default_max_tokens() -> u32 {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
-    pub content: String,
+    /// OpenAI-compatible `content`: a plain string, an array of content parts, or `null`
+    /// (assistant tool-call turns send `content: null`). Real servers accept all three; the
+    /// old bare-`String` field rejected array/null bodies with a 400, which broke any client
+    /// sending part-form content (multimodal messages, or gateways emitting single-text-part
+    /// arrays) before it ever reached the request→chat-template→tokenize chain.
+    #[serde(default)]
+    pub content: Option<MessageContent>,
+}
+
+/// String-or-parts `content`, matching what OpenAI-compatible servers accept.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum MessageContent {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+/// One entry of array-form content. Only `text` contributes to the prompt; non-text parts
+/// (e.g. `image_url`) and any extra fields on a part are accepted and ignored, like a real
+/// model server.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ContentPart {
+    #[serde(default)]
+    pub text: Option<String>,
+}
+
+impl MessageContent {
+    /// The message text for prompt assembly / token counting. Part texts are concatenated
+    /// with NO separator, so a single-text-part array counts identically to the same plain
+    /// string — the shape equivalence real chat templates give.
+    pub fn text(&self) -> String {
+        match self {
+            MessageContent::Text(t) => t.clone(),
+            MessageContent::Parts(parts) => {
+                parts.iter().filter_map(|p| p.text.as_deref()).collect()
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

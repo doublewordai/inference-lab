@@ -119,7 +119,7 @@ mod tests {
     fn solo_transfer_finishes_at_full_bandwidth() {
         let mut link = Link::new(1e9); // 1 GB/s
         link.submit("a".into(), 1_000_000_000, 0.0); // 1 GB
-        // Estimate alone: 1 second.
+                                                     // Estimate alone: 1 second.
         assert!((link.estimate_remaining("a") - 1.0).abs() < 1e-9);
         let done = link.advance(1.0);
         assert!(done.contains("a"));

@@ -88,7 +88,10 @@ impl Drafter {
                 experts_per_tok: 8,
                 shared_experts: 1,
             },
-            Drafter::Dflash => DrafterCost::BlockParallel { params: 982_515_712.0, block: 16 },
+            Drafter::Dflash => DrafterCost::BlockParallel {
+                params: 982_515_712.0,
+                block: 16,
+            },
         }
     }
     fn gamma_max(&self) -> u32 {
@@ -108,7 +111,9 @@ enum Policy {
 
 impl Policy {
     fn spec(&self, d: Drafter) -> Option<SpeculativeConfig> {
-        let acceptance = AcceptanceModel::TraceRounds { path: d.bank_path().into() };
+        let acceptance = AcceptanceModel::TraceRounds {
+            path: d.bank_path().into(),
+        };
         let mk = |gamma: u32, policy: GammaPolicy| {
             Some(SpeculativeConfig {
                 gamma,
@@ -131,7 +136,11 @@ impl Policy {
 fn base_config(conc: usize, isl: u32, osl: u32) -> Config {
     Config {
         hardware: b200_per_gpu(),
-        parallel: ParallelConfig { tp: 1, ep: 1, dp_attention: false },
+        parallel: ParallelConfig {
+            tp: 1,
+            ep: 1,
+            dp_attention: false,
+        },
         model: qwen36(),
         scheduler: SchedulerConfig {
             max_num_batched_tokens: 16384,

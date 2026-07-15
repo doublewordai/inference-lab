@@ -29,7 +29,11 @@ pub struct ParallelConfig {
 
 impl Default for ParallelConfig {
     fn default() -> Self {
-        Self { tp: 1, ep: 1, dp_attention: false }
+        Self {
+            tp: 1,
+            ep: 1,
+            dp_attention: false,
+        }
     }
 }
 

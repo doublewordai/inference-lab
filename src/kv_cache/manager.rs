@@ -547,7 +547,8 @@ impl KVCacheManager {
             active_tiers += 1;
         }
         if active_tiers > 0 {
-            self.leader_active_tiers.insert(request_id.clone(), active_tiers);
+            self.leader_active_tiers
+                .insert(request_id.clone(), active_tiers);
             self.leader_joiners.insert(request_id, Vec::new());
         }
     }
@@ -739,11 +740,12 @@ mod tests {
     #[test]
     fn test_spillover_demotion_on_eviction() {
         // 2 HBM blocks, 1 host-RAM tier of 2 blocks.
-        let mut manager = KVCacheManager::new(2 * 16 * 100, 16, 100, 0, true).with_tiers(&[KVTier {
-            name: "host_ram".into(),
-            capacity_bytes: 2 * 16 * 100,
-            bandwidth_to_hbm: 64e9,
-        }]);
+        let mut manager =
+            KVCacheManager::new(2 * 16 * 100, 16, 100, 0, true).with_tiers(&[KVTier {
+                name: "host_ram".into(),
+                capacity_bytes: 2 * 16 * 100,
+                bandwidth_to_hbm: 64e9,
+            }]);
 
         // Fill HBM with two requests' hashes.
         let mut req_a = create_test_request("a", 16);
@@ -907,11 +909,12 @@ mod tests {
     #[test]
     fn test_in_flight_join_refs_leader_block() {
         // Set up a host-RAM tier and seed a prefix into it.
-        let mut manager = KVCacheManager::new(2 * 16 * 100, 16, 100, 0, true).with_tiers(&[KVTier {
-            name: "host_ram".into(),
-            capacity_bytes: 8 * 16 * 100,
-            bandwidth_to_hbm: 1e9,
-        }]);
+        let mut manager =
+            KVCacheManager::new(2 * 16 * 100, 16, 100, 0, true).with_tiers(&[KVTier {
+                name: "host_ram".into(),
+                capacity_bytes: 8 * 16 * 100,
+                bandwidth_to_hbm: 1e9,
+            }]);
         let prefix_hash = 0x1234u64;
         // Get prefix_hash into host_ram by allocating then evicting.
         let mut seed = create_test_request("seed", 16);

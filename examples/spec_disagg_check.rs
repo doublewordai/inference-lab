@@ -13,11 +13,11 @@
 //!
 //! Run: `cargo run --release --example spec_disagg_check --no-default-features`
 
+use inference_lab::config::DisaggTopology;
 use inference_lab::config::{
     AcceptanceModel, ClusterSpec, CommsConfig, DeepseekV4Model, GammaPolicy, HardwareConfig,
     ModelConfig, Node, ParallelConfig, Precision, SchedulerConfig, SpeculativeConfig,
 };
-use inference_lab::config::DisaggTopology;
 use inference_lab::simulation::{simulate_closed_loop, Topology};
 use rayon::prelude::*;
 use std::collections::BTreeMap;
@@ -86,8 +86,16 @@ fn scheduler() -> SchedulerConfig {
 fn cluster(num_workers: u32) -> ClusterSpec {
     ClusterSpec {
         hardware: b200(),
-        parallel: ParallelConfig { tp: 1, ep: 1, dp_attention: false },
-        comms: Some(CommsConfig { link_bw: 9.0e11, allreduce_latency: 5e-6, alltoall_latency: 8e-6 }),
+        parallel: ParallelConfig {
+            tp: 1,
+            ep: 1,
+            dp_attention: false,
+        },
+        comms: Some(CommsConfig {
+            link_bw: 9.0e11,
+            allreduce_latency: 5e-6,
+            alltoall_latency: 8e-6,
+        }),
         num_workers,
         node: 0,
     }
@@ -105,32 +113,72 @@ fn spec_for(p: Policy, alpha: f64, c_draft: f64) -> Option<SpeculativeConfig> {
     match p {
         Policy::NoSpec => None,
         Policy::Fixed(g) => Some(SpeculativeConfig {
-            gamma: g, acceptance, policy: GammaPolicy::Fixed, draft_cost_frac: c_draft,
-            measured_cost: None, switch: Default::default(), drafter: None,
+            gamma: g,
+            acceptance,
+            policy: GammaPolicy::Fixed,
+            draft_cost_frac: c_draft,
+            measured_cost: None,
+            switch: Default::default(),
+            drafter: None,
         }),
         Policy::Budget(g) => Some(SpeculativeConfig {
-            gamma: g, acceptance, policy: GammaPolicy::GoodputBudget, draft_cost_frac: c_draft,
-            measured_cost: None, switch: Default::default(), drafter: None,
+            gamma: g,
+            acceptance,
+            policy: GammaPolicy::GoodputBudget,
+            draft_cost_frac: c_draft,
+            measured_cost: None,
+            switch: Default::default(),
+            drafter: None,
         }),
     }
 }
 
 /// Returns (goodput_tok_s, decode_batch).
-fn run(conc: u32, isl: u32, osl: u32, p_workers: u32, p: Policy, alpha: f64, c_draft: f64) -> (f64, f64) {
+fn run(
+    conc: u32,
+    isl: u32,
+    osl: u32,
+    p_workers: u32,
+    p: Policy,
+    alpha: f64,
+    c_draft: f64,
+) -> (f64, f64) {
     let topo = DisaggTopology {
-        nodes: vec![Node { name: "b200".into(), num_gpus: 72, intra_node_link_bw: 9.0e11 }],
+        nodes: vec![Node {
+            name: "b200".into(),
+            num_gpus: 72,
+            intra_node_link_bw: 9.0e11,
+        }],
         inter_node_link_bw: None,
-        prefill: ClusterSpec { num_workers: p_workers, ..cluster(p_workers) },
+        prefill: ClusterSpec {
+            num_workers: p_workers,
+            ..cluster(p_workers)
+        },
         decode: cluster(1),
         kv_link_bw: 9.0e11,
     };
     let topology = Topology::from_disagg(&topo, deepseek_v4_flash(), scheduler()).expect("topo");
     let total = (conc * 16).max(2000);
     let warmup = conc * 4;
-    let res = simulate_closed_loop(topology, conc, isl, osl, total, warmup, spec_for(p, alpha, c_draft), 7, false)
-        .expect("run");
+    let res = simulate_closed_loop(
+        topology,
+        conc,
+        isl,
+        osl,
+        total,
+        warmup,
+        spec_for(p, alpha, c_draft),
+        7,
+        false,
+    )
+    .expect("run");
     let goodput = res.throughput() * osl as f64;
-    let dbatch = res.mean_batch_per_pool.get(1).copied().flatten().unwrap_or(0.0);
+    let dbatch = res
+        .mean_batch_per_pool
+        .get(1)
+        .copied()
+        .flatten()
+        .unwrap_or(0.0);
     (goodput, dbatch)
 }
 
@@ -171,30 +219,47 @@ fn main() {
     let mut dbatch: BTreeMap<u32, f64> = BTreeMap::new();
     for (conc, col, g, db) in results {
         gp.entry(conc).or_insert([0.0; 10])[col] = g;
-        if col == 0 { dbatch.insert(conc, db); }
+        if col == 0 {
+            dbatch.insert(conc, db);
+        }
     }
 
     println!("Disagg control: V4-Flash, B200, decode pool TP1, prefill pool = conc workers");
     println!("ISL={isl} OSL={osl} alpha={alpha} c_draft={c_draft}. goodput = committed tok/s.\n");
     print!("{:>5} {:>8}", "conc", "dbatch");
     print!(" {:>9}", "nospec");
-    for g in fixed { print!(" {:>9}", format!("fix g{g}")); }
-    print!(" {:>9} {:>9} {:>7} {:>7}", "best-fix", "BUDGET", "argmax", "d%");
+    for g in fixed {
+        print!(" {:>9}", format!("fix g{g}"));
+    }
+    print!(
+        " {:>9} {:>9} {:>7} {:>7}",
+        "best-fix", "BUDGET", "argmax", "d%"
+    );
     println!();
 
     for &conc in &concs {
         let row = gp[&conc];
         let ns = row[0];
         let bud = row[9];
-        let mut best = ns; let mut bestg = 0u32;
+        let mut best = ns;
+        let mut bestg = 0u32;
         for (i, &g) in fixed.iter().enumerate() {
-            if row[1 + i] > best { best = row[1 + i]; bestg = g; }
+            if row[1 + i] > best {
+                best = row[1 + i];
+                bestg = g;
+            }
         }
         let d = 100.0 * (bud - best) / best;
         print!("{conc:>5} {:>8.1}", dbatch[&conc]);
         print!(" {ns:>9.0}");
-        for i in 0..8 { print!(" {:>9.0}", row[1 + i]); }
-        let argmax = if bestg == 0 { "nospec".into() } else { format!("g{bestg}") };
+        for i in 0..8 {
+            print!(" {:>9.0}", row[1 + i]);
+        }
+        let argmax = if bestg == 0 {
+            "nospec".into()
+        } else {
+            format!("g{bestg}")
+        };
         print!(" {best:>9.0} {bud:>9.0} {argmax:>7} {d:>+7.2}");
         println!();
     }
