@@ -90,10 +90,7 @@ pub fn simulate_closed_loop(
         });
     }
     let mean_batch_per_pool = engine.pool_batch_means();
-    let kept: Vec<_> = all
-        .into_iter()
-        .skip(warmup_completions as usize)
-        .collect();
+    let kept: Vec<_> = all.into_iter().skip(warmup_completions as usize).collect();
     let total_time = if let (Some(first), Some(last)) = (kept.first(), kept.last()) {
         (last.completion_time - first.completion_time).max(1e-9)
     } else {
@@ -186,7 +183,11 @@ mod tests {
         };
         let cluster = ClusterSpec {
             hardware,
-            parallel: ParallelConfig { tp: 1, ep: 1, dp_attention: false },
+            parallel: ParallelConfig {
+                tp: 1,
+                ep: 1,
+                dp_attention: false,
+            },
             comms: None,
             num_workers: 1,
             node: 0,

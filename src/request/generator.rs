@@ -38,7 +38,13 @@ impl RequestGenerator {
             if let Some(num_users) = workload.num_concurrent_users {
                 let jitter = workload.closed_loop_jitter_secs.unwrap_or(0.0);
                 pending_closed_loop_requests = (0..num_users)
-                    .map(|_| if jitter > 0.0 { rng.gen_range(0.0..jitter) } else { 0.0 })
+                    .map(|_| {
+                        if jitter > 0.0 {
+                            rng.gen_range(0.0..jitter)
+                        } else {
+                            0.0
+                        }
+                    })
                     .collect();
             }
         };
@@ -89,7 +95,13 @@ impl RequestGenerator {
             if let Some(num_users) = workload.num_concurrent_users {
                 let jitter = workload.closed_loop_jitter_secs.unwrap_or(0.0);
                 pending_closed_loop_requests = (0..num_users)
-                    .map(|_| if jitter > 0.0 { rng.gen_range(0.0..jitter) } else { 0.0 })
+                    .map(|_| {
+                        if jitter > 0.0 {
+                            rng.gen_range(0.0..jitter)
+                        } else {
+                            0.0
+                        }
+                    })
                     .collect();
             }
         };

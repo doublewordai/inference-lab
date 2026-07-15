@@ -138,8 +138,7 @@ impl RealtimeEngine {
                     // num_computed_tokens but don't yield user-visible text.
                     if !prog.was_prefill {
                         for _ in 0..prog.num_tokens {
-                            let word =
-                                PLACEHOLDER_WORDS[live.word_index % PLACEHOLDER_WORDS.len()];
+                            let word = PLACEHOLDER_WORDS[live.word_index % PLACEHOLDER_WORDS.len()];
                             live.word_index += 1;
                             let _ = live.tx.try_send(TokenEvent::Token {
                                 text: format!("{} ", word),
@@ -197,4 +196,3 @@ impl RealtimeEngine {
         epoch + Duration::from_secs_f64(t_sim.max(0.0))
     }
 }
-

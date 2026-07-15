@@ -70,7 +70,11 @@ fn deepseek_v4_flash() -> ModelConfig {
 fn topology() -> Topology {
     let cluster = ClusterSpec {
         hardware: b200_unlimited_kv(),
-        parallel: ParallelConfig { tp: 1, ep: 1, dp_attention: false },
+        parallel: ParallelConfig {
+            tp: 1,
+            ep: 1,
+            dp_attention: false,
+        },
         comms: None,
         num_workers: 1,
         node: 0,
@@ -100,17 +104,48 @@ fn spec_for(p: Policy, alpha: f64, c_draft: f64) -> Option<SpeculativeConfig> {
     let acceptance = AcceptanceModel::Constant { alpha };
     match p {
         Policy::NoSpec => None,
-        Policy::Fixed(g) => Some(SpeculativeConfig { gamma: g, acceptance, policy: GammaPolicy::Fixed, draft_cost_frac: c_draft, measured_cost: None, switch: Default::default(), drafter: None }),
-        Policy::Budget(g) => Some(SpeculativeConfig { gamma: g, acceptance, policy: GammaPolicy::GoodputBudget, draft_cost_frac: c_draft, measured_cost: None, switch: Default::default(), drafter: None }),
+        Policy::Fixed(g) => Some(SpeculativeConfig {
+            gamma: g,
+            acceptance,
+            policy: GammaPolicy::Fixed,
+            draft_cost_frac: c_draft,
+            measured_cost: None,
+            switch: Default::default(),
+            drafter: None,
+        }),
+        Policy::Budget(g) => Some(SpeculativeConfig {
+            gamma: g,
+            acceptance,
+            policy: GammaPolicy::GoodputBudget,
+            draft_cost_frac: c_draft,
+            measured_cost: None,
+            switch: Default::default(),
+            drafter: None,
+        }),
     }
 }
 
 fn run(conc: u32, isl: u32, osl: u32, p: Policy, alpha: f64, c_draft: f64) -> (f64, f64) {
     let total = (conc * 2).max(1000);
     let warmup = conc / 2;
-    let res = simulate_closed_loop(topology(), conc, isl, osl, total, warmup, spec_for(p, alpha, c_draft), 7, true)
-        .expect("run");
-    let dbatch = res.mean_batch_per_pool.first().copied().flatten().unwrap_or(0.0);
+    let res = simulate_closed_loop(
+        topology(),
+        conc,
+        isl,
+        osl,
+        total,
+        warmup,
+        spec_for(p, alpha, c_draft),
+        7,
+        true,
+    )
+    .expect("run");
+    let dbatch = res
+        .mean_batch_per_pool
+        .first()
+        .copied()
+        .flatten()
+        .unwrap_or(0.0);
     (res.throughput() * osl as f64, dbatch)
 }
 
@@ -121,7 +156,9 @@ fn main() {
     let c_draft = 0.10;
     let gamma_max = 8u32;
     let fixed = [1u32, 2, 3, 4, 5, 6, 7, 8];
-    let concs = [1u32, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384];
+    let concs = [
+        1u32, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384,
+    ];
 
     // Column layout per conc: 0 = nospec, 1..=8 = fixed g1..g8, 9 = BUDGET.
     let mut tasks: Vec<(u32, usize, Policy)> = Vec::new();
@@ -137,12 +174,17 @@ fn main() {
     // lifted), so cap concurrency to keep peak memory well under box RAM. Most of the
     // wall-clock is the few largest concs anyway, so this still parallelizes the
     // expensive part. Tune via RAYON_NUM_THREADS; defaults to 8 here.
-    let nthreads = std::env::var("ROOFLINE_THREADS").ok()
+    let nthreads = std::env::var("ROOFLINE_THREADS")
+        .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(8usize);
-    let pool = rayon::ThreadPoolBuilder::new().num_threads(nthreads).build().expect("pool");
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(nthreads)
+        .build()
+        .expect("pool");
     let results: Vec<(u32, usize, f64, f64)> = pool.install(|| {
-        tasks.par_iter()
+        tasks
+            .par_iter()
             .map(|&(conc, col, p)| {
                 let (gp, db) = run(conc, isl, osl, p, alpha, c_draft);
                 (conc, col, gp, db)
@@ -154,23 +196,39 @@ fn main() {
     let mut dbatch: BTreeMap<u32, f64> = BTreeMap::new();
     for (conc, col, g, db) in results {
         gp.entry(conc).or_insert([0.0; 10])[col] = g;
-        if col == 0 { dbatch.insert(conc, db); }
+        if col == 0 {
+            dbatch.insert(conc, db);
+        }
     }
 
     println!("Pure-decode roofline sweep (disagg decode pool in isolation, KV caps lifted)");
     println!("V4-Flash B200 TP1, ISL={isl} OSL={osl} alpha={alpha} c_draft={c_draft}\n");
-    print!("{:>7} {:>8} {:>9} {:>9} {:>9} {:>7} {:>7}", "conc", "dbatch", "nospec", "best-fix", "BUDGET", "argmax", "d%");
+    print!(
+        "{:>7} {:>8} {:>9} {:>9} {:>9} {:>7} {:>7}",
+        "conc", "dbatch", "nospec", "best-fix", "BUDGET", "argmax", "d%"
+    );
     println!();
     for &conc in &concs {
         let row = gp[&conc];
         let ns = row[0];
         let bud = row[9];
-        let mut best = ns; let mut bestg = 0u32;
+        let mut best = ns;
+        let mut bestg = 0u32;
         for (i, &g) in fixed.iter().enumerate() {
-            if row[1 + i] > best { best = row[1 + i]; bestg = g; }
+            if row[1 + i] > best {
+                best = row[1 + i];
+                bestg = g;
+            }
         }
         let d = 100.0 * (bud - best) / best;
-        let argmax = if bestg == 0 { "nospec".into() } else { format!("g{bestg}") };
-        println!("{conc:>7} {:>8.0} {ns:>9.0} {best:>9.0} {bud:>9.0} {argmax:>7} {d:>+7.2}", dbatch[&conc]);
+        let argmax = if bestg == 0 {
+            "nospec".into()
+        } else {
+            format!("g{bestg}")
+        };
+        println!(
+            "{conc:>7} {:>8.0} {ns:>9.0} {best:>9.0} {bud:>9.0} {argmax:>7} {d:>+7.2}",
+            dbatch[&conc]
+        );
     }
 }

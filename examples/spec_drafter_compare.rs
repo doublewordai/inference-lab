@@ -106,7 +106,10 @@ impl Drafter {
                 shared_experts: 1,
             },
             // Eight dense diffusion layers + fusion + tied head, streamed once.
-            Drafter::Dflash => DrafterCost::BlockParallel { params: 982_515_712.0, block: 16 },
+            Drafter::Dflash => DrafterCost::BlockParallel {
+                params: 982_515_712.0,
+                block: 16,
+            },
         }
     }
     fn gamma_max(&self) -> u32 {
@@ -130,7 +133,9 @@ enum Policy {
 
 impl Policy {
     fn spec(&self, d: Drafter) -> Option<SpeculativeConfig> {
-        let acceptance = AcceptanceModel::TraceRounds { path: d.bank_path().into() };
+        let acceptance = AcceptanceModel::TraceRounds {
+            path: d.bank_path().into(),
+        };
         let mk = |gamma: u32, policy: GammaPolicy| {
             Some(SpeculativeConfig {
                 gamma,
@@ -154,7 +159,11 @@ impl Policy {
 fn base_config(conc: usize, isl: u32, osl: u32) -> Config {
     Config {
         hardware: b200_per_gpu(),
-        parallel: ParallelConfig { tp: 1, ep: 1, dp_attention: false },
+        parallel: ParallelConfig {
+            tp: 1,
+            ep: 1,
+            dp_attention: false,
+        },
         model: qwen36(),
         scheduler: SchedulerConfig {
             max_num_batched_tokens: 16384,
@@ -193,17 +202,33 @@ fn run_point(conc: usize, isl: u32, osl: u32, d: Drafter, p: Policy) -> (f64, f6
     let (mut sim, _cfg) = Simulator::new(config, None).expect("build sim");
     sim.run_with_callback(|_| {}).expect("run");
     let s = sim.get_metrics_summary();
-    (s.output_tokens_per_sec, s.per_token_mean * 1000.0, s.avg_bandwidth_util)
+    (
+        s.output_tokens_per_sec,
+        s.per_token_mean * 1000.0,
+        s.avg_bandwidth_util,
+    )
 }
 
 fn sweep(d: Drafter, isl: u32, osl: u32, concs: &[usize]) {
     let gmax = d.gamma_max();
     let grid = d.fixed_grid();
-    println!("\n=== {}  (Qwen3.6-35B-A3B verifier, B200 TP1/EP1, ISL={isl} OSL={osl}) ===", d.label());
-    println!("goodput = committed output tok/s. drafter priced by its roofline (not a fixed fraction).");
+    println!(
+        "\n=== {}  (Qwen3.6-35B-A3B verifier, B200 TP1/EP1, ISL={isl} OSL={osl}) ===",
+        d.label()
+    );
+    println!(
+        "goodput = committed output tok/s. drafter priced by its roofline (not a fixed fraction)."
+    );
     println!(
         "{:>6}  {:>9}  {:>9}  {:>9} {:>6}  {:>9} {:>7}  {:>7}",
-        "conc", "nospec", format!("fixγ{gmax}"), "best-fix", "γ*", "adaptive", "Δvbest", "Δvγmax"
+        "conc",
+        "nospec",
+        format!("fixγ{gmax}"),
+        "best-fix",
+        "γ*",
+        "adaptive",
+        "Δvbest",
+        "Δvγmax"
     );
     println!("{}", "-".repeat(82));
     for &conc in concs {
@@ -224,7 +249,11 @@ fn sweep(d: Drafter, isl: u32, osl: u32, concs: &[usize]) {
         let (budget, _, _) = run_point(conc, isl, osl, d, Policy::Budget(gmax));
         let d_best = 100.0 * (budget - best_fixed) / best_fixed;
         let d_gmax = 100.0 * (budget - fix_gmax) / fix_gmax;
-        let gstar = if best_g == 0 { "—".to_string() } else { format!("γ{best_g}") };
+        let gstar = if best_g == 0 {
+            "—".to_string()
+        } else {
+            format!("γ{best_g}")
+        };
         println!(
             "{conc:>6}  {ns:>9.0}  {fix_gmax:>9.0}  {best_fixed:>9.0} {gstar:>6}  {budget:>9.0} {d_best:>+6.1}%  {d_gmax:>+6.1}%"
         );
@@ -238,7 +267,9 @@ fn crossover(isl: u32, osl: u32, concs: &[usize]) {
     let drafters = [Drafter::Mtp, Drafter::Dflash];
     let names = ["MTP", "DFlash"];
     println!("\n=== CROSSOVER: adaptive (priced-budget) goodput by drafter, tok/s ===");
-    println!("each drafter priced by its own roofline + acceptance bank; winner = highest goodput.");
+    println!(
+        "each drafter priced by its own roofline + acceptance bank; winner = highest goodput."
+    );
     println!(
         "{:>6}  {:>9}  {:>10}  {:>10}  {:>8}",
         "conc", "nospec", "MTP", "DFlash", "winner"
@@ -250,7 +281,9 @@ fn crossover(isl: u32, osl: u32, concs: &[usize]) {
             .iter()
             .map(|&d| run_point(conc, isl, osl, d, Policy::Budget(d.gamma_max())).0)
             .collect();
-        let widx = (0..2).max_by(|&a, &b| g[a].partial_cmp(&g[b]).unwrap()).unwrap();
+        let widx = (0..2)
+            .max_by(|&a, &b| g[a].partial_cmp(&g[b]).unwrap())
+            .unwrap();
         println!(
             "{conc:>6}  {ns:>9.0}  {:>10.0}  {:>10.0}  {:>8}",
             g[0], g[1], names[widx]
@@ -267,11 +300,15 @@ fn main() {
     let osl: u32 = 1024;
     let concs = [1usize, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048];
     println!("Drafter cost-shape comparison: MTP (linear-in-γ) vs DFlash (flat-in-γ).");
-    println!("Same verifier and policies; each drafter priced by its own roofline + acceptance bank.");
+    println!(
+        "Same verifier and policies; each drafter priced by its own roofline + acceptance bank."
+    );
     sweep(Drafter::Mtp, isl, osl, &concs);
     sweep(Drafter::Dflash, isl, osl, &concs);
     crossover(isl, osl, &concs);
-    println!("\nRead: Δvs-fix is how much a priced policy beats the best fixed γ chosen in hindsight.");
+    println!(
+        "\nRead: Δvs-fix is how much a priced policy beats the best fixed γ chosen in hindsight."
+    );
     println!("Hypothesis — MTP's linear cost gives adaptation a draft-depth lever; DFlash's flat");
     println!("cost removes it, leaving only the verify-side (expert-tax / load) gain.");
 }

@@ -8,14 +8,14 @@ pub mod topology;
 pub mod workload;
 
 pub use hardware::{HardwareConfig, KVTier, Precision};
-pub use model::{DenseModel, DeepseekV4Model, ModelConfig, ModelCosts, SlidingWindowModel};
+pub use model::{DeepseekV4Model, DenseModel, ModelConfig, ModelCosts, SlidingWindowModel};
 pub use parallel::{CommsConfig, ParallelConfig};
 pub use scheduler::SchedulerConfig;
+pub use simulation::SimulationConfig;
 pub use speculative::{
     AcceptanceModel, DrafterCost, GammaPolicy, MeasuredCostConfig, SpeculativeConfig,
     SwitchConstraints, TraceBank, TraceRound,
 };
-pub use simulation::SimulationConfig;
 pub use topology::{ClusterSpec, DisaggTopology, Node};
 pub use workload::{LengthDistribution, RateSchedule, WorkloadConfig};
 

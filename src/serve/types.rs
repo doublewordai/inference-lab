@@ -33,7 +33,49 @@ fn default_max_tokens() -> u32 {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
-    pub content: String,
+    /// OpenAI-compatible `content`: a plain string, an array of content parts, `null`, or
+    /// omitted entirely. The old bare-`String` field rejected everything but the string form
+    /// with a 400, which broke any client sending part-form content (multimodal messages, or
+    /// gateways emitting single-text-part arrays) before it ever reached the
+    /// request→chat-template→tokenize chain. `#[serde(default)]` is deliberate: per the
+    /// OpenAI spec, `content` is "required unless `tool_calls` is specified" — assistant
+    /// tool-call turns may OMIT the field (not just send `null`), and real model servers
+    /// accept that shape, so rejecting omission would reintroduce the same class of 400.
+    #[serde(default)]
+    pub content: Option<MessageContent>,
+}
+
+/// String-or-parts `content`, matching what OpenAI-compatible servers accept.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum MessageContent {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+/// One entry of array-form content. Only `text` contributes to the prompt; non-text parts
+/// (e.g. `image_url`) and any extra fields on a part are accepted and ignored, like a real
+/// model server.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ContentPart {
+    #[serde(default)]
+    pub text: Option<String>,
+}
+
+impl MessageContent {
+    /// The message text for prompt assembly / token counting. Part texts are concatenated
+    /// with NO separator, so a single-text-part array counts identically to the same plain
+    /// string — the shape equivalence real chat templates give. Borrows for the common
+    /// string form (load tests send multi-hundred-KB prompts; cloning each message would
+    /// double transient memory) and allocates only to join parts.
+    pub fn text(&self) -> std::borrow::Cow<'_, str> {
+        match self {
+            MessageContent::Text(t) => std::borrow::Cow::Borrowed(t),
+            MessageContent::Parts(parts) => {
+                std::borrow::Cow::Owned(parts.iter().filter_map(|p| p.text.as_deref()).collect())
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

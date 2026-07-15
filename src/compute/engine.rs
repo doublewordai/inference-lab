@@ -8,7 +8,9 @@
 use std::collections::HashMap;
 
 use super::arithmetic;
-use crate::config::{CommsConfig, HardwareConfig, ModelConfig, ModelCosts, ParallelConfig, Precision};
+use crate::config::{
+    CommsConfig, HardwareConfig, ModelConfig, ModelCosts, ParallelConfig, Precision,
+};
 use crate::request::Request;
 
 pub struct ComputeEngine {
@@ -104,8 +106,7 @@ impl ComputeEngine {
         let ep = self.parallel.ep;
         if ep > 1 {
             let factor = (ep - 1) as f64 / (ep as f64 * ep as f64);
-            let bytes_per_call =
-                factor * tokens * self.model.alltoall_bytes_per_token() as f64;
+            let bytes_per_call = factor * tokens * self.model.alltoall_bytes_per_token() as f64;
             let calls = self.model.num_ep_alltoalls_per_pass() as f64;
             total += calls * (comms.alltoall_latency + bytes_per_call / comms.link_bw);
         }
@@ -158,7 +159,8 @@ impl ComputeEngine {
             0
         };
         let shared_kv_bytes =
-            self.model.kv_bytes_read_per_decode_step(shared_prefix_tokens) as f64;
+            self.model
+                .kv_bytes_read_per_decode_step(shared_prefix_tokens) as f64;
         attn_entry.other_bytes += shared_kv_bytes;
 
         for (req, &num_new) in batch_requests.iter().zip(tokens_per_request) {
@@ -217,16 +219,16 @@ impl ComputeEngine {
     /// the live batch's sequences are shorter than the reference. This is a
     /// conservative lower-bound correction: it prices only the bandwidth of
     /// the KV delta at peak, not attention-kernel shape effects.
-    pub fn kv_read_seq_delta_seconds(
-        &self,
-        batch_requests: &[&Request],
-        ref_seq_len: u32,
-    ) -> f64 {
+    pub fn kv_read_seq_delta_seconds(&self, batch_requests: &[&Request], ref_seq_len: u32) -> f64 {
         let bw = self.aggregate_memory_bandwidth();
         let ref_bytes = self.model.kv_bytes_read_per_decode_step(ref_seq_len) as f64;
         batch_requests
             .iter()
-            .map(|r| self.model.kv_bytes_read_per_decode_step(r.num_computed_tokens) as f64 - ref_bytes)
+            .map(|r| {
+                self.model
+                    .kv_bytes_read_per_decode_step(r.num_computed_tokens) as f64
+                    - ref_bytes
+            })
             .sum::<f64>()
             / bw
     }

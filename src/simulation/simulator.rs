@@ -83,11 +83,8 @@ impl Simulator {
             num_workers: 1,
             node: 0,
         };
-        let topology = Topology::aggregated(
-            cluster,
-            config.model.clone(),
-            config.scheduler.clone(),
-        )?;
+        let topology =
+            Topology::aggregated(cluster, config.model.clone(), config.scheduler.clone())?;
 
         let request_generator = if let Some(dataset_path) = &config.workload.dataset_path {
             let tokenizer = tokenizer.ok_or_else(|| {
@@ -149,11 +146,7 @@ impl Simulator {
         // replenishment. Use current_time as a floor so closed-loop entries
         // are visible once we reach their arrival time.
         let now = self.engine.current_time();
-        let bound = self
-            .request_generator
-            .peek_next_arrival_time()
-            .max(now)
-            + 1e-9;
+        let bound = self.request_generator.peek_next_arrival_time().max(now) + 1e-9;
         while let Some(req) = self.request_generator.next_if_before(bound) {
             self.engine.submit(req);
             self.metrics.total_requests += 1;

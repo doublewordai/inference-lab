@@ -47,8 +47,7 @@ pub struct TraceBank {
 impl TraceBank {
     /// Load from CSV with header `commits,category,a0..a{D-1}`.
     pub fn load(path: &str) -> Result<Self, String> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| format!("trace bank {path}: {e}"))?;
+        let text = std::fs::read_to_string(path).map_err(|e| format!("trace bank {path}: {e}"))?;
         let mut lines = text.lines();
         let header = lines.next().ok_or("trace bank: empty file")?;
         let cols: Vec<&str> = header.split(',').collect();
@@ -77,7 +76,11 @@ impl TraceBank {
         let e_curve = (0..=depth as u32)
             .map(|g| rounds.iter().map(|r| r.commits.min(g) as f64).sum::<f64>() / n)
             .collect();
-        Ok(Self { rounds, e_curve, max_depth: depth as u32 })
+        Ok(Self {
+            rounds,
+            e_curve,
+            max_depth: depth as u32,
+        })
     }
 
     /// E[accepted draft tokens] under homogeneous draft depth `gamma`.
@@ -313,7 +316,9 @@ impl DrafterCost {
     /// non-autoregressive heads.
     pub fn pass_seconds(&self, batch: u32, peak: f64, bw: f64) -> f64 {
         match *self {
-            DrafterCost::Autoregressive { .. } if batch > 0 => self.seconds(1, batch, peak, bw, 0.0),
+            DrafterCost::Autoregressive { .. } if batch > 0 => {
+                self.seconds(1, batch, peak, bw, 0.0)
+            }
             _ => 0.0,
         }
     }
@@ -394,8 +399,16 @@ impl SpeculativeConfig {
     /// Drafter time (seconds) for this step, dispatching to the configured
     /// `drafter` model or the legacy `draft_cost_frac` fraction. Added to the
     /// verify cost wherever the engine or a budget policy prices a draft.
-    pub fn drafter_seconds(&self, gamma: u32, batch: u32, peak: f64, bw: f64, verify_c: f64) -> f64 {
-        self.resolved_drafter().seconds(gamma, batch, peak, bw, verify_c)
+    pub fn drafter_seconds(
+        &self,
+        gamma: u32,
+        batch: u32,
+        peak: f64,
+        bw: f64,
+        verify_c: f64,
+    ) -> f64 {
+        self.resolved_drafter()
+            .seconds(gamma, batch, peak, bw, verify_c)
     }
 
     /// Ragged-allocation drafter time for `draft_widths` (one entry per decode
@@ -454,8 +467,10 @@ mod tests {
         // sample mean converges to expectation
         let mut rng = StdRng::seed_from_u64(0);
         let n = 200_000;
-        let mean: f64 =
-            (0..n).map(|_| m.sample_accepted(4, &mut rng) as f64).sum::<f64>() / n as f64;
+        let mean: f64 = (0..n)
+            .map(|_| m.sample_accepted(4, &mut rng) as f64)
+            .sum::<f64>()
+            / n as f64;
         assert!((mean - e).abs() < 0.02, "sample mean {mean} vs {e}");
     }
 }

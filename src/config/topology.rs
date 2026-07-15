@@ -61,7 +61,9 @@ impl ClusterSpec {
 
     /// Aggregate memory capacity across the TP group, in bytes.
     pub fn aggregate_memory_capacity(&self) -> u64 {
-        self.hardware.memory_capacity.saturating_mul(self.parallel.tp as u64)
+        self.hardware
+            .memory_capacity
+            .saturating_mul(self.parallel.tp as u64)
     }
 
     /// Fill in `hardware.kv_cache_capacity` from `aggregate_memory_capacity *

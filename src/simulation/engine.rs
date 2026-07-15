@@ -161,7 +161,11 @@ impl Topology {
         let n = cluster.num_workers.max(1) as usize;
         let mut workers = Vec::with_capacity(n);
         for _ in 0..n {
-            workers.push(Worker::new(&cluster, model.clone(), scheduler_config.clone())?);
+            workers.push(Worker::new(
+                &cluster,
+                model.clone(),
+                scheduler_config.clone(),
+            )?);
         }
         Ok(Self {
             pools: vec![WorkerPool::new(workers)],
@@ -489,7 +493,13 @@ impl Engine {
             .pools
             .iter()
             .flat_map(|p| &p.workers)
-            .map(|w| w.scheduler.running().iter().filter(|r| r.is_prefill()).count())
+            .map(|w| {
+                w.scheduler
+                    .running()
+                    .iter()
+                    .filter(|r| r.is_prefill())
+                    .count()
+            })
             .sum()
     }
 
@@ -655,7 +665,11 @@ impl Engine {
         for req in outcome.completed {
             timings.push(self.finalise(req, now));
         }
-        let handoff_time = outcome.iteration.as_ref().map(|i| i.end_time).unwrap_or(now);
+        let handoff_time = outcome
+            .iteration
+            .as_ref()
+            .map(|i| i.end_time)
+            .unwrap_or(now);
         for req in outcome.handed_off {
             self.start_handoff(req, handoff_time);
         }
@@ -776,8 +790,9 @@ impl Engine {
             let running = w.scheduler.running();
             let batch_refs: Vec<&Request> = batch_indices.iter().map(|&i| &running[i]).collect();
             let measured_time: Option<f64> = self.measured_cost.as_ref().and_then(|table| {
-                let dec_idx: Vec<usize> =
-                    (0..batch_size).filter(|&j| !progress[j].was_prefill).collect();
+                let dec_idx: Vec<usize> = (0..batch_size)
+                    .filter(|&j| !progress[j].was_prefill)
+                    .collect();
                 if dec_idx.is_empty() {
                     return None; // pure prefill: roofline
                 }
@@ -786,8 +801,7 @@ impl Engine {
                 let g = (mean_w - 1.0).max(0.0);
                 let mut t_dec = table.step_time_frac(dec_idx.len() as u32, g)?;
                 if let Some(ref_len) = ref_seq_len {
-                    let dec_refs: Vec<&Request> =
-                        dec_idx.iter().map(|&j| batch_refs[j]).collect();
+                    let dec_refs: Vec<&Request> = dec_idx.iter().map(|&j| batch_refs[j]).collect();
                     let delta = w
                         .compute_engine
                         .kv_read_seq_delta_seconds(&dec_refs, ref_len);
@@ -821,11 +835,9 @@ impl Engine {
             let bw = w
                 .compute_engine
                 .calculate_bandwidth_utilization(bytes, iter_time);
-            let flops = w.compute_engine.calculate_flops_utilization(
-                &batch_refs,
-                &cost_tokens,
-                iter_time,
-            );
+            let flops =
+                w.compute_engine
+                    .calculate_flops_utilization(&batch_refs, &cost_tokens, iter_time);
             (iter_time, measured_time, bw, flops)
         };
         // Drafter overhead on roofline-priced speculated steps. The drafter runs
@@ -987,9 +999,9 @@ impl Engine {
                             // the policy must see the same prices the wall
                             // clock charges.
                             let kv_delta = match (ref_seq_len, &self.measured_cost) {
-                                (Some(ref_len), Some(_)) => w
-                                    .compute_engine
-                                    .kv_read_seq_delta_seconds(&dec, ref_len),
+                                (Some(ref_len), Some(_)) => {
+                                    w.compute_engine.kv_read_seq_delta_seconds(&dec, ref_len)
+                                }
                                 _ => 0.0,
                             };
                             let c_curve: Vec<f64> = (0..=gamma)
@@ -1427,7 +1439,11 @@ impl Engine {
             None => {
                 state.insert(
                     key,
-                    AggSwitchState { g: raw, rounds_since: 0, pending_cost: 0.0 },
+                    AggSwitchState {
+                        g: raw,
+                        rounds_since: 0,
+                        pending_cost: 0.0,
+                    },
                 );
                 return raw;
             }
@@ -1587,28 +1603,53 @@ mod tests {
         let mut c = vec![1.0f64; 9];
         c[5] = f64::INFINITY;
         c[7] = f64::INFINITY;
-        let sw = SwitchConstraints { cooldown_rounds: 4, max_step: Some(2), cost_ms: 0.5 };
+        let sw = SwitchConstraints {
+            cooldown_rounds: 4,
+            max_step: Some(2),
+            cost_ms: 0.5,
+        };
         let mut st: HashMap<(PoolId, usize), AggSwitchState> = HashMap::new();
         let key = (0usize, 0usize);
         // First decision is free (no previous width to persist).
-        assert_eq!(Engine::constrained_aggregate_choice(&mut st, key, 0, &c, &sw), 0);
+        assert_eq!(
+            Engine::constrained_aggregate_choice(&mut st, key, 0, &c, &sw),
+            0
+        );
         // Rounds 1..3 of the cooldown hold the width even as the argmax moves.
         for _ in 0..3 {
-            assert_eq!(Engine::constrained_aggregate_choice(&mut st, key, 8, &c, &sw), 0);
+            assert_eq!(
+                Engine::constrained_aggregate_choice(&mut st, key, 8, &c, &sw),
+                0
+            );
         }
         // Round 4 re-evaluates: walk two indices toward 8 -> g = 2; per-switch
         // cost accrued for the next round to pay.
-        assert_eq!(Engine::constrained_aggregate_choice(&mut st, key, 8, &c, &sw), 2);
+        assert_eq!(
+            Engine::constrained_aggregate_choice(&mut st, key, 8, &c, &sw),
+            2
+        );
         assert!((st[&key].pending_cost - 0.5e-3).abs() < 1e-12);
         // Hold, then 2 -> 4; hold, then 4 -> 8 (6 and 8 are one index each).
         for _ in 0..3 {
-            assert_eq!(Engine::constrained_aggregate_choice(&mut st, key, 8, &c, &sw), 2);
+            assert_eq!(
+                Engine::constrained_aggregate_choice(&mut st, key, 8, &c, &sw),
+                2
+            );
         }
-        assert_eq!(Engine::constrained_aggregate_choice(&mut st, key, 8, &c, &sw), 4);
+        assert_eq!(
+            Engine::constrained_aggregate_choice(&mut st, key, 8, &c, &sw),
+            4
+        );
         for _ in 0..3 {
-            assert_eq!(Engine::constrained_aggregate_choice(&mut st, key, 8, &c, &sw), 4);
+            assert_eq!(
+                Engine::constrained_aggregate_choice(&mut st, key, 8, &c, &sw),
+                4
+            );
         }
-        assert_eq!(Engine::constrained_aggregate_choice(&mut st, key, 8, &c, &sw), 8);
+        assert_eq!(
+            Engine::constrained_aggregate_choice(&mut st, key, 8, &c, &sw),
+            8
+        );
         // A re-evaluation that does not change the width accrues no cost.
         let before = st[&key].pending_cost;
         for _ in 0..4 {

@@ -70,16 +70,15 @@ impl Scheduler {
             if completed.contains(&req.request_id) {
                 // Publish the now-resident blocks to the HBM prefix cache so
                 // subsequent same-prefix requests get a clean HBM hit.
-                let cached_blocks = (req.num_cached_tokens as usize)
-                    .div_ceil(self.config.block_size as usize);
+                let cached_blocks =
+                    (req.num_cached_tokens as usize).div_ceil(self.config.block_size as usize);
                 let hashes: Vec<u64> = req
                     .get_prompt_block_hashes()
                     .iter()
                     .copied()
                     .take(cached_blocks)
                     .collect();
-                let blocks: Vec<u32> =
-                    req.kv_blocks.iter().copied().take(cached_blocks).collect();
+                let blocks: Vec<u32> = req.kv_blocks.iter().copied().take(cached_blocks).collect();
                 self.kv_cache_manager
                     .publish_transferred_blocks(&hashes, &blocks);
                 req.status = RequestStatus::Waiting;
@@ -264,11 +263,9 @@ impl Scheduler {
                     // Two paths, possibly both: start a transfer for the
                     // spillover portion, and/or join an existing one for
                     // the in-flight portion.
-                    let new_transfer_tokens: u32 =
-                        lookup.promote_tokens_per_tier.iter().sum();
+                    let new_transfer_tokens: u32 = lookup.promote_tokens_per_tier.iter().sum();
                     if new_transfer_tokens > 0 {
-                        let hashes: Vec<u64> =
-                            request.get_prompt_block_hashes().to_vec();
+                        let hashes: Vec<u64> = request.get_prompt_block_hashes().to_vec();
                         self.kv_cache_manager.start_transfer(
                             request.request_id.clone(),
                             &hashes,

@@ -84,6 +84,7 @@ fn run_for_batch(num_concurrent: usize, share_prefix: bool) -> Vec<f64> {
     // hand-poking the manager: allocate blocks for the prefix so its hashes
     // land in HBM, free them, then evict them by allocating fresh blocks.
     let prefix_blocks: u32 = 64; // 64 * 16 = 1024 tokens
+
     // Each request gets its own prefix; if `share_prefix` is set, all of
     // them get the same one. We pre-warm host RAM with all the prefixes
     // we're going to use.
@@ -104,13 +105,18 @@ fn run_for_batch(num_concurrent: usize, share_prefix: bool) -> Vec<f64> {
         for hashes in &prefix_hashes_per_req {
             let mut seed = Request::new("seed".into(), 0, 0.0, prefix_blocks * block_size, 1);
             seed.prompt_block_hashes = hashes.clone();
-            let blocks = mgr.allocate_blocks(&seed, prefix_blocks * block_size).unwrap();
+            let blocks = mgr
+                .allocate_blocks(&seed, prefix_blocks * block_size)
+                .unwrap();
             mgr.free_blocks(&blocks);
         }
         let churn_blocks = mgr.total_blocks() as u32;
         let mut churn = Request::new("churn".into(), 0, 0.0, churn_blocks * block_size, 1);
-        churn.prompt_block_hashes = (0..churn_blocks as u64).map(|i| 9_000_000_000 + i).collect();
-        mgr.allocate_blocks(&churn, churn_blocks * block_size).unwrap();
+        churn.prompt_block_hashes = (0..churn_blocks as u64)
+            .map(|i| 9_000_000_000 + i)
+            .collect();
+        mgr.allocate_blocks(&churn, churn_blocks * block_size)
+            .unwrap();
         let churn_blocks_alloc: Vec<u32> = (0..churn_blocks).collect();
         mgr.free_blocks(&churn_blocks_alloc);
     }
@@ -169,7 +175,10 @@ fn main() {
     println!();
 
     println!("Case A: all requests share the same prefix (sim joins them on one transfer).");
-    println!("{:>6}  {:>14}  {:>14}", "batch", "first_done(s)", "last_done(s)");
+    println!(
+        "{:>6}  {:>14}  {:>14}",
+        "batch", "first_done(s)", "last_done(s)"
+    );
     println!("{}", "-".repeat(40));
     for &n in &[1usize, 2, 4, 8, 16] {
         let times = run_for_batch(n, /*share_prefix=*/ true);
@@ -180,7 +189,10 @@ fn main() {
 
     println!();
     println!("Case B: each request has its own prefix (transfers contend on shared PCIe).");
-    println!("{:>6}  {:>14}  {:>14}", "batch", "first_done(s)", "last_done(s)");
+    println!(
+        "{:>6}  {:>14}  {:>14}",
+        "batch", "first_done(s)", "last_done(s)"
+    );
     println!("{}", "-".repeat(40));
     for &n in &[1usize, 2, 4, 8, 16] {
         let times = run_for_batch(n, /*share_prefix=*/ false);
