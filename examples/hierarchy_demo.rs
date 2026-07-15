@@ -84,9 +84,10 @@ fn run_for_batch(num_concurrent: usize, share_prefix: bool) -> Vec<f64> {
     // hand-poking the manager: allocate blocks for the prefix so its hashes
     // land in HBM, free them, then evict them by allocating fresh blocks.
     let prefix_blocks: u32 = 64; // 64 * 16 = 1024 tokens
-                                 // Each request gets its own prefix; if `share_prefix` is set, all of
-                                 // them get the same one. We pre-warm host RAM with all the prefixes
-                                 // we're going to use.
+
+    // Each request gets its own prefix; if `share_prefix` is set, all of
+    // them get the same one. We pre-warm host RAM with all the prefixes
+    // we're going to use.
     let prefix_hashes_per_req: Vec<Vec<u64>> = (0..num_concurrent)
         .map(|r| {
             let base = if share_prefix {

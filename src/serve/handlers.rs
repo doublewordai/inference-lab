@@ -432,12 +432,8 @@ fn messages_to_prompt_text(messages: &[ChatMessage]) -> String {
     messages
         .iter()
         .map(|m| {
-            // Null content (assistant tool-call turns) contributes an empty body.
-            let content = m
-                .content
-                .as_ref()
-                .map(MessageContent::text)
-                .unwrap_or_default();
+            // Null/omitted content (assistant tool-call turns) contributes an empty body.
+            let content = m.content.as_ref().map(|c| c.text()).unwrap_or_default();
             format!("{}: {}", m.role, content)
         })
         .collect::<Vec<_>>()
