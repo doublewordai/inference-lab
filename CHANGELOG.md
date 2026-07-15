@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.1](https://github.com/doublewordai/inference-lab/compare/inference-lab-v0.7.0...inference-lab-v0.7.1) (2026-07-15)
+
+
+### Bug Fixes
+
+* allow content array blocks as input ([#60](https://github.com/doublewordai/inference-lab/issues/60)) ([2e51610](https://github.com/doublewordai/inference-lab/commit/2e516101f20c643b541abb107f3636f31164e033))
+
 ## [0.7.0](https://github.com/doublewordai/inference-lab/compare/inference-lab-v0.6.2...inference-lab-v0.7.0) (2026-06-22)
 
 
