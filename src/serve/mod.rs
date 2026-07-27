@@ -1,3 +1,4 @@
+pub mod directive;
 pub mod engine;
 pub mod handlers;
 pub mod types;
