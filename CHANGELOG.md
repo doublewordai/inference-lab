@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.0](https://github.com/doublewordai/inference-lab/compare/inference-lab-v0.7.1...inference-lab-v0.8.0) (2026-07-28)
+
+
+### Features
+
+* echo directive ([#62](https://github.com/doublewordai/inference-lab/issues/62)) ([dcc7f2d](https://github.com/doublewordai/inference-lab/commit/dcc7f2d53e70ff4978b1a6ee6be0e7a1217065ab))
+
 ## [0.7.1](https://github.com/doublewordai/inference-lab/compare/inference-lab-v0.7.0...inference-lab-v0.7.1) (2026-07-15)
 
 
