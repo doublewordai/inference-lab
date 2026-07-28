@@ -19,6 +19,9 @@ pub struct AppState {
     pub engines: HashMap<String, mpsc::Sender<EngineRequest>>,
     pub model_names: Vec<String>,
     pub tokenizer: Option<Arc<tokenizers::Tokenizer>>,
+    /// Honor echo-directives (serve::directive). Explicitly opt-in: a scripted-response
+    /// bypass reachable by untrusted clients would be a response-spoofing vector.
+    pub enable_directives: bool,
 }
 
 pub async fn health() -> Json<serde_json::Value> {
@@ -58,6 +61,26 @@ pub async fn chat_completions(
         .as_ref()
         .map(|options| options.include_usage)
         .unwrap_or(false);
+
+    // Echo-directive mode (see serve::directive): a scripted response bypasses the engine —
+    // deterministic content/tool_calls, immediate return. The model must still exist so an
+    // unknown-model request fails the same way as the normal path. Gated on the
+    // --enable-directives opt-in; when off, directive text is inert prompt content.
+    if state.enable_directives {
+        if let Some(directive) = super::directive::find_directive(&req.messages) {
+            if !state.engines.contains_key(&req.model) {
+                return Err(model_not_found(&state, &req.model));
+            }
+            let completion_tokens = count_text_prompt_tokens(&state, &directive.completion_text());
+            return Ok(scripted_chat_response(
+                &req,
+                &directive,
+                prompt_tokens,
+                completion_tokens,
+            ));
+        }
+    }
+
     let (request_id, mut rx) = submit_engine_request(
         &state,
         &req.model,
@@ -91,6 +114,7 @@ pub async fn chat_completions(
                     delta: ChunkDelta {
                         role: Some("assistant"),
                         content: None,
+                        tool_calls: None,
                     },
                     finish_reason: None,
                 }],
@@ -119,6 +143,7 @@ pub async fn chat_completions(
                                 delta: ChunkDelta {
                                     role: None,
                                     content: Some(text),
+                                    tool_calls: None,
                                 },
                                 finish_reason: None,
                             }],
@@ -144,6 +169,7 @@ pub async fn chat_completions(
                                 delta: ChunkDelta {
                                     role: None,
                                     content: None,
+                                    tool_calls: None,
                                 },
                                 finish_reason: Some("stop"),
                             }],
@@ -218,7 +244,8 @@ pub async fn chat_completions(
                 index: 0,
                 message: ChoiceMessage {
                     role: "assistant",
-                    content: content.trim_end().to_string(),
+                    content: Some(content.trim_end().to_string()),
+                    tool_calls: None,
                 },
                 finish_reason: "stop",
             }],
@@ -372,6 +399,145 @@ pub async fn completions(
     }
 }
 
+fn model_not_found(state: &AppState, model: &str) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({
+            "error": {
+                "message": format!("Model '{}' not found. Available models: {}", model, state.model_names.join(", ")),
+                "type": "invalid_request_error",
+                "code": "model_not_found"
+            }
+        })),
+    )
+}
+
+/// Build the scripted (echo-directive) response — non-streaming JSON, or the same content
+/// as a minimal, well-formed SSE sequence (role chunk -> content/tool_call chunks ->
+/// finish+usage chunk -> [DONE]) when the request asked to stream.
+fn scripted_chat_response(
+    req: &ChatCompletionRequest,
+    directive: &super::directive::Directive,
+    prompt_tokens: u32,
+    completion_tokens: u32,
+) -> axum::response::Response {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
+    let usage = Usage {
+        prompt_tokens,
+        completion_tokens,
+        total_tokens: prompt_tokens + completion_tokens,
+    };
+    let tool_calls = directive.response_tool_calls();
+    let finish_reason = directive.finish_reason();
+    // Pure tool-call turns carry content: null, like a real model server.
+    let content = match directive.text.as_deref() {
+        Some(t) if !t.is_empty() => Some(t.to_string()),
+        _ if tool_calls.is_empty() => Some(String::new()),
+        _ => None,
+    };
+
+    if !req.stream {
+        let response = ChatCompletionResponse {
+            id,
+            object: "chat.completion",
+            created: now,
+            model: req.model.clone(),
+            choices: vec![Choice {
+                index: 0,
+                message: ChoiceMessage {
+                    role: "assistant",
+                    content,
+                    tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
+                },
+                finish_reason,
+            }],
+            usage,
+        };
+        return Json(response).into_response();
+    }
+
+    let chunk = |delta: ChunkDelta, finish: Option<&'static str>, usage: Option<Usage>| {
+        ChatCompletionChunk {
+            id: id.clone(),
+            object: "chat.completion.chunk",
+            created: now,
+            model: req.model.clone(),
+            choices: vec![ChunkChoice {
+                index: 0,
+                delta,
+                finish_reason: finish,
+            }],
+            usage,
+        }
+    };
+    let mut chunks = vec![chunk(
+        ChunkDelta {
+            role: Some("assistant"),
+            content: None,
+            tool_calls: None,
+        },
+        None,
+        None,
+    )];
+    if let Some(text) = content.filter(|c| !c.is_empty()) {
+        chunks.push(chunk(
+            ChunkDelta {
+                role: None,
+                content: Some(text),
+                tool_calls: None,
+            },
+            None,
+            None,
+        ));
+    }
+    if !tool_calls.is_empty() {
+        let stream_calls = tool_calls
+            .into_iter()
+            .enumerate()
+            .map(|(i, tc)| StreamToolCall {
+                index: i as u32,
+                id: tc.id,
+                r#type: tc.r#type,
+                function: tc.function,
+            })
+            .collect();
+        chunks.push(chunk(
+            ChunkDelta {
+                role: None,
+                content: None,
+                tool_calls: Some(stream_calls),
+            },
+            None,
+            None,
+        ));
+    }
+    // Scripted turns exist for usage assertions, so the final chunk ALWAYS carries usage,
+    // even without stream_options.include_usage — matching the many real providers
+    // (OpenRouter, vllm-with-flag, ...) that emit it unconditionally. The engine path keeps
+    // strict spec behavior; this deliberate divergence surfaced a real gateway gap
+    // (anthropic-ingress streaming not injecting include_usage) that spec-strict fakes hide.
+    chunks.push(chunk(
+        ChunkDelta {
+            role: None,
+            content: None,
+            tool_calls: None,
+        },
+        Some(finish_reason),
+        Some(usage),
+    ));
+
+    let mut events: Vec<Result<Event, Infallible>> = chunks
+        .into_iter()
+        .map(|c| Ok(Event::default().data(serde_json::to_string(&c).unwrap())))
+        .collect();
+    events.push(Ok(Event::default().data("[DONE]")));
+    Sse::new(tokio_stream::iter(events)).into_response()
+}
+
 async fn submit_engine_request(
     state: &AppState,
     model: &str,
@@ -379,18 +545,10 @@ async fn submit_engine_request(
     max_output_tokens: u32,
     request_prefix: &str,
 ) -> Result<(String, mpsc::Receiver<TokenEvent>), (StatusCode, Json<serde_json::Value>)> {
-    let engine_tx = state.engines.get(model).ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "error": {
-                    "message": format!("Model '{}' not found. Available models: {}", model, state.model_names.join(", ")),
-                    "type": "invalid_request_error",
-                    "code": "model_not_found"
-                }
-            })),
-        )
-    })?;
+    let engine_tx = state
+        .engines
+        .get(model)
+        .ok_or_else(|| model_not_found(state, model))?;
 
     let (tx, rx) = mpsc::channel::<TokenEvent>(64);
     let request_id = format!("{}-{}", request_prefix, uuid::Uuid::new_v4());
@@ -452,10 +610,22 @@ mod tests {
     use axum::response::Response;
 
     fn test_state(engine_tx: mpsc::Sender<EngineRequest>) -> Arc<AppState> {
+        // Directives ON: the directive tests exercise the scripted path; engine-path tests
+        // send no directive text, so the flag is inert for them.
         Arc::new(AppState {
             engines: HashMap::from([("test-model".to_string(), engine_tx)]),
             model_names: vec!["test-model".to_string()],
             tokenizer: None,
+            enable_directives: true,
+        })
+    }
+
+    fn test_state_directives_off(engine_tx: mpsc::Sender<EngineRequest>) -> Arc<AppState> {
+        Arc::new(AppState {
+            engines: HashMap::from([("test-model".to_string(), engine_tx)]),
+            model_names: vec!["test-model".to_string()],
+            tokenizer: None,
+            enable_directives: false,
         })
     }
 
@@ -519,6 +689,192 @@ mod tests {
             messages_to_prompt_text(&plain),
             messages_to_prompt_text(&array.messages)
         );
+    }
+
+    #[tokio::test]
+    async fn directive_returns_scripted_tool_calls_without_engine() {
+        // Channel with NO consumer: if the directive path touched the engine, the handler
+        // would hang or error — completing at all proves the bypass.
+        let (engine_tx, _engine_rx) = mpsc::channel::<EngineRequest>(1);
+        let state = test_state(engine_tx);
+
+        let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "messages": [
+                {"role": "user", "content": "please look this up <<respond:{\"tool_calls\":[{\"name\":\"Read\",\"arguments\":{\"file_path\":\"/w/step1.txt\"}}]}>>"}
+            ]
+        }))
+        .unwrap();
+        let response = chat_completions(State(state), Json(req))
+            .await
+            .unwrap()
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+
+        let choice = &json["choices"][0];
+        assert_eq!(choice["finish_reason"], "tool_calls");
+        assert!(choice["message"]["content"].is_null());
+        let tc = &choice["message"]["tool_calls"][0];
+        assert_eq!(tc["type"], "function");
+        assert_eq!(tc["function"]["name"], "Read");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                tc["function"]["arguments"].as_str().unwrap()
+            )
+            .unwrap()["file_path"],
+            "/w/step1.txt"
+        );
+        assert!(json["usage"]["prompt_tokens"].as_u64().unwrap() > 0);
+        assert!(json["usage"]["completion_tokens"].as_u64().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn directive_text_response_and_last_directive_wins() {
+        let (engine_tx, _engine_rx) = mpsc::channel::<EngineRequest>(1);
+        let state = test_state(engine_tx);
+
+        // The tool-result message carries the freshest directive — it must win over the
+        // task prompt's original one (the chained agent-loop flow).
+        let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "messages": [
+                {"role": "user", "content": "task <<respond:{\"tool_calls\":[{\"name\":\"Read\",\"arguments\":{\"file_path\":\"/w/s1\"}}]}>>"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "t1", "type": "function", "function": {"name": "Read", "arguments": "{\"file_path\":\"/w/s1\"}"}}
+                ]},
+                {"role": "tool", "content": "file body <<respond:{\"text\":\"all done\"}>>"}
+            ]
+        }))
+        .unwrap();
+        let response = chat_completions(State(state), Json(req))
+            .await
+            .unwrap()
+            .into_response();
+        let json = response_json(response).await;
+        let choice = &json["choices"][0];
+        assert_eq!(choice["finish_reason"], "stop");
+        assert_eq!(choice["message"]["content"], "all done");
+        assert!(choice["message"].get("tool_calls").is_none());
+    }
+
+    #[tokio::test]
+    async fn directive_streams_scripted_sequence_with_usage() {
+        let (engine_tx, _engine_rx) = mpsc::channel::<EngineRequest>(1);
+        let state = test_state(engine_tx);
+
+        let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "stream": true,
+            "stream_options": {"include_usage": true},
+            "messages": [
+                {"role": "user", "content": "<<respond:{\"text\":\"hi\",\"tool_calls\":[{\"name\":\"Read\",\"arguments\":{\"file_path\":\"/x\"}}]}>>"}
+            ]
+        }))
+        .unwrap();
+        let response = chat_completions(State(state), Json(req))
+            .await
+            .unwrap()
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let events = response_sse_events(response).await;
+        assert_eq!(events.last().map(String::as_str), Some("[DONE]"));
+
+        let frames: Vec<serde_json::Value> = events
+            .iter()
+            .filter(|e| *e != "[DONE]")
+            .map(|e| serde_json::from_str(e).unwrap())
+            .collect();
+        // role -> content -> tool_calls -> finish+usage
+        assert_eq!(frames[0]["choices"][0]["delta"]["role"], "assistant");
+        assert_eq!(frames[1]["choices"][0]["delta"]["content"], "hi");
+        let tc = &frames[2]["choices"][0]["delta"]["tool_calls"][0];
+        assert_eq!(tc["index"], 0);
+        assert_eq!(tc["function"]["name"], "Read");
+        let last = frames.last().unwrap();
+        assert_eq!(last["choices"][0]["finish_reason"], "tool_calls");
+        assert!(last["usage"]["prompt_tokens"].as_u64().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn directive_stream_carries_usage_without_stream_options() {
+        // Real harnesses (the claude CLI) don't set stream_options.include_usage; scripted
+        // turns must still return usage or every session asserts on zeros.
+        let (engine_tx, _engine_rx) = mpsc::channel::<EngineRequest>(1);
+        let state = test_state(engine_tx);
+        let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "stream": true,
+            "messages": [{"role": "user", "content": "<<respond:{\"text\":\"hi\"}>>"}]
+        }))
+        .unwrap();
+        let response = chat_completions(State(state), Json(req))
+            .await
+            .unwrap()
+            .into_response();
+        let events = response_sse_events(response).await;
+        let frames: Vec<serde_json::Value> = events
+            .iter()
+            .filter(|e| *e != "[DONE]")
+            .map(|e| serde_json::from_str(e).unwrap())
+            .collect();
+        let last = frames.last().unwrap();
+        assert!(last["usage"]["prompt_tokens"].as_u64().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn directive_inert_when_disabled() {
+        // With the flag off, directive text is ordinary prompt content: the request takes
+        // the ENGINE path (proven by answering the engine request it submits).
+        let (engine_tx, mut engine_rx) = mpsc::channel::<EngineRequest>(1);
+        let state = test_state_directives_off(engine_tx);
+
+        let answer = tokio::spawn(async move {
+            let engine_req = engine_rx.recv().await.expect("engine path must be taken");
+            let _ = engine_req
+                .tx
+                .send(TokenEvent::Token {
+                    text: "plain".into(),
+                })
+                .await;
+            let _ = engine_req
+                .tx
+                .send(TokenEvent::Done {
+                    prompt_tokens: 5,
+                    completion_tokens: 1,
+                })
+                .await;
+        });
+
+        let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "<<respond:{\"text\":\"spoof\"}>>"}]
+        }))
+        .unwrap();
+        let response = chat_completions(State(state), Json(req))
+            .await
+            .unwrap()
+            .into_response();
+        let json = response_json(response).await;
+        answer.await.unwrap();
+        assert_eq!(json["choices"][0]["message"]["content"], "plain");
+        assert!(json["choices"][0]["message"].get("tool_calls").is_none());
+    }
+
+    #[tokio::test]
+    async fn directive_unknown_model_is_404() {
+        let (engine_tx, _engine_rx) = mpsc::channel::<EngineRequest>(1);
+        let state = test_state(engine_tx);
+        let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "nope",
+            "messages": [{"role": "user", "content": "<<respond:{\"text\":\"x\"}>>"}]
+        }))
+        .unwrap();
+        let err = chat_completions(State(state), Json(req))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -947,6 +1303,7 @@ mod tests {
             engines: HashMap::new(),
             model_names: vec!["other-model".to_string()],
             tokenizer: None,
+            enable_directives: false,
         });
 
         let error = match completions(
@@ -980,6 +1337,7 @@ mod tests {
             engines: HashMap::new(),
             model_names: Vec::new(),
             tokenizer: None,
+            enable_directives: false,
         };
 
         assert_eq!(count_text_prompt_tokens(&state, "hello world"), 3);

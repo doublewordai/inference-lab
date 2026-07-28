@@ -116,7 +116,35 @@ pub struct Choice {
 #[derive(Debug, Serialize)]
 pub struct ChoiceMessage {
     pub role: &'static str,
-    pub content: String,
+    /// `null` (not omitted) on pure tool-call turns, matching real model servers.
+    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ResponseToolCall>>,
+}
+
+/// OpenAI response-shaped tool call (directive mode; see serve::directive).
+#[derive(Debug, Clone, Serialize)]
+pub struct ResponseToolCall {
+    pub id: String,
+    pub r#type: &'static str,
+    pub function: ToolCallFunction,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolCallFunction {
+    pub name: String,
+    /// JSON-encoded arguments object, per the OpenAI wire format.
+    pub arguments: String,
+}
+
+/// Streaming tool-call delta: the whole call in one chunk at its index (a real server
+/// fragments `arguments` across chunks; emitting it whole is valid and deterministic).
+#[derive(Debug, Clone, Serialize)]
+pub struct StreamToolCall {
+    pub index: u32,
+    pub id: String,
+    pub r#type: &'static str,
+    pub function: ToolCallFunction,
 }
 
 #[derive(Debug, Serialize)]
@@ -171,6 +199,8 @@ pub struct ChunkDelta {
     pub role: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<StreamToolCall>>,
 }
 
 #[derive(Debug, Serialize)]
