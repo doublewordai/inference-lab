@@ -20,6 +20,7 @@ pub async fn start_server(
     host: String,
     port: u16,
     tokenizer_path: Option<PathBuf>,
+    enable_directives: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Load tokenizer if provided
     let tokenizer = if let Some(path) = tokenizer_path {
@@ -54,7 +55,11 @@ pub async fn start_server(
         engines,
         model_names: model_names.clone(),
         tokenizer,
+        enable_directives,
     });
+    if enable_directives {
+        println!("  Echo-directives: ENABLED (scripted-response test mode)");
+    }
 
     // Build router
     let app = Router::new()

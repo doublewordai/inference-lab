@@ -19,6 +19,9 @@ pub struct AppState {
     pub engines: HashMap<String, mpsc::Sender<EngineRequest>>,
     pub model_names: Vec<String>,
     pub tokenizer: Option<Arc<tokenizers::Tokenizer>>,
+    /// Honor echo-directives (serve::directive). Explicitly opt-in: a scripted-response
+    /// bypass reachable by untrusted clients would be a response-spoofing vector.
+    pub enable_directives: bool,
 }
 
 pub async fn health() -> Json<serde_json::Value> {
@@ -61,18 +64,21 @@ pub async fn chat_completions(
 
     // Echo-directive mode (see serve::directive): a scripted response bypasses the engine —
     // deterministic content/tool_calls, immediate return. The model must still exist so an
-    // unknown-model request fails the same way as the normal path.
-    if let Some(directive) = super::directive::find_directive(&req.messages) {
-        if !state.engines.contains_key(&req.model) {
-            return Err(model_not_found(&state, &req.model));
+    // unknown-model request fails the same way as the normal path. Gated on the
+    // --enable-directives opt-in; when off, directive text is inert prompt content.
+    if state.enable_directives {
+        if let Some(directive) = super::directive::find_directive(&req.messages) {
+            if !state.engines.contains_key(&req.model) {
+                return Err(model_not_found(&state, &req.model));
+            }
+            let completion_tokens = count_text_prompt_tokens(&state, &directive.completion_text());
+            return Ok(scripted_chat_response(
+                &req,
+                &directive,
+                prompt_tokens,
+                completion_tokens,
+            ));
         }
-        let completion_tokens = count_text_prompt_tokens(&state, &directive.completion_text());
-        return Ok(scripted_chat_response(
-            &req,
-            &directive,
-            prompt_tokens,
-            completion_tokens,
-        ));
     }
 
     let (request_id, mut rx) = submit_engine_request(
@@ -604,10 +610,22 @@ mod tests {
     use axum::response::Response;
 
     fn test_state(engine_tx: mpsc::Sender<EngineRequest>) -> Arc<AppState> {
+        // Directives ON: the directive tests exercise the scripted path; engine-path tests
+        // send no directive text, so the flag is inert for them.
         Arc::new(AppState {
             engines: HashMap::from([("test-model".to_string(), engine_tx)]),
             model_names: vec!["test-model".to_string()],
             tokenizer: None,
+            enable_directives: true,
+        })
+    }
+
+    fn test_state_directives_off(engine_tx: mpsc::Sender<EngineRequest>) -> Arc<AppState> {
+        Arc::new(AppState {
+            engines: HashMap::from([("test-model".to_string(), engine_tx)]),
+            model_names: vec!["test-model".to_string()],
+            tokenizer: None,
+            enable_directives: false,
         })
     }
 
@@ -802,6 +820,45 @@ mod tests {
             .collect();
         let last = frames.last().unwrap();
         assert!(last["usage"]["prompt_tokens"].as_u64().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn directive_inert_when_disabled() {
+        // With the flag off, directive text is ordinary prompt content: the request takes
+        // the ENGINE path (proven by answering the engine request it submits).
+        let (engine_tx, mut engine_rx) = mpsc::channel::<EngineRequest>(1);
+        let state = test_state_directives_off(engine_tx);
+
+        let answer = tokio::spawn(async move {
+            let engine_req = engine_rx.recv().await.expect("engine path must be taken");
+            let _ = engine_req
+                .tx
+                .send(TokenEvent::Token {
+                    text: "plain".into(),
+                })
+                .await;
+            let _ = engine_req
+                .tx
+                .send(TokenEvent::Done {
+                    prompt_tokens: 5,
+                    completion_tokens: 1,
+                })
+                .await;
+        });
+
+        let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "<<respond:{\"text\":\"spoof\"}>>"}]
+        }))
+        .unwrap();
+        let response = chat_completions(State(state), Json(req))
+            .await
+            .unwrap()
+            .into_response();
+        let json = response_json(response).await;
+        answer.await.unwrap();
+        assert_eq!(json["choices"][0]["message"]["content"], "plain");
+        assert!(json["choices"][0]["message"].get("tool_calls").is_none());
     }
 
     #[tokio::test]
@@ -1246,6 +1303,7 @@ mod tests {
             engines: HashMap::new(),
             model_names: vec!["other-model".to_string()],
             tokenizer: None,
+            enable_directives: false,
         });
 
         let error = match completions(
@@ -1279,6 +1337,7 @@ mod tests {
             engines: HashMap::new(),
             model_names: Vec::new(),
             tokenizer: None,
+            enable_directives: false,
         };
 
         assert_eq!(count_text_prompt_tokens(&state, "hello world"), 3);
