@@ -72,7 +72,6 @@ pub async fn chat_completions(
             &directive,
             prompt_tokens,
             completion_tokens,
-            include_usage,
         ));
     }
 
@@ -415,7 +414,6 @@ fn scripted_chat_response(
     directive: &super::directive::Directive,
     prompt_tokens: u32,
     completion_tokens: u32,
-    include_usage: bool,
 ) -> axum::response::Response {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -511,6 +509,11 @@ fn scripted_chat_response(
             None,
         ));
     }
+    // Scripted turns exist for usage assertions, so the final chunk ALWAYS carries usage,
+    // even without stream_options.include_usage — matching the many real providers
+    // (OpenRouter, vllm-with-flag, ...) that emit it unconditionally. The engine path keeps
+    // strict spec behavior; this deliberate divergence surfaced a real gateway gap
+    // (anthropic-ingress streaming not injecting include_usage) that spec-strict fakes hide.
     chunks.push(chunk(
         ChunkDelta {
             role: None,
@@ -518,7 +521,7 @@ fn scripted_chat_response(
             tool_calls: None,
         },
         Some(finish_reason),
-        include_usage.then_some(usage),
+        Some(usage),
     ));
 
     let mut events: Vec<Result<Event, Infallible>> = chunks
@@ -772,6 +775,32 @@ mod tests {
         assert_eq!(tc["function"]["name"], "Read");
         let last = frames.last().unwrap();
         assert_eq!(last["choices"][0]["finish_reason"], "tool_calls");
+        assert!(last["usage"]["prompt_tokens"].as_u64().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn directive_stream_carries_usage_without_stream_options() {
+        // Real harnesses (the claude CLI) don't set stream_options.include_usage; scripted
+        // turns must still return usage or every session asserts on zeros.
+        let (engine_tx, _engine_rx) = mpsc::channel::<EngineRequest>(1);
+        let state = test_state(engine_tx);
+        let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "stream": true,
+            "messages": [{"role": "user", "content": "<<respond:{\"text\":\"hi\"}>>"}]
+        }))
+        .unwrap();
+        let response = chat_completions(State(state), Json(req))
+            .await
+            .unwrap()
+            .into_response();
+        let events = response_sse_events(response).await;
+        let frames: Vec<serde_json::Value> = events
+            .iter()
+            .filter(|e| *e != "[DONE]")
+            .map(|e| serde_json::from_str(e).unwrap())
+            .collect();
+        let last = frames.last().unwrap();
         assert!(last["usage"]["prompt_tokens"].as_u64().unwrap() > 0);
     }
 
