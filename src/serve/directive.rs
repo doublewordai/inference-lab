@@ -130,6 +130,7 @@ mod tests {
         ChatMessage {
             role: role.to_string(),
             content: Some(MessageContent::Text(text.to_string())),
+            tool_calls: None,
         }
     }
 
@@ -218,6 +219,7 @@ mod tests {
         let messages = vec![ChatMessage {
             role: "user".to_string(),
             content: Some(MessageContent::Parts(vec![])),
+            tool_calls: None,
         }];
         assert!(find_directive(&messages).is_none());
     }

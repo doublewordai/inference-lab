@@ -12,6 +12,10 @@ pub struct ChatCompletionRequest {
     pub max_tokens: u32,
     #[serde(default)]
     pub stream_options: Option<StreamOptions>,
+    /// Tool definitions. Kept as raw JSON purely for token accounting: a real engine's
+    /// chat template renders tool schemas into the prompt, so they must count.
+    #[serde(default)]
+    pub tools: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -33,6 +37,10 @@ fn default_max_tokens() -> u32 {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
+    /// Assistant tool calls, kept as raw JSON for token accounting (rendered into the
+    /// prompt by real chat templates, and counted by gateways that meter cache prefixes).
+    #[serde(default)]
+    pub tool_calls: Option<serde_json::Value>,
     /// OpenAI-compatible `content`: a plain string, an array of content parts, `null`, or
     /// omitted entirely. The old bare-`String` field rejected everything but the string form
     /// with a 400, which broke any client sending part-form content (multimodal messages, or
