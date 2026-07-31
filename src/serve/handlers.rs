@@ -605,7 +605,13 @@ fn prompt_text(messages: &[ChatMessage], tools: Option<&serde_json::Value>) -> S
         // Null/omitted content (assistant tool-call turns) contributes an empty body.
         let content = m.content.as_ref().map(|c| c.text()).unwrap_or_default();
         match &m.tool_calls {
-            Some(calls) => parts.push(format!("{}: {}{}", m.role, content, calls)),
+            Some(calls) => {
+                // Separate non-empty content from the tool-call JSON so the two tokenize
+                // as distinct chunks (direct concatenation could merge tokens across the
+                // boundary and makes the counted text ambiguous).
+                let sep = if content.is_empty() { "" } else { "\n" };
+                parts.push(format!("{}: {}{}{}", m.role, content, sep, calls));
+            }
             None => parts.push(format!("{}: {}", m.role, content)),
         }
     }
@@ -690,6 +696,21 @@ mod tests {
             "system: plain\nuser: part one, part two\nassistant: \
              [{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"t1\",\"type\":\"function\"}]"
         );
+    }
+
+    #[test]
+    fn tool_calls_with_content_include_separator() {
+        let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "messages": [{
+                "role": "assistant",
+                "content": "thinking",
+                "tool_calls": [{"id": "t1", "type": "function", "function": {"name": "f", "arguments": "{}"}}]
+            }]
+        }))
+        .unwrap();
+        let text = prompt_text(&req.messages, None);
+        assert!(text.contains("assistant: thinking\n["), "got: {text}");
     }
 
     #[test]
