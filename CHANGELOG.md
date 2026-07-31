@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.1](https://github.com/doublewordai/inference-lab/compare/inference-lab-v0.8.0...inference-lab-v0.8.1) (2026-07-31)
+
+
+### Bug Fixes
+
+* count tool definitions and tool_calls in serve prompt_tokens ([#64](https://github.com/doublewordai/inference-lab/issues/64)) ([aaa8ce9](https://github.com/doublewordai/inference-lab/commit/aaa8ce90fd7e1180f6acf225729fa32dd17a1072))
+
 ## [0.8.0](https://github.com/doublewordai/inference-lab/compare/inference-lab-v0.7.1...inference-lab-v0.8.0) (2026-07-28)
 
 
