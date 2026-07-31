@@ -55,7 +55,7 @@ pub async fn chat_completions(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    let prompt_tokens = count_prompt_tokens(&state, &req.messages);
+    let prompt_tokens = count_prompt_tokens(&state, &req.messages, req.tools.as_ref());
     let include_usage = req
         .stream_options
         .as_ref()
@@ -570,8 +570,12 @@ async fn submit_engine_request(
     Ok((request_id, rx))
 }
 
-fn count_prompt_tokens(state: &AppState, messages: &[ChatMessage]) -> u32 {
-    let text = messages_to_prompt_text(messages);
+fn count_prompt_tokens(
+    state: &AppState,
+    messages: &[ChatMessage],
+    tools: Option<&serde_json::Value>,
+) -> u32 {
+    let text = prompt_text(messages, tools);
     count_text_prompt_tokens(state, &text)
 }
 
@@ -586,16 +590,26 @@ fn count_text_prompt_tokens(state: &AppState, prompt: &str) -> u32 {
     }
 }
 
-fn messages_to_prompt_text(messages: &[ChatMessage]) -> String {
-    messages
-        .iter()
-        .map(|m| {
-            // Null/omitted content (assistant tool-call turns) contributes an empty body.
-            let content = m.content.as_ref().map(|c| c.text()).unwrap_or_default();
-            format!("{}: {}", m.role, content)
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+/// The text whose token count stands in for the engine's prompt_tokens. Real chat
+/// templates render tool DEFINITIONS and assistant tool CALLS into the prompt, so both
+/// count — as their JSON serialization, which is also what prefix-metering gateways
+/// (dwctl's cache classifier) tokenize. Leaving them out made the fake's count fall
+/// BELOW such gateways' on tool-heavy bodies, tripping their split-vs-prompt guards
+/// (the 2026-07-30 cache-parity tool_exchange failures).
+fn prompt_text(messages: &[ChatMessage], tools: Option<&serde_json::Value>) -> String {
+    let mut parts: Vec<String> = Vec::with_capacity(messages.len() + 1);
+    if let Some(tools) = tools {
+        parts.push(format!("tools: {}", tools));
+    }
+    for m in messages {
+        // Null/omitted content (assistant tool-call turns) contributes an empty body.
+        let content = m.content.as_ref().map(|c| c.text()).unwrap_or_default();
+        match &m.tool_calls {
+            Some(calls) => parts.push(format!("{}: {}{}", m.role, content, calls)),
+            None => parts.push(format!("{}: {}", m.role, content)),
+        }
+    }
+    parts.join("\n")
 }
 
 fn estimate_tokens_from_chars(text: &str) -> u32 {
@@ -666,8 +680,36 @@ mod tests {
         }))
         .expect("string, array, and null content all deserialize");
 
-        let text = messages_to_prompt_text(&req.messages);
-        assert_eq!(text, "system: plain\nuser: part one, part two\nassistant: ");
+        let text = prompt_text(&req.messages, None);
+        // The assistant tool-call turn contributes its JSON serialization: real chat
+        // templates render tool calls into the prompt, and prefix-metering gateways
+        // (dwctl's cache classifier) tokenize the same JSON — leaving it out made the
+        // fake's prompt_tokens undercount tool-heavy bodies.
+        assert_eq!(
+            text,
+            "system: plain\nuser: part one, part two\nassistant: \
+             [{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"t1\",\"type\":\"function\"}]"
+        );
+    }
+
+    #[test]
+    fn tools_definitions_count_toward_prompt_text() {
+        let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "tools": [{"type": "function", "function": {"name": "f", "parameters": {}}}],
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        let text = prompt_text(&req.messages, req.tools.as_ref());
+        assert!(
+            text.starts_with("tools: "),
+            "tool definitions lead the counted prompt"
+        );
+        assert!(
+            text.contains("\"name\":\"f\""),
+            "definition JSON is included"
+        );
+        assert!(text.ends_with("user: hi"));
     }
 
     #[test]
@@ -678,6 +720,7 @@ mod tests {
         let plain = vec![ChatMessage {
             role: "user".to_string(),
             content: Some(MessageContent::Text("hello world".to_string())),
+            tool_calls: None,
         }];
         let array: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
             "model": "m",
@@ -686,8 +729,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            messages_to_prompt_text(&plain),
-            messages_to_prompt_text(&array.messages)
+            prompt_text(&plain, None),
+            prompt_text(&array.messages, None)
         );
     }
 
@@ -973,10 +1016,12 @@ mod tests {
                 messages: vec![ChatMessage {
                     role: "user".to_string(),
                     content: Some(MessageContent::Text("hello world".to_string())),
+                    tool_calls: None,
                 }],
                 stream: false,
                 max_tokens: 4,
                 stream_options: None,
+                tools: None,
             }),
         )
         .await
@@ -1079,12 +1124,14 @@ mod tests {
                 messages: vec![ChatMessage {
                     role: "user".to_string(),
                     content: Some(MessageContent::Text("hello world".to_string())),
+                    tool_calls: None,
                 }],
                 stream: true,
                 max_tokens: 4,
                 stream_options: Some(StreamOptions {
                     include_usage: true,
                 }),
+                tools: None,
             }),
         )
         .await
@@ -1223,10 +1270,12 @@ mod tests {
                 messages: vec![ChatMessage {
                     role: "user".to_string(),
                     content: Some(MessageContent::Text("hello world".to_string())),
+                    tool_calls: None,
                 }],
                 stream: true,
                 max_tokens: 4,
                 stream_options: None,
+                tools: None,
             }),
         )
         .await
@@ -1271,12 +1320,14 @@ mod tests {
                 messages: vec![ChatMessage {
                     role: "user".to_string(),
                     content: Some(MessageContent::Text("hello world".to_string())),
+                    tool_calls: None,
                 }],
                 stream: true,
                 max_tokens: 4,
                 stream_options: Some(StreamOptions {
                     include_usage: false,
                 }),
+                tools: None,
             }),
         )
         .await
