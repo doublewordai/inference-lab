@@ -570,13 +570,30 @@ async fn submit_engine_request(
     Ok((request_id, rx))
 }
 
+/// Simulated chat-template overhead applied to the reported chat prompt count (percent).
+///
+/// Real engines report `prompt_tokens` from their chat-template RENDERING, which adds
+/// role headers and section scaffolding on top of the raw content — a few percent on
+/// typical prompts. This fake counts raw content, so a template-exact meter upstream
+/// (dwctl's render-counting cache classifier) legitimately counts a fully-marked
+/// prefix ABOVE our reported prompt and trips its creations-vs-prompt corrupt guard.
+/// Inflating the reported prompt by a bounded margin keeps that guard armed but not
+/// hair-triggered: template counts within +5% of raw pass; anything drifting further
+/// still zeroes the split and turns the cache-parity board red. Deliberately NOT
+/// sourced from tokenizer-svc — the fake must remain an independent count or the
+/// comparison stops testing anything. Floor arithmetic, so tiny prompts (< 20 tokens)
+/// round to no overhead. Applies to chat completions only; raw /v1/completions
+/// prompts are not chat-templated by real engines either.
+const PROMPT_TEMPLATE_OVERHEAD_PCT: u64 = 5;
+
 fn count_prompt_tokens(
     state: &AppState,
     messages: &[ChatMessage],
     tools: Option<&serde_json::Value>,
 ) -> u32 {
     let text = prompt_text(messages, tools);
-    count_text_prompt_tokens(state, &text)
+    let raw = u64::from(count_text_prompt_tokens(state, &text));
+    (raw * (100 + PROMPT_TEMPLATE_OVERHEAD_PCT) / 100) as u32
 }
 
 fn count_text_prompt_tokens(state: &AppState, prompt: &str) -> u32 {
@@ -1367,6 +1384,26 @@ mod tests {
 
         assert_eq!(final_chunk["choices"][0]["finish_reason"], "stop");
         assert!(final_chunk.get("usage").is_none());
+    }
+
+    #[test]
+    fn chat_prompt_count_includes_template_overhead() {
+        let state = Arc::new(AppState {
+            engines: HashMap::new(),
+            model_names: vec!["m".to_string()],
+            tokenizer: None,
+            enable_directives: false,
+        });
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            tool_calls: None,
+            content: Some(MessageContent::Text("x".repeat(400))),
+        }];
+        let raw = u64::from(count_text_prompt_tokens(&state, &prompt_text(&messages, None)));
+        assert!(raw >= 20, "prompt must be large enough for the floor overhead to bite");
+        let expected = (raw * (100 + PROMPT_TEMPLATE_OVERHEAD_PCT) / 100) as u32;
+        assert_eq!(count_prompt_tokens(&state, &messages, None), expected);
+        assert!(u64::from(count_prompt_tokens(&state, &messages, None)) > raw);
     }
 
     #[tokio::test]
