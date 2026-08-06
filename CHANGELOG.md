@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.2](https://github.com/doublewordai/inference-lab/compare/inference-lab-v0.8.1...inference-lab-v0.8.2) (2026-08-06)
+
+
+### Bug Fixes
+
+* report chat prompt_tokens with simulated template overhead ([#67](https://github.com/doublewordai/inference-lab/issues/67)) ([1601616](https://github.com/doublewordai/inference-lab/commit/16016168a414dfea065b569a270f24ba7bd5c102))
+
 ## [0.8.1](https://github.com/doublewordai/inference-lab/compare/inference-lab-v0.8.0...inference-lab-v0.8.1) (2026-07-31)
 
 
