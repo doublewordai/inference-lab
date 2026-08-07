@@ -1,0 +1,93 @@
+# === Estate serving config: Qwen/Qwen3.5-122B-A10B-FP8 on 2x B200 (tp=2) ===
+# Hardware: B200 (dense datasheet: fp4 9.0e15 / fp8 4.5e15 / bf16 2.25e15 FLOP/s, 7.7e12 B/s, 180 GB).
+# Scheduler: deadline-priority admission as the estate dispatches.
+# The [workload] block is required by the config loader but unused by
+# estate-lab (arrivals come from the replayed trace).
+#
+# Qwen/Qwen3.5-122B-A10B-FP8 — hybrid MoE (GatedDeltaNet linear + GQA full attention),
+# same family as the Qwen3.6-35B template (configs/qwen3.6-35b-a3b-gh200.toml).
+# From HF Qwen/Qwen3.5-122B-A10B-FP8 config.json (text_config):
+#   48 layers, full_attention_interval 4 -> 12 full-attn + 36 GatedDeltaNet
+#   linear; hidden 3072; full attn: 32 q / 2 kv heads, head_dim 256; linear:
+#   16 key / 64 value heads, key/value head_dim 128, conv kernel 4; MoE every
+#   layer: 256 routed + 1 shared expert, 8 per token, moe_intermediate
+#   1024 (shared_expert_intermediate 1024); vocab 248320; 1 MTP layer
+#   (not modeled); FP8 quantization; max_pos 262144.
+#
+# Param split (computed, template arithmetic):
+#   per expert = 3*3072*1024 = 9_437_184
+#   active expert  = (8 routed + 1 shared) * per * 48 = 4_076_863_488
+#   resident expert= (256 + 1 shared)      * per * 48 = 116_417_101_824
+#   full-attn layer (q+o 32x256, k+v 2x256) = 3072*17408 = 53_477_376
+#   linear layer (qkvz + out; 2*Hk*dk + 3*Hv*dv) = 3072*28672 = 88_080_384
+#   router = 37_748_736; lm_head = 248320*3072 = 762_839_040
+#   active non-exp = 12*attn + 36*linear + router + lm_head = 4_613_210_112
+#   resident non-exp (+embedding) = 5_376_049_152
+#   Sanity: fp8 residency ~= 121_793_150_976 B vs checkpoint 127_152_313_312 B.
+
+[hardware]
+name = "B200"
+flops_fp4 = 9.0e15
+flops_fp8 = 4.5e15
+flops_bf16 = 2.25e15
+flops_fp16 = 2.25e15
+memory_bandwidth = 7.7e12
+memory_capacity = 193273528320   # 180 GB
+kv_cache_capacity = 0            # auto: mem * util - weights
+gpu_memory_utilization = 0.9
+
+[parallel]
+tp = 2
+ep = 1
+
+[model]
+type = "qwen35"
+name = "Qwen3.5-122B-A10B-FP8"
+num_layers = 48
+hidden_dim = 3072
+max_seq_len = 262144
+
+num_attention_layers = 12
+num_attention_heads = 32
+num_kv_heads = 2
+attn_head_dim = 256
+
+linear_num_value_heads = 64
+linear_num_key_heads = 16
+linear_key_head_dim = 128
+linear_value_head_dim = 128
+linear_conv_kernel = 4
+
+num_active_expert_params = 4076863488
+num_active_non_expert_params = 4613210112
+num_resident_expert_params = 116417101824
+num_resident_non_expert_params = 5376049152
+
+num_experts_per_tok = 8
+num_routed_experts = 256
+num_moe_layers = 48
+
+expert_precision = "fp8"
+non_expert_precision = "fp8"
+kv_precision = "bf16"
+
+[scheduler]
+max_num_batched_tokens = 16384
+max_num_seqs = 256
+policy = "priority"
+enable_chunked_prefill = true
+block_size = 64
+
+[workload]
+arrival_pattern = "closed_loop"
+num_concurrent_users = 1
+num_requests = 1
+seed = 1
+
+[workload.input_len_dist]
+type = "fixed"
+value = 1024
+
+[workload.output_len_dist]
+type = "fixed"
+value = 256

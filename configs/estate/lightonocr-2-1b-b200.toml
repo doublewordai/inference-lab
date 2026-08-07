@@ -1,0 +1,86 @@
+# === Estate serving config: lightonai/LightOnOCR-2-1B-bbox-soup on 1x B200 (tp=1) ===
+# Hardware: B200 (dense datasheet: fp4 9.0e15 / fp8 4.5e15 / bf16 2.25e15 FLOP/s, 7.7e12 B/s, 180 GB).
+# Scheduler: deadline-priority admission as the estate dispatches.
+# The [workload] block is required by the config loader but unused by
+# estate-lab (arrivals come from the replayed trace).
+#
+# lightonai/LightOnOCR-2-1B-bbox-soup — Qwen3-1B-class dense GQA text stack
+# with a Pixtral vision encoder. From HF config.json (text_config, model_type
+# qwen3): 28 layers, hidden 1024, 16 heads x head_dim 128, 8 KV heads, full
+# attention, MLP inter 3072, vocab 151936 (tied embeddings), max_pos 16384,
+# bf16. `qwen35` with zero experts / all layers attention.
+#
+# Param split (all non-expert; computed):
+#   attn/layer (q 16x128 + k,v 8x128 + o) = 1024*6144 = 6_291_456
+#   MLP/layer = 3*1024*3072 = 9_437_184
+#   lm_head (tied) = 151936*1024 = 155_582_464
+#   active = 28*(attn+mlp) + lm_head = 595_984_384
+#   resident = active + ~0.4e9 vision tower (Pixtral 24 x hidden 1024)
+#            = 995_984_384 (embeddings tied -> single copy)
+
+[hardware]
+name = "B200"
+flops_fp4 = 9.0e15
+flops_fp8 = 4.5e15
+flops_bf16 = 2.25e15
+flops_fp16 = 2.25e15
+memory_bandwidth = 7.7e12
+memory_capacity = 193273528320   # 180 GB
+kv_cache_capacity = 0            # auto: mem * util - weights
+gpu_memory_utilization = 0.9
+
+[parallel]
+tp = 1
+ep = 1
+
+[model]
+type = "qwen35"
+name = "LightOnOCR-2-1B-bbox-soup"
+num_layers = 28
+hidden_dim = 1024
+max_seq_len = 16384
+
+num_attention_layers = 28
+num_attention_heads = 16
+num_kv_heads = 8
+attn_head_dim = 128
+
+linear_num_value_heads = 0
+linear_num_key_heads = 0
+linear_key_head_dim = 0
+linear_value_head_dim = 0
+linear_conv_kernel = 0
+
+num_active_expert_params = 0
+num_active_non_expert_params = 595984384
+num_resident_expert_params = 0
+num_resident_non_expert_params = 995984384
+
+num_experts_per_tok = 0
+num_routed_experts = 0
+num_moe_layers = 0
+
+expert_precision = "bf16"
+non_expert_precision = "bf16"
+kv_precision = "bf16"
+
+[scheduler]
+max_num_batched_tokens = 16384
+max_num_seqs = 256
+policy = "priority"
+enable_chunked_prefill = true
+block_size = 64
+
+[workload]
+arrival_pattern = "closed_loop"
+num_concurrent_users = 1
+num_requests = 1
+seed = 1
+
+[workload.input_len_dist]
+type = "fixed"
+value = 1024
+
+[workload.output_len_dist]
+type = "fixed"
+value = 256

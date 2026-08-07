@@ -1,0 +1,89 @@
+# === Estate serving config: Qwen/Qwen3.5-27B-FP8 on 1x GH200 (tp=1) ===
+# Hardware: GH200-120 (fp8/fp4 1.979e15, bf16 0.989e15 FLOP/s, 4.0e12 B/s, 96 GB usable).
+# Scheduler: deadline-priority admission as the estate dispatches.
+# The [workload] block is required by the config loader but unused by
+# estate-lab (arrivals come from the replayed trace).
+#
+# Qwen/Qwen3.5-27B-FP8 — DENSE hybrid (GatedDeltaNet linear + GQA full attention,
+# no MoE; model_type qwen3_5). From HF Qwen/Qwen3.5-27B-FP8 config.json (text_config):
+#   64 layers, full_attention_interval 4 -> 16 full-attn + 48 linear;
+#   hidden 5120; full attn: 24 q / 4 kv heads, head_dim 256; linear:
+#   16 key / 48 value heads x 128, conv 4; dense MLP inter 17408 every
+#   layer; vocab 248320 (untied); 1 MTP layer (not modeled); max_pos 262144.
+# `qwen35` with zero experts (dense MLP counted in the non-expert stream).
+#
+# Param split (all non-expert; computed):
+#   full-attn layer = 5120*14336 = 73_400_320
+#   linear layer = 5120*22528 = 115_343_360
+#   MLP/layer = 3*5120*17408 = 267_386_880
+#   lm_head = 248320*5120 = 1_271_398_400
+#   active = 16*attn + 48*linear + 64*mlp + lm_head = 25_095_045_120
+#   resident = 26_366_443_520 (untied embeddings)
+#   Sanity vs checkpoint: 30_866_680_160 B at fp8.
+
+[hardware]
+name = "GH200-120"
+flops_fp4 = 1.979e15
+flops_fp8 = 1.979e15
+flops_bf16 = 0.989e15
+flops_fp16 = 0.989e15
+memory_bandwidth = 4.0e12
+memory_capacity = 102642221056   # 96 GB usable of 120
+kv_cache_capacity = 0            # auto: mem * util - weights
+gpu_memory_utilization = 0.9
+
+[parallel]
+tp = 1
+ep = 1
+
+[model]
+type = "qwen35"
+name = "Qwen3.5-27B-FP8"
+num_layers = 64
+hidden_dim = 5120
+max_seq_len = 262144
+
+num_attention_layers = 16
+num_attention_heads = 24
+num_kv_heads = 4
+attn_head_dim = 256
+
+linear_num_value_heads = 48
+linear_num_key_heads = 16
+linear_key_head_dim = 128
+linear_value_head_dim = 128
+linear_conv_kernel = 4
+
+num_active_expert_params = 0
+num_active_non_expert_params = 25095045120
+num_resident_expert_params = 0
+num_resident_non_expert_params = 26366443520
+
+num_experts_per_tok = 0
+num_routed_experts = 0
+num_moe_layers = 0
+
+expert_precision = "fp8"
+non_expert_precision = "fp8"
+kv_precision = "bf16"
+
+[scheduler]
+max_num_batched_tokens = 16384
+max_num_seqs = 256
+policy = "priority"
+enable_chunked_prefill = true
+block_size = 64
+
+[workload]
+arrival_pattern = "closed_loop"
+num_concurrent_users = 1
+num_requests = 1
+seed = 1
+
+[workload.input_len_dist]
+type = "fixed"
+value = 1024
+
+[workload.output_len_dist]
+type = "fixed"
+value = 256

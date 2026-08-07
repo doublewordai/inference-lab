@@ -1,0 +1,112 @@
+# === Estate serving config: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 on 1x B300 (tp=1) ===
+# Hardware: B300 (dense datasheet: fp4 13.5e15 / fp8 4.5e15 / bf16 2.25e15 FLOP/s, 8.0e12 B/s, 288 GB).
+# Scheduler: deadline-priority admission as the estate dispatches.
+# The [workload] block is required by the config loader but unused by
+# estate-lab (arrivals come from the replayed trace).
+#
+# nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 — NemotronH hybrid: Mamba2 + attention +
+# latent-MoE FFN layers. From HF config.json (model_type nemotron_h):
+#   88 layers total: 40 mamba (M) + 8 attention (*) + 40 MoE-FFN (E);
+#   hidden 4096; attention 32 heads x 128, 2 KV heads; mamba: 128 heads x 64
+#   (d_inner 8192), ssm_state 128, 8 groups, conv 4, fp32 ssm cache;
+#   MoE (latent): experts act on moe_latent_size 1024 with inter 2688,
+#   relu^2 (non-gated, 2 matrices/expert), 512 routed + 1 shared (inter
+#   5376), 22 per token; vocab 131072; 1 MTP layer (not modeled);
+#   NVFP4 expert weights, bf16 elsewhere; max_pos 262144.
+#
+# qwen35 mapping:
+#   - num_layers is set to 48 = attention + mamba layers ONLY. The 40
+#     E-layers have no token mixing (no KV, no state) — their FFN params are
+#     carried in the expert/non-expert buckets, which don't depend on
+#     num_layers. num_moe_layers = 40 is bookkeeping (EP=1 here).
+#   - 8 attention layers exact: H=32 x 128, kv_heads 2.
+#   - 40 mamba layers as linear layers. Real state/layer = d_inner x
+#     state x fp32 = 8192*128*4 B + conv 40960*4 B; the model
+#     prices GDN state at bf16, so head counts are DOUBLED to keep bytes
+#     right: value_heads=256 x dk 128 x dv 64 = 2_097_152 elems x 2 B
+#     = 4_194_304 B (== fp32 truth), key_heads=16 makes the conv term
+#     match (81920*2 B).
+#
+# Param split (computed; shared expert kept in the fp4 expert bucket —
+# NVFP4 checkpoints quantize it too):
+#   per routed expert (2 matrices, latent 1024 x inter 2688) = 5_505_024
+#   shared expert total = 40*2*1024*5376 = 440_401_920
+#   active expert  = 22*per*40 + shared = 5_284_823_040
+#   resident expert= 512*per*40 + shared = 113_183_293_440
+#   mamba layer (in_proj 4096x18560 + out 8192x4096) = 109_576_192
+#   attn layer = 35_651_584; latent up/down proj = 335_544_320
+#   router = 83_886_080; lm_head = 536_870_912
+#   active non-exp = 5_624_561_664; resident non-exp = 6_161_432_576
+#   Sanity: fp4+bf16 residency ~= 68_914_511_872 B vs
+#   checkpoint 80_297_329_824 B (gap = NVFP4 scales + MTP).
+
+[hardware]
+name = "B300"
+flops_fp4 = 13.5e15
+flops_fp8 = 4.5e15
+flops_bf16 = 2.25e15
+flops_fp16 = 2.25e15
+memory_bandwidth = 8.0e12
+memory_capacity = 309237645312   # 288 GB
+kv_cache_capacity = 0            # auto: mem * util - weights
+gpu_memory_utilization = 0.9
+
+[parallel]
+tp = 1
+ep = 1
+
+[model]
+type = "qwen35"
+name = "NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
+# Attention + mamba layers only; the MoE-FFN-only layers carry no KV/state
+# (see header).
+num_layers = 48
+hidden_dim = 4096
+max_seq_len = 262144
+
+num_attention_layers = 8
+num_attention_heads = 32
+num_kv_heads = 2
+attn_head_dim = 128
+
+# Mamba2 layers as linear-state layers; heads doubled to price the fp32 ssm
+# state at the model's bf16 rate (see header).
+linear_num_value_heads = 256
+linear_num_key_heads = 16
+linear_key_head_dim = 128
+linear_value_head_dim = 64
+linear_conv_kernel = 4
+
+num_active_expert_params = 5284823040
+num_active_non_expert_params = 5624561664
+num_resident_expert_params = 113183293440
+num_resident_non_expert_params = 6161432576
+
+num_experts_per_tok = 22
+num_routed_experts = 512
+num_moe_layers = 40
+
+expert_precision = "fp4"
+non_expert_precision = "bf16"
+kv_precision = "bf16"
+
+[scheduler]
+max_num_batched_tokens = 16384
+max_num_seqs = 256
+policy = "priority"
+enable_chunked_prefill = true
+block_size = 64
+
+[workload]
+arrival_pattern = "closed_loop"
+num_concurrent_users = 1
+num_requests = 1
+seed = 1
+
+[workload.input_len_dist]
+type = "fixed"
+value = 1024
+
+[workload.output_len_dist]
+type = "fixed"
+value = 256

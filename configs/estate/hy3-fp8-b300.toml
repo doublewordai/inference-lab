@@ -1,0 +1,91 @@
+# === Estate serving config: tencent/Hy3-FP8 on 2x B300 (tp=2) ===
+# Hardware: B300 (dense datasheet: fp4 13.5e15 / fp8 4.5e15 / bf16 2.25e15 FLOP/s, 8.0e12 B/s, 288 GB).
+# Scheduler: deadline-priority admission as the estate dispatches.
+# The [workload] block is required by the config loader but unused by
+# estate-lab (arrivals come from the replayed trace).
+#
+# tencent/Hy3-FP8 — plain GQA MoE (model_type hy_v3). From HF
+# tencent/Hy3-FP8 config.json:
+#   80 layers, hidden 4096, 64 heads x head_dim 128, 8 KV heads, full
+#   attention; first layer dense (inter 13312), 79 MoE layers: 192 routed +
+#   1 shared expert, 8 per token, moe/expert inter 1536; vocab 120832;
+#   1 MTP layer (not modeled); FP8; max_pos 262144.
+# `qwen35` with num_attention_layers = num_layers (degenerates to plain
+# GQA + coupon-collector MoE; knee at E/k = 24).
+#
+# Param split (computed; shared expert in the fp8 expert bucket):
+#   per expert = 3*4096*1536 = 18_874_368
+#   active expert  = (8+1 shared) * per * 79 = 13_419_675_648
+#   resident expert= (192+1)      * per * 79 = 287_777_488_896
+#   attn/layer (q+o 64x128, k+v 8x128) = 4096*18432 = 75_497_472; x80 = 6_039_797_760
+#   dense FFN = 163_577_856; router = 62_128_128; lm_head = 494_927_872
+#   active non-exp = 6_760_431_616; resident non-exp (+embed) = 7_255_359_488
+#   Sanity: fp8 residency = 295_032_848_384 B vs checkpoint
+#   299_889_838_946 B (safetensors sum).
+
+[hardware]
+name = "B300"
+flops_fp4 = 13.5e15
+flops_fp8 = 4.5e15
+flops_bf16 = 2.25e15
+flops_fp16 = 2.25e15
+memory_bandwidth = 8.0e12
+memory_capacity = 309237645312   # 288 GB
+kv_cache_capacity = 0            # auto: mem * util - weights
+gpu_memory_utilization = 0.9
+
+[parallel]
+tp = 2
+ep = 1
+
+[model]
+type = "qwen35"
+name = "Hy3-FP8"
+num_layers = 80
+hidden_dim = 4096
+max_seq_len = 262144
+
+num_attention_layers = 80
+num_attention_heads = 64
+num_kv_heads = 8
+attn_head_dim = 128
+
+linear_num_value_heads = 0
+linear_num_key_heads = 0
+linear_key_head_dim = 0
+linear_value_head_dim = 0
+linear_conv_kernel = 0
+
+num_active_expert_params = 13419675648
+num_active_non_expert_params = 6760431616
+num_resident_expert_params = 287777488896
+num_resident_non_expert_params = 7255359488
+
+num_experts_per_tok = 8
+num_routed_experts = 192
+num_moe_layers = 79
+
+expert_precision = "fp8"
+non_expert_precision = "fp8"
+kv_precision = "bf16"
+
+[scheduler]
+max_num_batched_tokens = 16384
+max_num_seqs = 256
+policy = "priority"
+enable_chunked_prefill = true
+block_size = 64
+
+[workload]
+arrival_pattern = "closed_loop"
+num_concurrent_users = 1
+num_requests = 1
+seed = 1
+
+[workload.input_len_dist]
+type = "fixed"
+value = 1024
+
+[workload.output_len_dist]
+type = "fixed"
+value = 256
