@@ -1,0 +1,85 @@
+# Qwen3.6-35B-A3B-FP8 on one B200 (tp=1) — estate serving config.
+#
+# Model arithmetic is identical to configs/qwen3.6-35b-a3b-gh200.toml (HF
+# Qwen/Qwen3.6-35B-A3B config.json: 40 layers = 10 GQA full-attn + 30
+# GatedDeltaNet linear, 256-expert MoE with 8 routed + 1 shared, hidden 2048;
+# param split computed there). Differences here: the production deployment is
+# the FP8 quantization (expert + non-expert weights fp8, KV bf16), the
+# hardware is B200, and the scheduler runs deadline-priority admission the way
+# the estate dispatches (production injects deadline priorities into the
+# engines via inject_deadline_priority).
+#
+# B200 hardware (dense, not sparse, per-GPU; first-principles datasheet
+# numbers, deviations from achieved rates are findings):
+#   FP4  9.0e15 FLOP/s dense      FP8  4.5e15      BF16  2.25e15
+#   HBM3e 7.7e12 B/s, 180 GB capacity.
+#
+# The [workload] block is required by the config loader but unused by
+# estate-lab (arrivals come from the replayed trace).
+
+[hardware]
+name = "B200"
+flops_fp4 = 9.0e15
+flops_fp8 = 4.5e15
+flops_bf16 = 2.25e15
+flops_fp16 = 2.25e15
+memory_bandwidth = 7.7e12
+memory_capacity = 193273528320   # 180 GB
+kv_cache_capacity = 0            # auto: mem * util - weights
+gpu_memory_utilization = 0.9
+
+[parallel]
+tp = 1
+ep = 1
+
+[model]
+type = "qwen35"
+name = "Qwen3.6-35B-A3B-FP8"
+num_layers = 40
+hidden_dim = 2048
+max_seq_len = 262144
+
+num_attention_layers = 10
+num_attention_heads = 16
+num_kv_heads = 2
+attn_head_dim = 256
+
+linear_num_value_heads = 32
+linear_num_key_heads = 16
+linear_key_head_dim = 128
+linear_value_head_dim = 128
+linear_conv_kernel = 4
+
+num_active_expert_params = 1132462080
+num_active_non_expert_params = 1725693952
+num_resident_expert_params = 32338083840
+num_resident_non_expert_params = 2234253312
+
+num_experts_per_tok = 8
+num_routed_experts = 256
+num_moe_layers = 40
+
+expert_precision = "fp8"
+non_expert_precision = "fp8"
+kv_precision = "bf16"
+
+[scheduler]
+max_num_batched_tokens = 16384
+max_num_seqs = 256
+policy = "priority"
+enable_chunked_prefill = true
+block_size = 64
+
+[workload]
+arrival_pattern = "closed_loop"
+num_concurrent_users = 1
+num_requests = 1
+seed = 1
+
+[workload.input_len_dist]
+type = "fixed"
+value = 1024
+
+[workload.output_len_dist]
+type = "fixed"
+value = 256
