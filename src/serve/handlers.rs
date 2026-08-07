@@ -1,10 +1,11 @@
 use axum::{
     extract::State,
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{
         sse::{Event, Sse},
         IntoResponse, Json,
     },
+    Extension,
 };
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -13,6 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
+use super::fault;
 use super::types::*;
 
 pub struct AppState {
@@ -22,6 +24,10 @@ pub struct AppState {
     /// Honor echo-directives (serve::directive). Explicitly opt-in: a scripted-response
     /// bypass reachable by untrusted clients would be a response-spoofing vector.
     pub enable_directives: bool,
+    /// Static per-model fault injection (serve::fault), keyed by model name. The
+    /// fallback trigger for clients that can't set the fault header; validated at
+    /// server startup.
+    pub model_faults: HashMap<String, fault::FaultSpec>,
 }
 
 pub async fn health() -> Json<serde_json::Value> {
@@ -53,6 +59,8 @@ pub async fn list_models(State(state): State<Arc<AppState>>) -> Json<ModelList> 
 
 pub async fn chat_completions(
     State(state): State<Arc<AppState>>,
+    connection: Option<Extension<Arc<fault::FaultConnection>>>,
+    headers: HeaderMap,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let prompt_tokens = count_prompt_tokens(&state, &req.messages, req.tools.as_ref());
@@ -61,6 +69,28 @@ pub async fn chat_completions(
         .as_ref()
         .map(|options| options.include_usage)
         .unwrap_or(false);
+
+    // Fault injection (serve::fault): per-request header first, per-model static config
+    // as the fallback. Takes precedence over echo-directives — a faulting stream is
+    // about wire behavior, not content. With neither trigger present this block is
+    // inert and the request takes the unchanged normal path.
+    if let Some(spec) = resolve_fault(&state, &headers, &req)? {
+        // The model must still exist so an unknown-model request fails identically to
+        // the normal path (directive-mode precedent).
+        if !state.engines.contains_key(&req.model) {
+            return Err(model_not_found(&state, &req.model));
+        }
+        return Ok(fault::fault_response(
+            spec,
+            fault::StreamParams {
+                id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
+                model: req.model.clone(),
+                prompt_tokens,
+                include_usage,
+            },
+            connection.map(|Extension(conn)| conn),
+        ));
+    }
 
     // Echo-directive mode (see serve::directive): a scripted response bypasses the engine —
     // deterministic content/tool_calls, immediate return. The model must still exist so an
@@ -262,8 +292,16 @@ pub async fn chat_completions(
 
 pub async fn completions(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(req): Json<CompletionRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    // Fault injection is chat-completions-only; rejecting the header here beats
+    // silently streaming a healthy completion under an e2e test that asked for a death.
+    if headers.contains_key(fault::FAULT_HEADER) {
+        return Err(fault::invalid_fault(
+            "fault injection is only supported on /v1/chat/completions",
+        ));
+    }
     let prompt_tokens = count_text_prompt_tokens(&state, &req.prompt);
     let include_usage = req
         .stream_options
@@ -397,6 +435,36 @@ pub async fn completions(
 
         Ok(Json(response).into_response())
     }
+}
+
+/// The fault directive for this request, if any. Header wins over static model config;
+/// a malformed header is a 400 (never a silent no-op — a typo'd e2e test must fail
+/// loudly). Fault modes are mid-STREAM deaths: an explicit header on a non-streaming
+/// request is rejected, while static model config simply doesn't apply there (a fault
+/// model must still serve normal non-streaming traffic).
+fn resolve_fault(
+    state: &AppState,
+    headers: &HeaderMap,
+    req: &ChatCompletionRequest,
+) -> Result<Option<fault::FaultSpec>, (StatusCode, Json<serde_json::Value>)> {
+    if let Some(value) = headers.get(fault::FAULT_HEADER) {
+        let spec = value
+            .to_str()
+            .map_err(|_| "header value must be visible ASCII".to_string())
+            .and_then(fault::FaultSpec::parse_header)
+            .map_err(|e| fault::invalid_fault(&e))?;
+        if !req.stream {
+            return Err(fault::invalid_fault(
+                "fault modes are mid-stream deaths; set \"stream\": true",
+            ));
+        }
+        return Ok(Some(spec));
+    }
+    Ok(state
+        .model_faults
+        .get(&req.model)
+        .filter(|_| req.stream)
+        .cloned())
 }
 
 fn model_not_found(state: &AppState, model: &str) -> (StatusCode, Json<serde_json::Value>) {
@@ -654,6 +722,7 @@ mod tests {
             model_names: vec!["test-model".to_string()],
             tokenizer: None,
             enable_directives: true,
+            model_faults: HashMap::new(),
         })
     }
 
@@ -663,6 +732,7 @@ mod tests {
             model_names: vec!["test-model".to_string()],
             tokenizer: None,
             enable_directives: false,
+            model_faults: HashMap::new(),
         })
     }
 
@@ -786,7 +856,7 @@ mod tests {
             ]
         }))
         .unwrap();
-        let response = chat_completions(State(state), Json(req))
+        let response = chat_completions(State(state), None, HeaderMap::new(), Json(req))
             .await
             .unwrap()
             .into_response();
@@ -828,7 +898,7 @@ mod tests {
             ]
         }))
         .unwrap();
-        let response = chat_completions(State(state), Json(req))
+        let response = chat_completions(State(state), None, HeaderMap::new(), Json(req))
             .await
             .unwrap()
             .into_response();
@@ -853,7 +923,7 @@ mod tests {
             ]
         }))
         .unwrap();
-        let response = chat_completions(State(state), Json(req))
+        let response = chat_completions(State(state), None, HeaderMap::new(), Json(req))
             .await
             .unwrap()
             .into_response();
@@ -889,7 +959,7 @@ mod tests {
             "messages": [{"role": "user", "content": "<<respond:{\"text\":\"hi\"}>>"}]
         }))
         .unwrap();
-        let response = chat_completions(State(state), Json(req))
+        let response = chat_completions(State(state), None, HeaderMap::new(), Json(req))
             .await
             .unwrap()
             .into_response();
@@ -932,7 +1002,7 @@ mod tests {
             "messages": [{"role": "user", "content": "<<respond:{\"text\":\"spoof\"}>>"}]
         }))
         .unwrap();
-        let response = chat_completions(State(state), Json(req))
+        let response = chat_completions(State(state), None, HeaderMap::new(), Json(req))
             .await
             .unwrap()
             .into_response();
@@ -951,7 +1021,7 @@ mod tests {
             "messages": [{"role": "user", "content": "<<respond:{\"text\":\"x\"}>>"}]
         }))
         .unwrap();
-        let err = chat_completions(State(state), Json(req))
+        let err = chat_completions(State(state), None, HeaderMap::new(), Json(req))
             .await
             .err()
             .unwrap();
@@ -993,6 +1063,7 @@ mod tests {
 
         let response = completions(
             State(state),
+            HeaderMap::new(),
             Json(CompletionRequest {
                 model: "test-model".to_string(),
                 prompt: "hello world".to_string(),
@@ -1049,6 +1120,8 @@ mod tests {
 
         let response = chat_completions(
             State(state),
+            None,
+            HeaderMap::new(),
             Json(ChatCompletionRequest {
                 model: "test-model".to_string(),
                 messages: vec![ChatMessage {
@@ -1101,6 +1174,7 @@ mod tests {
 
         let response = completions(
             State(state),
+            HeaderMap::new(),
             Json(CompletionRequest {
                 model: "test-model".to_string(),
                 prompt: "hello world".to_string(),
@@ -1157,6 +1231,8 @@ mod tests {
 
         let response = chat_completions(
             State(state),
+            None,
+            HeaderMap::new(),
             Json(ChatCompletionRequest {
                 model: "test-model".to_string(),
                 messages: vec![ChatMessage {
@@ -1211,6 +1287,7 @@ mod tests {
 
         let response = completions(
             State(state),
+            HeaderMap::new(),
             Json(CompletionRequest {
                 model: "test-model".to_string(),
                 prompt: "hello world".to_string(),
@@ -1256,6 +1333,7 @@ mod tests {
 
         let response = completions(
             State(state),
+            HeaderMap::new(),
             Json(CompletionRequest {
                 model: "test-model".to_string(),
                 prompt: "hello world".to_string(),
@@ -1303,6 +1381,8 @@ mod tests {
 
         let response = chat_completions(
             State(state),
+            None,
+            HeaderMap::new(),
             Json(ChatCompletionRequest {
                 model: "test-model".to_string(),
                 messages: vec![ChatMessage {
@@ -1353,6 +1433,8 @@ mod tests {
 
         let response = chat_completions(
             State(state),
+            None,
+            HeaderMap::new(),
             Json(ChatCompletionRequest {
                 model: "test-model".to_string(),
                 messages: vec![ChatMessage {
@@ -1393,14 +1475,21 @@ mod tests {
             model_names: vec!["m".to_string()],
             tokenizer: None,
             enable_directives: false,
+            model_faults: HashMap::new(),
         });
         let messages = vec![ChatMessage {
             role: "user".to_string(),
             tool_calls: None,
             content: Some(MessageContent::Text("x".repeat(400))),
         }];
-        let raw = u64::from(count_text_prompt_tokens(&state, &prompt_text(&messages, None)));
-        assert!(raw >= 20, "prompt must be large enough for the floor overhead to bite");
+        let raw = u64::from(count_text_prompt_tokens(
+            &state,
+            &prompt_text(&messages, None),
+        ));
+        assert!(
+            raw >= 20,
+            "prompt must be large enough for the floor overhead to bite"
+        );
         let expected = (raw * (100 + PROMPT_TEMPLATE_OVERHEAD_PCT) / 100) as u32;
         assert_eq!(count_prompt_tokens(&state, &messages, None), expected);
         assert!(u64::from(count_prompt_tokens(&state, &messages, None)) > raw);
@@ -1413,10 +1502,12 @@ mod tests {
             model_names: vec!["other-model".to_string()],
             tokenizer: None,
             enable_directives: false,
+            model_faults: HashMap::new(),
         });
 
         let error = match completions(
             State(state),
+            HeaderMap::new(),
             Json(CompletionRequest {
                 model: "missing-model".to_string(),
                 prompt: "hello".to_string(),
@@ -1440,6 +1531,182 @@ mod tests {
             .contains("missing-model"));
     }
 
+    fn fault_header(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(fault::FAULT_HEADER, value.parse().unwrap());
+        headers
+    }
+
+    fn chat_request(stream: bool) -> ChatCompletionRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "stream": stream,
+            "stream_options": {"include_usage": true},
+            "messages": [{"role": "user", "content": "hello world"}]
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn fault_header_on_non_streaming_request_is_400() {
+        let (engine_tx, _engine_rx) = mpsc::channel::<EngineRequest>(1);
+        let state = test_state(engine_tx);
+        let err = chat_completions(
+            State(state),
+            None,
+            fault_header("cut_between_frames"),
+            Json(chat_request(false)),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        let body = serde_json::to_value(err.1 .0).unwrap();
+        assert_eq!(body["error"]["code"], "invalid_fault_directive");
+    }
+
+    #[tokio::test]
+    async fn malformed_fault_header_is_400_not_a_silent_noop() {
+        let (engine_tx, _engine_rx) = mpsc::channel::<EngineRequest>(1);
+        let state = test_state(engine_tx);
+        let err = chat_completions(
+            State(state),
+            None,
+            fault_header("cut_betwen_frames"), // typo'd mode
+            Json(chat_request(true)),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn fault_header_with_unknown_model_is_404() {
+        let (engine_tx, _engine_rx) = mpsc::channel::<EngineRequest>(1);
+        let state = test_state(engine_tx);
+        let mut req = chat_request(true);
+        req.model = "nope".to_string();
+        let err = chat_completions(State(state), None, fault_header("no_usage"), Json(req))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn fault_header_streams_the_death_without_touching_the_engine() {
+        // Channel with NO consumer: completing at all proves the engine bypass, like the
+        // directive tests.
+        let (engine_tx, _engine_rx) = mpsc::channel::<EngineRequest>(1);
+        let state = test_state(engine_tx);
+        let response = chat_completions(
+            State(state),
+            None,
+            fault_header("no_usage;after_chunks=2;delay_ms=0"),
+            Json(chat_request(true)),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[axum::http::header::CONTENT_TYPE],
+            "text/event-stream"
+        );
+
+        let events = response_sse_events(response).await;
+        // role + 2 content + finish + [DONE]
+        assert_eq!(events.len(), 5);
+        assert_eq!(events.last().map(String::as_str), Some("[DONE]"));
+        let finish: serde_json::Value = serde_json::from_str(&events[3]).unwrap();
+        assert_eq!(finish["choices"][0]["finish_reason"], "stop");
+        // The whole point of no_usage: include_usage was requested and never honored.
+        assert!(finish.get("usage").is_none());
+    }
+
+    #[tokio::test]
+    async fn static_model_fault_applies_without_header() {
+        let (engine_tx, _engine_rx) = mpsc::channel::<EngineRequest>(1);
+        let mut state = test_state(engine_tx);
+        let spec = fault::FaultSpec::parse_header("no_done;after_chunks=1;delay_ms=0").unwrap();
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .model_faults
+            .insert("test-model".to_string(), spec);
+
+        let response = chat_completions(
+            State(state),
+            None,
+            HeaderMap::new(),
+            Json(chat_request(true)),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        let events = response_sse_events(response).await;
+        // role + 1 content + finish, and no [DONE] — the configured death.
+        assert_eq!(events.len(), 3);
+        assert!(!events.iter().any(|e| e == "[DONE]"));
+        let finish: serde_json::Value = serde_json::from_str(&events[2]).unwrap();
+        assert_eq!(finish["choices"][0]["finish_reason"], "stop");
+    }
+
+    #[tokio::test]
+    async fn fault_header_takes_precedence_over_directive() {
+        let (engine_tx, _engine_rx) = mpsc::channel::<EngineRequest>(1);
+        let state = test_state(engine_tx); // directives enabled
+        let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "stream": true,
+            "messages": [{"role": "user", "content": "<<respond:{\"text\":\"scripted\"}>>"}]
+        }))
+        .unwrap();
+        let response = chat_completions(
+            State(state),
+            None,
+            fault_header("cancelled_499;after_chunks=1;delay_ms=0"),
+            Json(req),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        let events = response_sse_events(response).await;
+        assert_eq!(
+            events.last().map(String::as_str),
+            Some(
+                r#"{"error":{"code":499,"message":"CancelledError: ","type":"request_cancelled"}}"#
+            )
+        );
+        assert!(!events.iter().any(|e| e.contains("scripted")));
+    }
+
+    #[tokio::test]
+    async fn completions_endpoint_rejects_fault_header() {
+        let (engine_tx, _engine_rx) = mpsc::channel::<EngineRequest>(1);
+        let state = test_state(engine_tx);
+        let err = completions(
+            State(state),
+            fault_header("stall"),
+            Json(CompletionRequest {
+                model: "test-model".to_string(),
+                prompt: "hello".to_string(),
+                stream: true,
+                max_tokens: 4,
+                stream_options: None,
+            }),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        let body = serde_json::to_value(err.1 .0).unwrap();
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("/v1/chat/completions"));
+    }
+
     #[test]
     fn prompt_token_estimation_supports_raw_text() {
         let state = AppState {
@@ -1447,6 +1714,7 @@ mod tests {
             model_names: Vec::new(),
             tokenizer: None,
             enable_directives: false,
+            model_faults: HashMap::new(),
         };
 
         assert_eq!(count_text_prompt_tokens(&state, "hello world"), 3);

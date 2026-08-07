@@ -12,7 +12,8 @@ use crate::simulation::{Engine, StepKind, Topology};
 
 use super::types::{EngineRequest, TokenEvent};
 
-const PLACEHOLDER_WORDS: &[&str] = &[
+/// Also cycled by serve::fault for the deterministic partial output ahead of a death.
+pub(crate) const PLACEHOLDER_WORDS: &[&str] = &[
     "the", "of", "and", "to", "in", "a", "is", "that", "for", "it", "was", "on", "are", "be",
     "with", "as", "at", "this", "have", "from", "or", "an", "by", "not", "but", "what", "all",
     "were", "when", "we", "there", "can", "which", "their", "if", "do", "will", "each", "about",

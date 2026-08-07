@@ -38,6 +38,30 @@ pub struct Config {
     /// tokens and advance by `accepted + 1` per the acceptance model.
     #[serde(default)]
     pub speculative: Option<SpeculativeConfig>,
+    /// Serve-mode only: static mid-stream fault injection applied to every streaming
+    /// chat completion on this model (the fallback trigger for clients that can't set
+    /// the `x-inference-lab-fault` header). Validated by `serve::fault` at server
+    /// startup; inert outside `serve`.
+    #[serde(default)]
+    pub fault: Option<FaultConfig>,
+}
+
+/// TOML shape of `[fault]` (see `serve::fault` for the mode list and semantics).
+/// Kept as plain strings/options here so the core config crate stays serve-agnostic;
+/// `serve::fault::FaultSpec::from_config` validates and applies defaults.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FaultConfig {
+    /// Death mode name, e.g. "cut_mid_frame" — same names the header accepts.
+    pub mode: String,
+    /// Content-bearing delta frames emitted before the fault fires.
+    #[serde(default)]
+    pub after_chunks: Option<u32>,
+    /// Fixed pacing between emitted frames.
+    #[serde(default)]
+    pub delay_ms: Option<u64>,
+    /// `cut_mid_frame` variant: cut inside a multi-byte UTF-8 character.
+    #[serde(default)]
+    pub utf8: Option<bool>,
 }
 
 impl Config {
@@ -136,6 +160,7 @@ impl Config {
             workload,
             simulation,
             speculative: None,
+            fault: None,
         }
     }
 }
