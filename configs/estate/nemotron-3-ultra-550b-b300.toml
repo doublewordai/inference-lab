@@ -49,7 +49,7 @@ flops_fp16 = 2.25e15
 memory_bandwidth = 8.0e12
 memory_capacity = 309237645312   # 288 GB
 kv_cache_capacity = 0            # auto: mem * util - weights
-gpu_memory_utilization = 0.9
+gpu_memory_utilization = 0.88
 
 [parallel]
 tp = 4
@@ -90,9 +90,11 @@ expert_precision = "fp4"
 non_expert_precision = "bf16"
 kv_precision = "bf16"
 
+# Engine args from internal/inference/node catalogs (b300; backend sglang; backend defaults for mem_frac, chunked_prefill, max_running):
+# mem-fraction/chunked-prefill/max-running -> 0.88/8192/4096
 [scheduler]
-max_num_batched_tokens = 16384
-max_num_seqs = 256
+max_num_batched_tokens = 8192
+max_num_seqs = 4096
 policy = "priority"
 enable_chunked_prefill = true
 block_size = 64

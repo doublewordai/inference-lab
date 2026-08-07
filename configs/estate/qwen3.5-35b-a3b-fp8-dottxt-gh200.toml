@@ -1,5 +1,5 @@
-# === Estate serving config: Qwen/Qwen3.5-35B-A3B-FP8 on 1x B300 (tp=1) ===
-# Hardware: B300 (dense datasheet: fp4 13.5e15 / fp8 4.5e15 / bf16 2.25e15 FLOP/s, 8.0e12 B/s, 288 GB).
+# === Estate serving config: Qwen/Qwen3.5-35B-A3B-FP8 on 1x GH200 (tp=1) ===
+# Hardware: GH200-120 (fp8/fp4 1.979e15, bf16 0.989e15 FLOP/s, 4.0e12 B/s, 96 GB usable).
 # Scheduler: deadline-priority admission as the estate dispatches.
 # The [workload] block is required by the config loader but unused by
 # estate-lab (arrivals come from the replayed trace).
@@ -19,15 +19,15 @@
 # FP8 weights, KV bf16.
 
 [hardware]
-name = "B300"
-flops_fp4 = 13.5e15
-flops_fp8 = 4.5e15
-flops_bf16 = 2.25e15
-flops_fp16 = 2.25e15
-memory_bandwidth = 8.0e12
-memory_capacity = 309237645312   # 288 GB
+name = "GH200-120"
+flops_fp4 = 1.979e15
+flops_fp8 = 1.979e15
+flops_bf16 = 0.989e15
+flops_fp16 = 0.989e15
+memory_bandwidth = 4.0e12
+memory_capacity = 102642221056   # 96 GB usable of 120
 kv_cache_capacity = 0            # auto: mem * util - weights
-gpu_memory_utilization = 0.8
+gpu_memory_utilization = 0.9
 
 [parallel]
 tp = 1
@@ -64,11 +64,11 @@ expert_precision = "fp8"
 non_expert_precision = "fp8"
 kv_precision = "bf16"
 
-# Engine args from internal/inference/node catalogs (b300; backend sglang; backend defaults for max_running):
+# Engine args from internal/inference/node catalogs (b200, gh200 = b200 prod-parity; backend sglang; backend defaults for max_running):
 # mem-fraction/chunked-prefill/max-running -> 0.8/16384/4096
 [scheduler]
-max_num_batched_tokens = 16384
-max_num_seqs = 4096
+max_num_batched_tokens = 8192
+max_num_seqs = 1024
 policy = "priority"
 enable_chunked_prefill = true
 block_size = 64

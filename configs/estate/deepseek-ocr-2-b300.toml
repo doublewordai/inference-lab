@@ -71,9 +71,11 @@ expert_precision = "bf16"
 non_expert_precision = "bf16"
 kv_precision = "bf16"
 
+# Engine args from internal/inference/node catalogs (b300; backend sglang; backend defaults for chunked_prefill, max_running):
+# mem-fraction/chunked-prefill/max-running -> 0.9/8192/4096
 [scheduler]
-max_num_batched_tokens = 16384
-max_num_seqs = 256
+max_num_batched_tokens = 8192
+max_num_seqs = 4096
 policy = "priority"
 enable_chunked_prefill = true
 block_size = 64
