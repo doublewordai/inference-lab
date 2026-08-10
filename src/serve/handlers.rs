@@ -442,12 +442,22 @@ pub async fn completions(
 /// loudly). Fault modes are mid-STREAM deaths: an explicit header on a non-streaming
 /// request is rejected, while static model config simply doesn't apply there (a fault
 /// model must still serve normal non-streaming traffic).
+///
+/// The header is client-controlled and lets any caller stall or abort connections, so
+/// it sits behind `--enable-directives` — the same "untrusted clients must not reach
+/// this" trust boundary as echo-directives (rejected loudly when off, never ignored).
+/// Static `[fault]` config is operator input validated at boot and is not gated.
 fn resolve_fault(
     state: &AppState,
     headers: &HeaderMap,
     req: &ChatCompletionRequest,
 ) -> Result<Option<fault::FaultSpec>, (StatusCode, Json<serde_json::Value>)> {
     if let Some(value) = headers.get(fault::FAULT_HEADER) {
+        if !state.enable_directives {
+            return Err(fault::invalid_fault(
+                "fault injection via header requires --enable-directives",
+            ));
+        }
         let spec = value
             .to_str()
             .map_err(|_| "header value must be visible ASCII".to_string())
@@ -1626,9 +1636,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fault_header_without_enable_directives_is_400() {
+        // The header is client-controlled and can stall/abort connections, so it sits
+        // behind the same trust gate as echo-directives — and fails loudly, so an e2e
+        // test pointed at a mis-deployed sim can't chase a phantom pass.
+        let (engine_tx, _engine_rx) = mpsc::channel::<EngineRequest>(1);
+        let state = test_state_directives_off(engine_tx);
+        let err = chat_completions(
+            State(state),
+            None,
+            fault_header("cut_between_frames"),
+            Json(chat_request(true)),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        let body = serde_json::to_value(err.1 .0).unwrap();
+        assert_eq!(body["error"]["code"], "invalid_fault_directive");
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("--enable-directives"));
+    }
+
+    #[tokio::test]
     async fn static_model_fault_applies_without_header() {
         let (engine_tx, _engine_rx) = mpsc::channel::<EngineRequest>(1);
-        let mut state = test_state(engine_tx);
+        // Directives OFF: static [fault] config is operator input validated at boot,
+        // not client input — it is deliberately NOT behind the directives gate.
+        let mut state = test_state_directives_off(engine_tx);
         let spec = fault::FaultSpec::parse_header("no_done;after_chunks=1;delay_ms=0").unwrap();
         Arc::get_mut(&mut state)
             .unwrap()

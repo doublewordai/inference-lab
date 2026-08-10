@@ -18,6 +18,12 @@ never silently ignored. With no trigger present, behavior is completely unchange
 
 ## Trigger: the `x-inference-lab-fault` header
 
+The header is only honored when the server runs with `--enable-directives` — it is
+client-controlled and can stall or abort connections at will, so it sits behind the same
+"untrusted clients must not reach this server" gate as echo-directives. Without the flag
+the header is a 400 (`invalid_fault_directive`), never silently ignored. The staging
+deployment already sets the flag.
+
 ```text
 x-inference-lab-fault: <mode>[;after_chunks=<u32>][;delay_ms=<u64>][;utf8=<bool>]
 ```
@@ -42,7 +48,8 @@ happens after deploy.
 
 For clients that cannot set a header, a model's TOML config can apply one fault to every
 **streaming** chat completion on that model (non-streaming requests are served normally;
-an explicit header on the request still wins):
+an explicit header on the request still wins). Unlike the header, this is operator input
+validated at server boot, so it does **not** require `--enable-directives`:
 
 ```toml
 [fault]
