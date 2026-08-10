@@ -216,41 +216,42 @@ impl FaultSpec {
 /// Handle to the accepted TCP socket, threaded into request extensions by the serve
 /// accept loop so `reset` can arm an abortive close on the exact connection carrying
 /// the response.
+///
+/// Holds its own `dup(2)` of the accepted fd rather than the raw fd number: the fault
+/// body task is detached, so if the client disconnects mid-script hyper closes the
+/// original `TcpStream` while this handle is still alive — a raw fd could by then have
+/// been reused for an unrelated socket. The dup keeps the *same underlying socket*
+/// alive and owned, so `arm_reset` can never touch anyone else's connection.
 #[derive(Debug)]
 pub struct FaultConnection {
     #[cfg(unix)]
-    fd: std::os::unix::io::RawFd,
+    fd: std::os::fd::OwnedFd,
 }
 
 impl FaultConnection {
-    pub fn new(socket: &tokio::net::TcpStream) -> Self {
+    pub fn new(socket: &tokio::net::TcpStream) -> std::io::Result<Self> {
         #[cfg(unix)]
         {
-            use std::os::unix::io::AsRawFd;
-            Self {
-                fd: socket.as_raw_fd(),
-            }
+            use std::os::fd::AsFd;
+            Ok(Self {
+                fd: socket.as_fd().try_clone_to_owned()?,
+            })
         }
         #[cfg(not(unix))]
         {
             let _ = socket;
-            Self {}
+            Ok(Self {})
         }
     }
 
     /// Arm an abortive close: with linger zeroed, the kernel sends RST instead of FIN
-    /// when the socket is dropped. Called from the fault body task immediately before it
-    /// aborts the body; hyper is actively polling that body on this same connection, so
-    /// the fd is guaranteed live for the duration of the call.
+    /// when the socket's last fd closes. `SO_LINGER` lives on the socket, not the fd,
+    /// so setting it through our dup covers hyper's `TcpStream` too. If the client is
+    /// already gone this is a harmless setsockopt on a dead-but-owned socket.
     pub fn arm_reset(&self) -> std::io::Result<()> {
         #[cfg(unix)]
         {
-            use std::os::fd::BorrowedFd;
-            // SAFETY: `fd` belongs to the TcpStream owned by the hyper connection task
-            // currently polling this response body (see doc comment); it cannot have
-            // been closed or reused while the body is still being produced.
-            let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
-            socket2::SockRef::from(&fd).set_linger(Some(Duration::ZERO))
+            socket2::SockRef::from(&self.fd).set_linger(Some(Duration::ZERO))
         }
         #[cfg(not(unix))]
         {
@@ -738,7 +739,22 @@ mod tests {
             listener.accept().await.unwrap()
         });
         let _client = client.unwrap();
-        let conn = FaultConnection::new(&server);
+        let conn = FaultConnection::new(&server).unwrap();
+        conn.arm_reset().unwrap();
+    }
+
+    /// The regression the dup'd fd exists for: arming reset after hyper has already
+    /// closed its `TcpStream` must hit our own (still-open) dup, not a recycled fd.
+    #[tokio::test]
+    async fn arm_reset_is_safe_after_original_stream_closes() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (client, (server, _)) = tokio::join!(tokio::net::TcpStream::connect(addr), async {
+            listener.accept().await.unwrap()
+        });
+        let _client = client.unwrap();
+        let conn = FaultConnection::new(&server).unwrap();
+        drop(server); // client disconnect path: hyper drops the stream first
         conn.arm_reset().unwrap();
     }
 

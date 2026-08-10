@@ -106,18 +106,33 @@ pub async fn start_server(
         let (socket, _remote_addr) = match listener.accept().await {
             Ok(accepted) => accepted,
             Err(e) => {
-                // Transient accept failures (EMFILE etc.) must not kill the server.
-                log::warn!("accept failed: {e}");
+                // Same policy as `axum::serve`: per-connection errors (aborted handshakes
+                // etc.) retry immediately; anything else (EMFILE/ENFILE) must not kill the
+                // server, but backs off so a persistent error can't spin the loop.
+                if !is_connection_error(&e) {
+                    log::warn!("accept failed: {e}");
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
                 continue;
             }
         };
-        let conn = Arc::new(fault::FaultConnection::new(&socket));
+        // A failed dup only costs the `reset` mode its RST (degrades to FIN, which the
+        // fault path already tolerates) — never the connection itself.
+        let conn = match fault::FaultConnection::new(&socket) {
+            Ok(conn) => Some(Arc::new(conn)),
+            Err(e) => {
+                log::warn!("fault: could not dup connection fd ({e}); reset degrades to FIN");
+                None
+            }
+        };
         let tower_service = app.clone();
         tokio::spawn(async move {
             let socket = TokioIo::new(socket);
             let hyper_service = hyper::service::service_fn(
                 move |mut request: hyper::Request<hyper::body::Incoming>| {
-                    request.extensions_mut().insert(conn.clone());
+                    if let Some(conn) = &conn {
+                        request.extensions_mut().insert(conn.clone());
+                    }
                     tower_service.clone().oneshot(request)
                 },
             );
@@ -131,4 +146,15 @@ pub async fn start_server(
             }
         });
     }
+}
+
+/// Errors scoped to one failed connection attempt, not the listener — matches the set
+/// `axum::serve` retries without logging or backoff.
+fn is_connection_error(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+    )
 }
