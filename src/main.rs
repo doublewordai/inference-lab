@@ -55,8 +55,10 @@ struct ServeArgs {
     tokenizer: Option<PathBuf>,
 
     /// Honor <<respond:{...}>> echo-directives in message text (scripted responses that
-    /// bypass the engine — see serve::directive). Test-harness feature: leave OFF anywhere
-    /// untrusted clients can reach this server, or requests can spoof model output.
+    /// bypass the engine — see serve::directive) and the x-inference-lab-fault header
+    /// (mid-stream death injection — see serve::fault). Test-harness feature: leave OFF
+    /// anywhere untrusted clients can reach this server, or requests can spoof model
+    /// output and stall/abort connections at will.
     #[arg(long, default_value_t = false)]
     enable_directives: bool,
 }

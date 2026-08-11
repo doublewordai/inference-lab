@@ -191,6 +191,7 @@ fn base_config(conc: usize, isl: u32, osl: u32) -> Config {
         },
         simulation: SimulationConfig::default(),
         speculative: None,
+        fault: None,
     }
 }
 
