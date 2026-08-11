@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.0](https://github.com/doublewordai/inference-lab/compare/inference-lab-v0.8.2...inference-lab-v0.9.0) (2026-08-11)
+
+
+### Features
+
+* fault injection for midstream error testing ([#69](https://github.com/doublewordai/inference-lab/issues/69)) ([c817058](https://github.com/doublewordai/inference-lab/commit/c817058f36fc73c6044cb8852f5173fd378aba9c))
+
 ## [0.8.2](https://github.com/doublewordai/inference-lab/compare/inference-lab-v0.8.1...inference-lab-v0.8.2) (2026-08-06)
 
 
