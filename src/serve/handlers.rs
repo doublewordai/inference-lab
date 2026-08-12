@@ -391,17 +391,17 @@ pub async fn completions(
     Json(req): Json<CompletionRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     // Batched prompts would each need their own choice; this sim serves batch-of-one,
-    // like the engines behind the continuation targets. Reject the rest explicitly
-    // instead of silently answering only the first.
-    if req.prompt.batch_len() > 1 {
+    // like the engines behind the continuation targets. Reject anything else explicitly
+    // instead of silently answering only the first — and that includes the EMPTY batch
+    // (`"prompt": []`), which a `> 1` check waved through to be served as a zero-token
+    // prompt despite there being no prompt at all.
+    let batch_len = req.prompt.batch_len();
+    if batch_len != 1 {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
                 "error": {
-                    "message": format!(
-                        "batched prompts are not supported: got {} prompts, expected 1",
-                        req.prompt.batch_len()
-                    ),
+                    "message": format!("expected exactly 1 prompt, got {}", batch_len),
                     "type": "invalid_request_error",
                     "code": "invalid_prompt"
                 }
@@ -2189,6 +2189,106 @@ mod tests {
         let body = serde_json::to_value(err.1 .0).unwrap();
         assert_eq!(body["error"]["code"], "invalid_prompt");
         assert!(body["error"]["message"].as_str().unwrap().contains("got 2"));
+    }
+
+    #[tokio::test]
+    async fn empty_prompt_batch_is_rejected() {
+        // `"prompt": []` is not a batch of one — it is no prompt at all. A `> 1` check
+        // waved it through to be served as a zero-token prompt.
+        let (engine_tx, _engine_rx) = mpsc::channel::<EngineRequest>(1);
+        let state = test_state(engine_tx);
+
+        // On the wire an empty array lands on Texts (untagged variants are tried in
+        // order), so that is the shape a client can actually send.
+        let wire: CompletionRequest =
+            serde_json::from_value(serde_json::json!({"model": "test-model", "prompt": []}))
+                .unwrap();
+        assert!(
+            matches!(wire.prompt, CompletionPrompt::Texts(ref v) if v.is_empty()),
+            "empty array must deserialize to an empty Texts batch"
+        );
+
+        // Both empty batch shapes must be rejected identically.
+        for prompt in [
+            CompletionPrompt::Texts(Vec::new()),
+            CompletionPrompt::IdBatch(Vec::new()),
+        ] {
+            assert_eq!(prompt.batch_len(), 0);
+            let err = completions(
+                State(state.clone()),
+                None,
+                HeaderMap::new(),
+                Json(completion_request(prompt)),
+            )
+            .await
+            .err()
+            .expect("an empty prompt batch must not be served");
+            assert_eq!(err.0, StatusCode::BAD_REQUEST);
+            let body = serde_json::to_value(err.1 .0).unwrap();
+            assert_eq!(body["error"]["code"], "invalid_prompt");
+            assert!(body["error"]["message"].as_str().unwrap().contains("got 0"));
+        }
+    }
+
+    #[tokio::test]
+    async fn single_prompts_pass_the_batch_gate() {
+        // The other side of `batch_len != 1`: the non-batch variants report 1 and must
+        // still reach the engine. A batch-of-one id list counts as single too.
+        for prompt in [
+            text_prompt("hello world"),
+            CompletionPrompt::Ids(vec![1, 2, 3]),
+            CompletionPrompt::Texts(vec!["hello world".to_string()]),
+            CompletionPrompt::IdBatch(vec![vec![1, 2, 3]]),
+        ] {
+            assert_eq!(prompt.batch_len(), 1);
+            let (engine_tx, engine_rx) = mpsc::channel::<EngineRequest>(1);
+            let state = test_state(engine_tx);
+            let answered = answer_engine(engine_rx, &["ok"], 3, 1);
+
+            let response = completions(
+                State(state),
+                None,
+                HeaderMap::new(),
+                Json(completion_request(prompt)),
+            )
+            .await
+            .expect("a single prompt must pass the batch gate")
+            .into_response();
+
+            answered.await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response_json(response).await["choices"][0]["text"], "ok");
+        }
+    }
+
+    /// An empty string and an empty id list are real, servable prompts — they are a batch
+    /// of ONE that happens to be empty, not an absent prompt, and must not be swept up by
+    /// the empty-batch rejection.
+    #[tokio::test]
+    async fn empty_single_prompt_is_still_served() {
+        for prompt in [
+            text_prompt(""),
+            CompletionPrompt::Ids(Vec::new()),
+            CompletionPrompt::IdBatch(vec![Vec::new()]),
+        ] {
+            assert_eq!(prompt.batch_len(), 1);
+            let (engine_tx, engine_rx) = mpsc::channel::<EngineRequest>(1);
+            let state = test_state(engine_tx);
+            let answered = answer_engine(engine_rx, &["ok"], 0, 1);
+
+            let response = completions(
+                State(state),
+                None,
+                HeaderMap::new(),
+                Json(completion_request(prompt)),
+            )
+            .await
+            .expect("an empty single prompt is servable")
+            .into_response();
+
+            assert_eq!(answered.await.unwrap().prompt_tokens, 0);
+            assert_eq!(response.status(), StatusCode::OK);
+        }
     }
 
     #[tokio::test]
