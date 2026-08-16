@@ -200,6 +200,15 @@ impl Request {
         generated
     }
 
+    /// Make the request arrive already prefilled at `time`: its prompt is
+    /// resident and its first token produced, so it enters as pure decode
+    /// work (a disaggregated decode pool seen in isolation).
+    pub fn mark_prefilled(&mut self, time: f64) {
+        self.num_computed_tokens = self.num_prompt_tokens;
+        self.num_output_tokens = 1;
+        self.first_token_time = Some(time);
+    }
+
     /// Number of leading prompt blocks shared by every request in `batch`.
     /// Uses the incremental prompt block hashes as the equality check: hash N
     /// covers tokens 0..N*block_size, so two requests share a prefix of K

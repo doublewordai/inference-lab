@@ -119,7 +119,6 @@ impl Policy {
                 gamma,
                 acceptance: acceptance.clone(),
                 policy,
-                draft_cost_frac: 0.0,
                 measured_cost: None,
                 switch: Default::default(),
                 drafter: Some(d.cost()),

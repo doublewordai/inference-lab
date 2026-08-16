@@ -94,7 +94,6 @@ std_dev = 0.8
 [speculative]
 gamma = 4
 policy = "goodput_budget"
-draft_cost_frac = 0.0
 
 [speculative.acceptance]
 kind = "constant"

@@ -49,7 +49,7 @@ use inference_lab::config::{
     AcceptanceModel, ClusterSpec, Config, GammaPolicy, SpeculativeConfig, TraceBank,
 };
 use inference_lab::request::Request;
-use inference_lab::simulation::{simulate_closed_loop, Engine, Topology};
+use inference_lab::simulation::{simulate_closed_loop, ClosedLoop, Engine, Topology};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use rand_distr::{Distribution, LogNormal};
@@ -155,14 +155,16 @@ fn run(cfg: &Config, conc: u32, isl: u32, osl: u32, p: Policy) -> (f64, f64) {
     let warmup = conc / 2;
     let res = simulate_closed_loop(
         topology(cfg),
-        conc,
-        isl,
-        osl,
-        total,
-        warmup,
-        spec_for(p, base),
-        7,
-        true, // skip_prefill: pure-decode target, prefill not competing
+        &ClosedLoop {
+            concurrency: conc,
+            isl,
+            osl,
+            num_completions: total,
+            warmup_completions: warmup,
+            spec: spec_for(p, base),
+            seed: 7,
+            skip_prefill: true, // pure-decode target, prefill not competing
+        },
     )
     .expect("run");
     let dbatch = res
@@ -199,7 +201,9 @@ fn run_validation(
         Policy::Fixed(k)
     };
     let mut engine = Engine::new(topology(cfg));
-    engine.enable_speculative(spec_for(p, base).expect("spec"), seed);
+    engine
+        .enable_speculative(spec_for(p, base).expect("spec"), seed)
+        .expect("enable speculative decoding");
 
     let isl_dist =
         LogNormal::new(mean_isl.ln() - SIGMA_LOG * SIGMA_LOG / 2.0, SIGMA_LOG).expect("isl dist");
@@ -288,8 +292,8 @@ fn main() {
     println!("Engine-target sweep + validation: {}", cfg.model_name());
     println!("config:        {config_path}");
     println!(
-        "{} TP{}, gamma_max={gamma_max} c_draft={}",
-        cfg.hardware.name, cfg.parallel.tp, base.draft_cost_frac
+        "{} TP{}, gamma_max={gamma_max} drafter={:?}",
+        cfg.hardware.name, cfg.parallel.tp, base.drafter
     );
     println!("acceptance:    trace_rounds ({bank_path})");
     println!(

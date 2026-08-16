@@ -13,10 +13,10 @@
 //! Run: `cargo run --release --example spec_decode_roofline --no-default-features`
 
 use inference_lab::config::{
-    AcceptanceModel, ClusterSpec, DeepseekV4Model, GammaPolicy, HardwareConfig, ModelConfig,
-    ParallelConfig, Precision, SchedulerConfig, SpeculativeConfig,
+    AcceptanceModel, ClusterSpec, DeepseekV4Model, DrafterCost, GammaPolicy, HardwareConfig,
+    ModelConfig, ParallelConfig, Precision, SchedulerConfig, SpeculativeConfig,
 };
-use inference_lab::simulation::{simulate_closed_loop, Topology};
+use inference_lab::simulation::{simulate_closed_loop, ClosedLoop, Topology};
 use rayon::prelude::*;
 use std::collections::BTreeMap;
 
@@ -107,19 +107,17 @@ fn spec_for(p: Policy, alpha: f64, c_draft: f64) -> Option<SpeculativeConfig> {
             gamma: g,
             acceptance,
             policy: GammaPolicy::Fixed,
-            draft_cost_frac: c_draft,
             measured_cost: None,
             switch: Default::default(),
-            drafter: None,
+            drafter: Some(DrafterCost::Fraction { frac: c_draft }),
         }),
         Policy::Budget(g) => Some(SpeculativeConfig {
             gamma: g,
             acceptance,
             policy: GammaPolicy::GoodputBudget,
-            draft_cost_frac: c_draft,
             measured_cost: None,
             switch: Default::default(),
-            drafter: None,
+            drafter: Some(DrafterCost::Fraction { frac: c_draft }),
         }),
     }
 }
@@ -129,14 +127,16 @@ fn run(conc: u32, isl: u32, osl: u32, p: Policy, alpha: f64, c_draft: f64) -> (f
     let warmup = conc / 2;
     let res = simulate_closed_loop(
         topology(),
-        conc,
-        isl,
-        osl,
-        total,
-        warmup,
-        spec_for(p, alpha, c_draft),
-        7,
-        true,
+        &ClosedLoop {
+            concurrency: conc,
+            isl,
+            osl,
+            num_completions: total,
+            warmup_completions: warmup,
+            spec: spec_for(p, alpha, c_draft),
+            seed: 7,
+            skip_prefill: true,
+        },
     )
     .expect("run");
     let dbatch = res

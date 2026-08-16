@@ -23,9 +23,9 @@
 //! Run: `cargo run --release --example spec_c1_gamma_sweep --no-default-features`
 
 use inference_lab::config::{
-    AcceptanceModel, ArrivalPattern, Config, DeepseekV4Model, GammaPolicy, HardwareConfig,
-    LengthDistribution, ModelConfig, ParallelConfig, Precision, SchedulerConfig, SimulationConfig,
-    SpeculativeConfig, WorkloadConfig,
+    AcceptanceModel, ArrivalPattern, Config, DeepseekV4Model, DrafterCost, GammaPolicy,
+    HardwareConfig, LengthDistribution, ModelConfig, ParallelConfig, Precision, SchedulerConfig,
+    SimulationConfig, SpeculativeConfig, WorkloadConfig,
 };
 use inference_lab::simulation::Simulator;
 
@@ -143,19 +143,17 @@ impl Policy {
                 gamma: g,
                 acceptance,
                 policy: GammaPolicy::Fixed,
-                draft_cost_frac: c_draft,
                 measured_cost: None,
                 switch: Default::default(),
-                drafter: None,
+                drafter: Some(DrafterCost::Fraction { frac: c_draft }),
             }),
             Policy::Budget(g) => Some(SpeculativeConfig {
                 gamma: g,
                 acceptance,
                 policy: GammaPolicy::GoodputBudget,
-                draft_cost_frac: c_draft,
                 measured_cost: None,
                 switch: Default::default(),
-                drafter: None,
+                drafter: Some(DrafterCost::Fraction { frac: c_draft }),
             }),
         }
     }

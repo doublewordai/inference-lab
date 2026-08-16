@@ -62,12 +62,11 @@ std_dev = 0.8
 [speculative]
 gamma = 8
 policy = "gated_aggregate"       # engine-realizable: one batch-uniform width
-# 0.0 because the measured step-cost table below embodies the full engine
-# step, drafter included: the (1 + draft_cost_frac * g) multiplier would
-# double-count it on table-priced steps. Use ~0.05 (EAGLE3 single-layer
-# drafter, ~5% of target/pass) only when pricing purely via the analytic
-# roofline without a table.
-draft_cost_frac = 0.0
+# No drafter cost model: the measured step-cost table below embodies the
+# full engine step, drafter included, so a drafter term would double-count
+# it on table-priced steps. Set `drafter = { kind = "fraction", frac = 0.05 }`
+# (EAGLE3 single-layer drafter, ~5% of target/pass) only when pricing purely
+# via the analytic roofline without a table.
 
 # Real EAGLE3 ShareGPT per-round (a_hat, commits) traces measured on
 # sglang/GH200 on Llama-3.1-8B (calib 2026-06-12).

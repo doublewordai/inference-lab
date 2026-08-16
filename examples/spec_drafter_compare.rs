@@ -8,7 +8,7 @@
 //! the only difference is how many times that read is paid.
 //!
 //! This sweep prices each drafter with its real roofline (`DrafterCost`) instead
-//! of the zeroed `draft_cost_frac`, runs both against their measured acceptance
+//! of a free drafter, runs both against their measured acceptance
 //! banks (MTP D=8 / DFlash D=16, SPEED-Bench), and asks at each operating point:
 //! how far does a priced adaptive policy beat the best-in-hindsight fixed γ?
 //!
@@ -128,7 +128,6 @@ enum Policy {
     NoSpec,
     Fixed(u32),
     Budget(u32),
-    Gated(u32),
 }
 
 impl Policy {
@@ -141,7 +140,6 @@ impl Policy {
                 gamma,
                 acceptance: acceptance.clone(),
                 policy,
-                draft_cost_frac: 0.0,
                 measured_cost: None,
                 switch: Default::default(),
                 drafter: Some(d.cost()),
@@ -151,7 +149,6 @@ impl Policy {
             Policy::NoSpec => None,
             Policy::Fixed(g) => mk(g, GammaPolicy::Fixed),
             Policy::Budget(g) => mk(g, GammaPolicy::GoodputBudget),
-            Policy::Gated(g) => mk(g, GammaPolicy::GatedAggregate),
         }
     }
 }

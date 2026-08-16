@@ -79,7 +79,6 @@ std_dev = 1.0   # heavy tail: a few sequences run very long and pin KV
 [speculative]
 gamma = 4
 policy = "goodput_budget"
-draft_cost_frac = 0.0
 
 [speculative.acceptance]
 kind = "constant"

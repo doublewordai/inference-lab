@@ -13,45 +13,65 @@
 pub mod engine;
 pub mod roofline;
 pub mod simulator;
+pub mod spec;
 
 pub use engine::{
     Engine, IterationInfo, RequestProgress, RequestTiming, StepKind, StepOutcome, Topology,
 };
 pub use roofline::{predict_decode_tpot, predict_prefill_time};
 pub use simulator::{ProgressInfo, Simulator, TimeSeriesPoint};
+pub use spec::{DraftPlan, PlanCosts, SpecPlanner};
 
 use crate::config::SpeculativeConfig;
 use crate::request::Request;
 
-/// Run a closed-loop workload of `conc` users issuing fixed-shape requests
-/// (`isl` prompt tokens, `osl` output tokens) through `topology`. Stops once
-/// `num_completions` requests have finished. The first `warmup_completions`
-/// are dropped from the returned set (so the steady state is what's reported).
-/// `spec` optionally enables speculative decoding (applies only to decode
-/// steps, so on a disagg topology it affects only the decode pool).
+/// A closed-loop workload of fixed-shape requests for [`simulate_closed_loop`].
+#[derive(Debug, Clone)]
+pub struct ClosedLoop {
+    /// Concurrent users; each issues its next request when its previous one
+    /// completes.
+    pub concurrency: u32,
+    /// Prompt tokens per request.
+    pub isl: u32,
+    /// Output tokens per request.
+    pub osl: u32,
+    /// Stop once this many requests have completed.
+    pub num_completions: u32,
+    /// Drop the earliest completions from the result (steady state only).
+    pub warmup_completions: u32,
+    /// Optional speculative decoding (decode steps only, so on a disagg
+    /// topology it affects only the decode pool).
+    pub spec: Option<SpeculativeConfig>,
+    pub seed: u64,
+    /// Requests arrive already prefilled (pure decode work): the
+    /// disaggregated decode pool in isolation, no prefill compute sharing
+    /// the GPU. Pair with lifted KV caps to sweep the compute roofline.
+    pub skip_prefill: bool,
+}
+
+/// Run `workload` through `topology`.
 pub fn simulate_closed_loop(
     topology: Topology,
-    conc: u32,
-    isl: u32,
-    osl: u32,
-    num_completions: u32,
-    warmup_completions: u32,
-    spec: Option<SpeculativeConfig>,
-    seed: u64,
-    skip_prefill: bool,
+    workload: &ClosedLoop,
 ) -> Result<ClosedLoopResult, String> {
+    let ClosedLoop {
+        concurrency: conc,
+        isl,
+        osl,
+        num_completions,
+        warmup_completions,
+        seed,
+        skip_prefill,
+        ..
+    } = *workload;
     let mut engine = Engine::new(topology);
-    if let Some(s) = spec {
-        engine.enable_speculative(s, seed);
+    if let Some(s) = &workload.spec {
+        engine.enable_speculative(s.clone(), seed)?;
     }
-    // `skip_prefill` makes requests arrive already prefilled (num_computed = isl),
-    // i.e. as pure-decode work -- the disaggregated decode pool in isolation, no
-    // prefill compute sharing the GPU. Pair with lifted KV caps to sweep the
-    // compute roofline.
     let mk = |id: u32, arrival: f64| {
         let mut req = Request::new(format!("req-{id}"), 0, arrival, isl, osl);
         if skip_prefill {
-            req.num_computed_tokens = isl;
+            req.mark_prefilled(arrival);
         }
         req
     };
@@ -205,7 +225,6 @@ mod tests {
             gamma: 4,
             acceptance: AcceptanceModel::Constant { alpha: 0.9 },
             policy: GammaPolicy::GoodputBudget,
-            draft_cost_frac: 0.0,
             measured_cost: Some(MeasuredCostConfig {
                 path: path.to_str().unwrap().into(),
                 ref_seq_len: None,
@@ -214,10 +233,10 @@ mod tests {
             drafter: None,
         };
         let mut engine = Engine::new(small_dense_topology());
-        engine.enable_speculative(spec, 7);
+        engine.enable_speculative(spec, 7).unwrap();
         for i in 0..4u32 {
             let mut req = Request::new(format!("r{i}"), 0, 0.0, 64, 32);
-            req.num_computed_tokens = 64; // arrive prefilled: pure decode
+            req.mark_prefilled(0.0); // pure decode
             engine.submit(req);
         }
         let mut done = 0usize;

@@ -112,7 +112,7 @@ impl Simulator {
 
         let mut engine = Engine::new(topology);
         if let Some(spec) = &config.speculative {
-            engine.enable_speculative(spec.clone(), config.workload.seed);
+            engine.enable_speculative(spec.clone(), config.workload.seed)?;
         }
 
         Ok(Self {

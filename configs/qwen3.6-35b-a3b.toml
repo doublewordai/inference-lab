@@ -94,7 +94,6 @@ std_dev = 0.8
 [speculative]
 gamma = 8
 policy = "goodput_budget"
-draft_cost_frac = 0.0
 
 # Measured conditional acceptance a_d = P(accept depth d | reached d), from
 # 12k depth-8 MTP rounds on Qwen3.6-35B-A3B (vLLM, SPEED-Bench, temp 0.6).

@@ -94,10 +94,9 @@ std_dev = 0.8
 [speculative]
 gamma = 8
 policy = "gated_aggregate"       # engine-realizable: one batch-uniform width
-# 0.0: the measured step-cost table below embodies the full engine step,
-# native MTP drafter included — a (1 + draft_cost_frac * g) multiplier would
+# No drafter cost model: the measured step-cost table below embodies the
+# full engine step, native MTP drafter included, so a drafter term would
 # double-count it on table-priced steps.
-draft_cost_frac = 0.0
 
 # Real native-MTP ShareGPT per-round (commits, a0..a7) traces measured on the
 # target engine (sglang/GH200, depth-8 MTP rounds, ~106k rounds, 2026-06).
