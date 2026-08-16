@@ -8,6 +8,10 @@ Command-line interface reference for Inference Lab.
 inference-lab [OPTIONS]
 ```
 
+A binary built with `--features serve` (the Docker image) has subcommands
+instead: `inference-lab sim [OPTIONS]` takes the options below and
+`inference-lab serve` starts the OpenAI-compatible server.
+
 ## Options
 
 ### Required Options

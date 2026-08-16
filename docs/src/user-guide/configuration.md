@@ -300,10 +300,8 @@ policy = "sof"  # Shortest Output First
 Limit KV cache usage:
 
 ```toml
-[hardware]
-kv_cache_capacity = 34359738368  # 32 GB explicit limit
-
 [scheduler]
+kv_cache_capacity = 34359738368  # 32 GB explicit limit
 max_num_seqs = 128
 ```
 

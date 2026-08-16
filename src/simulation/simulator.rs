@@ -427,6 +427,21 @@ mod tests {
     }
 
     #[test]
+    fn closed_loop_with_jitter_starts_at_the_first_staggered_arrival() {
+        let mut config = create_minimal_test_config();
+        config.workload.arrival_pattern = crate::config::ArrivalPattern::ClosedLoop;
+        config.workload.num_concurrent_users = Some(4);
+        config.workload.closed_loop_jitter_secs = Some(0.05);
+        config.workload.num_requests = Some(12);
+        let mut simulator = Simulator::new(config, None).unwrap();
+        // Nothing is due at t=0; the simulator must jump to the earliest
+        // jittered arrival instead of reporting a stall.
+        simulator.run_with_callback(|_| {}).unwrap();
+        let summary = simulator.summary();
+        assert_eq!(summary.requests.completed, 12);
+    }
+
+    #[test]
     fn test_progress_callback_streams_each_sample_once() {
         let config = create_minimal_test_config();
         let mut simulator = Simulator::new(config, None).unwrap();
