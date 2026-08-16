@@ -173,7 +173,16 @@ impl RequestGenerator {
     /// Next open-loop arrival time (0 for closed loop, where arrivals follow
     /// completions).
     pub fn peek_next_arrival_time(&self) -> f64 {
-        self.next_arrival_time
+        if self.workload.arrival_pattern.is_closed_loop() {
+            // Closed loop: the earliest pending user slot (jittered at init,
+            // then each completion time); infinite when no slot is pending.
+            self.pending_closed_loop
+                .iter()
+                .copied()
+                .fold(f64::INFINITY, f64::min)
+        } else {
+            self.next_arrival_time
+        }
     }
 
     /// Incremental block hashes: hash `i` covers all tokens up to the end of
@@ -461,6 +470,28 @@ mod tests {
         assert!(generator.next_if_before(10.0).is_some());
         assert!(generator.next_if_before(10.0).is_none());
         assert!(generator.is_finished());
+    }
+
+    #[test]
+    fn test_closed_loop_peek_tracks_pending_slots() {
+        let mut workload = create_test_workload(ArrivalPattern::ClosedLoop, 0.0, 4);
+        workload.num_concurrent_users = Some(2);
+        workload.closed_loop_jitter_secs = Some(0.5);
+        let mut generator = RequestGenerator::new(workload);
+        // Jittered starts: nothing is due at t=0, and peek reports the
+        // earliest pending slot so the simulator can jump to it.
+        assert!(generator.next_if_before(0.0).is_none());
+        let first = generator.peek_next_arrival_time();
+        assert!(first > 0.0 && first < 0.5, "{first}");
+        let req = generator.next_if_before(first).unwrap();
+        assert_eq!(req.arrival_time, first);
+        let second = generator.peek_next_arrival_time();
+        assert!(second >= first && second < 0.5, "{second}");
+        assert!(generator.next_if_before(0.5).is_some());
+        // No pending slot: peek is infinite until a completion refills one.
+        assert!(generator.peek_next_arrival_time().is_infinite());
+        generator.on_request_complete(3.0);
+        assert_eq!(generator.peek_next_arrival_time(), 3.0);
     }
 
     #[test]

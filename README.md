@@ -95,7 +95,7 @@ println!("Throughput: {:.1} tok/s", summary.throughput_metrics.output_tokens_per
 ### WebAssembly
 
 ```javascript
-import init, { run_simulation } from '@doubleword/inference-lab';
+import init, { run_simulation } from '@doublewordai/inference-lab';
 
 await init();
 
@@ -180,17 +180,23 @@ cargo publish
 ```
 inference-lab/
 ├── src/
-│   ├── simulation/     # Core simulator logic
-│   ├── scheduler/      # Scheduling policies (FCFS, Priority, SJF)
-│   ├── compute/        # Performance calculations
-│   ├── kv_cache/       # KV cache management
+│   ├── simulation/     # Core simulator: engine, spec decoding, disagg
+│   ├── scheduler/      # Scheduling policies (FCFS, priority, SJF/SOF)
+│   ├── compute/        # Roofline performance model, measured step tables
+│   ├── kv_cache/       # KV block manager, prefix cache, tiers, links
 │   ├── request/        # Request generation and tracking
-│   ├── metrics/        # Performance metrics collection
+│   ├── metrics/        # Metrics collection and summaries
 │   ├── config/         # Configuration structures
+│   ├── serve/          # OpenAI-compatible server (`--features serve`)
+│   ├── catalog.rs      # Shipped hardware/model presets (embedded by build.rs)
+│   ├── dataset.rs      # Dataset loading for trace-driven workloads
 │   ├── lib.rs          # Library root
 │   ├── main.rs         # CLI entry point
 │   └── wasm.rs         # WebAssembly bindings
-├── configs/            # Example configurations
+├── catalog/            # hardware/*.toml and models/*.toml presets
+├── configs/            # Production-shaped configurations
+├── examples/           # Small example configs and Rust examples
+├── build.rs            # Embeds catalog/ into the crate
 ├── Cargo.toml          # Rust package manifest
 └── package.json        # npm package manifest
 ```

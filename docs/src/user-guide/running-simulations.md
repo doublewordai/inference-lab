@@ -142,7 +142,7 @@ Preemptions occur when new requests need memory but the KV cache is full:
 - Build with `--release`
 
 **Too many preemptions?**
-- Increase `kv_cache_capacity` in hardware config
+- Raise `gpu_memory_utilization` or set `kv_cache_capacity` in `[scheduler]`
 - Reduce `max_num_seqs` or `max_num_batched_tokens` in scheduler config
 
 **Dataset loading errors?**

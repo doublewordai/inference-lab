@@ -240,11 +240,7 @@ impl KVCacheManager {
         enable_prefix_caching: bool,
     ) -> Self {
         let bytes_per_block = kv_bytes_at(block_size);
-        let total_blocks = if bytes_per_block == 0 {
-            0
-        } else {
-            (kv_cache_capacity / bytes_per_block) as u32
-        };
+        let total_blocks = kv_cache_capacity.checked_div(bytes_per_block).unwrap_or(0) as u32;
         // Fixed per-sequence state (Mamba/GDN) padded up to a whole number of
         // blocks, vLLM-style. Held for the sequence's lifetime.
         let state_blocks = if bytes_per_block == 0 {
@@ -280,11 +276,10 @@ impl KVCacheManager {
         self.tiers = tiers
             .iter()
             .map(|t| {
-                let capacity_blocks = if self.bytes_per_block == 0 {
-                    0
-                } else {
-                    (t.capacity_bytes / self.bytes_per_block) as u32
-                };
+                let capacity_blocks = t
+                    .capacity_bytes
+                    .checked_div(self.bytes_per_block)
+                    .unwrap_or(0) as u32;
                 SpilloverTier::new(capacity_blocks, t.bandwidth_to_hbm)
             })
             .collect();
