@@ -1,0 +1,30 @@
+# Qwen/Qwen3-14B-FP8 — plain dense GQA transformer. From HF
+# Qwen/Qwen3-14B-FP8 config.json: 40 layers, hidden 5120, 40 heads x head_dim
+# 128, 8 KV heads, full attention, MLP inter 17408, vocab 151936 (untied),
+# max_pos 40960, FP8 quantization. `qwen35` with zero experts / all layers
+# attention (plain GQA with separate bf16 KV precision).
+#
+# Param split (all non-expert; computed):
+#   attn/layer (q 40x128 + k,v 8x128 + o) = 5120*12288 = 62_914_560
+#   MLP/layer = 3*5120*17408 = 267_386_880
+#   lm_head = 151936*5120 = 777_912_320
+#   active = 40*(attn+mlp) + lm_head = 13_989_969_920
+#   resident (+embedding) = 14_767_882_240  (advertised 14.8B)
+
+name = "Qwen3-14B-FP8"
+hidden_dim = 5120
+max_seq_len = 40960
+attention_precision = "bf16"
+
+[[weights]]
+precision = "fp8"
+active_params = 13989969920
+resident_params = 14767882240
+
+[[layers]]
+kind = "attention"
+count = 40
+heads = 40
+head_dim = 128
+kv_heads = 8
+kv_precision = "bf16"

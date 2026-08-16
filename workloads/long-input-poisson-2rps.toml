@@ -1,0 +1,16 @@
+# Poisson 2 req/s, 200 requests; median ISL 2981 / OSL 665 tokens.
+
+arrival_pattern = "poisson"
+arrival_rate = 2.0
+num_requests = 200
+seed = 42
+
+[input_len_dist]
+type = "lognormal"
+mean = 8.0
+std_dev = 1.0
+
+[output_len_dist]
+type = "lognormal"
+mean = 6.5
+std_dev = 0.9

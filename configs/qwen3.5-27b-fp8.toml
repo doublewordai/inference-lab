@@ -1,0 +1,18 @@
+model = "qwen3.5-27b-fp8"
+
+[scheduler]
+max_num_batched_tokens = 16384
+max_num_seqs = 4096
+policy = "priority"
+enable_chunked_prefill = true
+block_size = 64
+gpu_memory_utilization = 0.8
+
+[hardware.b200]
+tp = 1
+
+[hardware.b300]
+tp = 1
+
+[hardware.gh200-120]
+tp = 1

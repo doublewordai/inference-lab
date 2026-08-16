@@ -8,13 +8,21 @@ performance modeling.
 
 ## Features
 
-- **Accurate Performance Modeling**: Models compute (FLOPS) and memory bandwidth constraints
-- **Multiple Scheduling Policies**: FCFS, Priority, SJF, and more
-- **Chunked Prefill**: Simulates realistic request interleaving
-- **KV Cache Management**: Models GPU memory and KV cache utilization
-- **Workload Generation**: Supports Poisson, Gamma, and closed-loop patterns
-- **WebAssembly Support**: Run simulations in the browser via WASM
-- **CLI Tool**: Standalone binary for command-line usage
+- **Roofline performance model**: per-precision compute streams and memory
+  bandwidth, MoE expert loading, MLA / sliding-window / hybrid-linear KV,
+  TP / EP collectives
+- **vLLM-style scheduling**: chunked prefill, preemption with recompute,
+  FCFS / priority / length-based policies, preemption-free admission
+- **KV cache**: block allocation from each model's exact KV footprint,
+  prefix caching with block sharing, spillover tiers, cascade attention
+- **Disaggregated serving**: prefill and decode pools with a shared hand-off link
+- **Speculative decoding**: analytic or trace-replayed acceptance, fixed and
+  goodput-adaptive draft policies, measured step-cost tables
+- **Workloads**: Poisson / uniform / burst / batched / closed-loop arrivals,
+  synthetic length distributions or real datasets
+- **Shipped catalog**: hardware presets (B200/B300/GH200/H100) and ~40
+  model presets with their HF-derived numbers, referenced by name from configs
+- **CLI, Rust library and WebAssembly package**
 
 ## How does it work?
 
@@ -61,51 +69,43 @@ cargo install inference-lab
 **Note:** The CLI tool is only available if you install it using `cargo install inference-lab` (see above).
 
 ```bash
-# Run with default configuration
-inference-lab --config configs/config.toml
+# A model config (× one of its hardware entries) plus a workload
+inference-lab --config configs/qwen3.6-35b-a3b-fp8.toml --hardware b200 \
+              --workload workloads/chat-closed-256.toml
 
-# Example output shows TTFT, E2E latency, throughput, and utilization metrics
+# Output shows TTFT, E2E latency, throughput, and utilization metrics
 ```
 
 ### Rust Library
 
 ```rust
+use inference_lab::config::{ModelConfig, WorkloadConfig};
 use inference_lab::simulation::Simulator;
-use inference_lab::config::SimulationConfig;
 
-let config = SimulationConfig::from_file("config.toml")?;
-let mut simulator = Simulator::new(config);
-let results = simulator.run();
+// A model config resolves to a Deployment per hardware entry; add a workload
+// to get a runnable Config.
+let deployment = ModelConfig::from_file("configs/gemma-4-31b-it.toml")?
+    .deployment(Some("b200"))?;
+let workload = WorkloadConfig::from_file("workloads/chat-closed-256.toml")?;
+let mut simulator = Simulator::new(deployment.with_workload(workload), None)?;
+simulator.run_with_callback(|_| {})?;
+let summary = simulator.summary();
 
-println!("Mean TTFT: {:.2}ms", results.ttft_mean * 1000.0);
-println!("P99 E2E: {:.2}ms", results.e2e_p99 * 1000.0);
-println!("Throughput: {:.1} tok/s", results.throughput);
+println!("Mean TTFT: {:.2}ms", summary.latency_metrics.ttft_ms.mean);
+println!("P99 E2E: {:.2}ms", summary.latency_metrics.e2e_ms.p99);
+println!("Throughput: {:.1} tok/s", summary.throughput_metrics.output_tokens_per_sec);
 ```
 
 ### WebAssembly
 
 ```javascript
-import init, { run_simulation } from '@doubleword/inference-lab';
+import init, { run_simulation } from '@doublewordai/inference-lab';
 
 await init();
 
 const config = {
-  hardware: {
-    name: "H100",
-    compute_flops: 1.513e15,
-    memory_bandwidth: 3.35e12,
-    memory_capacity: 85899345920,
-    bytes_per_param: 2
-  },
-  model: {
-    name: "Llama-3-70B",
-    num_parameters: 70000000000,
-    num_layers: 80,
-    hidden_dim: 8192,
-    num_heads: 64,
-    num_kv_heads: 8,
-    max_seq_len: 8192
-  },
+  hardware: "h100",              // catalog preset (or an inline object)
+  model: "llama-3-70b-fp8",      // catalog preset (or an inline object)
   scheduler: {
     max_num_batched_tokens: 8192,
     max_num_seqs: 256,
@@ -138,18 +138,21 @@ console.log('Throughput:', results.metrics.output_tokens_per_sec);
 
 ## Configuration
 
-Configuration files use TOML format and specify:
+A simulation is a **model config** × one of its **hardware entries** × a
+**workload**:
 
-- **Hardware**: GPU specs (FLOPS, bandwidth, VRAM)
-- **Model**: LLM architecture (parameters, layers, heads)
-- **Scheduler**: Policies, max tokens, chunked prefill settings
-- **Workload**: Request arrival patterns and distributions
+- `configs/<model>.toml` — one file per model deployment: the model (a
+  catalog preset name or an inline architecture), its engine args
+  (`[scheduler]`), optional `[speculative]`, and a `[hardware.<name>]` entry
+  per hardware it runs on (`tp`/`ep`, per-entry scheduler overrides). Every
+  model the production fleet serves has a file here with its B200 / B300 /
+  GH200 entries.
+- `workloads/<name>.toml` — arrival pattern, request-length distributions or
+  a dataset, request count, seed.
 
-Example configurations are in the `configs/` directory:
-
-- `config.toml` - Default H100 + Llama-3-70B setup
-- `test_blog.toml` - Closed-loop benchmark (64 users)
-- `qwen3_30b_a3b.toml` - Qwen model configuration
+The hardware and model presets live in `catalog/{hardware,models}/*.toml`
+and are compiled into the crate (`inference_lab::catalog`); a config refers
+to them by name (`model = "gemma-4-31b-it"`, `[hardware.b200]`).
 
 ## Building
 
@@ -157,7 +160,7 @@ Example configurations are in the `configs/` directory:
 
 ```bash
 cargo build --release
-./target/release/inference-lab --config configs/config.toml
+./target/release/inference-lab --config configs/llama-3-70b.toml --workload workloads/quick.toml
 ```
 
 ### WASM Package
@@ -183,17 +186,24 @@ cargo publish
 ```
 inference-lab/
 ├── src/
-│   ├── simulation/     # Core simulator logic
-│   ├── scheduler/      # Scheduling policies (FCFS, Priority, SJF)
-│   ├── compute/        # Performance calculations
-│   ├── kv_cache/       # KV cache management
+│   ├── simulation/     # Core simulator: engine, spec decoding, disagg
+│   ├── scheduler/      # Scheduling policies (FCFS, priority, SJF/SOF)
+│   ├── compute/        # Roofline performance model, measured step tables
+│   ├── kv_cache/       # KV block manager, prefix cache, tiers, links
 │   ├── request/        # Request generation and tracking
-│   ├── metrics/        # Performance metrics collection
+│   ├── metrics/        # Metrics collection and summaries
 │   ├── config/         # Configuration structures
+│   ├── serve/          # OpenAI-compatible server (`--features serve`)
+│   ├── catalog.rs      # Shipped hardware/model presets (embedded by build.rs)
+│   ├── dataset.rs      # Dataset loading for trace-driven workloads
 │   ├── lib.rs          # Library root
 │   ├── main.rs         # CLI entry point
 │   └── wasm.rs         # WebAssembly bindings
-├── configs/            # Example configurations
+├── catalog/            # hardware/*.toml and models/*.toml presets
+├── configs/            # One model config per deployment (model × hardware entries)
+├── workloads/          # Workload files
+├── examples/           # Rust examples and a sample dataset
+├── build.rs            # Embeds catalog/ into the crate
 ├── Cargo.toml          # Rust package manifest
 └── package.json        # npm package manifest
 ```
