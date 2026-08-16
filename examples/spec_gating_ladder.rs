@@ -20,9 +20,9 @@
 
 use inference_lab::config::model::Qwen35Model;
 use inference_lab::config::{
-    AcceptanceModel, Config, DrafterCost, GammaPolicy, HardwareConfig, LengthDistribution,
-    ModelConfig, ParallelConfig, Precision, SchedulerConfig, SimulationConfig, SpeculativeConfig,
-    WorkloadConfig,
+    AcceptanceModel, ArrivalPattern, Config, DrafterCost, GammaPolicy, HardwareConfig,
+    LengthDistribution, ModelConfig, ParallelConfig, Precision, SchedulerConfig, SimulationConfig,
+    SpeculativeConfig, WorkloadConfig,
 };
 use inference_lab::simulation::Simulator;
 
@@ -103,7 +103,10 @@ impl Drafter {
                 experts_per_tok: 8,
                 shared_experts: 1,
             },
-            Drafter::Dflash => DrafterCost::BlockParallel { params: 982_515_712.0, block: 16 },
+            Drafter::Dflash => DrafterCost::BlockParallel {
+                params: 982_515_712.0,
+                block: 16,
+            },
         }
     }
     fn gamma_max(&self) -> u32 {
@@ -149,7 +152,11 @@ impl Policy {
 fn base_config(conc: usize, isl: u32, osl: u32) -> Config {
     Config {
         hardware: b200_per_gpu(),
-        parallel: ParallelConfig { tp: 1, ep: 1, dp_attention: false },
+        parallel: ParallelConfig {
+            tp: 1,
+            ep: 1,
+            dp_attention: false,
+        },
         model: qwen36(),
         scheduler: SchedulerConfig {
             max_num_batched_tokens: 16384,
@@ -164,7 +171,7 @@ fn base_config(conc: usize, isl: u32, osl: u32) -> Config {
         },
         workload: WorkloadConfig {
             dataset_path: None,
-            arrival_pattern: "closed_loop".into(),
+            arrival_pattern: ArrivalPattern::ClosedLoop,
             arrival_rate: 1.0,
             rate_schedule: None,
             num_concurrent_users: Some(conc),
@@ -184,14 +191,17 @@ fn goodput(conc: usize, isl: u32, osl: u32, d: Drafter, p: Policy) -> f64 {
     let mut config = base_config(conc, isl, osl);
     config.speculative = p.spec(d);
     config.finalize();
-    let (mut sim, _cfg) = Simulator::new(config, None).expect("build sim");
+    let mut sim = Simulator::new(config, None).expect("build sim");
     sim.run_with_callback(|_| {}).expect("run");
-    sim.get_metrics_summary().output_tokens_per_sec
+    sim.summary().throughput_metrics.output_tokens_per_sec
 }
 
 fn sweep(d: Drafter, isl: u32, osl: u32, concs: &[usize]) {
     let g = d.gamma_max();
-    println!("\n=== {}  (Qwen3.6-35B-A3B verifier, B200 TP1/EP1, decode-only) ===", d.label());
+    println!(
+        "\n=== {}  (Qwen3.6-35B-A3B verifier, B200 TP1/EP1, decode-only) ===",
+        d.label()
+    );
     println!("Δ columns are vs the homogeneous priced policy (the envelope).");
     println!(
         "{:>6}  {:>8}  {:>8}  {:>9}  {:>9}  {:>9}",

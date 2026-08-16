@@ -8,16 +8,16 @@ pub mod topology;
 pub mod workload;
 
 pub use hardware::{HardwareConfig, KVTier, Precision};
-pub use model::{DenseModel, DeepseekV4Model, ModelConfig, ModelCosts, SlidingWindowModel};
+pub use model::{DeepseekV4Model, DenseModel, ModelConfig, ModelCosts, SlidingWindowModel};
 pub use parallel::{CommsConfig, ParallelConfig};
 pub use scheduler::SchedulerConfig;
+pub use simulation::SimulationConfig;
 pub use speculative::{
     AcceptanceModel, DrafterCost, GammaPolicy, MeasuredCostConfig, SpeculativeConfig,
     SwitchConstraints, TraceBank, TraceRound,
 };
-pub use simulation::SimulationConfig;
-pub use topology::{ClusterSpec, DisaggTopology, Node};
-pub use workload::{LengthDistribution, RateSchedule, WorkloadConfig};
+pub use topology::{ClusterSpec, DisaggTopology};
+pub use workload::{ArrivalPattern, LengthDistribution, RateSchedule, WorkloadConfig};
 
 use serde::Deserialize;
 use std::fs;
@@ -52,21 +52,20 @@ impl Config {
     /// Fill in derived fields after deserialization. Public so wasm.rs can
     /// call it after `serde_json::from_str`.
     pub fn finalize(&mut self) {
-        self.model.finalize(&self.hardware);
-        let model_size_bytes = self.model.weight_residency_bytes();
-        // Re-use ClusterSpec's helper for KV-cache capacity sizing so the
-        // single-cluster path agrees with the disagg path.
-        let mut cluster = ClusterSpec {
+        self.scheduler
+            .set_default_prefill_threshold(self.model.max_seq_len());
+    }
+
+    /// The single worker pool this config describes: its hardware and
+    /// parallel layout as one `ClusterSpec` (no collective-comms model, one
+    /// worker).
+    pub fn cluster(&self) -> ClusterSpec {
+        ClusterSpec {
             hardware: self.hardware.clone(),
             parallel: self.parallel.clone(),
             comms: None,
             num_workers: 1,
-            node: 0,
-        };
-        cluster.compute_kv_cache_capacity(model_size_bytes);
-        self.hardware.kv_cache_capacity = cluster.hardware.kv_cache_capacity;
-        self.scheduler
-            .set_default_prefill_threshold(self.model.max_seq_len());
+        }
     }
 
     /// Get a default configuration for testing
@@ -114,7 +113,7 @@ impl Config {
 
         let workload = WorkloadConfig {
             dataset_path: None,
-            arrival_pattern: "poisson".to_string(),
+            arrival_pattern: ArrivalPattern::Poisson,
             arrival_rate: 1.0,
             rate_schedule: None,
             num_concurrent_users: None,

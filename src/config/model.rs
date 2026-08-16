@@ -289,8 +289,7 @@ impl DenseModel {
     }
     /// KV bytes per token for a single layer (K and V combined).
     fn kv_bytes_per_token_per_layer(&self) -> f64 {
-        2.0 * self.kv_heads() as f64 * self.head_dim() as f64
-            * self.precision.bytes_per_value()
+        2.0 * self.kv_heads() as f64 * self.head_dim() as f64 * self.precision.bytes_per_value()
     }
 }
 
@@ -366,8 +365,7 @@ impl SlidingWindowModel {
         self.hidden_dim / self.num_heads
     }
     fn kv_bytes_per_token_per_layer(&self) -> f64 {
-        2.0 * self.kv_heads() as f64 * self.head_dim() as f64
-            * self.precision.bytes_per_value()
+        2.0 * self.kv_heads() as f64 * self.head_dim() as f64 * self.precision.bytes_per_value()
     }
     fn num_full_layers(&self) -> u32 {
         self.num_layers.saturating_sub(self.num_sliding_layers)
@@ -552,8 +550,9 @@ impl DeepseekV4Model {
         // Per-routed-expert params `w` and always-resident shared params,
         // recovered from the active (k routed + shared) and resident (all
         // routed + shared) footprints: active = k·w + shared, resident = E·w + shared.
-        let w = (self.num_resident_expert_params.saturating_sub(self.num_active_expert_params)
-            as f64)
+        let w = (self
+            .num_resident_expert_params
+            .saturating_sub(self.num_active_expert_params) as f64)
             / (ef - kf);
         let shared = (self.num_active_expert_params as f64 - kf * w).max(0.0);
         // Expected distinct routed experts hit by N tokens each routing to k.
@@ -609,9 +608,7 @@ impl ModelCosts for DeepseekV4Model {
     fn alltoall_bytes_per_token(&self) -> u64 {
         // Each token is dispatched to `num_experts_per_tok` experts; each
         // dispatch sends one full hidden_dim-wide activation.
-        self.num_experts_per_tok as u64
-            * self.hidden_dim as u64
-            * self.activation_bytes() as u64
+        self.num_experts_per_tok as u64 * self.hidden_dim as u64 * self.activation_bytes() as u64
     }
     fn num_ep_alltoalls_per_pass(&self) -> u32 {
         // Dispatch + combine per MoE layer.
@@ -693,8 +690,7 @@ impl ModelCosts for DeepseekV4Model {
         (per * (window_total + near_total + far_total) + indexer_total) as u64
     }
     fn weight_residency_bytes(&self) -> u64 {
-        let exp = self.num_resident_expert_params as f64
-            * self.expert_precision.bytes_per_value();
+        let exp = self.num_resident_expert_params as f64 * self.expert_precision.bytes_per_value();
         let non_exp = self.num_resident_non_expert_params as f64
             * self.non_expert_precision.bytes_per_value();
         (exp + non_exp) as u64
@@ -706,11 +702,11 @@ impl ModelCosts for DeepseekV4Model {
         // Dense layers store only the rolling window.
         let dense_total = self.num_dense_layers as f64 * win;
         // Near layers store window + every compressed position.
-        let near_total = self.num_near_layers as f64
-            * (win + self.near_compressed_positions(seq_len) as f64);
+        let near_total =
+            self.num_near_layers as f64 * (win + self.near_compressed_positions(seq_len) as f64);
         // Far layers store window + every (more aggressively) compressed position.
-        let far_total = self.num_far_layers as f64
-            * (win + self.far_compressed_positions(seq_len) as f64);
+        let far_total =
+            self.num_far_layers as f64 * (win + self.far_compressed_positions(seq_len) as f64);
 
         // Indexer's auxiliary KV: one entry per compressed position, head_dim_idx wide.
         let indexer_per_position = self.index_head_dim as f64 * self.index_kv_bytes_per_value();
@@ -816,8 +812,9 @@ impl Qwen35Model {
         }
         let ef = e as f64;
         let kf = k as f64;
-        let w = (self.num_resident_expert_params.saturating_sub(self.num_active_expert_params)
-            as f64)
+        let w = (self
+            .num_resident_expert_params
+            .saturating_sub(self.num_active_expert_params) as f64)
             / (ef - kf);
         let shared = (self.num_active_expert_params as f64 - kf * w).max(0.0);
         let loaded = ef * (1.0 - (1.0 - 1.0 / ef).powf(num_tokens as f64 * kf));
@@ -831,7 +828,8 @@ impl Qwen35Model {
     /// KV bytes per token per *full-attention* layer (K and V, GQA), at
     /// `kv_precision`.
     fn attn_kv_bytes_per_token_per_layer(&self) -> f64 {
-        2.0 * self.num_kv_heads as f64 * self.attn_head_dim as f64
+        2.0 * self.num_kv_heads as f64
+            * self.attn_head_dim as f64
             * self.kv_precision.bytes_per_value()
     }
 
@@ -873,7 +871,10 @@ impl ModelCosts for Qwen35Model {
     fn matmul_flops_per_token_by_prec(&self) -> Vec<(Precision, u64)> {
         vec![
             (self.expert_precision, 2 * self.num_active_expert_params),
-            (self.non_expert_precision, 2 * self.num_active_non_expert_params),
+            (
+                self.non_expert_precision,
+                2 * self.num_active_non_expert_params,
+            ),
         ]
     }
     fn attention_flops(&self, s: u32, t: u32) -> u64 {
@@ -909,8 +910,8 @@ impl ModelCosts for Qwen35Model {
     }
     fn weight_residency_bytes(&self) -> u64 {
         let exp = self.num_resident_expert_params as f64 * self.expert_precision.bytes_per_value();
-        let non_exp =
-            self.num_resident_non_expert_params as f64 * self.non_expert_precision.bytes_per_value();
+        let non_exp = self.num_resident_non_expert_params as f64
+            * self.non_expert_precision.bytes_per_value();
         (exp + non_exp) as u64
     }
     fn per_sequence_state_bytes(&self) -> u64 {
@@ -974,7 +975,10 @@ mod tests {
         let one = m.expert_params_resident_per_step(1);
         let many = m.expert_params_resident_per_step(100_000);
         // ~active at a single token, ~all-experts-resident at large batch.
-        assert!((one as i64 - 9000).abs() < 500, "single-token ≈ active, got {one}");
+        assert!(
+            (one as i64 - 9000).abs() < 500,
+            "single-token ≈ active, got {one}"
+        );
         assert_eq!(many, 257_000, "large batch loads every expert");
         // monotonically non-decreasing in batch.
         let mut prev = 0;
@@ -996,8 +1000,19 @@ mod tests {
     #[test]
     fn weight_bytes_per_step_scales_with_batch_for_moe() {
         let m = ModelConfig::DeepseekV4(moe(256));
-        let small: u64 = m.weight_bytes_per_step_by_prec(1).iter().map(|(_, b)| b).sum();
-        let large: u64 = m.weight_bytes_per_step_by_prec(100_000).iter().map(|(_, b)| b).sum();
-        assert!(large > small, "MoE weight traffic must grow with batch tokens");
+        let small: u64 = m
+            .weight_bytes_per_step_by_prec(1)
+            .iter()
+            .map(|(_, b)| b)
+            .sum();
+        let large: u64 = m
+            .weight_bytes_per_step_by_prec(100_000)
+            .iter()
+            .map(|(_, b)| b)
+            .sum();
+        assert!(
+            large > small,
+            "MoE weight traffic must grow with batch tokens"
+        );
     }
 }

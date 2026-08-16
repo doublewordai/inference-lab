@@ -1,7 +1,10 @@
 pub mod collector;
-pub mod quantile;
+pub mod distribution;
 pub mod summary;
 
-pub use collector::{LatencySampleTriplet, LatencySeries, MetricsCollector};
-pub use quantile::StreamingQuantiles;
-pub use summary::MetricsSummary;
+pub use collector::{LatencySamples, MetricsCollector, RequestRow, SampleCursor, SeriesRef};
+pub use distribution::{Distribution, RunningMean};
+pub use summary::{
+    LatencyMetrics, LatencyStats, MetricsSummary, Preemptions, PrefixCacheMetrics, RequestCounts,
+    ThroughputMetrics, Utilization,
+};

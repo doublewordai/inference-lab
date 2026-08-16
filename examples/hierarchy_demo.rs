@@ -63,30 +63,24 @@ fn run_for_batch(num_concurrent: usize, share_prefix: bool) -> Vec<f64> {
     let config_scheduler = scheduler_cfg.clone();
     let block_size = scheduler_cfg.block_size;
 
-    let kv_cache_manager = KVCacheManager::new(
+    let kv_model = config_model.clone();
+    let mut kv_cache_manager = KVCacheManager::new(
         config_hardware.kv_cache_capacity,
         block_size,
-        config_model.kv_storage_bytes(1),
+        move |t| kv_model.kv_storage_bytes(t),
         config_model.per_sequence_state_bytes(),
         true,
     )
     .with_tiers(&config_hardware.kv_tiers);
 
-    let mut scheduler = Scheduler::new(
-        config_scheduler,
-        config_hardware,
-        config_model,
-        kv_cache_manager,
-    )
-    .unwrap();
-
     // Pre-warm: pretend a long prefix lives in host RAM. We do this by
-    // hand-poking the manager: allocate blocks for the prefix so its hashes
-    // land in HBM, free them, then evict them by allocating fresh blocks.
+    // hand-poking the manager before handing it to the scheduler: allocate
+    // blocks for the prefix so its hashes land in HBM, free them, then evict
+    // them by allocating fresh blocks.
     let prefix_blocks: u32 = 64; // 64 * 16 = 1024 tokens
-    // Each request gets its own prefix; if `share_prefix` is set, all of
-    // them get the same one. We pre-warm host RAM with all the prefixes
-    // we're going to use.
+                                 // Each request gets its own prefix; if `share_prefix` is set, all of
+                                 // them get the same one. We pre-warm host RAM with all the prefixes
+                                 // we're going to use.
     let prefix_hashes_per_req: Vec<Vec<u64>> = (0..num_concurrent)
         .map(|r| {
             let base = if share_prefix {
@@ -98,22 +92,29 @@ fn run_for_batch(num_concurrent: usize, share_prefix: bool) -> Vec<f64> {
         })
         .collect();
     {
-        let mgr = scheduler.kv_cache_manager_mut();
+        let mgr = &mut kv_cache_manager;
         // Allocate-and-free each prefix once to register them in HBM, then
         // churn them down to host RAM.
         for hashes in &prefix_hashes_per_req {
             let mut seed = Request::new("seed".into(), 0, 0.0, prefix_blocks * block_size, 1);
             seed.prompt_block_hashes = hashes.clone();
-            let blocks = mgr.allocate_blocks(&seed, prefix_blocks * block_size).unwrap();
+            let blocks = mgr
+                .allocate_blocks(&seed, prefix_blocks * block_size)
+                .unwrap();
             mgr.free_blocks(&blocks);
         }
         let churn_blocks = mgr.total_blocks() as u32;
         let mut churn = Request::new("churn".into(), 0, 0.0, churn_blocks * block_size, 1);
-        churn.prompt_block_hashes = (0..churn_blocks as u64).map(|i| 9_000_000_000 + i).collect();
-        mgr.allocate_blocks(&churn, churn_blocks * block_size).unwrap();
+        churn.prompt_block_hashes = (0..churn_blocks as u64)
+            .map(|i| 9_000_000_000 + i)
+            .collect();
+        mgr.allocate_blocks(&churn, churn_blocks * block_size)
+            .unwrap();
         let churn_blocks_alloc: Vec<u32> = (0..churn_blocks).collect();
         mgr.free_blocks(&churn_blocks_alloc);
     }
+
+    let mut scheduler = Scheduler::new(config_scheduler, kv_cache_manager).unwrap();
 
     for i in 0..num_concurrent {
         let mut req = Request::new(
@@ -169,7 +170,10 @@ fn main() {
     println!();
 
     println!("Case A: all requests share the same prefix (sim joins them on one transfer).");
-    println!("{:>6}  {:>14}  {:>14}", "batch", "first_done(s)", "last_done(s)");
+    println!(
+        "{:>6}  {:>14}  {:>14}",
+        "batch", "first_done(s)", "last_done(s)"
+    );
     println!("{}", "-".repeat(40));
     for &n in &[1usize, 2, 4, 8, 16] {
         let times = run_for_batch(n, /*share_prefix=*/ true);
@@ -180,7 +184,10 @@ fn main() {
 
     println!();
     println!("Case B: each request has its own prefix (transfers contend on shared PCIe).");
-    println!("{:>6}  {:>14}  {:>14}", "batch", "first_done(s)", "last_done(s)");
+    println!(
+        "{:>6}  {:>14}  {:>14}",
+        "batch", "first_done(s)", "last_done(s)"
+    );
     println!("{}", "-".repeat(40));
     for &n in &[1usize, 2, 4, 8, 16] {
         let times = run_for_batch(n, /*share_prefix=*/ false);

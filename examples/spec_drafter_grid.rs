@@ -11,9 +11,9 @@
 
 use inference_lab::config::model::Qwen35Model;
 use inference_lab::config::{
-    AcceptanceModel, Config, DrafterCost, GammaPolicy, HardwareConfig, LengthDistribution,
-    ModelConfig, ParallelConfig, Precision, SchedulerConfig, SimulationConfig, SpeculativeConfig,
-    WorkloadConfig,
+    AcceptanceModel, ArrivalPattern, Config, DrafterCost, GammaPolicy, HardwareConfig,
+    LengthDistribution, ModelConfig, ParallelConfig, Precision, SchedulerConfig, SimulationConfig,
+    SpeculativeConfig, WorkloadConfig,
 };
 use inference_lab::simulation::Simulator;
 
@@ -88,7 +88,10 @@ impl Drafter {
                 experts_per_tok: 8,
                 shared_experts: 1,
             },
-            Drafter::Dflash => DrafterCost::BlockParallel { params: 982_515_712.0, block: 16 },
+            Drafter::Dflash => DrafterCost::BlockParallel {
+                params: 982_515_712.0,
+                block: 16,
+            },
         }
     }
     fn gamma_max(&self) -> u32 {
@@ -108,7 +111,9 @@ enum Policy {
 
 impl Policy {
     fn spec(&self, d: Drafter) -> Option<SpeculativeConfig> {
-        let acceptance = AcceptanceModel::TraceRounds { path: d.bank_path().into() };
+        let acceptance = AcceptanceModel::TraceRounds {
+            path: d.bank_path().into(),
+        };
         let mk = |gamma: u32, policy: GammaPolicy| {
             Some(SpeculativeConfig {
                 gamma,
@@ -131,7 +136,11 @@ impl Policy {
 fn base_config(conc: usize, isl: u32, osl: u32) -> Config {
     Config {
         hardware: b200_per_gpu(),
-        parallel: ParallelConfig { tp: 1, ep: 1, dp_attention: false },
+        parallel: ParallelConfig {
+            tp: 1,
+            ep: 1,
+            dp_attention: false,
+        },
         model: qwen36(),
         scheduler: SchedulerConfig {
             max_num_batched_tokens: 16384,
@@ -146,7 +155,7 @@ fn base_config(conc: usize, isl: u32, osl: u32) -> Config {
         },
         workload: WorkloadConfig {
             dataset_path: None,
-            arrival_pattern: "closed_loop".into(),
+            arrival_pattern: ArrivalPattern::ClosedLoop,
             arrival_rate: 1.0,
             rate_schedule: None,
             num_concurrent_users: Some(conc),
@@ -167,11 +176,14 @@ fn run_point(conc: usize, isl: u32, osl: u32, d: Drafter, p: Policy) -> (f64, f6
     let mut config = base_config(conc, isl, osl);
     config.speculative = p.spec(d);
     config.finalize();
-    let (mut sim, _cfg) = Simulator::new(config, None).expect("build sim");
+    let mut sim = Simulator::new(config, None).expect("build sim");
     sim.run_with_callback(|_| {}).expect("run");
-    let s = sim.get_metrics_summary();
+    let s = sim.summary();
     // per_token_mean is already in ms (collector multiplies by 1000).
-    (s.output_tokens_per_sec, s.per_token_mean)
+    (
+        s.throughput_metrics.output_tokens_per_sec,
+        s.latency_metrics.per_token_ms.mean,
+    )
 }
 
 fn arr_f(v: &[f64]) -> String {

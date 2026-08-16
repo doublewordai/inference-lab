@@ -23,9 +23,9 @@
 //! Run: `cargo run --release --example spec_c1_gamma_sweep --no-default-features`
 
 use inference_lab::config::{
-    AcceptanceModel, Config, DeepseekV4Model, GammaPolicy, HardwareConfig, LengthDistribution,
-    ModelConfig, ParallelConfig, Precision, SchedulerConfig, SimulationConfig, SpeculativeConfig,
-    WorkloadConfig,
+    AcceptanceModel, ArrivalPattern, Config, DeepseekV4Model, GammaPolicy, HardwareConfig,
+    LengthDistribution, ModelConfig, ParallelConfig, Precision, SchedulerConfig, SimulationConfig,
+    SpeculativeConfig, WorkloadConfig,
 };
 use inference_lab::simulation::Simulator;
 
@@ -62,7 +62,7 @@ fn deepseek_v4_flash() -> ModelConfig {
         kv_latent_dim: 512, // head_dim
         qk_rope_head_dim: 64,
         kv_precision: Precision::Fp8,
-        num_active_expert_params: 7_574_913_024,     // (6+1)·25.17M·43
+        num_active_expert_params: 7_574_913_024, // (6+1)·25.17M·43
         num_active_non_expert_params: 5_660_947_776, // attn+indexer+compressor+gate+head
         num_resident_expert_params: 278_107_521_024, // (256+1)·25.17M·43
         num_resident_non_expert_params: 6_225_000_000,
@@ -89,7 +89,11 @@ fn base_config(conc: usize, isl: u32, osl: u32) -> Config {
         hardware: b200_per_gpu(),
         // Single B200, TP1/EP1 -- matches the post's per-GPU roofline (the
         // ~145GB of fp4 weights + small KV fit in 192GB). One pool, one device.
-        parallel: ParallelConfig { tp: 1, ep: 1, dp_attention: false },
+        parallel: ParallelConfig {
+            tp: 1,
+            ep: 1,
+            dp_attention: false,
+        },
         model: deepseek_v4_flash(),
         scheduler: SchedulerConfig {
             max_num_batched_tokens: 8192,
@@ -104,7 +108,7 @@ fn base_config(conc: usize, isl: u32, osl: u32) -> Config {
         },
         workload: WorkloadConfig {
             dataset_path: None,
-            arrival_pattern: "closed_loop".into(),
+            arrival_pattern: ArrivalPattern::ClosedLoop,
             arrival_rate: 1.0,
             rate_schedule: None,
             num_concurrent_users: Some(conc),
@@ -158,18 +162,25 @@ impl Policy {
 }
 
 /// Returns (goodput_tok_s, tpot_ms, bw_util, flops_util).
-fn run_point(conc: usize, isl: u32, osl: u32, alpha: f64, c_draft: f64, p: Policy) -> (f64, f64, f64, f64) {
+fn run_point(
+    conc: usize,
+    isl: u32,
+    osl: u32,
+    alpha: f64,
+    c_draft: f64,
+    p: Policy,
+) -> (f64, f64, f64, f64) {
     let mut config = base_config(conc, isl, osl);
     config.speculative = p.spec(alpha, c_draft);
     config.finalize();
-    let (mut sim, _cfg) = Simulator::new(config, None).expect("build sim");
+    let mut sim = Simulator::new(config, None).expect("build sim");
     sim.run_with_callback(|_| {}).expect("run");
-    let s = sim.get_metrics_summary();
+    let s = sim.summary();
     (
-        s.output_tokens_per_sec,
-        s.per_token_mean * 1000.0,
-        s.avg_bandwidth_util,
-        s.avg_flops_util,
+        s.throughput_metrics.output_tokens_per_sec,
+        s.latency_metrics.per_token_ms.mean * 1000.0,
+        s.utilization.avg_bandwidth_util,
+        s.utilization.avg_flops_util,
     )
 }
 
@@ -214,7 +225,8 @@ fn main() {
             }
             fixed_gp.push(gp);
         }
-        let (budget, _tpot, bw, _fl) = run_point(conc, isl, osl, alpha, c_draft, Policy::Budget(gamma_max));
+        let (budget, _tpot, bw, _fl) =
+            run_point(conc, isl, osl, alpha, c_draft, Policy::Budget(gamma_max));
         let d_budget = 100.0 * (budget - best_fixed) / best_fixed;
 
         print!("{conc:>6}");
@@ -225,12 +237,18 @@ fn main() {
         print!("  {best_fixed:>10.0}");
         print!("  {budget:>10.0}");
         print!("  {d_budget:>+7.2}");
-        let argmax = if best_g == 0 { "nospec".to_string() } else { format!("γ{best_g}") };
+        let argmax = if best_g == 0 {
+            "nospec".to_string()
+        } else {
+            format!("γ{best_g}")
+        };
         print!("  {argmax:>7}");
         print!("  {:>5.0}%", bw * 100.0);
         println!();
     }
 
     println!("\nPass criterion: Δ% ≈ 0 (BUDGET matches best fixed γ) at every conc, with the");
-    println!("winning fixed γ (argmax) shifting across the sweep -- that shift is what C2 exploits.");
+    println!(
+        "winning fixed γ (argmax) shifting across the sweep -- that shift is what C2 exploits."
+    );
 }

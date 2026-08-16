@@ -1,56 +1,49 @@
-use super::{decision::ScheduleDecision, policy::SchedulingPolicy};
-use crate::config::{HardwareConfig, ModelConfig, SchedulerConfig};
+use super::{decision::ScheduleDecision, decision::ScheduledSeq, policy::SchedulingPolicy};
+use crate::config::SchedulerConfig;
 use crate::kv_cache::KVCacheManager;
-use crate::request::{Request, RequestStatus};
+use crate::request::Request;
 use ordered_float::OrderedFloat;
 use std::collections::VecDeque;
 
+/// vLLM-v1-style iteration scheduler for one worker: a waiting queue, a
+/// running set, and the worker's KV cache manager. Each `schedule` call
+/// reaps finished requests, grows the running set (preempting under KV
+/// pressure), then admits waiting requests into the leftover token budget.
 pub struct Scheduler {
     config: SchedulerConfig,
-    _hardware: HardwareConfig,
-    _model: ModelConfig,
 
-    /// Waiting queue (FIFO)
+    /// Waiting queue. Preempted requests re-enter at the front.
     waiting: VecDeque<Request>,
 
-    /// Running requests
+    /// Running requests, in admission order.
     running: Vec<Request>,
 
     /// Requests holding HBM blocks while their KV cache is being promoted
-    /// from a slower tier. They re-enter `waiting` once `current_time >=
-    /// ready_at`. Blocks reserved during the wait are not freed until the
-    /// transfer completes (or the request is preempted).
+    /// from a slower tier. They re-enter `waiting` once the transfer
+    /// completes. Blocks reserved during the wait are not freed until the
+    /// transfer completes.
     pending_transfers: Vec<Request>,
 
-    /// Scheduling policy
     policy: SchedulingPolicy,
 
-    /// KV cache manager
     kv_cache_manager: KVCacheManager,
 
-    /// Current iteration number
-    iteration: u64,
+    /// Total preemptions performed so far.
+    num_preemptions: u64,
 }
 
 impl Scheduler {
-    pub fn new(
-        config: SchedulerConfig,
-        hardware: HardwareConfig,
-        model: ModelConfig,
-        kv_cache_manager: KVCacheManager,
-    ) -> Result<Self, String> {
+    pub fn new(config: SchedulerConfig, kv_cache_manager: KVCacheManager) -> Result<Self, String> {
         let policy = config.policy.parse::<SchedulingPolicy>()?;
 
         Ok(Self {
             config,
-            _hardware: hardware,
-            _model: model,
             waiting: VecDeque::new(),
             running: Vec::new(),
             pending_transfers: Vec::new(),
             policy,
             kv_cache_manager,
-            iteration: 0,
+            num_preemptions: 0,
         })
     }
 
@@ -70,19 +63,18 @@ impl Scheduler {
             if completed.contains(&req.request_id) {
                 // Publish the now-resident blocks to the HBM prefix cache so
                 // subsequent same-prefix requests get a clean HBM hit.
-                let cached_blocks = (req.num_cached_tokens as usize)
-                    .div_ceil(self.config.block_size as usize);
+                let cached_blocks = self
+                    .kv_cache_manager
+                    .content_blocks_for_tokens(req.num_cached_tokens);
                 let hashes: Vec<u64> = req
-                    .get_prompt_block_hashes()
+                    .prompt_block_hashes
                     .iter()
                     .copied()
                     .take(cached_blocks)
                     .collect();
-                let blocks: Vec<u32> =
-                    req.kv_blocks.iter().copied().take(cached_blocks).collect();
+                let blocks: Vec<u32> = req.kv_blocks.iter().copied().take(cached_blocks).collect();
                 self.kv_cache_manager
                     .publish_transferred_blocks(&hashes, &blocks);
-                req.status = RequestStatus::Waiting;
                 req.ready_at = None;
                 req.num_computed_tokens = req.num_cached_tokens;
                 self.waiting.push_back(req);
@@ -97,164 +89,130 @@ impl Scheduler {
         self.pending_transfers = still_pending;
     }
 
-    /// Main scheduling function - called each iteration
-    /// Returns a ScheduleDecision with all scheduling actions
+    /// Main scheduling function, called once per iteration.
     pub fn schedule(&mut self, current_time: f64) -> ScheduleDecision {
-        self.iteration += 1;
-
         // Promote any pending KV transfers whose deadline has passed; their
         // KV is now resident in HBM and they can be scheduled normally.
         self.promote_finished_transfers(current_time);
 
-        let mut decision = ScheduleDecision::new();
+        let mut decision = ScheduleDecision::default();
         let mut token_budget = self.config.max_num_batched_tokens;
 
-        // Phase 1: Schedule RUNNING requests (with preemption if needed)
+        // Phase 0: reap finished requests, freeing their blocks BEFORE any
+        // allocation this pass. Within a step, retirement must precede
+        // growth: a request later in `running` may have finished, and an
+        // earlier request's allocation should be able to use those blocks.
         let mut idx = 0;
-        while idx < self.running.len() && token_budget > 0 {
-            // Check if request is finished
+        while idx < self.running.len() {
             if self.running[idx].is_finished() {
                 let mut req = self.running.remove(idx);
-                req.status = RequestStatus::Completed;
-                req.completion_time = Some(current_time);
-
-                // Free KV cache blocks
                 self.kv_cache_manager.free_blocks(&req.kv_blocks);
                 req.kv_blocks.clear();
-
                 decision.completed.push(req);
+            } else {
+                idx += 1;
+            }
+        }
+
+        // Phase 1: schedule RUNNING requests, preempting under KV pressure.
+        let mut idx = 0;
+        while idx < self.running.len() && token_budget > 0 {
+            let tokens_to_schedule = self.tokens_to_schedule(&self.running[idx], token_budget);
+            let blocks_needed = self
+                .kv_cache_manager
+                .blocks_needed(&self.running[idx], tokens_to_schedule);
+
+            if blocks_needed > 0 && self.kv_cache_manager.num_free_blocks() < blocks_needed {
+                if self.config.enable_preemption_free {
+                    // Admission control guarantees every admitted request can
+                    // grow to its bound without preemption; reaching here
+                    // means that projection was violated. Fall through to
+                    // preemption rather than wedge the worker.
+                    log::error!(
+                        "preemption-free admission violated at t={current_time}: \
+                         request {} needs {blocks_needed} blocks, {} free",
+                        self.running[idx].request_id,
+                        self.kv_cache_manager.num_free_blocks()
+                    );
+                }
+                // Victims are restricted to positions >= idx: earlier
+                // positions are already recorded in the decision by index,
+                // and removing one would invalidate those indices.
+                if let Some(victim) = self.select_preemption_victim(idx) {
+                    let mut preempted = self.running.remove(victim);
+                    self.preempt_request(&mut preempted);
+                    // vLLM puts preempted requests back at the head of the
+                    // waiting queue; push_back would starve them behind the
+                    // whole arrival backlog.
+                    self.waiting.push_front(preempted);
+                    decision.num_preempted += 1;
+                    // Victim was at >= idx, so recorded indices stay valid.
+                    // If we preempted ourselves, running[idx] is now the
+                    // next request; either way, re-evaluate at idx.
+                    continue;
+                }
+                // Nothing left to preempt; skip this request this step.
+                idx += 1;
                 continue;
             }
 
-            // Calculate tokens to schedule for this request
-            let tokens_to_process = self.running[idx].tokens_to_process();
-            let mut tokens_to_schedule = tokens_to_process.min(token_budget);
-
-            // If in prefill phase, limit to only prefill tokens (don't cross into decode)
-            if self.running[idx].is_prefill() {
-                let remaining_prefill =
-                    self.running[idx].num_prompt_tokens - self.running[idx].num_computed_tokens;
-                tokens_to_schedule = tokens_to_schedule.min(remaining_prefill);
-
-                // Apply chunked prefill limit if enabled (vLLM's long_prefill_token_threshold)
-                if self.config.enable_chunked_prefill
-                    && self.config.long_prefill_token_threshold > 0
-                {
-                    tokens_to_schedule =
-                        tokens_to_schedule.min(self.config.long_prefill_token_threshold);
-                }
-            } else {
-                // Decode phase: one bonus token plus the speculative verify pass.
-                // `pending_draft_len` (decided last iteration; 0 if speculation is
-                // off) makes the step process `1 + draft` tokens, so the token
-                // budget and KV are reserved for the verify cost. The earlier
-                // `.min(token_budget)` already trims `draft` to fit the budget.
-                let verify_width = 1 + self.running[idx].pending_draft_len;
-                tokens_to_schedule = tokens_to_schedule.min(verify_width);
-            }
-
-            // Try to allocate KV cache blocks if needed
-            let blocks_needed =
-                self.calculate_blocks_needed(&self.running[idx], tokens_to_schedule);
-
-            if blocks_needed > 0 && self.kv_cache_manager.num_free_blocks() < blocks_needed {
-                // Need to preempt or skip
-                if self.config.enable_preemption_free {
-                    // In preemption-free mode, we shouldn't reach this point
-                    eprintln!("ERROR: Admission control failed!");
-                    eprintln!("  blocks_needed: {}", blocks_needed);
-                    eprintln!("  free_blocks: {}", self.kv_cache_manager.num_free_blocks());
-                    eprintln!("  running_requests: {}", self.running.len());
-                    eprintln!("  waiting_requests: {}", self.waiting.len());
-                    eprintln!("  current_time: {}", current_time);
-                    eprintln!("  request_id: {}", self.running[idx].request_id);
-                    eprintln!("  tokens_to_schedule: {}", tokens_to_schedule);
-                    unreachable!();
-                }
-
-                // Normal preemption logic
-                if let Some(preempt_idx) = self.select_preemption_victim() {
-                    let mut preempted_req = self.running.remove(preempt_idx);
-                    self.preempt_request(&mut preempted_req, current_time);
-                    self.waiting.push_back(preempted_req);
-                    decision.preempted.push(preempt_idx);
-
-                    // If we preempted ourselves, we can't schedule
-                    if preempt_idx == idx {
-                        continue;
-                    }
-
-                    // Adjust index if we preempted someone before us
-                    if preempt_idx < idx {
-                        idx -= 1;
-                    }
-                    continue;
-                } else {
-                    // Can't preempt anyone, skip this request
-                    idx += 1;
-                    continue;
-                }
-            }
-
-            // Allocate blocks if needed
             if blocks_needed > 0 {
-                if let Some(blocks) = self
+                let blocks = self
                     .kv_cache_manager
                     .allocate_blocks(&self.running[idx], tokens_to_schedule)
-                {
-                    self.running[idx].kv_blocks.extend(blocks);
-                } else {
-                    // Shouldn't happen since we checked above
-                    idx += 1;
-                    continue;
-                }
+                    .expect("free-block check above guarantees allocation");
+                self.running[idx].kv_blocks.extend(blocks);
             }
 
-            // Schedule this request
-            decision.scheduled_running.push(idx);
-            decision.tokens_for_running.push(tokens_to_schedule);
+            decision.batch.push(ScheduledSeq {
+                idx,
+                num_tokens: tokens_to_schedule,
+            });
             token_budget -= tokens_to_schedule;
             idx += 1;
         }
 
-        // Phase 2: Schedule WAITING requests (only if no preemptions occurred)
-        if decision.preempted.is_empty() {
+        // Phase 2: admit WAITING requests (only if nothing was preempted:
+        // preemption means KV is full, so admitting would just be preempted
+        // again).
+        if decision.num_preempted == 0 {
             while !self.waiting.is_empty() && token_budget > 0 {
                 if self.running.len() >= self.config.max_num_seqs as usize {
                     break;
                 }
 
-                // Select next request based on scheduling policy
                 let selected_idx = self.select_next_waiting_request();
-                let mut request = self.waiting.get(selected_idx).unwrap().clone();
+                let request = &self.waiting[selected_idx];
 
-                // In preemption-free mode, check if we can safely admit this request
-                if self.config.enable_preemption_free
-                    && !self.can_admit_without_preemption(&request)
+                if self.config.enable_preemption_free && !self.can_admit_without_preemption(request)
                 {
                     break; // Can't admit without risking future preemption need
                 }
 
-                // Check for prefix cache hits (peek doesn't increment any prefix cache stats).
-                let lookup = self.kv_cache_manager.peek_prefix_cache(&request);
-                let cached_tokens = lookup.total_cached_tokens;
-                request.num_cached_tokens = cached_tokens;
+                let lookup = self.kv_cache_manager.peek_prefix_cache(request);
+                let cached_tokens = self.usable_cached_tokens(request, lookup.total_cached_tokens);
 
-                // If part of the prefix lives in a slower tier, kick off an
-                // async promotion: reserve HBM blocks for the cached portion,
-                // park the request in `pending_transfers` until the transfer
-                // completes. The running batch is unaffected (PCIe runs in
-                // parallel with HBM).
+                // If part of the prefix lives in a slower tier (or is in
+                // flight for another request), kick off / join an async
+                // promotion: reserve HBM blocks for the cached portion and
+                // park the request until the transfer completes. The
+                // running batch is unaffected (PCIe runs in parallel with
+                // HBM).
                 if (lookup.needs_promotion() || lookup.needs_join()) && cached_tokens > 0 {
-                    // Always reserve our own HBM blocks for the cached
-                    // prefix (the simulator's block model isn't ref-counted,
-                    // so each request keeps its own copy). Bytes/PCIe cost
-                    // is only paid for the spillover portion; the in-flight
-                    // portion is joined.
-                    let blocks_needed = self.calculate_blocks_needed(&request, cached_tokens);
+                    // Each request reserves its own landing blocks; blocks
+                    // already in flight for a leader are shared by
+                    // reference. Bytes/PCIe cost is only paid for the
+                    // spillover portion; the in-flight portion is joined.
+                    let blocks_needed = self
+                        .kv_cache_manager
+                        .blocks_for_context(cached_tokens)
+                        .saturating_sub(request.kv_blocks.len());
                     if self.kv_cache_manager.num_free_blocks() < blocks_needed {
                         break;
                     }
+                    let mut request = self.waiting.remove(selected_idx).unwrap();
+                    self.kv_cache_manager.record_prefix_lookup(&lookup);
+                    request.num_cached_tokens = cached_tokens;
                     let allocated = self
                         .kv_cache_manager
                         .reserve_blocks_for_transfer(&request, cached_tokens)
@@ -264,358 +222,334 @@ impl Scheduler {
                     // Two paths, possibly both: start a transfer for the
                     // spillover portion, and/or join an existing one for
                     // the in-flight portion.
-                    let new_transfer_tokens: u32 =
-                        lookup.promote_tokens_per_tier.iter().sum();
-                    if new_transfer_tokens > 0 {
-                        let hashes: Vec<u64> =
-                            request.get_prompt_block_hashes().to_vec();
+                    if lookup.needs_promotion() {
                         self.kv_cache_manager.start_transfer(
                             request.request_id.clone(),
-                            &hashes,
                             &lookup,
                             current_time,
                         );
-                    } else if lookup.needs_join() {
+                    } else {
                         self.kv_cache_manager
                             .join_transfer(request.request_id.clone(), &lookup);
                     }
-
-                    let new_remaining = if new_transfer_tokens > 0 {
+                    let own_remaining = if lookup.needs_promotion() {
                         self.kv_cache_manager
                             .estimate_remaining_time(&request.request_id)
                     } else {
                         0.0
                     };
-                    let join_remaining = if lookup.needs_join() {
-                        // Look up the leader's projection.
-                        if let Some(leader) = lookup.join_leader.as_deref() {
-                            self.kv_cache_manager.estimate_remaining_time(leader)
-                        } else {
-                            0.0
-                        }
-                    } else {
-                        0.0
-                    };
-                    let remaining = new_remaining.max(join_remaining);
-                    request.ready_at = Some(current_time + remaining);
-                    request.status = RequestStatus::WaitingOnTransfer;
-                    self.waiting.remove(selected_idx);
+                    let join_remaining = lookup
+                        .join_leader
+                        .as_deref()
+                        .map(|leader| self.kv_cache_manager.estimate_remaining_time(leader))
+                        .unwrap_or(0.0);
+                    request.ready_at = Some(current_time + own_remaining.max(join_remaining));
                     self.pending_transfers.push(request);
                     continue;
                 }
-                // Note: We don't advance num_computed_tokens here!
-                // Cached tokens save COMPUTE time but we still need to allocate KV blocks
-                // num_computed_tokens is advanced after we process the tokens
 
-                // Calculate tokens to schedule
-                let mut tokens_to_schedule = request.tokens_to_process().min(token_budget);
-
-                // If in prefill phase, limit to only prefill tokens (don't cross into decode)
-                if request.is_prefill() {
-                    let remaining_prefill = request.num_prompt_tokens - request.num_computed_tokens;
-                    tokens_to_schedule = tokens_to_schedule.min(remaining_prefill);
-
-                    // Apply chunked prefill limit if enabled (vLLM's long_prefill_token_threshold)
-                    if self.config.enable_chunked_prefill
-                        && self.config.long_prefill_token_threshold > 0
-                    {
-                        tokens_to_schedule =
-                            tokens_to_schedule.min(self.config.long_prefill_token_threshold);
-                    }
-                } else {
-                    // Decode phase: bonus token + speculative verify pass (see
-                    // the running-request loop above).
-                    let verify_width = 1 + request.pending_draft_len;
-                    tokens_to_schedule = tokens_to_schedule.min(verify_width);
-                }
-
+                // Cached prefix already resident in HBM: skip its compute.
+                // The blocks are still allocated (by reference) so the
+                // request holds them for its lifetime.
+                let tokens_to_schedule =
+                    self.tokens_to_schedule_from(request, cached_tokens, token_budget);
                 if tokens_to_schedule == 0 {
                     break;
                 }
-
-                // Try to allocate KV cache
-                let blocks_needed = self.calculate_blocks_needed(&request, tokens_to_schedule);
+                // A promoted request already holds its cached-prefix blocks.
+                let blocks_needed = self
+                    .kv_cache_manager
+                    .blocks_for_context(cached_tokens + tokens_to_schedule)
+                    .saturating_sub(request.kv_blocks.len());
                 if self.kv_cache_manager.num_free_blocks() < blocks_needed {
                     break; // Can't fit, stop scheduling new requests
                 }
 
-                // query the prefix cache (increments prefix cache stats)
-                self.kv_cache_manager.query_prefix_cache(&request);
-
-                // Allocate blocks
-                if let Some(blocks) = self
+                let mut request = self.waiting.remove(selected_idx).unwrap();
+                self.kv_cache_manager.record_prefix_lookup(&lookup);
+                request.num_cached_tokens = cached_tokens;
+                request.num_computed_tokens = cached_tokens;
+                let blocks = self
                     .kv_cache_manager
                     .allocate_blocks(&request, tokens_to_schedule)
-                {
-                    // This should always succeed - because of the check above?
-                    request.kv_blocks.extend(blocks);
-                } else {
-                    break;
-                }
+                    .expect("free-block check above guarantees allocation");
+                request.kv_blocks.extend(blocks);
 
-                // Move to running
-                request.status = RequestStatus::Running;
-                let new_idx = self.running.len();
-
-                decision.scheduled_new.push(new_idx);
-                decision.tokens_for_new.push(tokens_to_schedule);
+                decision.batch.push(ScheduledSeq {
+                    idx: self.running.len(),
+                    num_tokens: tokens_to_schedule,
+                });
                 token_budget -= tokens_to_schedule;
-
                 self.running.push(request);
-                self.waiting.remove(selected_idx);
             }
         }
 
         decision
     }
 
-    /// Calculate how many new blocks are needed for a request
-    fn calculate_blocks_needed(&self, request: &Request, num_new_tokens: u32) -> usize {
-        let total_tokens = request.num_computed_tokens + num_new_tokens;
-        // Mirror KVCacheManager: growing attention blocks + fixed per-sequence
-        // state reservation (zero for pure-attention models).
-        let total_blocks_needed = self.kv_cache_manager.state_blocks()
-            + total_tokens.div_ceil(self.config.block_size) as usize;
-        total_blocks_needed.saturating_sub(request.kv_blocks.len())
+    /// Prefix tokens whose compute can be skipped for `request`: block-aligned
+    /// and short of the whole prompt, so at least the last block is computed
+    /// (a fully cached prompt still needs a forward pass for its logits, as
+    /// in vLLM).
+    fn usable_cached_tokens(&self, request: &Request, cached: u32) -> u32 {
+        let block_size = self.config.block_size.max(1);
+        let cap = request.num_prompt_tokens.saturating_sub(1);
+        (cached.min(cap) / block_size) * block_size
     }
 
-    /// Check if we can admit a new request without risking preemption
-    /// Conservative approach: ensure total allocated + needed for all to complete fits
-    fn can_admit_without_preemption(&self, request: &Request) -> bool {
-        // Calculate total blocks that will EVER be needed by all running + new.
-        // Each sequence also holds a fixed state reservation for its whole life.
-        let state_blocks = self.kv_cache_manager.state_blocks();
-        let mut max_blocks_needed = 0;
-
-        for r in &self.running {
-            let total_needed =
-                state_blocks + r.total_tokens().div_ceil(self.config.block_size) as usize;
-            max_blocks_needed += total_needed;
-        }
-
-        // Add new request
-        let new_total =
-            state_blocks + request.total_tokens().div_ceil(self.config.block_size) as usize;
-        max_blocks_needed += new_total;
-
-        // Check against total capacity (not just free blocks!)
-        let total_blocks = self.kv_cache_manager.total_blocks();
-        max_blocks_needed <= total_blocks
-    }
-
-    /// Find the index of the best waiting request to schedule based on policy
-    fn select_next_waiting_request(&self) -> usize {
-        if self.waiting.is_empty() {
+    /// Positions to compute for `request` this step under `token_budget`,
+    /// given that `computed` positions are already resident. Prefill is
+    /// capped at the remaining prefill (never crossing into decode) and at
+    /// the chunked-prefill threshold; decode processes one bonus position
+    /// plus the pending speculative draft.
+    fn tokens_to_schedule_from(&self, request: &Request, computed: u32, token_budget: u32) -> u32 {
+        let planned = request.planned_positions();
+        if request.is_finished() || computed >= planned {
             return 0;
         }
+        let mut tokens = (planned - computed).min(token_budget);
+        let prefill_len = request.prefill_len();
+        if computed < prefill_len {
+            tokens = tokens.min(prefill_len - computed);
+            if self.config.enable_chunked_prefill && self.config.long_prefill_token_threshold > 0 {
+                tokens = tokens.min(self.config.long_prefill_token_threshold);
+            }
+        } else {
+            // `pending_draft_len` (decided last iteration; 0 if speculation
+            // is off) makes the step process `1 + draft` positions, so the
+            // token budget and KV are reserved for the verify cost. The
+            // `.min(token_budget)` above already trims `draft` to fit.
+            tokens = tokens.min(1 + request.pending_draft_len);
+        }
+        tokens
+    }
 
+    fn tokens_to_schedule(&self, request: &Request, token_budget: u32) -> u32 {
+        self.tokens_to_schedule_from(request, request.num_computed_tokens, token_budget)
+    }
+
+    /// Whether admitting `request` keeps every running request able to grow
+    /// to its bound (prompt + max output) without preemption. Conservative:
+    /// assumes all sequences reach their peak simultaneously.
+    fn can_admit_without_preemption(&self, request: &Request) -> bool {
+        let running_peak: usize = self
+            .running
+            .iter()
+            .map(|r| self.kv_cache_manager.blocks_for_context(r.total_tokens()))
+            .sum();
+        let new_peak = self
+            .kv_cache_manager
+            .blocks_for_context(request.total_tokens());
+        running_peak + new_peak <= self.kv_cache_manager.total_blocks()
+    }
+
+    /// Index into `waiting` of the request the policy admits next.
+    fn select_next_waiting_request(&self) -> usize {
+        let pick = |key: &dyn Fn(&Request) -> u64, longest: bool| -> usize {
+            let it = self.waiting.iter().enumerate();
+            let best = if longest {
+                it.max_by_key(|(_, r)| key(r))
+            } else {
+                it.min_by_key(|(_, r)| key(r))
+            };
+            best.map(|(i, _)| i).unwrap_or(0)
+        };
         match self.policy {
-            SchedulingPolicy::FCFS | SchedulingPolicy::Priority => {
-                // FCFS and Priority: always take first (FIFO order)
-                0
-            }
-            SchedulingPolicy::SIF => {
-                // Shortest Input First: find request with smallest input length
-                self.waiting
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, r)| r.num_prompt_tokens)
-                    .map(|(idx, _)| idx)
-                    .unwrap_or(0)
-            }
-            SchedulingPolicy::LIF => {
-                // Longest Input First: find request with largest input length
-                self.waiting
-                    .iter()
-                    .enumerate()
-                    .max_by_key(|(_, r)| r.num_prompt_tokens)
-                    .map(|(idx, _)| idx)
-                    .unwrap_or(0)
-            }
-            SchedulingPolicy::SOF => {
-                // Shortest Output First: find request with smallest output length
-                self.waiting
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, r)| r.max_output_tokens)
-                    .map(|(idx, _)| idx)
-                    .unwrap_or(0)
-            }
-            SchedulingPolicy::LOF => {
-                // Longest Output First: find request with largest output length
-                self.waiting
-                    .iter()
-                    .enumerate()
-                    .max_by_key(|(_, r)| r.max_output_tokens)
-                    .map(|(idx, _)| idx)
-                    .unwrap_or(0)
-            }
-            SchedulingPolicy::STF => {
-                // Shortest Total First: find request with smallest total length
-                self.waiting
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, r)| r.total_tokens())
-                    .map(|(idx, _)| idx)
-                    .unwrap_or(0)
-            }
-            SchedulingPolicy::LTF => {
-                // Longest Total First: find request with largest total length
-                self.waiting
-                    .iter()
-                    .enumerate()
-                    .max_by_key(|(_, r)| r.total_tokens())
-                    .map(|(idx, _)| idx)
-                    .unwrap_or(0)
-            }
+            SchedulingPolicy::FCFS | SchedulingPolicy::Priority => 0,
+            SchedulingPolicy::SIF => pick(&|r| r.num_prompt_tokens as u64, false),
+            SchedulingPolicy::LIF => pick(&|r| r.num_prompt_tokens as u64, true),
+            SchedulingPolicy::SOF => pick(&|r| r.max_output_tokens as u64, false),
+            SchedulingPolicy::LOF => pick(&|r| r.max_output_tokens as u64, true),
+            SchedulingPolicy::STF => pick(&|r| r.total_tokens() as u64, false),
+            SchedulingPolicy::LTF => pick(&|r| r.total_tokens() as u64, true),
         }
     }
 
-    /// Select a request to preempt based on policy
-    fn select_preemption_victim(&self) -> Option<usize> {
-        if self.running.is_empty() {
+    /// Pick a preemption victim among running requests at positions
+    /// `>= min_idx`. Positions before `min_idx` have already been scheduled
+    /// this pass and recorded by index, so they must not be removed.
+    fn select_preemption_victim(&self, min_idx: usize) -> Option<usize> {
+        if min_idx >= self.running.len() {
             return None;
         }
-
+        let candidates = || self.running.iter().enumerate().skip(min_idx);
+        let longest = |key: &dyn Fn(&Request) -> u64| -> Option<usize> {
+            candidates().max_by_key(|(_, r)| key(r)).map(|(i, _)| i)
+        };
         match self.policy {
-            SchedulingPolicy::FCFS => {
-                // FCFS: preempt the last (most recent) request
-                Some(self.running.len() - 1)
+            // Preempt the most recently admitted request (vLLM's choice).
+            SchedulingPolicy::FCFS => Some(self.running.len() - 1),
+            // Lowest priority (highest value), latest arrival breaks ties.
+            SchedulingPolicy::Priority => candidates()
+                .max_by_key(|(_, r)| (r.priority, OrderedFloat(r.arrival_time)))
+                .map(|(i, _)| i),
+            // Length policies sacrifice the longest under memory pressure,
+            // whichever end they prioritise on admission.
+            SchedulingPolicy::SIF | SchedulingPolicy::LIF => {
+                longest(&|r| r.num_prompt_tokens as u64)
             }
-            SchedulingPolicy::Priority => {
-                // Priority: preempt the lowest priority (highest priority value) request
-                self.running
-                    .iter()
-                    .enumerate()
-                    .max_by_key(|(_, r)| (r.priority, OrderedFloat(r.arrival_time)))
-                    .map(|(idx, _)| idx)
+            SchedulingPolicy::SOF | SchedulingPolicy::LOF => {
+                longest(&|r| (r.max_output_tokens - r.num_output_tokens) as u64)
             }
-            SchedulingPolicy::SIF => {
-                // SIF: preempt the request with longest input
-                self.running
-                    .iter()
-                    .enumerate()
-                    .max_by_key(|(_, r)| r.num_prompt_tokens)
-                    .map(|(idx, _)| idx)
-            }
-            SchedulingPolicy::LIF => {
-                // LIF: preempt the request with longest input to avoid starvation
-                // (prioritizes long inputs, but must sacrifice long when memory tight)
-                self.running
-                    .iter()
-                    .enumerate()
-                    .max_by_key(|(_, r)| r.num_prompt_tokens)
-                    .map(|(idx, _)| idx)
-            }
-            SchedulingPolicy::SOF => {
-                // SOF: preempt the longest remaining output
-                self.running
-                    .iter()
-                    .enumerate()
-                    .max_by_key(|(_, r)| r.max_output_tokens - r.num_output_tokens)
-                    .map(|(idx, _)| idx)
-            }
-            SchedulingPolicy::LOF => {
-                // LOF: preempt the longest remaining output to avoid starvation
-                // (prioritizes long, but must sacrifice long when memory tight)
-                self.running
-                    .iter()
-                    .enumerate()
-                    .max_by_key(|(_, r)| r.max_output_tokens - r.num_output_tokens)
-                    .map(|(idx, _)| idx)
-            }
-            SchedulingPolicy::STF => {
-                // STF: preempt the request with longest total remaining
-                self.running
-                    .iter()
-                    .enumerate()
-                    .max_by_key(|(_, r)| r.remaining_tokens())
-                    .map(|(idx, _)| idx)
-            }
-            SchedulingPolicy::LTF => {
-                // LTF: preempt the request with longest total remaining to avoid starvation
-                // (prioritizes long totals, but must sacrifice long when memory tight)
-                self.running
-                    .iter()
-                    .enumerate()
-                    .max_by_key(|(_, r)| r.remaining_tokens())
-                    .map(|(idx, _)| idx)
+            SchedulingPolicy::STF | SchedulingPolicy::LTF => {
+                longest(&|r| r.remaining_tokens() as u64)
             }
         }
     }
 
-    /// Preempt a request (free KV blocks, update state)
-    fn preempt_request(&mut self, request: &mut Request, current_time: f64) {
-        request.mark_preempted(current_time);
-
-        // Free KV cache blocks
+    /// Preempt a running request: free its KV; it recomputes on resume.
+    fn preempt_request(&mut self, request: &mut Request) {
+        self.num_preemptions += 1;
         self.kv_cache_manager.free_blocks(&request.kv_blocks);
         request.kv_blocks.clear();
-
-        // Note: num_computed_tokens is NOT reset - we can resume from where we left off
-        // if prefix caching is enabled
+        request.preempt();
     }
 
-    /// Add a new request to the waiting queue
+    /// Add a new request to the waiting queue.
     pub fn add_request(&mut self, request: Request) {
         self.waiting.push_back(request);
     }
 
-    /// Get number of running requests
+    /// Record that running request `idx` computed `num_tokens` positions in
+    /// the pass ending at `time`. Returns the output tokens it generated.
+    pub fn record_progress(&mut self, idx: usize, num_tokens: u32, time: f64) -> u32 {
+        self.running[idx].record_generated_tokens(num_tokens, time)
+    }
+
+    /// Set the speculative draft plan for the decode set (running requests
+    /// that are neither prefilling nor finished), in `running` order.
+    /// `plans` must have one entry per decode request; each entry is
+    /// `(draft_len, round_commits)`.
+    pub fn set_draft_plans(&mut self, plans: &[(u32, Option<u32>)]) {
+        let mut k = 0usize;
+        for req in self.running.iter_mut() {
+            if !req.is_prefill() && !req.is_finished() {
+                let (draft, commits) = plans.get(k).copied().unwrap_or((0, None));
+                req.pending_draft_len = draft;
+                req.pending_round_commits = commits;
+                k += 1;
+            }
+        }
+        debug_assert_eq!(k, plans.len(), "one draft plan per decode request");
+    }
+
+    /// Remove and return every running request whose prefill is complete and
+    /// which still has output to generate, freeing its KV here. Used by a
+    /// disaggregated prefill worker to hand requests to the decode pool.
+    pub fn take_prefill_complete(&mut self) -> Vec<Request> {
+        let mut handed = Vec::new();
+        let mut keep = Vec::with_capacity(self.running.len());
+        for mut r in self.running.drain(..) {
+            if !r.is_prefill() && !r.is_finished() {
+                self.kv_cache_manager.free_blocks(&r.kv_blocks);
+                r.kv_blocks.clear();
+                handed.push(r);
+            } else {
+                keep.push(r);
+            }
+        }
+        self.running = keep;
+        handed
+    }
+
     pub fn num_running(&self) -> usize {
         self.running.len()
     }
 
-    /// Get number of waiting requests
+    /// Waiting requests, including requests parked on a KV transfer: they
+    /// are still in the system, and the engine's idle check must see them.
     pub fn num_waiting(&self) -> usize {
-        self.waiting.len()
+        self.waiting.len() + self.pending_transfers.len()
     }
 
-    /// Get reference to running requests
-    pub fn running(&self) -> &Vec<Request> {
+    /// Earliest `ready_at` among requests parked on a KV transfer.
+    pub fn earliest_pending_ready(&self) -> Option<f64> {
+        self.pending_transfers
+            .iter()
+            .filter_map(|r| r.ready_at)
+            .min_by(f64::total_cmp)
+    }
+
+    pub fn num_preemptions(&self) -> u64 {
+        self.num_preemptions
+    }
+
+    pub fn running(&self) -> &[Request] {
         &self.running
     }
 
-    /// Get mutable reference to running requests
-    pub fn running_mut(&mut self) -> &mut Vec<Request> {
-        &mut self.running
-    }
-
-    /// Snapshot of requests currently waiting on a KV-cache promotion.
+    /// Requests parked on an in-flight KV promotion.
     pub fn pending_transfers(&self) -> &[Request] {
         &self.pending_transfers
     }
 
-    /// Get reference to KV cache manager
     pub fn kv_cache_manager(&self) -> &KVCacheManager {
         &self.kv_cache_manager
-    }
-
-    /// Get mutable reference to KV cache manager
-    pub fn kv_cache_manager_mut(&mut self) -> &mut KVCacheManager {
-        &mut self.kv_cache_manager
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, ModelCosts};
+    use crate::config::{Config, KVTier, ModelCosts};
+
+    /// KV manager over the test model with `capacity` bytes.
+    fn kv_manager(config: &Config, capacity: u64, prefix_caching: bool) -> KVCacheManager {
+        let model = config.model.clone();
+        KVCacheManager::new(
+            capacity,
+            config.scheduler.block_size,
+            move |t| model.kv_storage_bytes(t),
+            config.model.per_sequence_state_bytes(),
+            prefix_caching,
+        )
+    }
+
+    fn scheduler_from(config: Config, kv: KVCacheManager) -> Scheduler {
+        Scheduler::new(config.scheduler, kv).unwrap()
+    }
 
     fn create_test_scheduler() -> Scheduler {
         let config = Config::test_default();
-        let kv_cache = KVCacheManager::new(
-            config.hardware.kv_cache_capacity,
-            config.scheduler.block_size,
-            config.model.kv_storage_bytes(1),
-            config.model.per_sequence_state_bytes(),
-            false,
-        );
-        Scheduler::new(config.scheduler, config.hardware, config.model, kv_cache).unwrap()
+        let kv = kv_manager(&config, config.hardware.kv_cache_capacity, false);
+        scheduler_from(config, kv)
+    }
+
+    fn create_scheduler_with_policy(policy: &str) -> Scheduler {
+        let mut config = Config::test_default();
+        config.scheduler.policy = policy.to_string();
+        let kv = kv_manager(&config, config.hardware.kv_cache_capacity, false);
+        scheduler_from(config, kv)
+    }
+
+    /// Scheduler whose KV holds exactly `blocks` blocks (test model, no
+    /// prefix caching).
+    fn scheduler_with_blocks(policy: &str, blocks: u64) -> Scheduler {
+        let mut config = Config::test_default();
+        config.scheduler.policy = policy.to_string();
+        let per_block = config.model.kv_storage_bytes(config.scheduler.block_size);
+        let kv = kv_manager(&config, blocks * per_block, false);
+        scheduler_from(config, kv)
     }
 
     fn create_test_request(id: &str, prompt: u32, output: u32) -> Request {
         Request::new(id.to_string(), 0, 0.0, prompt, output)
+    }
+
+    /// Apply a decision as the engine would: every batch entry computes its
+    /// scheduled positions.
+    fn apply(scheduler: &mut Scheduler, decision: &ScheduleDecision, time: f64) {
+        for s in &decision.batch {
+            scheduler.record_progress(s.idx, s.num_tokens, time);
+        }
+    }
+
+    fn running_ids(scheduler: &Scheduler) -> Vec<&str> {
+        scheduler
+            .running()
+            .iter()
+            .map(|r| r.request_id.as_str())
+            .collect()
     }
 
     #[test]
@@ -628,152 +562,172 @@ mod tests {
     #[test]
     fn test_add_request() {
         let mut scheduler = create_test_scheduler();
-        let req = create_test_request("req-1", 100, 50);
-
-        scheduler.add_request(req);
+        scheduler.add_request(create_test_request("req-1", 100, 50));
         assert_eq!(scheduler.num_waiting(), 1);
     }
 
     #[test]
     fn test_waiting_on_transfer_then_promoted() {
-        use crate::config::KVTier;
         let config = Config::test_default();
         let block_size = config.scheduler.block_size;
-        let kv_cache = KVCacheManager::new(
-            config.hardware.kv_cache_capacity,
-            block_size,
-            config.model.kv_storage_bytes(1),
-            config.model.per_sequence_state_bytes(),
-            true,
-        )
-        .with_tiers(&[KVTier {
-            name: "host_ram".into(),
-            // Plenty of host RAM.
-            capacity_bytes: 10 * 1024 * 1024 * 1024,
-            // 1 GB/s, very slow on purpose so the transfer time is observable.
-            bandwidth_to_hbm: 1e9,
-        }]);
-        let mut scheduler =
-            Scheduler::new(config.scheduler, config.hardware, config.model, kv_cache).unwrap();
+        let kv =
+            kv_manager(&config, config.hardware.kv_cache_capacity, true).with_tiers(&[KVTier {
+                name: "host_ram".into(),
+                // Plenty of host RAM.
+                capacity_bytes: 10 * 1024 * 1024 * 1024,
+                // 1 GB/s, very slow on purpose so the transfer time is observable.
+                bandwidth_to_hbm: 1e9,
+            }]);
+        let mut scheduler = scheduler_from(config, kv);
 
-        // Seed the host-RAM tier by running a request through HBM and then
-        // forcing eviction. Easiest approach: poke the manager directly.
+        // Seed the host-RAM tier: allocate then free a block carrying our
+        // prefix hash, then recycle it with a different hash so `prefix_hash`
+        // is demoted into host RAM.
         let prefix_hash = 0xCAFE_u64;
-        let mgr = scheduler.kv_cache_manager_mut();
-        // Allocate then free a block carrying our prefix hash; then evict by
-        // allocating enough new blocks to recycle it.
+        let mgr = &mut scheduler.kv_cache_manager;
         let mut seed = create_test_request("seed", block_size, 1);
         seed.prompt_block_hashes = vec![prefix_hash];
         let blocks = mgr.allocate_blocks(&seed, block_size).unwrap();
         mgr.free_blocks(&blocks);
-        // Now allocate a fresh request with a different hash to recycle the
-        // free block and demote `prefix_hash` into host RAM.
         let mut churn = create_test_request("churn", block_size, 1);
         churn.prompt_block_hashes = vec![0xDEAD_u64];
         mgr.allocate_blocks(&churn, block_size).unwrap();
 
-        // Now submit a real request whose prompt starts with the prefix hash.
+        // A request whose prompt starts with the prefix hash.
         let mut req = create_test_request("req", block_size * 2, 1);
         req.prompt_block_hashes = vec![prefix_hash, 0xBEEF_u64];
         scheduler.add_request(req);
 
-        // Schedule at t=0: should detect host-RAM hit and park the request
-        // in pending_transfers, not running.
+        // t=0: host-RAM hit; parked in pending_transfers, not running.
         let decision = scheduler.schedule(0.0);
-        assert_eq!(decision.scheduled_new.len(), 0);
-        assert_eq!(scheduler.num_waiting(), 0);
+        assert!(decision.batch.is_empty());
+        assert_eq!(scheduler.num_waiting(), 1); // parked requests count as waiting
         assert_eq!(scheduler.pending_transfers.len(), 1);
         let ready_at = scheduler.pending_transfers[0].ready_at.unwrap();
         assert!(ready_at > 0.0);
+        assert_eq!(scheduler.earliest_pending_ready(), Some(ready_at));
 
-        // Schedule again before the transfer completes: still pending.
+        // Before the transfer completes: still pending.
         let decision = scheduler.schedule(ready_at / 2.0);
-        assert_eq!(decision.scheduled_new.len(), 0);
+        assert!(decision.batch.is_empty());
         assert_eq!(scheduler.pending_transfers.len(), 1);
 
-        // After the transfer completes, the request promotes back and runs.
+        // After it completes, the request promotes back and runs from the
+        // cached prefix.
         let decision = scheduler.schedule(ready_at + 1e-9);
         assert_eq!(scheduler.pending_transfers.len(), 0);
-        assert_eq!(decision.scheduled_new.len(), 1);
+        assert_eq!(decision.batch.len(), 1);
         assert_eq!(scheduler.num_running(), 1);
-        // num_computed_tokens should reflect the cached prefix length.
         assert_eq!(scheduler.running()[0].num_computed_tokens, block_size);
+        assert_eq!(decision.batch[0].num_tokens, block_size);
     }
 
     #[test]
     fn test_concurrent_same_prefix_join_one_transfer() {
-        use crate::config::KVTier;
         let config = Config::test_default();
         let block_size = config.scheduler.block_size;
-        // Constrained HBM so a model that didn't share blocks would fail.
-        let small_hbm = 2 * 16 * (config.model.kv_storage_bytes(1) as u64);
-        let kv_cache = KVCacheManager::new(
-            small_hbm,
-            block_size,
-            config.model.kv_storage_bytes(1),
-            config.model.per_sequence_state_bytes(),
-            true,
-        )
-        .with_tiers(&[KVTier {
+        let per_block = config.model.kv_storage_bytes(block_size);
+        // Constrained HBM so a model that didn't share the prefix block would
+        // fail: one shared prefix block plus one private block per request.
+        let kv = kv_manager(&config, 4 * per_block, true).with_tiers(&[KVTier {
             name: "host_ram".into(),
-            capacity_bytes: 16 * 16 * config.model.kv_storage_bytes(1),
+            capacity_bytes: 16 * per_block,
             bandwidth_to_hbm: 1e9,
         }]);
-        let mut scheduler =
-            Scheduler::new(config.scheduler, config.hardware, config.model, kv_cache).unwrap();
+        let mut scheduler = scheduler_from(config, kv);
 
         // Pre-warm the prefix into host RAM.
         let prefix_hash = 0xABCDu64;
         {
-            let mgr = scheduler.kv_cache_manager_mut();
+            let mgr = &mut scheduler.kv_cache_manager;
             let mut seed = create_test_request("seed", block_size, 1);
             seed.prompt_block_hashes = vec![prefix_hash];
             let blocks = mgr.allocate_blocks(&seed, block_size).unwrap();
             mgr.free_blocks(&blocks);
-            // Churn HBM to evict prefix_hash to host RAM.
             let mut churn = create_test_request("churn", block_size * 2, 1);
             churn.prompt_block_hashes = vec![0xDEAD, 0xBEEF];
             let cb = mgr.allocate_blocks(&churn, block_size * 2).unwrap();
             mgr.free_blocks(&cb);
         }
 
-        // Three requests share the prefix.
         for i in 0..3 {
             let mut req = create_test_request(&format!("req-{i}"), block_size * 2, 1);
             req.prompt_block_hashes = vec![prefix_hash, 0x1000 + i as u64];
             scheduler.add_request(req);
         }
 
-        // First scheduling tick: leader starts transfer; followers join.
+        // First tick: leader starts the transfer; followers join it and
+        // reference the same landing block.
         let _ = scheduler.schedule(0.0);
-        assert_eq!(scheduler.pending_transfers().len(), 3);
-        // All three should reference the same leader's blocks: HBM only used
-        // once even though three requests reserved.
-        let mgr = scheduler.kv_cache_manager();
-        let leader_block = scheduler.pending_transfers()[0].kv_blocks[0];
-        for r in scheduler.pending_transfers().iter() {
+        assert_eq!(scheduler.pending_transfers.len(), 3);
+        let leader_block = scheduler.pending_transfers[0].kv_blocks[0];
+        for r in scheduler.pending_transfers.iter() {
             assert_eq!(r.kv_blocks[0], leader_block);
         }
-        assert_eq!(mgr.block_ref_count(leader_block), 3);
+        assert_eq!(
+            scheduler.kv_cache_manager().block_ref_count(leader_block),
+            3
+        );
 
-        // Step past completion. The leader's transfer time alone (single
-        // host_ram entry, 1 block of bytes) should be tiny; pick t large
-        // enough to cover it.
         let _ = scheduler.schedule(10.0);
-        assert_eq!(scheduler.pending_transfers().len(), 0);
+        assert_eq!(scheduler.pending_transfers.len(), 0);
         assert_eq!(scheduler.num_running(), 3);
+        // Each request holds the shared prefix block plus its own second block.
+        let mut second: Vec<u32> = scheduler.running().iter().map(|r| r.kv_blocks[1]).collect();
+        second.sort();
+        second.dedup();
+        assert_eq!(second.len(), 3);
+        assert!(scheduler
+            .running()
+            .iter()
+            .all(|r| r.kv_blocks[0] == leader_block));
+        assert_eq!(scheduler.kv_cache_manager().num_free_blocks(), 0);
+    }
+
+    #[test]
+    fn test_hbm_prefix_hit_skips_cached_compute() {
+        let config = Config::test_default();
+        let bs = config.scheduler.block_size;
+        let kv = kv_manager(&config, config.hardware.kv_cache_capacity, true);
+        let mut scheduler = scheduler_from(config, kv);
+
+        let mut a = create_test_request("a", 4 * bs, 10);
+        a.prompt_block_hashes = vec![1, 2, 3, 4];
+        scheduler.add_request(a);
+        let d = scheduler.schedule(0.0);
+        assert_eq!(d.batch[0].num_tokens, 4 * bs);
+        apply(&mut scheduler, &d, 1.0);
+
+        // b shares a's first three blocks: it computes only its last block.
+        let mut b = create_test_request("b", 4 * bs, 10);
+        b.prompt_block_hashes = vec![1, 2, 3, 9];
+        scheduler.add_request(b);
+        let d = scheduler.schedule(1.0);
+        let b_entry = d.batch.iter().find(|s| s.idx == 1).unwrap();
+        assert_eq!(b_entry.num_tokens, bs);
+        assert_eq!(scheduler.running()[1].num_computed_tokens, 3 * bs);
+        assert_eq!(scheduler.running()[1].num_cached_tokens, 3 * bs);
+        let stats = scheduler.kv_cache_manager().prefix_cache_stats();
+        assert_eq!((stats.hits, stats.misses), (1, 1));
+
+        // c is identical to a: a fully cached prompt still computes its
+        // last block (the logits need a forward pass).
+        let mut c = create_test_request("c", 4 * bs, 10);
+        c.prompt_block_hashes = vec![1, 2, 3, 4];
+        scheduler.add_request(c);
+        let d = scheduler.schedule(2.0);
+        let c_entry = d.batch.iter().find(|s| s.idx == 2).unwrap();
+        assert_eq!(c_entry.num_tokens, bs);
+        assert_eq!(scheduler.running()[2].num_computed_tokens, 3 * bs);
     }
 
     #[test]
     fn test_schedule_single_request() {
         let mut scheduler = create_test_scheduler();
-        let req = create_test_request("req-1", 16, 10);
-
-        scheduler.add_request(req);
-
+        scheduler.add_request(create_test_request("req-1", 16, 10));
         let decision = scheduler.schedule(0.0);
-
-        assert_eq!(decision.scheduled_new.len(), 1);
+        assert_eq!(decision.batch.len(), 1);
+        assert_eq!(decision.batch[0].num_tokens, 16);
         assert_eq!(scheduler.num_running(), 1);
         assert_eq!(scheduler.num_waiting(), 0);
     }
@@ -781,319 +735,283 @@ mod tests {
     #[test]
     fn test_schedule_multiple_requests() {
         let mut scheduler = create_test_scheduler();
-
         scheduler.add_request(create_test_request("req-1", 16, 10));
         scheduler.add_request(create_test_request("req-2", 16, 10));
-
         let decision = scheduler.schedule(0.0);
-
-        // Both should be scheduled if token budget allows
-        assert!(!decision.scheduled_new.is_empty());
-        assert!(scheduler.num_running() >= 1);
+        assert_eq!(decision.batch.len(), 2);
+        assert_eq!(scheduler.num_running(), 2);
     }
 
     #[test]
-    fn test_completion() {
+    fn test_prefill_then_decode_then_completion() {
         let mut scheduler = create_test_scheduler();
-        let mut req = create_test_request("req-1", 16, 10);
-        req.num_computed_tokens = 16; // Prefill done
-        req.num_output_tokens = 10; // All output generated
-        req.status = RequestStatus::Running;
-
-        scheduler.running.push(req);
-
-        let decision = scheduler.schedule(0.0);
-
-        assert_eq!(decision.completed.len(), 1);
+        scheduler.add_request(create_test_request("req-1", 16, 3));
+        // Prefill pass: 16 positions, yields token 1.
+        let d = scheduler.schedule(0.0);
+        assert_eq!(d.batch[0].num_tokens, 16);
+        apply(&mut scheduler, &d, 1.0);
+        assert_eq!(scheduler.running()[0].num_output_tokens, 1);
+        // Two decode passes finish it (3 tokens total).
+        let d = scheduler.schedule(1.0);
+        assert_eq!(d.batch[0].num_tokens, 1);
+        apply(&mut scheduler, &d, 2.0);
+        let d = scheduler.schedule(2.0);
+        assert_eq!(d.batch[0].num_tokens, 1);
+        apply(&mut scheduler, &d, 3.0);
+        assert!(scheduler.running()[0].is_finished());
+        // Reaped at the next pass, blocks freed.
+        let free_before = scheduler.kv_cache_manager().num_free_blocks();
+        let d = scheduler.schedule(3.0);
+        assert_eq!(d.completed.len(), 1);
         assert_eq!(scheduler.num_running(), 0);
+        assert!(scheduler.kv_cache_manager().num_free_blocks() > free_before);
     }
 
     #[test]
-    fn test_preemption_fcfs() {
+    fn test_speculative_verify_width_and_trim() {
         let mut scheduler = create_test_scheduler();
-
-        // Add requests
-        scheduler.add_request(create_test_request("req-1", 16, 10));
-        scheduler.add_request(create_test_request("req-2", 16, 10));
-
-        // Schedule them
-        scheduler.schedule(0.0);
-
-        // FCFS should preempt the last one
-        if let Some(idx) = scheduler.select_preemption_victim() {
-            assert_eq!(idx, scheduler.num_running() - 1);
-        }
+        scheduler.add_request(create_test_request("req-1", 16, 4));
+        let d = scheduler.schedule(0.0);
+        apply(&mut scheduler, &d, 1.0);
+        // Plan a 5-token draft: the verify width is 1 + 5, trimmed to the
+        // three positions still needed.
+        scheduler.set_draft_plans(&[(5, None)]);
+        let d = scheduler.schedule(1.0);
+        assert_eq!(d.batch[0].num_tokens, 3);
     }
 
-    fn create_scheduler_with_policy(policy: &str) -> Scheduler {
-        let mut config = Config::test_default();
-        config.scheduler.policy = policy.to_string();
-        let kv_cache = KVCacheManager::new(
-            config.hardware.kv_cache_capacity,
-            config.scheduler.block_size,
-            config.model.kv_storage_bytes(1),
-            config.model.per_sequence_state_bytes(),
-            false,
-        );
-        Scheduler::new(config.scheduler, config.hardware, config.model, kv_cache).unwrap()
+    #[test]
+    fn test_preemption_fcfs_takes_last() {
+        let mut scheduler = create_test_scheduler();
+        scheduler.add_request(create_test_request("req-1", 16, 10));
+        scheduler.add_request(create_test_request("req-2", 16, 10));
+        scheduler.schedule(0.0);
+        assert_eq!(scheduler.select_preemption_victim(0), Some(1));
+        assert_eq!(scheduler.select_preemption_victim(1), Some(1));
+        assert_eq!(scheduler.select_preemption_victim(2), None);
+    }
+
+    #[test]
+    fn test_preemption_recomputes_and_requeues_at_head() {
+        // 6 blocks; block_size 16. a: 32-token prompt (2 blocks), b: 32
+        // (2 blocks). Both at a block boundary after prefill+1 decode... use
+        // 31-token prompts so the prefill pass fills two blocks exactly at
+        // computed=32 after the first decode.
+        let mut scheduler = scheduler_with_blocks("fcfs", 5);
+        scheduler.add_request(create_test_request("a", 32, 100));
+        scheduler.add_request(create_test_request("b", 32, 100));
+        scheduler.add_request(create_test_request("late", 16, 100));
+        let d = scheduler.schedule(0.0); // a, b prefill (4 blocks); late waits
+        assert_eq!(d.batch.len(), 3); // 4 + 1 blocks fit
+        apply(&mut scheduler, &d, 1.0);
+        // Everyone at a block boundary needing a new block; 0 free.
+        assert_eq!(scheduler.kv_cache_manager().num_free_blocks(), 0);
+        let d = scheduler.schedule(1.0);
+        // FCFS preempts from the end until the cursor fits: `late` (idx 2)
+        // is preempted for a; then b (idx 1) needs a block, none free ->
+        // preempts itself. a runs alone.
+        assert_eq!(d.num_preempted, 2);
+        assert_eq!(d.batch.len(), 1);
+        assert_eq!(running_ids(&scheduler), vec!["a"]);
+        assert_eq!(scheduler.num_preemptions(), 2);
+        // Preempted requests are at the head of the waiting queue, in the
+        // order they were preempted, with their KV gone but tokens kept.
+        let head = scheduler.waiting.front().unwrap();
+        assert_eq!(head.request_id, "b");
+        assert_eq!(head.num_computed_tokens, 0);
+        assert_eq!(head.num_output_tokens, 1);
+        assert!(head.kv_blocks.is_empty());
+        assert_eq!(head.num_preemptions, 1);
+        assert!(head.is_prefill());
+        // Nothing new is admitted in a pass that preempted.
+        assert_eq!(scheduler.num_waiting(), 2);
+    }
+
+    #[test]
+    fn test_preemption_victim_never_precedes_cursor() {
+        // Regression: a length policy must not evict a request already
+        // recorded in the batch (indices would shift). SIF's victim is the
+        // longest prompt, which we admit first so it sits at index 0.
+        let mut scheduler = scheduler_with_blocks("sif", 12);
+        scheduler.add_request(create_test_request("A", 64, 100));
+        let d = scheduler.schedule(0.0);
+        apply(&mut scheduler, &d, 0.5);
+        scheduler.add_request(create_test_request("B", 32, 100));
+        scheduler.add_request(create_test_request("C", 32, 100));
+        let d = scheduler.schedule(0.5);
+        apply(&mut scheduler, &d, 1.0);
+        assert_eq!(running_ids(&scheduler), vec!["A", "B", "C"]);
+        let d = scheduler.schedule(1.0);
+        apply(&mut scheduler, &d, 1.5);
+        // A=66 (5 blocks), B=C=33 (3 blocks each): 11 used, 1 free.
+        assert_eq!(scheduler.kv_cache_manager().num_free_blocks(), 1);
+        for r in scheduler.running.iter_mut() {
+            r.record_generated_tokens(15, 2.0);
+        }
+        // A=81, B=C=48: everyone's next position opens a new block. A takes
+        // the last free one; B must preempt. SIF's longest prompt is A (idx
+        // 0, already in the batch) — the victim must be chosen at >= idx 1.
+        let d = scheduler.schedule(2.0);
+        assert!(!running_ids(&scheduler).contains(&"C"));
+        assert_eq!(running_ids(&scheduler), vec!["A", "B"]);
+        let mut idxs: Vec<usize> = d.batch.iter().map(|s| s.idx).collect();
+        idxs.dedup();
+        assert_eq!(idxs.len(), d.batch.len(), "no duplicate batch indices");
+        assert!(d.batch.iter().all(|s| s.idx < scheduler.num_running()));
+        assert!(d.num_preempted >= 1);
     }
 
     #[test]
     fn test_sof_selection() {
         let mut scheduler = create_scheduler_with_policy("sof");
-
-        // Add requests with different output lengths
-        scheduler.add_request(create_test_request("req-long", 16, 100)); // longest
-        scheduler.add_request(create_test_request("req-short", 16, 10)); // shortest
-        scheduler.add_request(create_test_request("req-medium", 16, 50)); // medium
-
-        // SOF should select the shortest output first (output=10)
+        scheduler.add_request(create_test_request("req-long", 16, 100));
+        scheduler.add_request(create_test_request("req-short", 16, 10));
+        scheduler.add_request(create_test_request("req-medium", 16, 50));
         let idx = scheduler.select_next_waiting_request();
-        assert_eq!(scheduler.waiting.get(idx).unwrap().max_output_tokens, 10);
+        assert_eq!(scheduler.waiting[idx].max_output_tokens, 10);
     }
 
     #[test]
     fn test_sof_preemption() {
         let mut scheduler = create_scheduler_with_policy("sof");
-
-        // Add running requests with different remaining outputs
         let mut req1 = create_test_request("req-1", 16, 100);
         req1.num_output_tokens = 50; // 50 remaining
-        req1.status = RequestStatus::Running;
-
         let mut req2 = create_test_request("req-2", 16, 50);
         req2.num_output_tokens = 10; // 40 remaining
-        req2.status = RequestStatus::Running;
-
         let mut req3 = create_test_request("req-3", 16, 30);
         req3.num_output_tokens = 5; // 25 remaining
-        req3.status = RequestStatus::Running;
-
-        scheduler.running.push(req1);
-        scheduler.running.push(req2);
-        scheduler.running.push(req3);
-
-        // SOF should preempt the longest remaining output (req-1 with 50 remaining)
-        let victim_idx = scheduler.select_preemption_victim().unwrap();
-        assert_eq!(
-            scheduler.running[victim_idx].max_output_tokens
-                - scheduler.running[victim_idx].num_output_tokens,
-            50
-        );
+        scheduler.running.extend([req1, req2, req3]);
+        // Longest remaining output is preempted...
+        assert_eq!(scheduler.select_preemption_victim(0), Some(0));
+        // ...but only among positions at or after the cursor.
+        assert_eq!(scheduler.select_preemption_victim(1), Some(1));
     }
 
     #[test]
     fn test_sif_selection() {
         let mut scheduler = create_scheduler_with_policy("sif");
-
-        // Add requests with different input lengths
-        scheduler.add_request(create_test_request("req-long", 200, 10)); // longest input
-        scheduler.add_request(create_test_request("req-short", 50, 10)); // shortest input
-        scheduler.add_request(create_test_request("req-medium", 100, 10)); // medium input
-
-        // SIF should select the shortest input first (prompt=50)
+        scheduler.add_request(create_test_request("req-long", 200, 10));
+        scheduler.add_request(create_test_request("req-short", 50, 10));
+        scheduler.add_request(create_test_request("req-medium", 100, 10));
         let idx = scheduler.select_next_waiting_request();
-        assert_eq!(scheduler.waiting.get(idx).unwrap().num_prompt_tokens, 50);
+        assert_eq!(scheduler.waiting[idx].num_prompt_tokens, 50);
     }
 
     #[test]
     fn test_sif_preemption() {
         let mut scheduler = create_scheduler_with_policy("sif");
-
-        // Add running requests with different input lengths
-        let mut req1 = create_test_request("req-1", 200, 10);
-        req1.status = RequestStatus::Running;
-
-        let mut req2 = create_test_request("req-2", 50, 10);
-        req2.status = RequestStatus::Running;
-
-        let mut req3 = create_test_request("req-3", 100, 10);
-        req3.status = RequestStatus::Running;
-
-        scheduler.running.push(req1);
-        scheduler.running.push(req2);
-        scheduler.running.push(req3);
-
-        // SIF should preempt the longest input (req-1 with 200 tokens)
-        let victim_idx = scheduler.select_preemption_victim().unwrap();
-        assert_eq!(scheduler.running[victim_idx].num_prompt_tokens, 200);
+        scheduler.running.extend([
+            create_test_request("req-1", 200, 10),
+            create_test_request("req-2", 50, 10),
+            create_test_request("req-3", 100, 10),
+        ]);
+        let victim = scheduler.select_preemption_victim(0).unwrap();
+        assert_eq!(scheduler.running[victim].num_prompt_tokens, 200);
     }
 
     #[test]
     fn test_lif_selection() {
         let mut scheduler = create_scheduler_with_policy("lif");
-
-        // Add requests with different input lengths
-        scheduler.add_request(create_test_request("req-long", 200, 10)); // longest input
-        scheduler.add_request(create_test_request("req-short", 50, 10)); // shortest input
-        scheduler.add_request(create_test_request("req-medium", 100, 10)); // medium input
-
-        // LIF should select the longest input first (prompt=200)
+        scheduler.add_request(create_test_request("req-long", 200, 10));
+        scheduler.add_request(create_test_request("req-short", 50, 10));
+        scheduler.add_request(create_test_request("req-medium", 100, 10));
         let idx = scheduler.select_next_waiting_request();
-        assert_eq!(scheduler.waiting.get(idx).unwrap().num_prompt_tokens, 200);
+        assert_eq!(scheduler.waiting[idx].num_prompt_tokens, 200);
     }
 
     #[test]
     fn test_lif_preemption() {
         let mut scheduler = create_scheduler_with_policy("lif");
-
-        // Add running requests with different input lengths
-        let mut req1 = create_test_request("req-1", 200, 10);
-        req1.status = RequestStatus::Running;
-
-        let mut req2 = create_test_request("req-2", 50, 10);
-        req2.status = RequestStatus::Running;
-
-        let mut req3 = create_test_request("req-3", 100, 10);
-        req3.status = RequestStatus::Running;
-
-        scheduler.running.push(req1);
-        scheduler.running.push(req2);
-        scheduler.running.push(req3);
-
-        // LIF should preempt the longest input to avoid starvation (req-1 with 200 tokens)
-        let victim_idx = scheduler.select_preemption_victim().unwrap();
-        assert_eq!(scheduler.running[victim_idx].num_prompt_tokens, 200);
+        scheduler.running.extend([
+            create_test_request("req-1", 200, 10),
+            create_test_request("req-2", 50, 10),
+            create_test_request("req-3", 100, 10),
+        ]);
+        let victim = scheduler.select_preemption_victim(0).unwrap();
+        assert_eq!(scheduler.running[victim].num_prompt_tokens, 200);
     }
 
     #[test]
     fn test_priority_selection_fifo() {
         let mut scheduler = create_scheduler_with_policy("priority");
-
-        // Priority uses FIFO for selection (takes first)
         scheduler.add_request(create_test_request("req-1", 100, 10));
         scheduler.add_request(create_test_request("req-2", 200, 20));
         scheduler.add_request(create_test_request("req-3", 50, 5));
-
-        let idx = scheduler.select_next_waiting_request();
-        assert_eq!(idx, 0); // Should always be first
+        assert_eq!(scheduler.select_next_waiting_request(), 0);
     }
 
     #[test]
     fn test_priority_preemption() {
         let mut scheduler = create_scheduler_with_policy("priority");
-
-        // Add running requests with different priorities (lower value = higher priority)
         let mut req1 = create_test_request("req-1", 100, 10);
-        req1.priority = 0; // highest priority
+        req1.priority = 0;
         req1.arrival_time = 1.0;
-        req1.status = RequestStatus::Running;
-
         let mut req2 = create_test_request("req-2", 100, 10);
-        req2.priority = 5; // lowest priority
+        req2.priority = 5;
         req2.arrival_time = 2.0;
-        req2.status = RequestStatus::Running;
-
         let mut req3 = create_test_request("req-3", 100, 10);
-        req3.priority = 2; // medium priority
+        req3.priority = 2;
         req3.arrival_time = 3.0;
-        req3.status = RequestStatus::Running;
-
-        scheduler.running.push(req1);
-        scheduler.running.push(req2);
-        scheduler.running.push(req3);
-
-        // Priority should preempt the lowest priority (highest value = 5)
-        let victim_idx = scheduler.select_preemption_victim().unwrap();
-        assert_eq!(scheduler.running[victim_idx].priority, 5);
+        scheduler.running.extend([req1, req2, req3]);
+        let victim = scheduler.select_preemption_victim(0).unwrap();
+        assert_eq!(scheduler.running[victim].priority, 5);
     }
 
     #[test]
     fn test_fcfs_selection_fifo() {
-        let scheduler = create_test_scheduler(); // default is FCFS
-
-        let mut sched = scheduler;
+        let mut sched = create_test_scheduler();
         sched.add_request(create_test_request("req-1", 100, 10));
         sched.add_request(create_test_request("req-2", 200, 20));
         sched.add_request(create_test_request("req-3", 50, 5));
-
-        // FCFS always selects first (FIFO)
-        let idx = sched.select_next_waiting_request();
-        assert_eq!(idx, 0);
+        assert_eq!(sched.select_next_waiting_request(), 0);
     }
 
     #[test]
     fn test_policy_selection_deterministic() {
-        // Test that policies produce deterministic results for fixed inputs
         let mut scheduler = create_scheduler_with_policy("sjf");
-
         scheduler.add_request(create_test_request("req-1", 16, 100));
         scheduler.add_request(create_test_request("req-2", 16, 10));
         scheduler.add_request(create_test_request("req-3", 16, 50));
-
         let idx1 = scheduler.select_next_waiting_request();
         let idx2 = scheduler.select_next_waiting_request();
-        let idx3 = scheduler.select_next_waiting_request();
-
-        // Should always select same index for same state
         assert_eq!(idx1, idx2);
-        assert_eq!(idx2, idx3);
+        assert_eq!(scheduler.waiting[idx1].max_output_tokens, 10);
     }
 
     fn create_scheduler_with_preemption_free() -> Scheduler {
         let mut config = Config::test_default();
         config.scheduler.enable_preemption_free = true;
-        let kv_cache = KVCacheManager::new(
-            config.hardware.kv_cache_capacity,
-            config.scheduler.block_size,
-            config.model.kv_storage_bytes(1),
-            config.model.per_sequence_state_bytes(),
-            false,
-        );
-        Scheduler::new(config.scheduler, config.hardware, config.model, kv_cache).unwrap()
+        let kv = kv_manager(&config, config.hardware.kv_cache_capacity, false);
+        scheduler_from(config, kv)
     }
 
     #[test]
     fn test_preemption_free_admission_control() {
-        // Create a scheduler with small cache capacity
         let mut config = Config::test_default();
         config.scheduler.enable_preemption_free = true;
         config.hardware.kv_cache_capacity = 100_000_000; // Small cache
-        let kv_cache = KVCacheManager::new(
-            config.hardware.kv_cache_capacity,
-            config.scheduler.block_size,
-            config.model.kv_storage_bytes(1),
-            config.model.per_sequence_state_bytes(),
-            false,
-        );
-        let mut scheduler =
-            Scheduler::new(config.scheduler, config.hardware, config.model, kv_cache).unwrap();
+        let kv = kv_manager(&config, config.hardware.kv_cache_capacity, false);
+        let mut scheduler = scheduler_from(config, kv);
 
-        // Calculate how many blocks we have
         let total_blocks = scheduler.kv_cache_manager().total_blocks();
-
-        // Add a request that takes up 60% of the cache
+        // A request whose peak context takes 60% of the cache.
         let blocks_for_first = (total_blocks * 60) / 100;
-        let tokens_for_first = blocks_for_first * 16; // block_size = 16
-        let large_req = create_test_request(
-            "req-large",
-            tokens_for_first as u32 / 2,
-            tokens_for_first as u32 / 2,
-        );
-        scheduler.add_request(large_req);
-
-        // Schedule it
+        let tokens_for_first = blocks_for_first * 16;
+        let half = tokens_for_first as u32 / 2;
+        scheduler.add_request(create_test_request("req-large", half, half));
         let decision1 = scheduler.schedule(0.0);
         assert_eq!(
-            decision1.scheduled_new.len(),
+            decision1.batch.len(),
             1,
             "First request should be scheduled"
         );
         assert_eq!(scheduler.num_running(), 1);
 
-        // Try to add another request that needs 60% - should not be admitted (would exceed capacity)
-        let another_large = create_test_request(
-            "req-large2",
-            tokens_for_first as u32 / 2,
-            tokens_for_first as u32 / 2,
-        );
-        scheduler.add_request(another_large);
-
+        // Another 60% request is not admitted: 60% + 60% > 100%.
+        scheduler.add_request(create_test_request("req-large2", half, half));
         let decision2 = scheduler.schedule(0.0);
-        // Should not admit the second request because 60% + 60% > 100%
-        assert_eq!(
-            decision2.scheduled_new.len(),
-            0,
+        assert!(
+            decision2.batch.iter().all(|s| s.idx == 0),
             "Second request should not be admitted"
         );
         assert_eq!(scheduler.num_running(), 1);
@@ -1103,73 +1021,62 @@ mod tests {
     #[test]
     fn test_preemption_free_no_preemptions() {
         let mut scheduler = create_scheduler_with_preemption_free();
-
-        // Add multiple requests
         scheduler.add_request(create_test_request("req-1", 100, 50));
         scheduler.add_request(create_test_request("req-2", 100, 50));
         scheduler.add_request(create_test_request("req-3", 100, 50));
 
         let mut total_preemptions = 0;
         let mut time = 0.0;
-
-        // Run scheduler for many iterations
         for _ in 0..100 {
             let decision = scheduler.schedule(time);
-            total_preemptions += decision.preempted.len();
-
-            // Update running requests
-            for (idx, &tokens) in decision
-                .scheduled_running
-                .iter()
-                .zip(decision.tokens_for_running.iter())
-            {
-                scheduler.running[*idx].record_generated_tokens(tokens, time);
-            }
-
-            for (idx, &tokens) in decision
-                .scheduled_new
-                .iter()
-                .zip(decision.tokens_for_new.iter())
-            {
-                scheduler.running[*idx].record_generated_tokens(tokens, time);
-            }
-
+            total_preemptions += decision.num_preempted;
+            apply(&mut scheduler, &decision, time);
             time += 0.01;
-
             if scheduler.num_running() == 0 && scheduler.num_waiting() == 0 {
                 break;
             }
         }
-
-        // Assert zero preemptions
         assert_eq!(total_preemptions, 0);
+        assert_eq!(scheduler.num_preemptions(), 0);
     }
 
     #[test]
     fn test_preemption_free_fcfs_ordering() {
         let mut scheduler = create_scheduler_with_preemption_free();
-
-        // Add requests with different arrival times
         let mut req1 = create_test_request("req-1", 16, 10);
         req1.arrival_time = 0.0;
-
         let mut req2 = create_test_request("req-2", 16, 10);
         req2.arrival_time = 1.0;
-
         let mut req3 = create_test_request("req-3", 16, 10);
         req3.arrival_time = 2.0;
-
         scheduler.add_request(req1);
         scheduler.add_request(req2);
         scheduler.add_request(req3);
-
-        // Schedule first batch
         let decision = scheduler.schedule(0.0);
+        assert!(!decision.batch.is_empty());
+        assert_eq!(scheduler.running[0].request_id, "req-1");
+    }
 
-        // Should maintain FCFS ordering
-        assert!(!decision.scheduled_new.is_empty());
-        if !scheduler.running.is_empty() {
-            assert_eq!(scheduler.running[0].request_id, "req-1");
+    #[test]
+    fn test_take_prefill_complete_hands_off_and_frees_kv() {
+        let mut scheduler = create_test_scheduler();
+        scheduler.add_request(create_test_request("done", 16, 5));
+        scheduler.add_request(create_test_request("mid", 64, 5));
+        scheduler.add_request(create_test_request("one", 16, 1));
+        let d = scheduler.schedule(0.0);
+        // Give `mid` only part of its prefill.
+        for s in &d.batch {
+            let tokens = if s.idx == 1 { 16 } else { s.num_tokens };
+            scheduler.record_progress(s.idx, tokens, 1.0);
         }
+        let free_before = scheduler.kv_cache_manager().num_free_blocks();
+        let handed = scheduler.take_prefill_complete();
+        let ids: Vec<&str> = handed.iter().map(|r| r.request_id.as_str()).collect();
+        // `done` finished prefill with output left; `one` is finished (stays
+        // to be reaped); `mid` is still prefilling.
+        assert_eq!(ids, vec!["done"]);
+        assert!(handed[0].kv_blocks.is_empty());
+        assert!(scheduler.kv_cache_manager().num_free_blocks() > free_before);
+        assert_eq!(running_ids(&scheduler), vec!["mid", "one"]);
     }
 }

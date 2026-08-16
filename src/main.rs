@@ -1,5 +1,5 @@
 use clap::Parser;
-use inference_lab::config::{Config, ModelCosts};
+use inference_lab::config::{ArrivalPattern, Config, ModelCosts};
 use inference_lab::dataset::{BatchTokenizerFn, Message, PromptInput};
 use inference_lab::simulation::Simulator;
 use std::path::PathBuf;
@@ -383,14 +383,15 @@ fn run_sim(args: SimArgs) {
     #[cfg(not(feature = "cli"))]
     let tokenizer = None;
 
-    // Create simulator (returns updated config with counted dataset entries if applicable)
-    let (mut simulator, config) = match Simulator::new(config, tokenizer) {
-        Ok((sim, cfg)) => (sim, cfg),
+    let mut simulator = match Simulator::new(config, tokenizer) {
+        Ok(sim) => sim,
         Err(e) => {
             eprintln!("Error creating simulator: {}", e);
             std::process::exit(1);
         }
     };
+    // The simulator may have filled in `num_requests` from a counted dataset.
+    let config = simulator.config().clone();
 
     // Print configuration summary (after simulator creation to show updated dataset entry count)
     if verbosity >= VerbosityLevel::Normal {
@@ -406,21 +407,20 @@ fn run_sim(args: SimArgs) {
             config.scheduler.max_num_batched_tokens
         );
 
-        // Print arrival pattern with relevant details
-        match config.workload.arrival_pattern.to_lowercase().as_str() {
-            "closed_loop" => {
+        match config.workload.arrival_pattern {
+            ArrivalPattern::ClosedLoop => {
                 if let Some(users) = config.workload.num_concurrent_users {
                     println!("  Arrival: closed-loop ({} concurrent users)", users);
                 } else {
                     println!("  Arrival: closed-loop");
                 }
             }
-            "batched" => {
+            ArrivalPattern::Batched => {
                 println!("  Arrival: batched (all requests at t=0)");
             }
             pattern => {
                 println!(
-                    "  Arrival: {} ({} req/sec)",
+                    "  Arrival: {:?} ({} req/sec)",
                     pattern, config.workload.arrival_rate
                 );
             }
@@ -461,9 +461,8 @@ fn run_sim(args: SimArgs) {
                     elapsed.as_secs_f64()
                 );
             }
-            // Print final metrics for debug mode
-            let summary = simulator.get_metrics_summary();
-            summary.print();
+            let summary = simulator.summary();
+            println!("{}", serde_json::to_string_pretty(&summary).unwrap());
             return;
         }
     }
@@ -471,10 +470,10 @@ fn run_sim(args: SimArgs) {
     let elapsed = start_time.elapsed();
 
     // Print final metrics
-    let summary = simulator.get_metrics_summary();
+    let summary = simulator.summary();
     print_final_metrics(
         &summary,
-        simulator.get_current_time(),
+        simulator.current_time(),
         elapsed,
         verbosity,
         use_color,
@@ -497,7 +496,7 @@ fn run_sim(args: SimArgs) {
     // Save per-request CSV if requested (plus a sibling .depth.csv with the
     // per-second mean chosen draft depth and decode batch, when speculating)
     if let Some(csv_path) = args.request_csv {
-        let depth = simulator.get_spec_depth_series();
+        let depth = simulator.spec_depth_series();
         if !depth.is_empty() {
             let mut d = String::from("second,mean_draft,mean_decode_batch\n");
             for (s, md, mb) in &depth {
@@ -508,11 +507,20 @@ fn run_sim(args: SimArgs) {
                 eprintln!("Error saving depth CSV: {}", e);
             }
         }
-        let mut out =
-            String::from("arrival,completion,ttft,e2e,mean_tpot,prompt_toks,output_toks\n");
-        for (arr, comp, ttft, e2e, tpot, pt, ot) in simulator.get_request_rows() {
+        let mut out = String::from(
+            "arrival,completion,ttft,e2e,mean_tpot,prompt_toks,output_toks,preemptions\n",
+        );
+        for r in simulator.request_rows() {
             out.push_str(&format!(
-                "{arr:.4},{comp:.4},{ttft:.5},{e2e:.4},{tpot:.6},{pt},{ot}\n"
+                "{:.4},{:.4},{:.5},{:.4},{:.6},{},{},{}\n",
+                r.arrival,
+                r.completion,
+                r.ttft,
+                r.e2e,
+                r.mean_tpot,
+                r.prompt_tokens,
+                r.output_tokens,
+                r.num_preemptions
             ));
         }
         match std::fs::write(&csv_path, out) {
@@ -626,8 +634,8 @@ fn run_verbose(simulator: &mut Simulator, _use_color: bool, config: &Config) {
                 progress.running,
                 progress.waiting,
                 progress.kv_cache_util * 100.0,
-                progress.metrics.as_ref().map(|m| m.avg_flops_util * 100.0).unwrap_or(0.0),
-                progress.metrics.as_ref().map(|m| m.avg_bandwidth_util * 100.0).unwrap_or(0.0),
+                progress.metrics.utilization.avg_flops_util * 100.0,
+                progress.metrics.utilization.avg_bandwidth_util * 100.0,
             );
         })
         .unwrap();
@@ -666,31 +674,19 @@ fn print_final_metrics(
         println!("\nLATENCY METRICS");
     }
 
+    let row = |metric: &str, l: &inference_lab::metrics::LatencyStats| LatencyRow {
+        metric: metric.to_string(),
+        min: format!("{:.2}", l.min),
+        mean: format!("{:.2}", l.mean),
+        p50: format!("{:.2}", l.p50),
+        p90: format!("{:.2}", l.p90),
+        p99: format!("{:.2}", l.p99),
+    };
+    let lat = &summary.latency_metrics;
     let latency_rows = vec![
-        LatencyRow {
-            metric: "TTFT (ms)".to_string(),
-            min: format!("{:.2}", summary.ttft_min),
-            mean: format!("{:.2}", summary.ttft_mean),
-            p50: format!("{:.2}", summary.ttft_p50),
-            p90: format!("{:.2}", summary.ttft_p90),
-            p99: format!("{:.2}", summary.ttft_p99),
-        },
-        LatencyRow {
-            metric: "E2E Latency (ms)".to_string(),
-            min: format!("{:.2}", summary.e2e_min),
-            mean: format!("{:.2}", summary.e2e_mean),
-            p50: format!("{:.2}", summary.e2e_p50),
-            p90: format!("{:.2}", summary.e2e_p90),
-            p99: format!("{:.2}", summary.e2e_p99),
-        },
-        LatencyRow {
-            metric: "Per-Token Latency (ms)".to_string(),
-            min: format!("{:.2}", summary.per_token_min),
-            mean: format!("{:.2}", summary.per_token_mean),
-            p50: format!("{:.2}", summary.per_token_p50),
-            p90: format!("{:.2}", summary.per_token_p90),
-            p99: format!("{:.2}", summary.per_token_p99),
-        },
+        row("TTFT (ms)", &lat.ttft_ms),
+        row("E2E Latency (ms)", &lat.e2e_ms),
+        row("Per-Token Latency (ms)", &lat.per_token_ms),
     ];
 
     let latency_table = Table::new(&latency_rows).with(Style::rounded()).to_string();
@@ -706,15 +702,15 @@ fn print_final_metrics(
     let throughput_rows = vec![
         ThroughputRow {
             metric: "Input Tokens/sec".to_string(),
-            value: format!("{:.2}", summary.input_tokens_per_sec),
+            value: format!("{:.2}", summary.throughput_metrics.input_tokens_per_sec),
         },
         ThroughputRow {
             metric: "Output Tokens/sec".to_string(),
-            value: format!("{:.2}", summary.output_tokens_per_sec),
+            value: format!("{:.2}", summary.throughput_metrics.output_tokens_per_sec),
         },
         ThroughputRow {
             metric: "Requests/sec".to_string(),
-            value: format!("{:.2}", summary.requests_per_sec),
+            value: format!("{:.2}", summary.throughput_metrics.requests_per_sec),
         },
     ];
 
@@ -729,18 +725,13 @@ fn print_final_metrics(
     } else {
         println!("\nUTILIZATION");
     }
-    println!(
-        "  • KV Cache:  {:.1}% avg",
-        summary.avg_kv_cache_util * 100.0
-    );
-    println!("  • FLOPS:     {:.1}% avg", summary.avg_flops_util * 100.0);
-    println!(
-        "  • Bandwidth: {:.1}% avg",
-        summary.avg_bandwidth_util * 100.0
-    );
+    let util = &summary.utilization;
+    println!("  • KV Cache:  {:.1}% avg", util.avg_kv_cache_util * 100.0);
+    println!("  • FLOPS:     {:.1}% avg", util.avg_flops_util * 100.0);
+    println!("  • Bandwidth: {:.1}% avg", util.avg_bandwidth_util * 100.0);
     println!(
         "  • Preemptions: {} total ({:.2} per request avg)",
-        summary.total_preemptions, summary.preemptions_per_request_mean
+        summary.preemptions.total, summary.preemptions.per_request_mean
     );
 
     // Summary Section
@@ -751,30 +742,23 @@ fn print_final_metrics(
     }
     println!(
         "  • Total Requests: {} completed",
-        summary.completed_requests
+        summary.requests.completed
     );
     println!("  • Simulation Time: {:.1}s", sim_time);
     println!("  • Real Time: {:.2}s", real_time.as_secs_f64());
 
     // Prefix Cache Section
-    if summary.prefix_cache_hits + summary.prefix_cache_misses > 0 {
+    let pc = &summary.prefix_cache;
+    if pc.hits + pc.misses > 0 {
         if use_color {
             println!("\n{}", "PREFIX CACHE".yellow().bold());
         } else {
             println!("\nPREFIX CACHE");
         }
-        println!("  • Hits:      {}", summary.prefix_cache_hits);
-        println!("  • Misses:    {}", summary.prefix_cache_misses);
-        println!(
-            "  • Avg hit size: {}/{}={}",
-            summary.prefix_cache_hit_size_sum,
-            summary.prefix_cache_hit_size_count,
-            summary.prefix_cache_hit_size_sum / summary.prefix_cache_hit_size_count
-        );
-        println!(
-            "  • Hit Rate:  {:.1}%",
-            summary.prefix_cache_hit_rate * 100.0
-        );
+        println!("  • Hits:      {}", pc.hits);
+        println!("  • Misses:    {}", pc.misses);
+        println!("  • Avg hit size: {:.1} tokens", pc.mean_hit_size);
+        println!("  • Hit Rate:  {:.1}%", pc.hit_rate * 100.0);
     }
 }
 
@@ -788,71 +772,18 @@ fn print_final_metrics(
 ) {
     // Fallback for when CLI features are not available
     println!("\nSimulation Complete ({:.1}s)", sim_time);
+    let l = &summary.latency_metrics;
     println!(
         "TTFT: {:.2}ms (p50: {:.2}ms)",
-        summary.ttft_mean, summary.ttft_p50
+        l.ttft_ms.mean, l.ttft_ms.p50
     );
-    println!(
-        "E2E: {:.2}ms (p50: {:.2}ms)",
-        summary.e2e_mean, summary.e2e_p50
-    );
+    println!("E2E: {:.2}ms (p50: {:.2}ms)", l.e2e_ms.mean, l.e2e_ms.p50);
 }
 
 fn save_metrics_json(
     summary: &inference_lab::metrics::MetricsSummary,
     path: &PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use serde_json::json;
-
-    let json_data = json!({
-        "latency_metrics": {
-            "ttft_ms": {
-                "min": summary.ttft_min,
-                "mean": summary.ttft_mean,
-                "p50": summary.ttft_p50,
-                "p90": summary.ttft_p90,
-                "p99": summary.ttft_p99,
-            },
-            "e2e_ms": {
-                "min": summary.e2e_min,
-                "mean": summary.e2e_mean,
-                "p50": summary.e2e_p50,
-                "p90": summary.e2e_p90,
-                "p99": summary.e2e_p99,
-            },
-            "per_token_ms": {
-                "min": summary.per_token_min,
-                "mean": summary.per_token_mean,
-                "p50": summary.per_token_p50,
-                "p90": summary.per_token_p90,
-                "p99": summary.per_token_p99,
-            },
-        },
-        "throughput_metrics": {
-            "input_tokens_per_sec": summary.input_tokens_per_sec,
-            "output_tokens_per_sec": summary.output_tokens_per_sec,
-            "requests_per_sec": summary.requests_per_sec,
-        },
-        "utilization": {
-            "avg_kv_cache_util": summary.avg_kv_cache_util,
-            "avg_flops_util": summary.avg_flops_util,
-            "avg_bandwidth_util": summary.avg_bandwidth_util,
-        },
-        "preemptions": {
-            "total": summary.total_preemptions,
-            "per_request_mean": summary.preemptions_per_request_mean,
-        },
-        "requests": {
-            "completed": summary.completed_requests,
-            "total": summary.total_requests,
-        },
-        "prefix_cache": {
-            "hits": summary.prefix_cache_hits,
-            "misses": summary.prefix_cache_misses,
-            "hit_rate": summary.prefix_cache_hit_rate,
-        },
-    });
-
-    std::fs::write(path, serde_json::to_string_pretty(&json_data)?)?;
+    std::fs::write(path, serde_json::to_string_pretty(summary)?)?;
     Ok(())
 }

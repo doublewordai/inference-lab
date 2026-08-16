@@ -15,7 +15,7 @@ use crate::config::{
     ClusterSpec, DisaggTopology, GammaPolicy, ModelConfig, ModelCosts, SchedulerConfig,
     SpeculativeConfig,
 };
-use crate::kv_cache::{KVCacheManager, Link};
+use crate::kv_cache::{KVCacheManager, Link, PrefixCacheStats};
 use crate::request::Request;
 use crate::scheduler::Scheduler;
 
@@ -38,6 +38,8 @@ pub struct RequestTiming {
     pub completion_time: f64,
     pub num_prompt_tokens: u32,
     pub num_output_tokens: u32,
+    /// Times the request was preempted (and recomputed) before completing.
+    pub num_preemptions: u32,
 }
 
 impl RequestTiming {
@@ -75,26 +77,21 @@ impl Worker {
         let model_size_bytes = model.weight_residency_bytes();
         cluster.compute_kv_cache_capacity(model_size_bytes);
 
+        // Blocks are charged from the model's exact KV curve: linear-KV
+        // models get ceil(t / block_size), models whose footprint is
+        // nonlinear in position (sliding window, DeepSeek-V4's window +
+        // compressed history) get their real bytes.
+        let kv_model = model.clone();
         let kv_cache_manager = KVCacheManager::new(
             cluster.hardware.kv_cache_capacity,
             scheduler_config.block_size,
-            model.kv_storage_bytes(1),
+            move |t| kv_model.kv_storage_bytes(t),
             model.per_sequence_state_bytes(),
             true,
         )
-        // Charge blocks from the model's exact KV curve. For linear-KV models
-        // this reproduces ceil(t / block_size); for models whose footprint is
-        // nonlinear in position (DeepSeek-V4 window+compression, sliding
-        // window) it is the only correct charge.
-        .with_kv_curve(|t| model.kv_storage_bytes(t), model.max_seq_len())
         .with_tiers(&cluster.hardware.kv_tiers);
 
-        let scheduler = Scheduler::new(
-            scheduler_config.clone(),
-            cluster.hardware.clone(),
-            model.clone(),
-            kv_cache_manager,
-        )?;
+        let scheduler = Scheduler::new(scheduler_config.clone(), kv_cache_manager)?;
         let mut compute_engine =
             ComputeEngine::new(cluster.hardware.clone(), cluster.parallel.clone(), model)
                 .with_cascade_attention(
@@ -283,22 +280,18 @@ impl Ord for TimedEvent {
     }
 }
 
-struct Bookkeeping {
-    arrival_time: f64,
-    num_prompt_tokens: u32,
-    prefill_done_time: Option<f64>,
-    handoff_done_time: Option<f64>,
-}
-
-/// Per-request progress yielded by a worker iteration. `num_tokens` is the
-/// tokens generated *during this iter* for this request (one for decode, the
-/// prefill chunk size for prefill).
+/// Per-request progress yielded by a worker iteration.
 #[derive(Debug, Clone)]
 pub struct RequestProgress {
     pub request_id: String,
     /// Whether the request was in prefill phase BEFORE this iteration ran.
     pub was_prefill: bool,
+    /// Positions computed for this request in the iteration: the prefill
+    /// chunk, or the decode verify width (`1 + draft`).
     pub num_tokens: u32,
+    /// Output tokens the iteration produced for this request: 1 when it
+    /// completed prefill, `1 + accepted` for a decode step, 0 otherwise.
+    pub num_output: u32,
 }
 
 /// Information about the iteration that ran during a `step` call. Present
@@ -336,7 +329,6 @@ pub struct StepOutcome {
 pub struct Engine {
     topology: Topology,
     events: BinaryHeap<TimedEvent>,
-    bookkeeping: HashMap<String, Bookkeeping>,
     /// Requests that finished prefill on the P pool and are mid-handoff over
     /// the link.
     parked: HashMap<String, Request>,
@@ -364,9 +356,9 @@ pub struct Engine {
     /// `spec.switch` is constrained (cooldown / bounded candidate walk /
     /// per-switch cost). Empty when unconstrained (the fast path never
     /// touches it, so the raw policy is reproduced bit-for-bit).
+    agg_switch: HashMap<(PoolId, usize), AggSwitchState>,
     /// Optional affine step-time correction (alpha, beta seconds).
     time_correction: Option<(f64, f64)>,
-    agg_switch: HashMap<(PoolId, usize), AggSwitchState>,
 }
 
 /// `GatedAggregate` switching state under engine constraints.
@@ -391,7 +383,6 @@ impl Engine {
         Self {
             topology,
             events: BinaryHeap::new(),
-            bookkeeping: HashMap::new(),
             parked: HashMap::new(),
             worker_busy,
             pool_batch_acc,
@@ -455,9 +446,9 @@ impl Engine {
     /// Submit a request for arrival at `req.arrival_time`. The request is
     /// enqueued as an `Arrival` event; it does not enter any worker until a
     /// `step()` call processes that event. If `arrival_time` is in the past
-    /// (relative to the engine clock) the event fires immediately at `now`,
-    /// but bookkeeping retains the original `arrival_time` so TTFT is still
-    /// computed against the request's intended emission moment.
+    /// (relative to the engine clock) the event fires immediately at `now`;
+    /// the request keeps its own `arrival_time`, so TTFT is still computed
+    /// against the intended emission moment.
     pub fn submit(&mut self, req: Request) {
         let when = req.arrival_time.max(self.current_time);
         self.push(when, EventKind::Arrival(req));
@@ -531,8 +522,6 @@ impl Engine {
             .sum()
     }
 
-    /// Aggregate prefix-cache stats across every worker's KV manager.
-    /// Returned as `(hits, misses, hit_size_sum, hit_size_count)`.
     /// Per-second speculative draft-depth series:
     /// (second, mean drafts per decode seq, mean decode batch).
     pub fn spec_depth_series(&self) -> Vec<(u64, f64, f64)> {
@@ -548,21 +537,15 @@ impl Engine {
             .collect()
     }
 
-    pub fn aggregate_prefix_cache(&self) -> (u64, u64, u64, u64) {
-        let mut hits = 0u64;
-        let mut misses = 0u64;
-        let mut size_sum = 0u64;
-        let mut size_count = 0u64;
+    /// Prefix-cache lookup statistics summed over every worker's KV manager.
+    pub fn aggregate_prefix_cache(&self) -> PrefixCacheStats {
+        let mut total = PrefixCacheStats::default();
         for pool in &self.topology.pools {
             for worker in &pool.workers {
-                let mgr = worker.scheduler.kv_cache_manager();
-                hits += mgr.num_prefix_cache_hits;
-                misses += mgr.num_prefix_cache_misses;
-                size_sum += mgr.hit_size_sum;
-                size_count += mgr.hit_size_count;
+                total += worker.scheduler.kv_cache_manager().prefix_cache_stats();
             }
         }
-        (hits, misses, size_sum, size_count)
+        total
     }
 
     /// Aggregate KV cache utilisation across pools, weighted by capacity.
@@ -651,15 +634,6 @@ impl Engine {
     }
 
     fn handle_arrival(&mut self, req: Request) {
-        self.bookkeeping.insert(
-            req.request_id.clone(),
-            Bookkeeping {
-                arrival_time: req.arrival_time,
-                num_prompt_tokens: req.num_prompt_tokens,
-                prefill_done_time: None,
-                handoff_done_time: None,
-            },
-        );
         let entry = self.topology.entry_pool();
         self.route_into_pool(entry, req);
     }
@@ -729,32 +703,8 @@ impl Engine {
             // or tier promotion). Re-arm at its completion time so the
             // engine doesn't stall waiting for an arrival.
             self.maybe_wake_worker(pool, worker, ready.max(now));
-        } else {
-            let w = &self.topology.pools[pool].workers[worker];
-            if w.scheduler.num_running() == 0 && w.scheduler.num_waiting() > 0 {
-                let head = w.scheduler.waiting_head();
-                eprintln!(
-                    "STALL DEBUG: t={} free_blocks={}/{} waiting={} head={:?}",
-                    now,
-                    w.scheduler.kv_cache_manager().num_free_blocks(),
-                    w.scheduler.kv_cache_manager().total_blocks(),
-                    w.scheduler.num_waiting(),
-                    head.map(|r| (
-                        r.request_id.clone(),
-                        r.num_prompt_tokens,
-                        r.num_computed_tokens,
-                        r.num_output_tokens,
-                        r.target_output_tokens,
-                        r.status,
-                    ))
-                );
-            }
         }
         (outcome.iteration, timings)
-    }
-
-    fn run_iteration_correction(&self) -> Option<(f64, f64)> {
-        self.time_correction
     }
 
     fn run_iteration(
@@ -764,16 +714,14 @@ impl Engine {
         role: PoolRole,
         now: f64,
     ) -> RunIterationOutcome {
-        let correction = self.run_iteration_correction();
+        let correction = self.time_correction;
         let w = &mut self.topology.pools[pool].workers[worker];
         let decision = w.scheduler.schedule(now);
         let completed = decision.completed;
-        let preempted = !decision.preempted.is_empty();
+        let preempted = decision.num_preempted > 0;
 
-        let mut batch_indices: Vec<usize> = decision.scheduled_new.to_vec();
-        batch_indices.extend(decision.scheduled_running.iter().copied());
-        let mut tokens_per_request: Vec<u32> = decision.tokens_for_new.clone();
-        tokens_per_request.extend(decision.tokens_for_running.iter().copied());
+        let batch_indices: Vec<usize> = decision.batch.iter().map(|s| s.idx).collect();
+        let tokens_per_request: Vec<u32> = decision.batch.iter().map(|s| s.num_tokens).collect();
 
         if batch_indices.is_empty() {
             return RunIterationOutcome {
@@ -797,6 +745,7 @@ impl Engine {
                         request_id: req.request_id.clone(),
                         was_prefill: req.is_prefill(),
                         num_tokens: tokens_per_request[i],
+                        num_output: 0,
                     });
                     round_commits.push(req.pending_round_commits);
                 }
@@ -807,12 +756,11 @@ impl Engine {
         // length was decided at the END of the previous iteration and stored as
         // `pending_draft_len`; the scheduler has already reserved a `1 + draft`
         // verify pass in the token budget and KV (trimming `draft` to fit if
-        // capacity was tight), which is exactly what `tokens_for_running` now
-        // carries. So here we only realise the *outcome*: sample how many of the
+        // capacity was tight), which is exactly what the batch's `num_tokens`
+        // now carries. So here we only realise the *outcome*: sample how many of the
         // reserved draft tokens are accepted and advance by `accepted + 1`. The
         // verify pass itself (`1 + draft` tokens) is the cost. Prefill and
         // chunked-prefill continuations (was_prefill) are never speculated.
-        let n_new = decision.scheduled_new.len();
         let cost_tokens = tokens_per_request.clone(); // verify width per request
         let mut accepted_extra = vec![0u32; batch_size];
         let mut step_gamma_max = 0u32; // widest draft this step (for drafter overhead)
@@ -837,7 +785,6 @@ impl Engine {
                     },
                 };
                 accepted_extra[j] = accepted; // bonus (+1) added at progress
-                progress[j].num_tokens = accepted + 1; // tokens generated this step
             }
         }
 
@@ -952,46 +899,23 @@ impl Engine {
         }
         let end_time = now + iter_time;
 
-        for (i, &idx) in decision.scheduled_new.iter().enumerate() {
-            if let Some(req) = w.scheduler.running_mut().get_mut(idx) {
-                req.record_generated_tokens(decision.tokens_for_new[i], end_time);
-            }
-        }
-        for (i, &idx) in decision.scheduled_running.iter().enumerate() {
-            if let Some(req) = w.scheduler.running_mut().get_mut(idx) {
-                let j = n_new + i;
-                // Decode: advance by the verified tokens (bonus + accepted), NOT
-                // the verify width (`tokens_for_running` = 1 + draft, the cost).
-                // Chunked prefill: advance by the scheduled prefill chunk.
-                let adv = if progress[j].was_prefill {
-                    decision.tokens_for_running[i]
-                } else {
-                    1 + accepted_extra[j]
-                };
-                req.record_generated_tokens(adv, end_time);
-            }
+        for (j, &idx) in batch_indices.iter().enumerate() {
+            // Decode: advance by the verified tokens (bonus + accepted), NOT
+            // the verify width (`num_tokens` = 1 + draft, the cost). Prefill
+            // (including chunked continuations and recompute after
+            // preemption): advance by the scheduled chunk.
+            let adv = if progress[j].was_prefill {
+                tokens_per_request[j]
+            } else {
+                1 + accepted_extra[j]
+            };
+            progress[j].num_output = w.scheduler.record_progress(idx, adv, end_time);
         }
 
         let handed_off = if matches!(role, PoolRole::DisaggPrefill) {
-            // Pull out anything whose prefill is now complete; free its KV
-            // (it's about to leave this worker via the link).
-            let running = w.scheduler.running_mut();
-            let mut keep = Vec::with_capacity(running.len());
-            let mut handed = Vec::new();
-            for r in running.drain(..) {
-                if r.num_computed_tokens >= r.num_prompt_tokens {
-                    handed.push(r);
-                } else {
-                    keep.push(r);
-                }
-            }
-            *running = keep;
-            for req in &handed {
-                w.scheduler
-                    .kv_cache_manager_mut()
-                    .free_blocks(&req.kv_blocks);
-            }
-            handed
+            // Anything whose prefill is now complete leaves this worker via
+            // the link; the scheduler frees its KV on the way out.
+            w.scheduler.take_prefill_complete()
         } else {
             Vec::new()
         };
@@ -1164,14 +1088,13 @@ impl Engine {
                 };
                 (drafts, commits)
             };
-            let mut k = 0usize;
-            for req in w.scheduler.running_mut().iter_mut() {
-                if !req.is_prefill() && !req.is_finished() {
-                    req.pending_draft_len = drafts.get(k).copied().unwrap_or(0);
-                    req.pending_round_commits = next_commits.get(k).copied().flatten();
-                    k += 1;
-                }
-            }
+            let plans: Vec<(u32, Option<u32>)> = drafts
+                .iter()
+                .copied()
+                .zip(next_commits.iter().copied())
+                .collect();
+            let k = plans.len();
+            w.scheduler.set_draft_plans(&plans);
             if k > 0 {
                 let e = self
                     .spec_depth_buckets
@@ -1575,11 +1498,11 @@ impl Engine {
     }
 
     fn start_handoff(&mut self, mut req: Request, prefill_done_at: f64) {
-        if let Some(b) = self.bookkeeping.get_mut(&req.request_id) {
-            b.prefill_done_time = Some(prefill_done_at);
-        }
-        req.kv_blocks.clear();
-        let kv_bytes = self.topology.model.kv_storage_bytes(req.num_prompt_tokens);
+        req.prefill_done_time = Some(prefill_done_at);
+        let kv_bytes = self
+            .topology
+            .model
+            .kv_storage_bytes(req.num_computed_tokens);
         let id = req.request_id.clone();
         let (link, then_pool) = match self.topology.roles {
             Roles::Disagg {
@@ -1609,49 +1532,31 @@ impl Engine {
     ) -> Result<(), String> {
         let now = self.current_time;
         let _ = self.topology.links[link].advance(now);
-        if let Some(b) = self.bookkeeping.get_mut(&request_id) {
-            b.handoff_done_time = Some(now);
-        }
-        let req = self
+        let mut req = self
             .parked
             .remove(&request_id)
             .ok_or_else(|| format!("link complete for unknown request {request_id}"))?;
+        req.handoff_done_time = Some(now);
         self.route_into_pool(then_pool, req);
         Ok(())
     }
 
     fn finalise(&mut self, req: Request, completion_time: f64) -> RequestTiming {
-        let id = req.request_id.clone();
-        let book = self.bookkeeping.remove(&id);
-        let arrival = book
-            .as_ref()
-            .map(|b| b.arrival_time)
-            .unwrap_or(req.arrival_time);
         let first_token = req.first_token_time.unwrap_or(completion_time);
-        // Aggregated mode doesn't track an explicit prefill→decode boundary
-        // (no handoff to time-stamp). Fall back to first_token_time so the
-        // breakdown reads as "prefill ends when the first decode token is
-        // produced," matching the previous hand-rolled behaviour.
-        let prefill_done = book
-            .as_ref()
-            .and_then(|b| b.prefill_done_time)
-            .unwrap_or(first_token);
-        let handoff_done = book
-            .as_ref()
-            .and_then(|b| b.handoff_done_time)
-            .unwrap_or(prefill_done);
+        // On an aggregated topology the prefill pass produces the first
+        // token, so prefill ends when the first token is produced.
+        let prefill_done = req.prefill_done_time.unwrap_or(first_token);
+        let handoff_done = req.handoff_done_time.unwrap_or(prefill_done);
         RequestTiming {
-            request_id: id,
-            arrival_time: arrival,
+            request_id: req.request_id,
+            arrival_time: req.arrival_time,
             prefill_done_time: prefill_done,
             handoff_done_time: handoff_done,
             first_token_time: first_token,
             completion_time,
-            num_prompt_tokens: book
-                .as_ref()
-                .map(|b| b.num_prompt_tokens)
-                .unwrap_or(req.num_prompt_tokens),
+            num_prompt_tokens: req.num_prompt_tokens,
             num_output_tokens: req.num_output_tokens,
+            num_preemptions: req.num_preemptions,
         }
     }
 }
