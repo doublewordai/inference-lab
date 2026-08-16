@@ -4,26 +4,35 @@ fn default_dim() -> u32 {
     1
 }
 
-/// Parallelism configuration for a worker pool. Describes how the model is
-/// laid out across the GPUs in a TP / EP group; aggregation helpers on
-/// `ClusterSpec` use these to scale per-GPU hardware figures up to cluster
-/// totals.
+/// How one replica of the model is laid out across its GPUs.
+///
+/// * `tp` — the replica's world size. Its GPUs pool FLOP rate, HBM bandwidth
+///   and memory; weights are sharded across them (each expert's matrices
+///   included, unless `ep` says otherwise). Every layer's sharded output is
+///   all-reduced: once after attention, once after the FFN.
+/// * `ep` — experts sharded across `ep` of the ranks (must divide `tp`).
+///   MoE layers then exchange tokens with dispatch and combine all-to-alls
+///   over the `ep` group instead of the FFN all-reduce; expert reads and
+///   FLOPs are taken as balanced across the ranks.
+/// * `dp_attention` — attention runs data-parallel over the `tp` ranks
+///   (sglang `--enable-dp-attention`): each rank holds the full attention
+///   projections (replicated: `tp×` resident, `tp×` read per step) and its
+///   own sequences' KV, and needs no attention all-reduce; the FFN, still
+///   TP-sharded, gathers the ranks' tokens with an all-gather and returns
+///   them with a reduce-scatter (or, with `ep > 1`, the all-to-alls do it).
+///
+/// Collectives are priced on the hardware's [`super::FabricConfig`].
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ParallelConfig {
-    /// Tensor-parallel group size. Defaults to 1.
+    /// Replica world size. Defaults to 1.
     #[serde(default = "default_dim")]
     pub tp: u32,
-    /// Expert-parallel group size for MoE layers. Defaults to 1 (experts
-    /// replicated across the TP group rather than sharded).
+    /// Expert-parallel group size (divides `tp`). Defaults to 1: experts
+    /// TP-sharded like every other weight.
     #[serde(default = "default_dim")]
     pub ep: u32,
-    /// DP-attention layout (sglang's `--enable-dp-attention`). When true, the
-    /// `tp` ranks run attention in data-parallel mode — each rank holds full
-    /// attention weights and a 1/tp shard of sequences, so there is no TP
-    /// all-reduce in the per-layer hot path. The `tp` value is then really a
-    /// world-size knob, not a tensor-parallel group. EP collectives are
-    /// unaffected. Defaults to false (classic TP).
+    /// Data-parallel attention over the `tp` ranks. Defaults to false.
     #[serde(default)]
     pub dp_attention: bool,
 }
@@ -36,24 +45,4 @@ impl Default for ParallelConfig {
             dp_attention: false,
         }
     }
-}
-
-/// Collective-communications cost model. Describes the fabric and per-call
-/// fixed overheads used to estimate TP all-reduce and EP all-to-all time per
-/// iteration. Optional on `ClusterSpec` and top-level `Config`; if absent
-/// the simulator contributes zero collective time (current behaviour).
-#[derive(Debug, Clone, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-pub struct CommsConfig {
-    /// Per-GPU bandwidth available for collective operations, in bytes/sec.
-    /// On NVL72 this is the NVLink5 bidirectional limit (~900 GB/s).
-    pub link_bw: f64,
-    /// Per-call fixed latency for an all-reduce, in seconds. Captures
-    /// kernel launch + NCCL setup overhead. ~5–10 μs is typical on NVLink.
-    #[serde(default)]
-    pub allreduce_latency: f64,
-    /// Per-call fixed latency for an all-to-all, in seconds. Slightly higher
-    /// than all-reduce in practice; ~8–15 μs on NVLink.
-    #[serde(default)]
-    pub alltoall_latency: f64,
 }

@@ -10,9 +10,11 @@ gpu_memory_utilization = 0.8
 
 [hardware.b200]
 tp = 8
+dp_attention = true
 
 [hardware.b300]
 tp = 8
+dp_attention = true
 
 [hardware.b200-datasheet]
 tp = 8

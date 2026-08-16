@@ -149,6 +149,15 @@ pub enum LayerClass {
         qk_head_dim: Option<u32>,
         #[serde(default)]
         v_head_dim: Option<u32>,
+        /// Low-rank query path (`q_lora_rank`): the query projection is
+        /// `H × q_latent` down and `q_latent × heads × qk` up. Absent = a
+        /// full `H × heads × qk` projection.
+        #[serde(default)]
+        q_latent_dim: Option<u32>,
+        /// Low-rank output path (`o_lora_rank`, DeepSeek-V4): `heads × v ×
+        /// o_latent` then `o_latent × H`. Absent = a full `heads × v × H`.
+        #[serde(default)]
+        o_latent_dim: Option<u32>,
     },
     /// Linear attention / SSM (GatedDeltaNet, Mamba, KDA): a fixed
     /// per-sequence state, no context-scaling work.
@@ -517,36 +526,112 @@ impl ModelSpec {
             .sum()
     }
 
-    /// Activation bytes per token in one TP all-reduce.
+    /// Activation bytes per token in one TP all-reduce / all-gather.
     pub fn allreduce_bytes_per_token(&self) -> u64 {
         self.hidden_dim as u64 * self.activation_bytes as u64
     }
 
-    /// TP all-reduces per forward pass (post-attention + post-MLP per layer).
-    pub fn num_tp_allreduces_per_pass(&self) -> u32 {
-        2 * self.num_layers()
-    }
-
-    /// Activation bytes per token sent one way in an EP all-to-all: each
-    /// token is dispatched to `experts_per_tok` experts, one full
-    /// hidden-wide activation each. Zero without routing.
-    pub fn alltoall_bytes_per_token(&self) -> u64 {
+    /// Layers whose FFN is a routed MoE (sum over routed streams).
+    pub fn moe_layers(&self) -> u32 {
         self.weights
             .iter()
             .filter_map(|w| w.routing)
-            .map(|r| {
-                r.experts_per_tok as u64 * self.hidden_dim as u64 * self.activation_bytes as u64
+            .map(|r| r.moe_layers)
+            .sum()
+    }
+
+    /// Layers with a dense FFN.
+    pub fn dense_ffn_layers(&self) -> u32 {
+        self.num_layers().saturating_sub(self.moe_layers())
+    }
+
+    /// Precision the attention projections are stored at: that of the
+    /// largest non-routed weight stream, or `attention_precision` when every
+    /// stream is routed.
+    pub fn projection_precision(&self) -> Precision {
+        self.weights
+            .iter()
+            .filter(|w| w.routing.is_none())
+            .max_by_key(|w| w.resident_params)
+            .map(|w| w.precision)
+            .unwrap_or(self.attention_precision)
+    }
+
+    /// Attention projection parameters, derived from the layer geometry
+    /// (the weight streams do not separate attention from the rest):
+    /// GQA `H·d·(2·heads + 2·kv_heads)` (`H·d·(2·heads + kv_heads)` when K
+    /// and V share a tensor); MLA `H·(latent + rope)` down and
+    /// `latent·heads·(qk_nope + v)` up for KV, the query path through
+    /// `q_latent_dim` (else full), the output path through `o_latent_dim`
+    /// (else full), plus the indexer's `H·heads·d`, taking a `H/128`-head
+    /// MHA shape when the head shape is not given; linear-attention layers
+    /// contribute nothing (their projections are not separable from
+    /// `state_bytes`). Replicated on every rank under DP-attention.
+    pub fn attention_weight_params(&self) -> u64 {
+        let h = self.hidden_dim as u64;
+        self.layers
+            .iter()
+            .map(|l| match *l {
+                LayerClass::Attention {
+                    count,
+                    heads,
+                    head_dim,
+                    kv_heads,
+                    kv_shared,
+                    ..
+                } => {
+                    let kv_mats = if kv_shared { 1 } else { 2 };
+                    count as u64
+                        * h
+                        * head_dim as u64
+                        * (2 * heads as u64 + kv_mats * kv_heads as u64)
+                }
+                LayerClass::Mla {
+                    count,
+                    latent_dim,
+                    rope_dim,
+                    history,
+                    heads,
+                    qk_head_dim,
+                    v_head_dim,
+                    q_latent_dim,
+                    o_latent_dim,
+                    ..
+                } => {
+                    let (heads, qk, v) = match (heads, qk_head_dim, v_head_dim) {
+                        (Some(n), Some(qk), Some(v)) => (n as u64, qk as u64, v as u64),
+                        _ => (h / 128, 128, 128),
+                    };
+                    let latent = latent_dim as u64;
+                    let rope = rope_dim as u64;
+                    let nope = qk.saturating_sub(rope);
+                    let q_path = match q_latent_dim {
+                        Some(q) => h * q as u64 + q as u64 * heads * qk,
+                        None => h * heads * qk,
+                    };
+                    let o_path = match o_latent_dim {
+                        Some(o) => heads * v * o as u64 + o as u64 * h,
+                        None => heads * v * h,
+                    };
+                    let per_layer = h * (latent + rope)
+                        + latent * heads * (nope + v)
+                        + q_path
+                        + o_path
+                        + history
+                            .and_then(|hist| hist.indexer)
+                            .map(|ix| h * ix.heads as u64 * ix.head_dim as u64)
+                            .unwrap_or(0);
+                    count as u64 * per_layer
+                }
+                LayerClass::Linear { .. } => 0,
             })
             .sum()
     }
 
-    /// EP all-to-alls per forward pass (dispatch + combine per MoE layer).
-    pub fn num_ep_alltoalls_per_pass(&self) -> u32 {
-        self.weights
-            .iter()
-            .filter_map(|w| w.routing)
-            .map(|r| 2 * r.moe_layers)
-            .sum()
+    /// Bytes of the attention projections at their stored precision.
+    pub fn attention_weight_bytes(&self) -> u64 {
+        (self.attention_weight_params() as f64 * self.projection_precision().bytes_per_value())
+            as u64
     }
 }
 
@@ -639,8 +724,15 @@ mod tests {
         assert_eq!(m.attention_flops(1, 100), 4 * 4096 * 100 * 32);
         assert_eq!(m.weight_residency_bytes(), 14_000_000_000);
         assert_eq!(m.per_sequence_state_bytes(), 0);
-        assert_eq!(m.num_tp_allreduces_per_pass(), 64);
-        assert_eq!(m.num_ep_alltoalls_per_pass(), 0);
+        assert_eq!(m.num_layers(), 32);
+        assert_eq!(m.moe_layers(), 0);
+        assert_eq!(m.dense_ffn_layers(), 32);
+        // GQA projections: H·d·(2·heads + 2·kv_heads) per layer.
+        assert_eq!(
+            m.attention_weight_params(),
+            32 * 4096 * 128 * (2 * 32 + 2 * 8)
+        );
+        assert_eq!(m.projection_precision(), Precision::Bf16);
     }
 
     #[test]
@@ -697,6 +789,8 @@ mod tests {
             heads: None,
             qk_head_dim: None,
             v_head_dim: None,
+            q_latent_dim: None,
+            o_latent_dim: None,
         };
         let ix = Indexer {
             heads: 1,
@@ -755,6 +849,8 @@ mod tests {
             heads: Some(64),
             qk_head_dim: Some(192),
             v_head_dim: Some(128),
+            q_latent_dim: None,
+            o_latent_dim: None,
         }];
         // Full context: attends and stores every position.
         assert_eq!(m.attention_flops(1, 100), 2 * 64 * (192 + 128) * 100);
@@ -774,6 +870,8 @@ mod tests {
             heads: None,
             qk_head_dim: None,
             v_head_dim: None,
+            q_latent_dim: None,
+            o_latent_dim: None,
         }];
         assert_eq!(m.kv_storage_bytes(4096), (512 + 64) * (128 + 32));
         assert_eq!(m.attention_flops(1, 4096), 4 * 7168 * (128 + 32));
@@ -792,6 +890,8 @@ mod tests {
             heads: None,
             qk_head_dim: None,
             v_head_dim: None,
+            q_latent_dim: None,
+            o_latent_dim: None,
         }];
         assert_eq!(m.attention_flops(1, 4096), 4 * 7168 * 2048);
         assert_eq!(m.kv_storage_bytes(4096), (512 + 64) * 2 * 4096);
@@ -853,8 +953,7 @@ mod tests {
             "MoE weight traffic must grow with batch tokens"
         );
         assert_eq!(m.weight_residency_bytes(), 257_000 / 2 + 1000);
-        assert_eq!(m.alltoall_bytes_per_token(), 8 * 1024 * 2);
-        assert_eq!(m.num_ep_alltoalls_per_pass(), 8);
+        assert_eq!(m.moe_layers(), 4);
     }
 
     #[test]
@@ -888,6 +987,8 @@ mod tests {
             heads: None,
             qk_head_dim: None,
             v_head_dim: None,
+            q_latent_dim: None,
+            o_latent_dim: None,
         }];
         assert!(m.validate().is_err());
     }

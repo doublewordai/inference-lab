@@ -7,3 +7,11 @@ flops_bf16 = 9.89e14
 flops_fp16 = 9.89e14
 memory_bandwidth = 4.0e12
 memory_capacity = 102642221056
+
+# Fabric: 4-GPU GH200 node (Isambard-AI) — GPUs joined by NVLink 4 (900 GB/s
+# bidirectional per GPU = 450 GB/s per direction; point-to-point, no NVSwitch
+# reduction), one Slingshot-11 200 Gb/s NIC per GPU across nodes.
+[fabric]
+gpus_per_node = 4
+scale_up = { bandwidth = 4.5e11, latency = 5e-6 }
+scale_out = { bandwidth = 2.5e10, latency = 2e-5 }

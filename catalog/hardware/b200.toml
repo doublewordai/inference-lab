@@ -7,3 +7,11 @@ flops_bf16 = 2.25e15
 flops_fp16 = 2.25e15
 memory_bandwidth = 7.7e12
 memory_capacity = 193273528320
+
+# Fabric: HGX B200 — 8 GPUs on NVSwitch (NVLink 5, 1.8 TB/s bidirectional per
+# GPU = 900 GB/s per direction, in-network reduction via NVLink SHARP), one
+# ConnectX-7 400 Gb/s NIC per GPU rail-optimised across nodes.
+[fabric]
+gpus_per_node = 8
+scale_up = { bandwidth = 9.0e11, latency = 5e-6, in_network_reduction = true }
+scale_out = { bandwidth = 5.0e10, latency = 2e-5 }

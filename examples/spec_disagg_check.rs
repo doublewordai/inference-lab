@@ -17,8 +17,8 @@ mod common;
 
 use inference_lab::config::DisaggTopology;
 use inference_lab::config::{
-    AcceptanceModel, ClusterSpec, CommsConfig, DrafterCost, GammaPolicy, HardwareConfig,
-    ParallelConfig, SchedulerConfig, SpeculativeConfig,
+    AcceptanceModel, ClusterSpec, DrafterCost, FabricConfig, FabricLink, GammaPolicy,
+    HardwareConfig, ParallelConfig, SchedulerConfig, SpeculativeConfig,
 };
 use inference_lab::scheduler::SchedulingPolicy;
 use inference_lab::simulation::{simulate_closed_loop, ClosedLoop, Topology};
@@ -35,6 +35,15 @@ fn b200() -> HardwareConfig {
         memory_bandwidth: 8.0e12,
         memory_capacity: 206_158_430_208,
         kv_tiers: Vec::new(),
+        fabric: Some(FabricConfig {
+            gpus_per_node: 8,
+            scale_up: FabricLink {
+                bandwidth: 9.0e11,
+                latency: 5e-6,
+                in_network_reduction: true,
+            },
+            scale_out: None,
+        }),
     }
 }
 
@@ -63,11 +72,6 @@ fn cluster(num_workers: u32) -> ClusterSpec {
             ep: 1,
             dp_attention: false,
         },
-        comms: Some(CommsConfig {
-            link_bw: 9.0e11,
-            allreduce_latency: 5e-6,
-            alltoall_latency: 8e-6,
-        }),
         num_workers,
     }
 }

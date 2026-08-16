@@ -10,6 +10,8 @@ gpu_memory_utilization = 0.8
 
 [hardware.b200]
 tp = 4
+ep = 4
 
 [hardware.b300]
 tp = 4
+ep = 4

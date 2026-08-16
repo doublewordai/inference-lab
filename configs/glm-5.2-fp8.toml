@@ -9,6 +9,8 @@ block_size = 64
 
 [hardware.b200]
 tp = 8
+dp_attention = true
 
 [hardware.b300]
 tp = 8
+dp_attention = true

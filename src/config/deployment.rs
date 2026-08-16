@@ -62,13 +62,11 @@ pub struct Deployment {
 }
 
 impl Deployment {
-    /// This deployment's hardware and parallel layout as one worker pool
-    /// (no collective-comms model, one worker).
+    /// This deployment's hardware and parallel layout as one worker pool.
     pub fn cluster(&self) -> ClusterSpec {
         ClusterSpec {
             hardware: self.hardware.clone(),
             parallel: self.parallel.clone(),
-            comms: None,
             num_workers: 1,
         }
     }
@@ -197,8 +195,13 @@ impl ModelConfig {
         if let Some(fault) = &self.fault {
             merged.insert("fault".into(), Value::Table(fault.clone()));
         }
-        Deployment::deserialize(Value::Table(merged))
-            .map_err(|e| DeploymentError(format!("[hardware.{name}]: {e}")))
+        let deployment = Deployment::deserialize(Value::Table(merged))
+            .map_err(|e| DeploymentError(format!("[hardware.{name}]: {e}")))?;
+        deployment
+            .cluster()
+            .validate()
+            .map_err(|e| DeploymentError(format!("[hardware.{name}]: {e}")))?;
+        Ok(deployment)
     }
 }
 

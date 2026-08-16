@@ -177,6 +177,7 @@ mod tests {
             memory_bandwidth: 1e12,
             memory_capacity: 80_000_000_000,
             kv_tiers: Vec::new(),
+            fabric: None,
         };
         let model = ModelSpec {
             name: "test-dense".into(),
@@ -221,7 +222,6 @@ mod tests {
                 ep: 1,
                 dp_attention: false,
             },
-            comms: None,
             num_workers: 1,
         };
         (cluster, model, sched)
