@@ -1,52 +1,39 @@
 use crate::request::Request;
 
-/// Result of a scheduling decision
-#[derive(Debug)]
-pub struct ScheduleDecision {
-    /// Indices of newly scheduled requests (from waiting -> running)
-    pub scheduled_new: Vec<usize>,
-
-    /// Indices of continuing running requests
-    pub scheduled_running: Vec<usize>,
-
-    /// Indices of preempted requests
-    pub preempted: Vec<usize>,
-
-    /// Completed requests
-    pub completed: Vec<Request>,
-
-    /// Number of tokens for each newly scheduled request (parallel to scheduled_new)
-    pub tokens_for_new: Vec<u32>,
-
-    /// Number of tokens for each continuing request (parallel to scheduled_running)
-    pub tokens_for_running: Vec<u32>,
+/// One running request scheduled into the step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScheduledSeq {
+    /// Index into the scheduler's `running` set.
+    pub idx: usize,
+    /// Positions this request computes in the step: a prefill chunk, or
+    /// `1 + pending_draft_len` for decode (the verify width, i.e. the cost).
+    pub num_tokens: u32,
 }
 
-impl Default for ScheduleDecision {
-    fn default() -> Self {
-        Self::new()
-    }
+/// Result of one `Scheduler::schedule` call.
+#[derive(Debug, Default)]
+pub struct ScheduleDecision {
+    /// The batch that runs this step, in `running` order. Requests admitted
+    /// this step come last.
+    pub batch: Vec<ScheduledSeq>,
+
+    /// Requests that finished at the end of the previous step, reaped and
+    /// removed from `running` before anything else was scheduled.
+    pub completed: Vec<Request>,
+
+    /// Requests preempted this pass (returned to the head of the waiting
+    /// queue; they recompute on resume). When non-zero, nothing new was
+    /// admitted.
+    pub num_preempted: usize,
 }
 
 impl ScheduleDecision {
-    pub fn new() -> Self {
-        Self {
-            scheduled_new: Vec::new(),
-            scheduled_running: Vec::new(),
-            preempted: Vec::new(),
-            completed: Vec::new(),
-            tokens_for_new: Vec::new(),
-            tokens_for_running: Vec::new(),
-        }
-    }
-
-    /// Get total number of tokens scheduled in this iteration
+    /// Total positions computed in this step.
     pub fn total_tokens(&self) -> u32 {
-        self.tokens_for_new.iter().sum::<u32>() + self.tokens_for_running.iter().sum::<u32>()
+        self.batch.iter().map(|s| s.num_tokens).sum()
     }
 
-    /// Get number of scheduled requests (new + running)
     pub fn num_scheduled(&self) -> usize {
-        self.scheduled_new.len() + self.scheduled_running.len()
+        self.batch.len()
     }
 }

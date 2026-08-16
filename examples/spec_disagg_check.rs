@@ -13,12 +13,15 @@
 //!
 //! Run: `cargo run --release --example spec_disagg_check --no-default-features`
 
+mod common;
+
 use inference_lab::config::DisaggTopology;
 use inference_lab::config::{
-    AcceptanceModel, ClusterSpec, CommsConfig, DeepseekV4Model, GammaPolicy, HardwareConfig,
-    ModelConfig, Node, ParallelConfig, Precision, SchedulerConfig, SpeculativeConfig,
+    AcceptanceModel, ClusterSpec, CommsConfig, DrafterCost, GammaPolicy, HardwareConfig,
+    ParallelConfig, SchedulerConfig, SpeculativeConfig,
 };
-use inference_lab::simulation::{simulate_closed_loop, Topology};
+use inference_lab::scheduler::SchedulingPolicy;
+use inference_lab::simulation::{simulate_closed_loop, ClosedLoop, Topology};
 use rayon::prelude::*;
 use std::collections::BTreeMap;
 
@@ -31,42 +34,8 @@ fn b200() -> HardwareConfig {
         flops_fp16: Some(2.25e15),
         memory_bandwidth: 8.0e12,
         memory_capacity: 206_158_430_208,
-        kv_cache_capacity: 0,
-        gpu_memory_utilization: 0.9,
         kv_tiers: Vec::new(),
     }
-}
-
-fn deepseek_v4_flash() -> ModelConfig {
-    ModelConfig::DeepseekV4(DeepseekV4Model {
-        name: "DeepSeek-V4-Flash".into(),
-        num_layers: 43,
-        hidden_dim: 4096,
-        num_heads: 64,
-        max_seq_len: 1_048_576,
-        kv_latent_dim: 512,
-        qk_rope_head_dim: 64,
-        kv_precision: Precision::Fp8,
-        num_active_expert_params: 7_574_913_024,
-        num_active_non_expert_params: 5_660_947_776,
-        num_resident_expert_params: 278_107_521_024,
-        num_resident_non_expert_params: 6_225_000_000,
-        expert_precision: Precision::Fp4,
-        non_expert_precision: Precision::Fp8,
-        window_size: 128,
-        num_dense_layers: 2,
-        num_near_layers: 21,
-        num_far_layers: 20,
-        near_compress_ratio: 4,
-        far_compress_ratio: 128,
-        index_topk: 512,
-        index_n_heads: 64,
-        index_head_dim: 128,
-        index_kv_precision: None,
-        num_experts_per_tok: 6,
-        num_routed_experts: 256,
-        num_moe_layers: 43,
-    })
 }
 
 fn scheduler() -> SchedulerConfig {
@@ -77,7 +46,10 @@ fn scheduler() -> SchedulerConfig {
         long_prefill_token_threshold: 0,
         max_num_partial_prefills: 1,
         block_size: 64,
-        policy: "fcfs".into(),
+        gpu_memory_utilization: 0.9,
+        kv_cache_capacity: 0,
+        max_model_len: None,
+        policy: SchedulingPolicy::FCFS,
         enable_preemption_free: true,
         enable_cascade_attention: false,
     }
@@ -97,7 +69,6 @@ fn cluster(num_workers: u32) -> ClusterSpec {
             alltoall_latency: 8e-6,
         }),
         num_workers,
-        node: 0,
     }
 }
 
@@ -116,19 +87,17 @@ fn spec_for(p: Policy, alpha: f64, c_draft: f64) -> Option<SpeculativeConfig> {
             gamma: g,
             acceptance,
             policy: GammaPolicy::Fixed,
-            draft_cost_frac: c_draft,
             measured_cost: None,
             switch: Default::default(),
-            drafter: None,
+            drafter: Some(DrafterCost::Fraction { frac: c_draft }),
         }),
         Policy::Budget(g) => Some(SpeculativeConfig {
             gamma: g,
             acceptance,
             policy: GammaPolicy::GoodputBudget,
-            draft_cost_frac: c_draft,
             measured_cost: None,
             switch: Default::default(),
-            drafter: None,
+            drafter: Some(DrafterCost::Fraction { frac: c_draft }),
         }),
     }
 }
@@ -144,12 +113,6 @@ fn run(
     c_draft: f64,
 ) -> (f64, f64) {
     let topo = DisaggTopology {
-        nodes: vec![Node {
-            name: "b200".into(),
-            num_gpus: 72,
-            intra_node_link_bw: 9.0e11,
-        }],
-        inter_node_link_bw: None,
         prefill: ClusterSpec {
             num_workers: p_workers,
             ..cluster(p_workers)
@@ -157,19 +120,22 @@ fn run(
         decode: cluster(1),
         kv_link_bw: 9.0e11,
     };
-    let topology = Topology::from_disagg(&topo, deepseek_v4_flash(), scheduler()).expect("topo");
+    let topology =
+        Topology::from_disagg(&topo, common::deepseek_v4_flash(), scheduler()).expect("topo");
     let total = (conc * 16).max(2000);
     let warmup = conc * 4;
     let res = simulate_closed_loop(
         topology,
-        conc,
-        isl,
-        osl,
-        total,
-        warmup,
-        spec_for(p, alpha, c_draft),
-        7,
-        false,
+        &ClosedLoop {
+            concurrency: conc,
+            isl,
+            osl,
+            num_completions: total,
+            warmup_completions: warmup,
+            spec: spec_for(p, alpha, c_draft),
+            seed: 7,
+            skip_prefill: false,
+        },
     )
     .expect("run");
     let goodput = res.throughput() * osl as f64;

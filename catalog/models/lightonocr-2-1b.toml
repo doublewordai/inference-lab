@@ -1,0 +1,31 @@
+# lightonai/LightOnOCR-2-1B-bbox-soup — Qwen3-1B-class dense GQA text stack
+# with a Pixtral vision encoder. From HF config.json (text_config, model_type
+# qwen3): 28 layers, hidden 1024, 16 heads x head_dim 128, 8 KV heads, full
+# attention, MLP inter 3072, vocab 151936 (tied embeddings), max_pos 16384,
+# bf16. `qwen35` with zero experts / all layers attention.
+#
+# Param split (all non-expert; computed):
+#   attn/layer (q 16x128 + k,v 8x128 + o) = 1024*6144 = 6_291_456
+#   MLP/layer = 3*1024*3072 = 9_437_184
+#   lm_head (tied) = 151936*1024 = 155_582_464
+#   active = 28*(attn+mlp) + lm_head = 595_984_384
+#   resident = active + ~0.4e9 vision tower (Pixtral 24 x hidden 1024)
+#            = 995_984_384 (embeddings tied -> single copy)
+
+name = "LightOnOCR-2-1B-bbox-soup"
+hidden_dim = 1024
+max_seq_len = 16384
+attention_precision = "bf16"
+
+[[weights]]
+precision = "bf16"
+active_params = 595984384
+resident_params = 995984384
+
+[[layers]]
+kind = "attention"
+count = 28
+heads = 16
+head_dim = 128
+kv_heads = 8
+kv_precision = "bf16"

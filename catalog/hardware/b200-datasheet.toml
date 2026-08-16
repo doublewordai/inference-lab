@@ -1,0 +1,9 @@
+# NVIDIA B200 at the nominal datasheet memory figures (192 GB HBM3e, 8 TB/s), dense peaks.
+
+name = "B200"
+flops_fp4 = 9.0e15
+flops_fp8 = 4.5e15
+flops_bf16 = 2.25e15
+flops_fp16 = 2.25e15
+memory_bandwidth = 8.0e12
+memory_capacity = 206158430208
