@@ -1,7 +1,7 @@
 //! Unified discrete-event engine. Pure state machine: knows about pools,
 //! workers, the event heap, KV bookkeeping and time. Knows nothing about
 //! request generation, metrics, real wall-clock, or how to render progress.
-//! Drivers (batch [`super::sim::Simulator`], serve [`crate::serve::engine`])
+//! Drivers (batch [`super::simulator::Simulator`], serve `crate::serve::engine`)
 //! pump it by alternating `next_event_time` / `submit` / `step`.
 
 use std::cmp::Ordering;
