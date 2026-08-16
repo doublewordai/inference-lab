@@ -9,6 +9,8 @@ block_size = 64
 
 [hardware.b200]
 tp = 4
+ep = 4
 
 [hardware.b300]
 tp = 4
+ep = 4

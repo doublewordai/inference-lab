@@ -32,6 +32,8 @@ resident_params = 53000000000
 kind = "mla"
 count = 30
 latent_dim = 512
+q_latent_dim = 1536
+o_latent_dim = 1024
 rope_dim = 64
 kv_precision = "fp8"
 window = 128
@@ -41,6 +43,8 @@ history = { compress_ratio = 4, index_topk = 1024, indexer = { heads = 64, head_
 kind = "mla"
 count = 31
 latent_dim = 512
+q_latent_dim = 1536
+o_latent_dim = 1024
 rope_dim = 64
 kv_precision = "fp8"
 window = 128

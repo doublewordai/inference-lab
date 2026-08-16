@@ -47,6 +47,7 @@ resident_params = 43990352896
 kind = "mla"
 count = 24
 latent_dim = 512
+q_latent_dim = 1536
 rope_dim = 64
 kv_precision = "bf16"
 heads = 96

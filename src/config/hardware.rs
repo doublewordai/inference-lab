@@ -123,22 +123,41 @@ impl FabricConfig {
     /// inside each node (`(k-1)/k × bytes` each) around an all-reduce of the
     /// `bytes/k` shard over the `n = ceil(g/k)` nodes on each rank's NIC.
     pub fn allreduce_time(&self, g: u32, bytes: f64) -> f64 {
+        self.reduce_time(g, bytes, true, 1.0)
+    }
+
+    /// Time of an all-gather followed by a reduce-scatter of a `bytes`-long
+    /// vector over `g` ranks (DP-attention feeding a TP-sharded FFN): the
+    /// ring all-reduce's traffic, no in-network reduction, two calls'
+    /// latency.
+    pub fn allgather_reducescatter_time(&self, g: u32, bytes: f64) -> f64 {
+        self.reduce_time(g, bytes, false, 2.0)
+    }
+
+    fn reduce_time(&self, g: u32, bytes: f64, in_network_ok: bool, calls: f64) -> f64 {
         if g <= 1 {
             return 0.0;
         }
         let k = self.gpus_per_node.max(1);
         let up = self.scale_up;
+        let factor = |link: FabricLink, g: u32| {
+            if in_network_ok {
+                link.allreduce_factor(g)
+            } else {
+                2.0 * (g - 1) as f64 / g as f64
+            }
+        };
         if g <= k {
-            return up.latency + up.allreduce_factor(g) * bytes / up.bandwidth;
+            return calls * up.latency + factor(up, g) * bytes / up.bandwidth;
         }
         let out = self
             .scale_out
             .expect("group spans nodes: validated by ClusterSpec::validate");
         let n = g.div_ceil(k);
         let kf = k as f64;
-        2.0 * (up.latency + (kf - 1.0) / kf * bytes / up.bandwidth)
-            + out.latency
-            + out.allreduce_factor(n) * (bytes / kf) / out.bandwidth
+        2.0 * (calls * up.latency + (kf - 1.0) / kf * bytes / up.bandwidth)
+            + calls * out.latency
+            + factor(out, n) * (bytes / kf) / out.bandwidth
     }
 
     /// Time of one all-to-all where each of `g` ranks holds `per_rank_bytes`

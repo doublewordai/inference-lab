@@ -49,10 +49,25 @@ impl ClusterSpec {
         ComputeEngine::new(self.hardware.clone(), self.parallel.clone(), model)
     }
 
-    /// A parallel group wider than one GPU needs a fabric to price its
+    /// Weights resident on the replica: every stream once, plus the
+    /// attention projections replicated on each rank under DP-attention.
+    pub fn resident_weight_bytes(&self, model: &ModelSpec) -> u64 {
+        let mut bytes = model.weight_residency_bytes();
+        if self.parallel.dp_attention && self.parallel.tp > 1 {
+            bytes += (self.parallel.tp as u64 - 1) * model.attention_weight_bytes();
+        }
+        bytes
+    }
+
+    /// `ep` shards the experts of the `tp`-wide replica, so it must divide
+    /// `tp`; a parallel group wider than one GPU needs a fabric to price its
     /// collectives, and one wider than a node needs `scale_out`.
     pub fn validate(&self) -> Result<(), String> {
-        for (name, g) in [("tp", self.parallel.tp), ("ep", self.parallel.ep)] {
+        let (tp, ep) = (self.parallel.tp, self.parallel.ep);
+        if tp == 0 || ep == 0 || tp % ep != 0 {
+            return Err(format!("ep = {ep} must divide tp = {tp}"));
+        }
+        for (name, g) in [("tp", tp), ("ep", ep)] {
             if g <= 1 {
                 continue;
             }
@@ -63,10 +78,12 @@ impl ClusterSpec {
                         self.hardware.name
                     ))
                 }
-                Some(f) if !f.supports_group(g) => return Err(format!(
+                Some(f) if !f.supports_group(g) => {
+                    return Err(format!(
                     "{name} = {g} spans nodes of {} GPUs on {} but its [fabric] has no scale_out",
                     f.gpus_per_node, self.hardware.name
-                )),
+                ))
+                }
                 Some(_) => {}
             }
         }

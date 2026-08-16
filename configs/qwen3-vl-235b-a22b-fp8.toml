@@ -9,12 +9,15 @@ block_size = 64
 
 [hardware.b200]
 tp = 2
+ep = 2
 
 [hardware.b300]
 tp = 2
+ep = 2
 
 [hardware.gh200-120]
 tp = 4
+ep = 4
 
 [hardware.b200-datasheet]
 tp = 2

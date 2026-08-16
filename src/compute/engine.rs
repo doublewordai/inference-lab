@@ -81,38 +81,52 @@ impl ComputeEngine {
         self.aggregate_memory_bandwidth()
     }
 
-    /// Time spent in TP all-reduces and EP all-to-alls for a step of
-    /// `total_tokens` tokens, priced on the hardware's [`FabricConfig`]
-    /// (zero when the hardware declares none — `ClusterSpec::validate`
-    /// rejects that for tp/ep > 1). Collectives are added serially to the
-    /// compute/memory time: no overlap is modelled.
+    /// Collective time for a step of `total_tokens` tokens, priced on the
+    /// hardware's [`FabricConfig`] and added serially to the compute/memory
+    /// time (no overlap). Per layer, over the `tp`-wide replica:
+    ///
+    /// * attention: one all-reduce of the hidden-wide activation, unless
+    ///   `dp_attention` (each rank owns its sequences' attention outright);
+    /// * dense FFN, or MoE with `ep = 1` (experts TP-sharded): one
+    ///   all-reduce, or under `dp_attention` an all-gather in and a
+    ///   reduce-scatter out (the ranks' tokens meet the sharded FFN);
+    /// * MoE with `ep > 1`: dispatch and combine all-to-alls over the `ep`
+    ///   group, each rank moving its `tokens / ep` share of the routed
+    ///   activations (`experts_per_tok` copies of the hidden vector).
     fn collective_time(&self, total_tokens: u32) -> f64 {
         let Some(fabric) = &self.hardware.fabric else {
             return 0.0;
         };
-        let tokens = total_tokens as f64;
-        let mut total = 0.0;
-
-        // TP all-reduce of the full hidden-wide activation, twice per layer.
-        // Skipped under DP-attention: each rank owns its sequence shard and
-        // needs no per-layer all-reduce.
         let tp = self.parallel.tp;
-        if tp > 1 && !self.parallel.dp_attention {
-            let bytes = tokens * self.model.allreduce_bytes_per_token() as f64;
-            let calls = self.model.num_tp_allreduces_per_pass() as f64;
-            total += calls * fabric.allreduce_time(tp, bytes);
+        if tp <= 1 {
+            return 0.0;
         }
-
-        // EP all-to-all: the step's dispatched activations are spread over
-        // the ep ranks; each rank exchanges its share (dispatch + combine per
-        // MoE layer).
         let ep = self.parallel.ep;
-        if ep > 1 {
-            let per_rank = tokens * self.model.alltoall_bytes_per_token() as f64 / ep as f64;
-            let calls = self.model.num_ep_alltoalls_per_pass() as f64;
-            total += calls * fabric.alltoall_time(ep, per_rank);
-        }
+        let dpa = self.parallel.dp_attention;
+        let tokens = total_tokens as f64;
+        let hidden = tokens * self.model.allreduce_bytes_per_token() as f64;
+        let ffn_exchange = |layers: u32| {
+            let t = if dpa {
+                fabric.allgather_reducescatter_time(tp, hidden)
+            } else {
+                fabric.allreduce_time(tp, hidden)
+            };
+            layers as f64 * t
+        };
 
+        let mut total = 0.0;
+        if !dpa {
+            total += self.model.num_layers() as f64 * fabric.allreduce_time(tp, hidden);
+        }
+        total += ffn_exchange(self.model.dense_ffn_layers());
+        if ep > 1 {
+            for r in self.model.weights.iter().filter_map(|w| w.routing) {
+                let per_rank = tokens / ep as f64 * r.experts_per_tok as f64 * hidden / tokens;
+                total += 2.0 * r.moe_layers as f64 * fabric.alltoall_time(ep, per_rank);
+            }
+        } else {
+            total += ffn_exchange(self.model.moe_layers());
+        }
         total
     }
 
@@ -141,6 +155,12 @@ impl ComputeEngine {
         // with the step's token count (coupon-collector expert loading).
         for (prec, b) in self.model.weight_bytes_per_step_by_prec(total_tokens) {
             streams[prec.index()].bytes += b as f64;
+        }
+        // DP-attention: every rank holds and reads the full attention
+        // projections, so the replica reads them tp times per step.
+        if self.parallel.dp_attention && self.parallel.tp > 1 {
+            streams[self.model.projection_precision().index()].bytes +=
+                (self.parallel.tp - 1) as f64 * self.model.attention_weight_bytes() as f64;
         }
 
         let attn = &mut streams[self.model.attention_precision.index()];
@@ -313,11 +333,57 @@ mod tests {
             "{with} {without}"
         );
 
-        // DP-attention drops the per-layer all-reduce.
+        // DP-attention: no attention all-reduce; the 32 dense FFNs each
+        // all-gather + reduce-scatter (ring bytes, two latencies), and every
+        // rank reads the full attention projections.
         par.dp_attention = true;
         let dpa = ComputeEngine::new(hw, par, base.model.clone());
-        let t = dpa.calculate_iteration_time(&[&req], &[1024]);
-        assert!((t - without).abs() < 1e-12);
+        let expected = 32.0 * (2e-6 + 1024.0 * 4096.0 * 2.0 / 1e12);
+        assert!((dpa.collective_time(1024) - expected).abs() < 1e-12);
+        let extra = dpa.step_cost(&[&req], &[1024]).bytes - tp2.step_cost(&[&req], &[1024]).bytes;
+        assert_eq!(extra, base.model.attention_weight_bytes() as f64);
+    }
+
+    /// EP replaces the MoE layers' FFN all-reduce with dispatch + combine
+    /// all-to-alls over the ep group; dense layers keep the all-reduce.
+    #[test]
+    fn ep_prices_alltoalls_on_moe_layers() {
+        use crate::config::{FabricConfig, FabricLink, Routing, WeightStream};
+        let base = Config::test_default();
+        let mut hw = base.hardware.clone();
+        hw.fabric = Some(FabricConfig {
+            gpus_per_node: 8,
+            scale_up: FabricLink {
+                bandwidth: 1e12,
+                latency: 1e-6,
+                in_network_reduction: false,
+            },
+            scale_out: None,
+        });
+        let mut model = base.model.clone();
+        model.weights.push(WeightStream {
+            precision: Precision::Bf16,
+            active_params: 1_000_000,
+            resident_params: 64_000_000,
+            routing: Some(Routing {
+                routed_experts: 64,
+                experts_per_tok: 4,
+                moe_layers: 24,
+            }),
+        });
+        let mut par = base.parallel.clone();
+        par.tp = 4;
+        par.ep = 4;
+        let eng = ComputeEngine::new(hw, par, model);
+        let tokens = 1024.0;
+        let hidden = tokens * 4096.0 * 2.0;
+        let allreduce = 1e-6 + 2.0 * 3.0 / 4.0 * hidden / 1e12;
+        // Each rank dispatches 1024/4 tokens × 4 experts × hidden bytes,
+        // 3/4 of it to other ranks.
+        let per_rank = tokens / 4.0 * 4.0 * 4096.0 * 2.0;
+        let a2a = 1e-6 + 3.0 / 4.0 * per_rank / 1e12;
+        let expected = 32.0 * allreduce + 8.0 * allreduce + 2.0 * 24.0 * a2a;
+        assert!((eng.collective_time(1024) - expected).abs() < 1e-12);
     }
 
     fn create_test_request(id: &str, computed: u32, prompt: u32) -> Request {

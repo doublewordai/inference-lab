@@ -69,7 +69,7 @@ impl Worker {
         scheduler_config: SchedulerConfig,
     ) -> Result<Self, String> {
         let kv_capacity =
-            cluster.kv_cache_capacity(&scheduler_config, model.weight_residency_bytes());
+            cluster.kv_cache_capacity(&scheduler_config, cluster.resident_weight_bytes(&model));
 
         // Blocks are charged from the model's exact KV curve: linear-KV
         // models get ceil(t / block_size), models whose footprint is
