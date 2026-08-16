@@ -12,9 +12,20 @@ is always something to resume. The fault path bypasses the simulation engine (li
 echo-directives) and contains no randomness: the same trigger produces the same frames
 and the same death at the same byte, every time.
 
-**Scope**: streaming `POST /v1/chat/completions` only. A fault header on a non-streaming
-request, or on `/v1/completions`, is rejected with a 400 (`invalid_fault_directive`) —
-never silently ignored. With no trigger present, behavior is completely unchanged.
+**Scope**: streaming `POST /v1/chat/completions` **and** streaming `POST /v1/completions`.
+A fault header on a non-streaming request is rejected with a 400
+(`invalid_fault_directive`) — never silently ignored. With no trigger present, behavior is
+completely unchanged.
+
+Both endpoints matter because a mid-stream-continuation **resume leg** is a streaming
+`/v1/completions` request, so chain-resume tests need to kill one. The frames follow the
+endpoint's own wire shape: `/v1/completions` emits `text_completion` chunks carrying
+`text` and has **no role frame**, so `after_chunks=N` puts exactly N frames on the wire
+before the death (one fewer than the chat flavor, which leads with its role frame).
+`mid_reasoning` and `mid_tool_call` have no delta object to use there, so they stream the
+same partial payloads as raw text — an unterminated `<think>` block and a tool call the
+model never finished writing — which is how both actually appear on a real base-model
+completions stream.
 
 ## Trigger: the `x-inference-lab-fault` header
 
@@ -73,8 +84,8 @@ Precedence per request: header > model `[fault]` config > (echo-directives >) no
 | `stall` | nothing, forever; connection stays open until the client gives up | exit 28 (client timeout) |
 | `error_envelope_200` | OpenRouter-style error envelope as an SSE data frame, then `[DONE]`; HTTP status stays 200 | exit 0, `{"error":{"message":…,"code":502,"metadata":{…}}}` |
 | `error_400_in_sse` | vLLM-style 400 object in-stream (the nemotron-incident signature), then clean close, no `[DONE]` | exit 0, `{"object":"error",…,"code":400}` |
-| `no_done` | finish_reason frame (with usage if requested), then clean close — `[DONE]` never comes | exit 0, stream just ends |
-| `no_usage` | finish_reason frame **without** usage (even when `stream_options.include_usage` was set), then `[DONE]` | exit 0, usage missing |
+| `no_done` | finish_reason frame, then the separate `choices: []` usage frame if requested, then clean close — `[DONE]` never comes | exit 0, stream just ends |
+| `no_usage` | finish_reason frame then `[DONE]`, but the usage frame never arrives (even when `stream_options.include_usage` was set) | exit 0, usage missing |
 | `cancelled_499` | the exact dynamo frontend-cancellation body, then clean close | exit 0, `{"error":{"code":499,"message":"CancelledError: ","type":"request_cancelled"}}` |
 | `mid_reasoning` | frames carry `reasoning_content` deltas instead of `content`; dies cut_between_frames-style | exit 18, last deltas are reasoning |
 | `mid_tool_call` | frame 1 announces a tool call (id + name), later frames stream `arguments` fragments that never terminate; dies cut_between_frames-style | exit 18, partial tool call |
@@ -93,7 +104,7 @@ Notes:
 
 ## Examples
 
-All against a local sim (`inference-lab serve --config configs/ --port 8080`); `$BODY` is
+All against a local sim (`inference-lab serve --config configs/ --hardware b200 --port 8080`); `$BODY` is
 any streaming chat request:
 
 ```bash
@@ -123,7 +134,7 @@ curl -N $URL -H 'content-type: application/json' -H 'x-inference-lab-fault: erro
 # 6. error_400_in_sse — 400-shaped object inside the 200 stream
 curl -N $URL -H 'content-type: application/json' -H 'x-inference-lab-fault: error_400_in_sse' -d "$BODY"
 
-# 7. no_done — finish_reason + usage, then the stream ends without [DONE]
+# 7. no_done — finish_reason + usage frame, then the stream ends without [DONE]
 curl -N $URL -H 'content-type: application/json' -H 'x-inference-lab-fault: no_done' -d "$BODY"
 
 # 8. no_usage — [DONE] arrives but the requested usage never does
@@ -137,4 +148,18 @@ curl -N $URL -H 'content-type: application/json' -H 'x-inference-lab-fault: mid_
 
 # 11. mid_tool_call — dies with a tool call's arguments unterminated
 curl -N $URL -H 'content-type: application/json' -H 'x-inference-lab-fault: mid_tool_call;after_chunks=4' -d "$BODY"
+```
+
+### Killing a resume leg
+
+A resume leg is a streaming `/v1/completions` request whose prompt is token ids. Every
+mode above works against it; only the frame shape differs (no role frame, `text` instead
+of a delta):
+
+```bash
+RESUME='{"model":"DeepSeek-V4-Flash","prompt":[1,2,3,4],"stream":true,"priority":0,"stream_options":{"include_usage":true},"max_tokens":64}'
+
+# exactly 2 text frames, then FIN (curl exit 18)
+curl -N http://localhost:8080/v1/completions -H 'content-type: application/json' \
+  -H 'x-inference-lab-fault: cut_between_frames;after_chunks=2' -d "$RESUME"
 ```

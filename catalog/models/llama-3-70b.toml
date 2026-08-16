@@ -1,0 +1,19 @@
+# Source: examples/config.toml
+
+name = "Llama-3-70B"
+hidden_dim = 8192
+max_seq_len = 8192
+attention_precision = "bf16"
+
+[[weights]]
+precision = "bf16"
+active_params = 70000000000
+resident_params = 70000000000
+
+[[layers]]
+kind = "attention"
+count = 80
+heads = 64
+head_dim = 128
+kv_heads = 8
+kv_precision = "bf16"

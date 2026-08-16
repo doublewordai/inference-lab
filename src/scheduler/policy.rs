@@ -1,7 +1,11 @@
+use serde::Deserialize;
+use std::fmt;
 use std::str::FromStr;
 
-/// Scheduling policy for request ordering
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Scheduling policy for request ordering. Deserialises from its lowercase
+/// name (`"fcfs"`, `"sof"`, ...); `"sjf"` is accepted as an alias of `"sof"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "String")]
 pub enum SchedulingPolicy {
     /// First-Come-First-Served: requests served in arrival order
     FCFS,
@@ -27,6 +31,28 @@ pub enum SchedulingPolicy {
     LTF,
 }
 
+impl SchedulingPolicy {
+    /// Config name of the policy.
+    pub fn name(self) -> &'static str {
+        match self {
+            SchedulingPolicy::FCFS => "fcfs",
+            SchedulingPolicy::Priority => "priority",
+            SchedulingPolicy::SIF => "sif",
+            SchedulingPolicy::LIF => "lif",
+            SchedulingPolicy::SOF => "sof",
+            SchedulingPolicy::LOF => "lof",
+            SchedulingPolicy::STF => "stf",
+            SchedulingPolicy::LTF => "ltf",
+        }
+    }
+}
+
+impl fmt::Display for SchedulingPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
 impl FromStr for SchedulingPolicy {
     type Err = String;
 
@@ -36,14 +62,20 @@ impl FromStr for SchedulingPolicy {
             "priority" => Ok(SchedulingPolicy::Priority),
             "sif" => Ok(SchedulingPolicy::SIF),
             "lif" => Ok(SchedulingPolicy::LIF),
-            "sof" => Ok(SchedulingPolicy::SOF),
+            "sof" | "sjf" => Ok(SchedulingPolicy::SOF),
             "lof" => Ok(SchedulingPolicy::LOF),
             "stf" => Ok(SchedulingPolicy::STF),
             "ltf" => Ok(SchedulingPolicy::LTF),
-            // Backward compatibility
-            "sjf" => Ok(SchedulingPolicy::SOF),
-            _ => Err(format!("Unknown scheduling policy: {}", s)),
+            _ => Err(format!("Unknown scheduling policy: {s}")),
         }
+    }
+}
+
+impl TryFrom<String> for SchedulingPolicy {
+    type Error = String;
+
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        s.parse()
     }
 }
 
@@ -113,7 +145,7 @@ mod tests {
             "LTF".parse::<SchedulingPolicy>().unwrap(),
             SchedulingPolicy::LTF
         );
-        // Test backward compatibility
+        // "sjf" is an alias of "sof".
         assert_eq!(
             "sjf".parse::<SchedulingPolicy>().unwrap(),
             SchedulingPolicy::SOF

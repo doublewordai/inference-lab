@@ -1,0 +1,14 @@
+model = "nemotron-3-super-120b"
+
+[scheduler]
+max_num_batched_tokens = 8192
+max_num_seqs = 1024
+policy = "priority"
+enable_chunked_prefill = true
+block_size = 64
+
+[hardware.b200]
+tp = 1
+
+[hardware.b300]
+tp = 1
