@@ -1,0 +1,14 @@
+model = "kimi-k2.5"
+
+[scheduler]
+max_num_batched_tokens = 16384
+max_num_seqs = 256
+policy = "priority"
+enable_chunked_prefill = true
+block_size = 64
+
+[hardware.b200]
+tp = 8
+
+[hardware.b300]
+tp = 8
