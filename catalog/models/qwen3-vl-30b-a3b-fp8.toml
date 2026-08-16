@@ -1,4 +1,3 @@
-# Source: configs/estate/qwen3-vl-30b-a3b-fp8-b200.toml
 # Qwen/Qwen3-VL-30B-A3B-Instruct-FP8 — GQA MoE vision-language model.
 # From HF Qwen/Qwen3-VL-30B-A3B-Instruct-FP8 config.json (text_config):
 #   48 layers, hidden 2048, 32 heads x head_dim 128, 4 KV heads, full

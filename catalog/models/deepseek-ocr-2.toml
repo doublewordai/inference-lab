@@ -1,4 +1,3 @@
-# Source: configs/estate/deepseek-ocr-2-b200.toml
 # deepseek-ai/DeepSeek-OCR-2 — DeepseekV2-style small MoE language stack
 # behind a DeepEncoder vision front-end. From HF deepseek-ai/DeepSeek-OCR-2
 # config.json (language_config, use_mla=false -> plain MHA):

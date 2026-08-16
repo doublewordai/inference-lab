@@ -1,31 +1,74 @@
 # Configuration File Reference
 
-Field-by-field reference for the TOML (or, for WASM, JSON) configuration a
-simulation takes. Unknown fields anywhere in the file are rejected.
+Field-by-field reference for the two TOML files a simulation takes: a
+**model config** (`configs/<name>.toml`) and a **workload**
+(`workloads/<name>.toml`). Unknown fields anywhere in either file are
+rejected.
 
 ```toml
-hardware = "b200"              # catalog preset, or an inline [hardware] table
+# configs/<name>.toml
 model = "deepseek-v4-flash"    # catalog preset, or an inline [model] table
 
-[parallel]     # optional: TP / EP layout
-[scheduler]    # engine args: batching, KV blocks, memory, policy
-[workload]     # arrivals and request shapes
-[speculative]  # optional: speculative decoding
+[scheduler]                    # engine args shared by every hardware entry
+[speculative]                  # optional: speculative decoding, shared default
+[fault]                        # optional: serve-mode static fault injection
+
+[hardware.b200]                # one entry per hardware the model runs on
+tp = 4
+[hardware.gh200-120]
+tp = 4
+scheduler = { max_num_batched_tokens = 4096 }
 ```
+
+```toml
+# workloads/<name>.toml — the [workload] table at top level
+arrival_pattern = "closed_loop"
+num_concurrent_users = 256
+num_requests = 2000
+seed = 7
+input_len_dist = { type = "lognormal", mean = 7.0, std_dev = 0.5 }
+output_len_dist = { type = "lognormal", mean = 6.5, std_dev = 0.8 }
+```
+
+`inference-lab --config <model config> --hardware <entry> --workload <workload>`
+runs one; `--hardware` may be omitted when the file has one entry. In Rust,
+`ModelConfig::from_file(..).deployment(Some("b200"))` gives a `Deployment`
+(model on hardware) and `.with_workload(WorkloadConfig::from_file(..))` a
+`Config`. The WASM API takes that resolved `Config` as JSON: `hardware`,
+`parallel`, `model`, `scheduler`, `workload`, optional `speculative`.
 
 ## Catalog presets
 
 Hardware and model presets ship inside the crate (`catalog/hardware/*.toml`,
 `catalog/models/*.toml`, embedded at build time). A config names one with
-`hardware = "<name>"` / `model = "<name>"`; `inference_lab::catalog::
+`model = "<name>"` and `[hardware.<name>]`; `inference_lab::catalog::
 {hardware_names, model_names, hardware, model}` list and load them from
 Rust. Presets carry only the physical hardware spec and the model
 architecture; everything about a deployment (TP, memory utilisation, batch
 limits) is in the config. To tweak a preset, copy its table inline.
 
-## [hardware]
+## [hardware.\<name\>]
 
-Per-GPU physical spec.
+One entry per hardware the model is deployed on. The entry name is the
+hardware preset unless `spec` says otherwise.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `tp` | U32 | 1 | Tensor-parallel group size: FLOP rate, bandwidth and memory scale by `tp` |
+| `ep` | U32 | 1 | Expert-parallel group size (MoE all-to-all volume) |
+| `dp_attention` | Bool | false | DP-attention layout: no per-layer TP all-reduce |
+| `spec` | String or Table | the entry name | Another catalog preset, or an inline hardware table (fields below) |
+| `scheduler` | Table | `{}` | Keys merged over the shared `[scheduler]` for this entry |
+| `speculative` | Table | shared `[speculative]` | Replaces the shared block for this entry |
+
+Collective comms (`allreduce`/`alltoall` latency and link bandwidth) are only
+modelled when a `ClusterSpec` carries a `comms` block, which the library API
+exposes; model configs have none.
+
+### Hardware spec
+
+Per-GPU physical spec: a catalog preset (`catalog/hardware/<name>.toml`) or
+an inline `spec` table.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -40,18 +83,6 @@ Per-GPU physical spec.
 
 Shipped presets: `b200` (180 GiB / 7.7 TB/s as reported on the fleet),
 `b200-datasheet` (192 GB / 8 TB/s), `b300`, `gh200-120`, `gh200-96`, `h100`.
-
-## [parallel]
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `tp` | U32 | 1 | Tensor-parallel group size: FLOP rate, bandwidth and memory scale by `tp` |
-| `ep` | U32 | 1 | Expert-parallel group size (MoE all-to-all volume) |
-| `dp_attention` | Bool | false | DP-attention layout: no per-layer TP all-reduce |
-
-Collective comms (`allreduce`/`alltoall` latency and link bandwidth) are only
-modelled when a `ClusterSpec` carries a `comms` block, which the library API
-exposes; the single-cluster TOML has none.
 
 ---
 
@@ -142,7 +173,9 @@ each with the derivation of its numbers from the HF config in its header.
 
 ---
 
-## [workload]
+## Workload file
+
+The `[workload]` table, at top level of `workloads/<name>.toml`.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|

@@ -1,0 +1,23 @@
+model = "llama-3.1-8b-instruct"
+
+[scheduler]
+max_num_batched_tokens = 8192
+max_num_seqs = 1024
+policy = "fcfs"
+enable_chunked_prefill = true
+block_size = 16
+
+[speculative]
+gamma = 8
+policy = "gated_aggregate"
+
+[speculative.acceptance]
+kind = "trace_rounds"
+path = "data/llama31_eagle3_gh200_rounds.csv"
+
+[speculative.measured_cost]
+path = "data/llama31_eagle3_gh200_costs.csv"
+ref_seq_len = 1050
+
+[hardware.gh200-96]
+tp = 1

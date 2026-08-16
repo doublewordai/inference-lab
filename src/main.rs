@@ -1,5 +1,5 @@
 use clap::Parser;
-use inference_lab::config::{ArrivalPattern, Config};
+use inference_lab::config::{ArrivalPattern, Config, Deployment, ModelConfig, WorkloadConfig};
 use inference_lab::dataset::{BatchTokenizerFn, Message, PromptInput};
 use inference_lab::simulation::Simulator;
 use std::path::PathBuf;
@@ -38,9 +38,21 @@ enum Commands {
 #[cfg(feature = "serve")]
 #[derive(Parser, Debug)]
 struct ServeArgs {
-    /// Path to a TOML config file or directory of TOML configs (one per model)
+    /// Model config file, or a directory of them (one model each)
     #[arg(short, long, default_value = "config.toml")]
     config: PathBuf,
+
+    /// Hardware entry to serve each model on ([hardware.<name>] in the model
+    /// config). Optional when a config has exactly one entry; with a
+    /// directory, models without this entry are skipped.
+    #[arg(long)]
+    hardware: Option<String>,
+
+    /// Workload file whose output_len_dist samples each response's length
+    /// (capped at the request's max_tokens). Without it responses run to
+    /// max_tokens.
+    #[arg(short, long)]
+    workload: Option<PathBuf>,
 
     /// Port to listen on
     #[arg(short, long, default_value_t = 8080)]
@@ -66,9 +78,18 @@ struct ServeArgs {
 #[derive(Parser, Debug)]
 #[cfg_attr(not(feature = "serve"), command(author, version, about = "LLM Inference Simulator", long_about = None))]
 struct SimArgs {
-    /// Path to the TOML configuration file
+    /// Model config file
     #[arg(short, long, default_value = "config.toml")]
     config: PathBuf,
+
+    /// Hardware entry to run on ([hardware.<name>] in the model config).
+    /// Optional when the config has exactly one entry.
+    #[arg(long)]
+    hardware: Option<String>,
+
+    /// Workload file
+    #[arg(short, long)]
+    workload: PathBuf,
 
     /// Path to tokenizer.json file (required if dataset_path is set in config)
     #[arg(short, long)]
@@ -258,46 +279,58 @@ async fn main() {
     match cli.command {
         Commands::Sim(args) => run_sim(args),
         Commands::Serve(args) => {
-            let configs = if args.config.is_dir() {
-                // Load all .toml files from directory
-                let mut configs = Vec::new();
-                let entries = match std::fs::read_dir(&args.config) {
-                    Ok(entries) => entries,
+            let workload = args.workload.as_ref().map(|p| {
+                WorkloadConfig::from_file(p).unwrap_or_else(|e| {
+                    eprintln!("Error loading workload: {e}");
+                    std::process::exit(1);
+                })
+            });
+            let deployments = if args.config.is_dir() {
+                let mut paths: Vec<PathBuf> = match std::fs::read_dir(&args.config) {
+                    Ok(entries) => entries
+                        .flatten()
+                        .map(|e| e.path())
+                        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("toml"))
+                        .collect(),
                     Err(e) => {
                         eprintln!("Error reading config directory {:?}: {}", args.config, e);
                         std::process::exit(1);
                     }
                 };
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.extension().and_then(|e| e.to_str()) == Some("toml") {
-                        match Config::from_file(&path) {
-                            Ok(config) => configs.push(config),
-                            Err(e) => {
-                                eprintln!("Error loading config {:?}: {}", path, e);
-                                std::process::exit(1);
-                            }
+                paths.sort();
+                let mut deployments = Vec::new();
+                for path in &paths {
+                    let cfg = ModelConfig::from_file(path).unwrap_or_else(|e| {
+                        eprintln!("Error loading config: {e}");
+                        std::process::exit(1);
+                    });
+                    match &args.hardware {
+                        Some(hw) if !cfg.hardware_names().contains(&hw.as_str()) => {
+                            println!("  Skipping {}: no [hardware.{hw}] entry", path.display());
                         }
+                        hw => deployments.push(load_deployment(&cfg, path, hw.as_deref())),
                     }
                 }
-                if configs.is_empty() {
-                    eprintln!("No .toml config files found in {:?}", args.config);
+                if deployments.is_empty() {
+                    eprintln!("No model configs to serve in {:?}", args.config);
                     std::process::exit(1);
                 }
-                configs
+                deployments
             } else {
-                // Single config file
-                match Config::from_file(&args.config) {
-                    Ok(config) => vec![config],
-                    Err(e) => {
-                        eprintln!("Error loading configuration: {}", e);
-                        std::process::exit(1);
-                    }
-                }
+                let cfg = ModelConfig::from_file(&args.config).unwrap_or_else(|e| {
+                    eprintln!("Error loading config: {e}");
+                    std::process::exit(1);
+                });
+                vec![load_deployment(
+                    &cfg,
+                    &args.config,
+                    args.hardware.as_deref(),
+                )]
             };
 
             if let Err(e) = inference_lab::serve::start_server(
-                configs,
+                deployments,
+                workload,
                 args.host,
                 args.port,
                 args.tokenizer,
@@ -319,6 +352,22 @@ fn main() {
     run_sim(args);
 }
 
+/// Resolve one hardware entry of a model config, exiting with the loader's
+/// message on failure.
+fn load_deployment(
+    cfg: &ModelConfig,
+    path: &std::path::Path,
+    hardware: Option<&str>,
+) -> Deployment {
+    cfg.deployment(hardware).unwrap_or_else(|e| {
+        eprintln!("Error in {}: {e}", path.display());
+        if hardware.is_none() {
+            eprintln!("Pass --hardware <name>.");
+        }
+        std::process::exit(1);
+    })
+}
+
 fn run_sim(args: SimArgs) {
     let verbosity = args.verbosity_level();
     if args.no_color {
@@ -329,17 +378,23 @@ fn run_sim(args: SimArgs) {
     // Header
     if verbosity >= VerbosityLevel::Normal {
         println!("{}", "LLM Inference Simulator".bright_cyan().bold());
-        println!("Loading configuration from: {:?}\n", args.config);
+        println!(
+            "Loading configuration from: {:?} (workload {:?})\n",
+            args.config, args.workload
+        );
     }
 
-    // Load configuration
-    let mut config = match Config::from_file(&args.config) {
-        Ok(config) => config,
-        Err(e) => {
-            eprintln!("Error loading configuration: {}", e);
-            std::process::exit(1);
-        }
-    };
+    // Load configuration: model config × hardware entry × workload.
+    let model_config = ModelConfig::from_file(&args.config).unwrap_or_else(|e| {
+        eprintln!("Error loading configuration: {e}");
+        std::process::exit(1);
+    });
+    let deployment = load_deployment(&model_config, &args.config, args.hardware.as_deref());
+    let workload = WorkloadConfig::from_file(&args.workload).unwrap_or_else(|e| {
+        eprintln!("Error loading workload: {e}");
+        std::process::exit(1);
+    });
+    let mut config = Config::new(deployment, workload);
 
     // Override seed if provided via CLI
     if let Some(seed) = args.seed {

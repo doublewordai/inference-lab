@@ -1,6 +1,5 @@
-# Source: configs/estate/deepseek-v4-pro-b200.toml
 # deepseek-ai/DeepSeek-V4-Pro — MLA MoE, hybrid sparse attention (adapted
-# from configs/deepseek-v4-pro.toml; HF deepseek-ai/DeepSeek-V4-Pro
+# from catalog/models/deepseek-v4-pro.toml; HF deepseek-ai/DeepSeek-V4-Pro
 # config.json): 61 layers, hidden 7168, 128 heads, MLA latent 512 + rope 64;
 # compress_ratios -> 0 dense + 30 near(4) + 31 far(128) (+1 trailing 0 = MTP);
 # window 128; indexer 64x128 top-k 1024; MoE 384 routed + 1 shared, 6/tok,
@@ -10,7 +9,7 @@
 #   per expert = 3*7168*3072 = 66_060_288
 #   active expert  = (6+1) * per * 61  = 28_207_742_976
 #   resident expert= (384+1) * per * 61 = 1_551_425_863_680
-#   non-expert kept from configs/deepseek-v4-pro.toml (MLA q_lora 1536 /
+#   non-expert kept from catalog/models/deepseek-v4-pro.toml (MLA q_lora 1536 /
 #   o_lora 1024 / o_groups 16 internals): active 20.8e9, resident 53e9.
 
 name = "DeepSeek-V4-Pro"

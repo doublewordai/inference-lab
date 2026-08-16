@@ -1,4 +1,3 @@
-# Source: configs/estate/lightonocr-2-1b-b200.toml
 # lightonai/LightOnOCR-2-1B-bbox-soup — Qwen3-1B-class dense GQA text stack
 # with a Pixtral vision encoder. From HF config.json (text_config, model_type
 # qwen3): 28 layers, hidden 1024, 16 heads x head_dim 128, 8 KV heads, full

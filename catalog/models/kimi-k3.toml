@@ -1,4 +1,3 @@
-# Source: configs/estate/kimi-k3-b200.toml
 # moonshotai/kimi-k3 — KimiLinear hybrid: 69 KDA (Kimi Delta Attention,
 # linear) + 24 full MLA layers, latent MoE. From HF moonshotai/kimi-k3
 # config.json (text_config, model_type kimi_linear):

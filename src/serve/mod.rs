@@ -14,12 +14,13 @@ use tokio::sync::mpsc;
 use tower::ServiceExt;
 use tower_http::cors::CorsLayer;
 
-use crate::config::Config;
+use crate::config::{Deployment, WorkloadConfig};
 use engine::RealtimeEngine;
 use handlers::AppState;
 
 pub async fn start_server(
-    configs: Vec<Config>,
+    deployments: Vec<Deployment>,
+    workload: Option<WorkloadConfig>,
     host: String,
     port: u16,
     tokenizer_path: Option<PathBuf>,
@@ -39,12 +40,12 @@ pub async fn start_server(
     let mut model_names: Vec<String> = Vec::new();
     let mut model_faults: HashMap<String, fault::FaultSpec> = HashMap::new();
 
-    for config in configs {
-        let model_name = config.model.name.clone();
+    for deployment in deployments {
+        let model_name = deployment.model.name.clone();
 
         // Validate static fault config at boot: a typo'd mode must fail the server, not
         // silently serve healthy streams under an e2e test that expects deaths.
-        if let Some(fault_cfg) = &config.fault {
+        if let Some(fault_cfg) = &deployment.fault {
             let spec = fault::FaultSpec::from_config(fault_cfg)
                 .map_err(|e| format!("invalid [fault] config for model {}: {}", model_name, e))?;
             println!(
@@ -60,7 +61,7 @@ pub async fn start_server(
         let (engine_tx, engine_rx) = mpsc::channel::<types::EngineRequest>(256);
 
         // Start the engine
-        let engine = RealtimeEngine::new(config, engine_rx)?;
+        let engine = RealtimeEngine::new(&deployment, workload.clone(), engine_rx)?;
         tokio::spawn(engine.run());
 
         println!("  Loaded model: {}", model_name);

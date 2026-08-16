@@ -1,11 +1,4 @@
-# Presets ship in the crate catalog (inference_lab::catalog); replace either with an
-# inline [hardware] / [model] table to override.
-hardware = "b200-datasheet"
 model = "qwen3.6-35b-a3b"
-
-[parallel]
-tp = 1
-ep = 1
 
 [scheduler]
 max_num_batched_tokens = 16384
@@ -14,31 +7,28 @@ policy = "fcfs"
 enable_chunked_prefill = true
 block_size = 64
 
-[workload]
-arrival_pattern = "closed_loop"
-num_concurrent_users = 256
-closed_loop_jitter_secs = 0.05
-num_requests = 2000
-seed = 7
+[hardware.gh200-120]
+tp = 1
 
-[workload.input_len_dist]
-type = "lognormal"
-mean = 7.0
-std_dev = 0.5
+[hardware.gh200-120.speculative]
+gamma = 8
+policy = "gated_aggregate"
 
-[workload.output_len_dist]
-type = "lognormal"
-mean = 6.5
-std_dev = 0.8
+[hardware.gh200-120.speculative.acceptance]
+kind = "trace_rounds"
+path = "data/qwen36_gate_gh200_rounds.csv"
 
-[speculative]
+[hardware.gh200-120.speculative.measured_cost]
+path = "data/qwen36_gate_gh200_costs.csv"
+ref_seq_len = 1100
+
+[hardware.b200-datasheet]
+tp = 1
+
+[hardware.b200-datasheet.speculative]
 gamma = 8
 policy = "goodput_budget"
 
-# Measured conditional acceptance a_d = P(accept depth d | reached d), from
-# 12k depth-8 MTP rounds on Qwen3.6-35B-A3B (vLLM, SPEED-Bench, temp 0.6).
-# See campaigns/adaptive-speculation. Unconditional commit probabilities were
-# [.835 .650 .525 .441 .363 .297 .251 .214]; E[accepted] = 3.58.
-[speculative.acceptance]
+[hardware.b200-datasheet.speculative.acceptance]
 kind = "per_position"
-a = [0.8348, 0.7791, 0.8077, 0.8397, 0.8220, 0.8197, 0.8445, 0.8531]
+a = [0.8348, 0.7791, 0.8077, 0.8397, 0.822, 0.8197, 0.8445, 0.8531]

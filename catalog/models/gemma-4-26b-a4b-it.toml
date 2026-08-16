@@ -1,4 +1,3 @@
-# Source: configs/estate/gemma-4-26b-a4b-it-b200.toml
 # google/gemma-4-26B-A4B-it — MoE hybrid: 25 sliding(1024) + 5 full-attention
 # layers, every layer MoE. From HF google/gemma-4-26B-A4B-it config.json
 # (gated repo, fetched with the local HF token):

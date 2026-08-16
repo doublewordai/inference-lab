@@ -1,4 +1,6 @@
 use serde::Deserialize;
+use std::fs;
+use std::path::Path;
 
 fn default_arrival_rate() -> f64 {
     1.0
@@ -30,6 +32,16 @@ impl ArrivalPattern {
     }
 }
 
+/// A workload file is this table at top level:
+///
+/// ```toml
+/// arrival_pattern = "closed_loop"
+/// num_concurrent_users = 256
+/// num_requests = 2000
+/// seed = 7
+/// input_len_dist = { type = "lognormal", mean = 7.0, std_dev = 0.5 }
+/// output_len_dist = { type = "lognormal", mean = 6.5, std_dev = 0.8 }
+/// ```
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkloadConfig {
@@ -193,5 +205,14 @@ impl LengthDistribution {
                 lognormal.sample(rng).max(1.0) as u32
             }
         }
+    }
+}
+
+impl WorkloadConfig {
+    pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error>> {
+        let path = path.as_ref();
+        let contents =
+            fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+        toml::from_str(&contents).map_err(|e| format!("{}: {e}", path.display()).into())
     }
 }

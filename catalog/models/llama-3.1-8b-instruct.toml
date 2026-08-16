@@ -1,4 +1,3 @@
-# Source: configs/llama31-8b-eagle3-gh200.toml
 # Llama-3.1-8B-Instruct + EAGLE3 drafter on a single GH200 (96 GB HBM3).
 # Dense GQA transformer modeled by the generic `dense` variant:
 #   32 layers, hidden 4096, 32 q / 8 kv heads, head_dim 128, 8.03B params, bf16.

@@ -1,42 +1,30 @@
-# Presets ship in the crate catalog (inference_lab::catalog); replace either with an
-# inline [hardware] / [model] table to override.
-hardware = "b200-datasheet"
 model = "deepseek-v4-flash"
 
-[parallel]
-tp = 1
-ep = 1
-
 [scheduler]
-max_num_batched_tokens = 16384
+max_num_batched_tokens = 4096
 max_num_seqs = 4096
-policy = "fcfs"
+policy = "priority"
 enable_chunked_prefill = true
 block_size = 64
-kv_cache_capacity = 2000000000
+gpu_memory_utilization = 0.8
 
-[workload]
-arrival_pattern = "closed_loop"
-num_concurrent_users = 512
-closed_loop_jitter_secs = 0.05
-num_requests = 4000
-seed = 7
+[hardware.b200]
+tp = 4
 
-# Modest input, long heavy-tailed output: decode dominates and the long tail holds KV.
-[workload.input_len_dist]
-type = "lognormal"
-mean = 6.0      # ~400 tokens median
-std_dev = 0.5
+[hardware.b300]
+tp = 4
 
-[workload.output_len_dist]
-type = "lognormal"
-mean = 6.0      # ~400 tokens median
-std_dev = 1.0   # heavy tail: a few sequences run very long and pin KV
+[hardware.gh200-120]
+tp = 4
 
-[speculative]
+[hardware.b200-datasheet]
+tp = 1
+scheduler = { max_num_batched_tokens = 16384, policy = "fcfs", gpu_memory_utilization = 0.9 }
+
+[hardware.b200-datasheet.speculative]
 gamma = 4
 policy = "goodput_budget"
 
-[speculative.acceptance]
+[hardware.b200-datasheet.speculative.acceptance]
 kind = "constant"
 alpha = 0.75

@@ -1,3 +1,4 @@
+pub mod deployment;
 pub mod hardware;
 pub mod model;
 pub mod parallel;
@@ -6,6 +7,7 @@ pub mod speculative;
 pub mod topology;
 pub mod workload;
 
+pub use deployment::{Deployment, DeploymentError, ModelConfig};
 pub use hardware::{HardwareConfig, KVTier, Precision};
 pub use model::{
     expected_distinct_experts, History, Indexer, LayerClass, ModelSpec, Routing, WeightStream,
@@ -23,8 +25,6 @@ pub use workload::{ArrivalPattern, LengthDistribution, RateSchedule, WorkloadCon
 use crate::scheduler::SchedulingPolicy;
 use serde::de::{self, Deserializer};
 use serde::Deserialize;
-use std::fs;
-use std::path::Path;
 
 /// A config field that is either a catalog name or an inline table.
 #[derive(Deserialize)]
@@ -52,7 +52,9 @@ pub(crate) fn model_ref<'de, D: Deserializer<'de>>(d: D) -> Result<ModelSpec, D:
     Ok(spec)
 }
 
-/// Top-level configuration that aggregates all sub-configs
+/// A runnable simulation: one deployment plus one workload. Built from a
+/// model config file and a workload file (see [`deployment`]), or as JSON
+/// through the wasm API.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -97,12 +99,28 @@ pub struct FaultConfig {
 }
 
 impl Config {
-    /// Load configuration from a TOML file
-    pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error>> {
-        let contents = fs::read_to_string(path)?;
-        let mut config: Config = toml::from_str(&contents)?;
+    /// A simulation: a deployment (model on hardware) plus the workload
+    /// offered to it.
+    pub fn new(deployment: Deployment, workload: WorkloadConfig) -> Self {
+        let Deployment {
+            hardware,
+            parallel,
+            model,
+            scheduler,
+            speculative,
+            fault,
+        } = deployment;
+        let mut config = Config {
+            hardware,
+            parallel,
+            model,
+            scheduler,
+            workload,
+            speculative,
+            fault,
+        };
         config.finalize();
-        Ok(config)
+        config
     }
 
     /// Fill in derived fields after deserialization. Public so wasm.rs can
@@ -213,35 +231,45 @@ impl Config {
 mod tests {
     use super::*;
 
-    /// Every TOML shipped under configs/ and examples/ must parse under the
-    /// current schema (unknown fields are rejected, so this catches drift).
-    #[test]
-    fn shipped_configs_parse() {
+    fn toml_files(dir: &str) -> Vec<std::path::PathBuf> {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let mut paths = Vec::new();
-        for dir in ["configs", "configs/estate", "examples"] {
-            let Ok(entries) = fs::read_dir(root.join(dir)) else {
-                continue;
-            };
-            for e in entries.flatten() {
-                let p = e.path();
-                if p.extension().and_then(|x| x.to_str()) == Some("toml") {
-                    paths.push(p);
+        let mut paths: Vec<_> = std::fs::read_dir(root.join(dir))
+            .unwrap_or_else(|e| panic!("{dir}: {e}"))
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("toml"))
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    /// Every model config shipped under configs/ must parse and every one of
+    /// its hardware entries must resolve; every workload under workloads/
+    /// must parse. Unknown fields are rejected, so this catches drift.
+    #[test]
+    fn shipped_configs_resolve() {
+        let configs = toml_files("configs");
+        let workloads = toml_files("workloads");
+        assert!(!configs.is_empty() && !workloads.is_empty());
+        let mut failures = Vec::new();
+        for p in &configs {
+            match ModelConfig::from_file(p) {
+                Err(e) => failures.push(e.to_string()),
+                Ok(cfg) => {
+                    for hw in cfg.hardware_names() {
+                        if let Err(e) = cfg.deployment(Some(hw)) {
+                            failures.push(format!("{}: {e}", p.display()));
+                        }
+                    }
                 }
             }
         }
-        assert!(!paths.is_empty(), "no configs found");
-        let mut failures = Vec::new();
-        for p in &paths {
-            if let Err(e) = Config::from_file(p) {
-                failures.push(format!("{}: {e}", p.display()));
+        for p in &workloads {
+            if let Err(e) = WorkloadConfig::from_file(p) {
+                failures.push(e.to_string());
             }
         }
-        assert!(
-            failures.is_empty(),
-            "configs failed to parse:\n{}",
-            failures.join("\n")
-        );
+        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
     }
 
     #[test]
@@ -263,19 +291,12 @@ max_num_seqs = 256
 policy = "fcfs"
 enable_chunked_prefill = true
 block_size = 64
-
-[workload]
-arrival_pattern = "poisson"
-num_requests = 1
-seed = 1
-input_len_dist = { type = "fixed", value = 10 }
-output_len_dist = { type = "fixed", value = 10 }
 "#;
-        let cfg: Config = toml::from_str(toml_src).unwrap();
-        assert_eq!(cfg.hardware.name, "B200");
-        assert_eq!(cfg.model.name, "DeepSeek-V4-Flash");
+        let dep: Deployment = toml::from_str(toml_src).unwrap();
+        assert_eq!(dep.hardware.name, "B200");
+        assert_eq!(dep.model.name, "DeepSeek-V4-Flash");
         let bad = toml_src.replace("\"b200\"", "\"b2000\"");
-        let err = toml::from_str::<Config>(&bad).unwrap_err().to_string();
+        let err = toml::from_str::<Deployment>(&bad).unwrap_err().to_string();
         assert!(err.contains("unknown hardware preset"), "{err}");
     }
 }

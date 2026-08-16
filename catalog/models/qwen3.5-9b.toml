@@ -1,4 +1,3 @@
-# Source: configs/estate/qwen3.5-9b-b200.toml
 # Qwen/Qwen3.5-9B — DENSE hybrid (GatedDeltaNet linear + GQA full attention,
 # no MoE; model_type qwen3_5). From HF Qwen/Qwen3.5-9B config.json (text_config):
 #   32 layers, full_attention_interval 4 -> 8 full-attn + 24 linear;
