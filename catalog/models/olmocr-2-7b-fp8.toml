@@ -1,0 +1,34 @@
+# allenai/olmOCR-2-7B-1025-FP8 — Qwen2.5-VL-7B fine-tune, dense GQA text
+# stack. From HF allenai/olmOCR-2-7B-1025-FP8 config.json:
+#   28 layers, hidden 3584, 28 heads x head_dim 128, 4 KV heads, full attention
+#   (use_sliding_window=false), MLP inter 18944, vocab 152064, max_pos 128000.
+#   FP8 weight quantization (alias); KV bf16. Vision tower (32-layer ViT,
+#   ~0.67B params) is counted in residency only — per-image encode compute is
+#   outside this cost model.
+# Modeled by `qwen35` with zero experts and num_attention_layers = num_layers
+# (degenerates to a plain GQA transformer with a separate KV precision).
+#
+# Param split (all non-expert; computed):
+#   attn/layer (q 28x128 + k,v 4x128 + o) = 3584*8192 = 29_360_128
+#   MLP/layer (gated, inter 18944) = 3*3584*18944 = 203_685_888
+#   lm_head = 152064*3584 = 544_997_376
+#   active = 28*(attn+mlp) + lm_head = 7_070_285_824
+#   resident = 8_290_000_000 (Qwen2.5-VL-7B total incl. embedding + vision tower)
+
+name = "olmOCR-2-7B-1025-FP8"
+hidden_dim = 3584
+max_seq_len = 128000
+attention_precision = "bf16"
+
+[[weights]]
+precision = "fp8"
+active_params = 7070285824
+resident_params = 8290000000
+
+[[layers]]
+kind = "attention"
+count = 28
+heads = 28
+head_dim = 128
+kv_heads = 4
+kv_precision = "bf16"

@@ -1,0 +1,29 @@
+# osmosis-ai/Osmosis-Structure-0.6B — Qwen3-0.6B dense GQA fine-tune.
+# From HF osmosis-ai/Osmosis-Structure-0.6B config.json: 28 layers, hidden
+# 1024, 16 heads x head_dim 128, 8 KV heads, full attention, MLP inter 3072,
+# vocab 151936 (tied), max_pos 40960. Served bf16.
+# `qwen35` with zero experts / all layers attention.
+#
+# Param split (all non-expert; computed):
+#   attn/layer = 1024*6144 = 6_291_456; MLP/layer = 9_437_184
+#   lm_head (tied) = 155_582_464
+#   active = 28*(attn+mlp) + lm_head = 595_984_384
+#   resident = 595_984_384 (tied embeddings, single copy)
+
+name = "Osmosis-Structure-0.6B"
+hidden_dim = 1024
+max_seq_len = 40960
+attention_precision = "bf16"
+
+[[weights]]
+precision = "bf16"
+active_params = 595984384
+resident_params = 595984384
+
+[[layers]]
+kind = "attention"
+count = 28
+heads = 16
+head_dim = 128
+kv_heads = 8
+kv_precision = "bf16"

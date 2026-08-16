@@ -4,4 +4,4 @@ pub mod manager;
 
 pub use block::Block;
 pub use link::Link;
-pub use manager::{KVCacheManager, PrefixCacheLookup};
+pub use manager::{KVCacheManager, KvBytesFn, PrefixCacheLookup, PrefixCacheStats};

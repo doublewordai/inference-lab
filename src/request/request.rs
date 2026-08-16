@@ -1,75 +1,70 @@
-use super::status::RequestStatus;
-use crate::config::{ModelConfig, ModelCosts};
-
 pub type BlockId = u32;
 
-/// Request represents a single inference request in the simulation
+/// One inference request as the scheduler and engine see it.
+///
+/// Token accounting follows the engine's forward passes: the prefill pass over
+/// the prompt produces the first output token, and every decode pass over one
+/// position produces one more. So a request with prompt length `P` and target
+/// output `T` computes exactly `P + T - 1` positions, and its output count is
+/// `num_computed_tokens - P + 1` once the prompt is done. Preemption discards
+/// the resident KV (`num_computed_tokens = 0`) and keeps the tokens already
+/// generated: on resume the request re-prefills the prompt plus the generated
+/// tokens whose KV was lost, then continues decoding (vLLM v1 recompute
+/// semantics).
 #[derive(Debug, Clone)]
 pub struct Request {
-    /// Unique request ID
+    /// Unique request ID.
     pub request_id: String,
 
-    /// Client priority (lower = higher priority)
+    /// Client priority (lower = higher priority).
     pub priority: i32,
 
-    /// Arrival time (simulated time)
+    /// Arrival time (simulated seconds).
     pub arrival_time: f64,
 
-    /// Request status
-    pub status: RequestStatus,
-
-    /// Number of input tokens
+    /// Number of prompt tokens.
     pub num_prompt_tokens: u32,
 
-    /// Maximum number of output tokens to generate
+    /// Maximum output tokens the client allows. The scheduler may use this
+    /// (it is what a real scheduler can see).
     pub max_output_tokens: u32,
 
-    /// Actual number of output tokens to generate (sampled, may be less than max)
-    /// This simulates hitting an EOS token
+    /// Output tokens this request will actually produce (the sampled EOS
+    /// point). Ground truth for the simulation; at most `max_output_tokens`.
     pub target_output_tokens: u32,
 
-    /// Number of tokens computed so far
+    /// Positions whose KV is resident: the context the next forward pass
+    /// attends to. Reset to 0 by preemption.
     pub num_computed_tokens: u32,
 
-    /// Number of output tokens generated so far
+    /// Output tokens generated so far. Monotone across preemptions.
     pub num_output_tokens: u32,
 
-    /// Total tokens (prompt + output)
-    pub num_tokens: u32,
-
-    /// Number of prefix-cached tokens (set by cache manager)
+    /// Prefix tokens found in the KV cache at admission (set by the scheduler).
     pub num_cached_tokens: u32,
 
-    /// Synthetic block hashes for prefix caching modeling
-    /// In synthetic mode: pre-generated hashes (some shared, some unique)
-    /// In semantic mode: will be computed from actual token content
+    /// Incremental content hashes of the prompt, one per `block_size` tokens:
+    /// hash `n` covers all tokens up to the end of block `n`. Empty when the
+    /// prompt has no content identity (synthetic workloads).
     pub prompt_block_hashes: Vec<u64>,
 
-    /// KV cache blocks allocated to this request
+    /// KV cache blocks allocated to this request.
     pub kv_blocks: Vec<BlockId>,
 
-    /// Number of times this request has been preempted
+    /// Number of times this request has been preempted.
     pub num_preemptions: u32,
 
-    /// Time when first token was generated (TTFT tracking)
+    /// Time the first output token was produced (end of the prefill pass).
     pub first_token_time: Option<f64>,
 
-    /// Time when request completed
-    pub completion_time: Option<f64>,
+    /// Disaggregated serving: time prefill finished on the prefill worker,
+    /// and time the KV hand-off to the decode worker completed. `None` on an
+    /// aggregated topology.
+    pub prefill_done_time: Option<f64>,
+    pub handoff_done_time: Option<f64>,
 
-    /// Per-token generation times
-    pub token_generation_times: Vec<f64>,
-
-    /// Time spent preempted (not running)
-    pub preempted_time: f64,
-
-    /// Last preemption start time
-    pub last_preempted_at: Option<f64>,
-
-    /// Earliest simulation time at which this request becomes runnable.
-    /// Set when the request is in `WaitingOnTransfer` state and an in-flight
-    /// promotion of its KV cache from a slower tier is in progress; cleared
-    /// once the request returns to `Waiting`.
+    /// Earliest simulation time at which this request becomes runnable while
+    /// it is parked on an in-flight KV promotion from a slower tier.
     pub ready_at: Option<f64>,
 
     /// Speculative decoding: draft length to verify on this request's NEXT
@@ -90,7 +85,9 @@ pub struct Request {
 }
 
 impl Request {
-    /// Create a new request with a target output length
+    /// Create a request that will produce `target_output_tokens` tokens (at
+    /// least one: the prefill pass always yields a token) out of an allowed
+    /// `max_output_tokens`.
     pub fn new_with_target(
         request_id: String,
         priority: i32,
@@ -99,33 +96,30 @@ impl Request {
         max_output_tokens: u32,
         target_output_tokens: u32,
     ) -> Self {
+        let max_output_tokens = max_output_tokens.max(1);
         Self {
             request_id,
             priority,
             arrival_time,
-            status: RequestStatus::Waiting,
             num_prompt_tokens,
             max_output_tokens,
-            target_output_tokens,
+            target_output_tokens: target_output_tokens.clamp(1, max_output_tokens),
             num_computed_tokens: 0,
             num_output_tokens: 0,
-            num_tokens: num_prompt_tokens + target_output_tokens,
             num_cached_tokens: 0,
             prompt_block_hashes: Vec::new(),
             kv_blocks: Vec::new(),
             num_preemptions: 0,
             first_token_time: None,
-            completion_time: None,
-            token_generation_times: Vec::new(),
-            preempted_time: 0.0,
-            last_preempted_at: None,
+            prefill_done_time: None,
+            handoff_done_time: None,
             ready_at: None,
             pending_draft_len: 0,
             pending_round_commits: None,
         }
     }
 
-    /// Create a new request (target = max)
+    /// Create a request whose target output equals its maximum.
     pub fn new(
         request_id: String,
         priority: i32,
@@ -139,93 +133,114 @@ impl Request {
             arrival_time,
             num_prompt_tokens,
             max_output_tokens,
-            max_output_tokens, // Target = max (used for synthetic workloads)
+            max_output_tokens,
         )
     }
 
-    /// Get block hashes for the prompt
-    /// These should be thought of as 'incremental hashes' - i.e. the hash of block n is the hash
-    /// of all the tokens up to that block (not just that block alone).
-    /// In synthetic mode: returns pre-generated hashes
-    /// In semantic mode: will compute from actual token content
-    pub fn get_prompt_block_hashes(&self) -> &[u64] {
-        &self.prompt_block_hashes
+    /// Positions that must be resident before the request can decode: the
+    /// prompt, plus (after a preemption) the already-generated tokens whose
+    /// KV has to be rebuilt.
+    pub fn prefill_len(&self) -> u32 {
+        self.num_prompt_tokens + self.num_output_tokens.saturating_sub(1)
     }
 
-    /// Check if this is in prefill phase
+    /// Whether the next pass is (re)prefill rather than decode.
     pub fn is_prefill(&self) -> bool {
-        self.num_computed_tokens < self.num_prompt_tokens
+        self.num_computed_tokens < self.prefill_len()
     }
 
-    /// Get number of tokens needed to process
+    /// Positions this request will have computed when it finishes.
+    pub fn planned_positions(&self) -> u32 {
+        self.num_prompt_tokens + self.target_output_tokens - 1
+    }
+
+    /// Positions still to compute before the request finishes.
     pub fn tokens_to_process(&self) -> u32 {
         if self.is_finished() {
-            return 0; // Don't process more if we've generated all output
+            return 0;
         }
-        self.num_tokens - self.num_computed_tokens
+        self.planned_positions()
+            .saturating_sub(self.num_computed_tokens)
     }
 
-    /// Check if request is done
+    /// Whether every target output token has been generated.
     pub fn is_finished(&self) -> bool {
         self.num_output_tokens >= self.target_output_tokens
     }
 
-    /// Get total tokens (prompt + max output)
+    /// Prompt plus maximum output: the context a scheduler must plan for.
     pub fn total_tokens(&self) -> u32 {
         self.num_prompt_tokens + self.max_output_tokens
     }
 
-    /// Get remaining tokens to process
+    /// Positions left under the scheduler-visible bound (prompt + max output).
     pub fn remaining_tokens(&self) -> u32 {
-        self.num_prompt_tokens + self.max_output_tokens - self.num_computed_tokens
+        self.total_tokens().saturating_sub(self.num_computed_tokens)
     }
 
-    /// Calculate KV cache requirement for this request
-    pub fn kv_cache_size(&self, model: &ModelConfig) -> u64 {
-        model.kv_storage_bytes(self.num_tokens)
-    }
-
-    /// Record that tokens were generated (update output token count and total)
-    pub fn record_generated_tokens(&mut self, num_new_tokens: u32, current_time: f64) {
-        // Update computed tokens
+    /// Record that `num_new_tokens` positions were computed in a pass ending
+    /// at `current_time`. Returns the number of output tokens the pass
+    /// generated (1 when the pass completed prefill, the advance during
+    /// decode, 0 mid-prefill or during recompute).
+    pub fn record_generated_tokens(&mut self, num_new_tokens: u32, current_time: f64) -> u32 {
         self.num_computed_tokens += num_new_tokens;
+        if self.num_computed_tokens < self.num_prompt_tokens {
+            return 0;
+        }
+        let output =
+            (self.num_computed_tokens - self.num_prompt_tokens + 1).min(self.max_output_tokens);
+        if output <= self.num_output_tokens {
+            return 0;
+        }
+        if self.num_output_tokens == 0 && self.first_token_time.is_none() {
+            self.first_token_time = Some(current_time);
+        }
+        let generated = output - self.num_output_tokens;
+        self.num_output_tokens = output;
+        generated
+    }
 
-        // If we've crossed into decode phase, update output tokens
-        if self.num_computed_tokens > self.num_prompt_tokens {
-            let new_output_tokens =
-                (self.num_computed_tokens - self.num_prompt_tokens).min(self.max_output_tokens); // Cap at max
+    /// Make the request arrive already prefilled at `time`: its prompt is
+    /// resident and its first token produced, so it enters as pure decode
+    /// work (a disaggregated decode pool seen in isolation).
+    pub fn mark_prefilled(&mut self, time: f64) {
+        self.num_computed_tokens = self.num_prompt_tokens;
+        self.num_output_tokens = 1;
+        self.first_token_time = Some(time);
+    }
 
-            // Record first token time if this is the first output token
-            if self.first_token_time.is_none() && new_output_tokens > 0 {
-                self.first_token_time = Some(current_time);
+    /// Number of leading prompt blocks shared by every request in `batch`.
+    /// Uses the incremental prompt block hashes as the equality check: hash N
+    /// covers tokens 0..N*block_size, so two requests share a prefix of K
+    /// blocks iff their first K block hashes are pairwise equal.
+    pub fn shared_prefix_blocks(batch: &[&Request]) -> u32 {
+        if batch.len() < 2 {
+            return 0;
+        }
+        let first = &batch[0].prompt_block_hashes;
+        let mut shared = first.len();
+        for req in &batch[1..] {
+            let other = &req.prompt_block_hashes;
+            let mut i = 0;
+            while i < shared && i < other.len() && first[i] == other[i] {
+                i += 1;
             }
-
-            self.num_output_tokens = new_output_tokens;
-            // Note: num_tokens stays fixed at num_prompt_tokens + max_output_tokens
-            //
-            // Per-token timestamps are NOT recorded here. A speculative step
-            // advances by `num_new_tokens > 1`, so one push per call would
-            // undercount them. The metrics path doesn't rely on it anyway:
-            // `Simulator::handle_completion` rebuilds `token_generation_times`
-            // from `(first_token_time, completion_time, num_output_tokens)` as an
-            // even cadence before the collector reads it.
+            shared = i;
+            if shared == 0 {
+                return 0;
+            }
         }
+        shared as u32
     }
 
-    /// Mark request as preempted
-    pub fn mark_preempted(&mut self, current_time: f64) {
-        self.status = RequestStatus::Preempted;
+    /// Preempt: the resident KV is discarded and must be recomputed on resume.
+    /// The caller frees `kv_blocks`.
+    pub fn preempt(&mut self) {
         self.num_preemptions += 1;
-        self.last_preempted_at = Some(current_time);
-    }
-
-    /// Resume a preempted request
-    pub fn resume(&mut self, current_time: f64) {
-        if let Some(preempted_at) = self.last_preempted_at {
-            self.preempted_time += current_time - preempted_at;
-        }
-        self.status = RequestStatus::Running;
-        self.last_preempted_at = None;
+        self.num_computed_tokens = 0;
+        self.num_cached_tokens = 0;
+        self.pending_draft_len = 0;
+        self.pending_round_commits = None;
     }
 }
 
@@ -240,12 +255,21 @@ mod tests {
         assert_eq!(req.request_id, "req-1");
         assert_eq!(req.priority, 0);
         assert_eq!(req.arrival_time, 0.0);
-        assert_eq!(req.status, RequestStatus::Waiting);
         assert_eq!(req.num_prompt_tokens, 100);
         assert_eq!(req.max_output_tokens, 50);
         assert_eq!(req.num_computed_tokens, 0);
         assert_eq!(req.num_output_tokens, 0);
-        assert_eq!(req.num_tokens, 150); // prompt + max_output
+        // prompt(100) + target(50) - 1: the prefill pass yields token 1.
+        assert_eq!(req.planned_positions(), 149);
+        assert_eq!(req.tokens_to_process(), 149);
+    }
+
+    #[test]
+    fn test_target_is_at_least_one_and_at_most_max() {
+        let req = Request::new_with_target("r".into(), 0, 0.0, 10, 5, 0);
+        assert_eq!(req.target_output_tokens, 1);
+        let req = Request::new_with_target("r".into(), 0, 0.0, 10, 5, 9);
+        assert_eq!(req.target_output_tokens, 5);
     }
 
     #[test]
@@ -262,86 +286,81 @@ mod tests {
     }
 
     #[test]
-    fn test_tokens_to_process() {
+    fn test_prefill_pass_produces_first_token() {
         let mut req = Request::new("req-1".to_string(), 0, 0.0, 100, 50);
 
-        assert_eq!(req.tokens_to_process(), 150); // prompt(100) + max_output(50)
-
-        req.num_computed_tokens = 50;
-        assert_eq!(req.tokens_to_process(), 100); // 150 - 50
-
-        req.num_computed_tokens = 100;
-        assert_eq!(req.tokens_to_process(), 50); // 150 - 100 (in decode phase now)
-
-        req.num_computed_tokens = 150;
-        assert_eq!(req.tokens_to_process(), 0); // All tokens processed
-    }
-
-    #[test]
-    fn test_is_finished() {
-        let mut req = Request::new("req-1".to_string(), 0, 0.0, 100, 50);
-
-        assert!(!req.is_finished());
-
-        req.num_output_tokens = 25;
-        assert!(!req.is_finished());
-
-        req.num_output_tokens = 50;
-        assert!(req.is_finished());
-
-        req.num_output_tokens = 60;
-        assert!(req.is_finished());
-    }
-
-    #[test]
-    fn test_record_generated_tokens() {
-        let mut req = Request::new("req-1".to_string(), 0, 0.0, 100, 50);
-
-        // Prefill phase
-        req.record_generated_tokens(50, 1.0);
+        // Chunked prefill: no output mid-prompt.
+        assert_eq!(req.record_generated_tokens(50, 1.0), 0);
         assert_eq!(req.num_computed_tokens, 50);
         assert_eq!(req.num_output_tokens, 0);
-        assert_eq!(req.num_tokens, 150); // prompt(100) + max_output(50)
         assert!(req.first_token_time.is_none());
+        assert!(req.is_prefill());
 
-        // Complete prefill and start decode
-        req.record_generated_tokens(51, 2.0);
-        assert_eq!(req.num_computed_tokens, 101);
+        // Last prefill chunk: first token comes out of the prefill pass.
+        assert_eq!(req.record_generated_tokens(50, 2.0), 1);
+        assert_eq!(req.num_computed_tokens, 100);
         assert_eq!(req.num_output_tokens, 1);
-        assert_eq!(req.num_tokens, 150); // Stays fixed at prompt(100) + max_output(50)
+        assert_eq!(req.first_token_time, Some(2.0));
+        assert!(!req.is_prefill());
+
+        // Decode: one position, one token.
+        assert_eq!(req.record_generated_tokens(1, 3.0), 1);
+        assert_eq!(req.num_computed_tokens, 101);
+        assert_eq!(req.num_output_tokens, 2);
         assert_eq!(req.first_token_time, Some(2.0));
 
-        // Continue decode
-        req.record_generated_tokens(1, 3.0);
-        assert_eq!(req.num_computed_tokens, 102);
-        assert_eq!(req.num_output_tokens, 2);
-        assert_eq!(req.num_tokens, 150); // Stays fixed
-        assert_eq!(req.first_token_time, Some(2.0)); // Doesn't change
+        // Speculative verify: three accepted + bonus advances by four.
+        assert_eq!(req.record_generated_tokens(4, 4.0), 4);
+        assert_eq!(req.num_output_tokens, 6);
     }
 
     #[test]
-    fn test_preemption() {
+    fn test_finishes_after_planned_positions() {
         let mut req = Request::new("req-1".to_string(), 0, 0.0, 100, 50);
-        req.status = RequestStatus::Running;
+        req.record_generated_tokens(100, 1.0);
+        for _ in 0..49 {
+            assert!(!req.is_finished());
+            req.record_generated_tokens(1, 2.0);
+        }
+        assert!(req.is_finished());
+        assert_eq!(req.num_output_tokens, 50);
+        assert_eq!(req.num_computed_tokens, req.planned_positions());
+        assert_eq!(req.tokens_to_process(), 0);
+    }
 
-        // Preempt
-        req.mark_preempted(5.0);
-        assert_eq!(req.status, RequestStatus::Preempted);
+    #[test]
+    fn test_single_token_request_finishes_at_prefill() {
+        let mut req = Request::new("req-1".to_string(), 0, 0.0, 100, 1);
+        assert_eq!(req.tokens_to_process(), 100);
+        req.record_generated_tokens(100, 1.0);
+        assert!(req.is_finished());
+        assert_eq!(req.first_token_time, Some(1.0));
+    }
+
+    #[test]
+    fn test_preemption_recomputes_prompt_and_generated_tokens() {
+        let mut req = Request::new("req-1".to_string(), 0, 0.0, 100, 50);
+        req.record_generated_tokens(100, 1.0);
+        req.record_generated_tokens(1, 2.0);
+        req.record_generated_tokens(1, 3.0);
+        assert_eq!(req.num_output_tokens, 3);
+        assert_eq!(req.num_computed_tokens, 102);
+
+        req.preempt();
         assert_eq!(req.num_preemptions, 1);
-        assert_eq!(req.last_preempted_at, Some(5.0));
+        assert_eq!(req.num_computed_tokens, 0);
+        // Tokens already generated survive; their KV must be rebuilt.
+        assert_eq!(req.num_output_tokens, 3);
+        assert!(req.is_prefill());
+        assert_eq!(req.prefill_len(), 102);
+        assert_eq!(req.first_token_time, Some(1.0));
 
-        // Resume
-        req.resume(10.0);
-        assert_eq!(req.status, RequestStatus::Running);
-        assert_eq!(req.preempted_time, 5.0);
-        assert!(req.last_preempted_at.is_none());
-
-        // Preempt again
-        req.mark_preempted(15.0);
-        assert_eq!(req.num_preemptions, 2);
-
-        // Resume again
-        req.resume(20.0);
-        assert_eq!(req.preempted_time, 10.0); // 5.0 + 5.0
+        // Recompute pass produces no new output; decode then continues.
+        assert_eq!(req.record_generated_tokens(102, 4.0), 0);
+        assert_eq!(req.num_output_tokens, 3);
+        assert!(!req.is_prefill());
+        assert_eq!(req.record_generated_tokens(1, 5.0), 1);
+        assert_eq!(req.num_output_tokens, 4);
+        assert_eq!(req.tokens_to_process(), 149 - 103);
     }
 }

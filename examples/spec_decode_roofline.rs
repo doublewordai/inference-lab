@@ -12,11 +12,14 @@
 //!
 //! Run: `cargo run --release --example spec_decode_roofline --no-default-features`
 
+mod common;
+
 use inference_lab::config::{
-    AcceptanceModel, ClusterSpec, DeepseekV4Model, GammaPolicy, HardwareConfig, ModelConfig,
-    ParallelConfig, Precision, SchedulerConfig, SpeculativeConfig,
+    AcceptanceModel, ClusterSpec, DrafterCost, GammaPolicy, HardwareConfig, ParallelConfig,
+    SchedulerConfig, SpeculativeConfig,
 };
-use inference_lab::simulation::{simulate_closed_loop, Topology};
+use inference_lab::scheduler::SchedulingPolicy;
+use inference_lab::simulation::{simulate_closed_loop, ClosedLoop, Topology};
 use rayon::prelude::*;
 use std::collections::BTreeMap;
 
@@ -29,42 +32,8 @@ fn b200_unlimited_kv() -> HardwareConfig {
         flops_fp16: Some(2.25e15),
         memory_bandwidth: 8.0e12,
         memory_capacity: 1_000_000_000_000_000, // 1 PB -> KV cap never binds
-        kv_cache_capacity: 0,
-        gpu_memory_utilization: 0.9,
         kv_tiers: Vec::new(),
     }
-}
-
-fn deepseek_v4_flash() -> ModelConfig {
-    ModelConfig::DeepseekV4(DeepseekV4Model {
-        name: "DeepSeek-V4-Flash".into(),
-        num_layers: 43,
-        hidden_dim: 4096,
-        num_heads: 64,
-        max_seq_len: 1_048_576,
-        kv_latent_dim: 512,
-        qk_rope_head_dim: 64,
-        kv_precision: Precision::Fp8,
-        num_active_expert_params: 7_574_913_024,
-        num_active_non_expert_params: 5_660_947_776,
-        num_resident_expert_params: 278_107_521_024,
-        num_resident_non_expert_params: 6_225_000_000,
-        expert_precision: Precision::Fp4,
-        non_expert_precision: Precision::Fp8,
-        window_size: 128,
-        num_dense_layers: 2,
-        num_near_layers: 21,
-        num_far_layers: 20,
-        near_compress_ratio: 4,
-        far_compress_ratio: 128,
-        index_topk: 512,
-        index_n_heads: 64,
-        index_head_dim: 128,
-        index_kv_precision: None,
-        num_experts_per_tok: 6,
-        num_routed_experts: 256,
-        num_moe_layers: 43,
-    })
 }
 
 fn topology() -> Topology {
@@ -77,7 +46,6 @@ fn topology() -> Topology {
         },
         comms: None,
         num_workers: 1,
-        node: 0,
     };
     let sched = SchedulerConfig {
         max_num_batched_tokens: 100_000_000, // lift token budget too
@@ -86,11 +54,14 @@ fn topology() -> Topology {
         long_prefill_token_threshold: 0,
         max_num_partial_prefills: 1,
         block_size: 64,
-        policy: "fcfs".into(),
+        gpu_memory_utilization: 0.9,
+        kv_cache_capacity: 0,
+        max_model_len: None,
+        policy: SchedulingPolicy::FCFS,
         enable_preemption_free: false,
         enable_cascade_attention: false,
     };
-    Topology::aggregated(cluster, deepseek_v4_flash(), sched).expect("topo")
+    Topology::aggregated(cluster, common::deepseek_v4_flash(), sched).expect("topo")
 }
 
 #[derive(Clone, Copy)]
@@ -108,19 +79,17 @@ fn spec_for(p: Policy, alpha: f64, c_draft: f64) -> Option<SpeculativeConfig> {
             gamma: g,
             acceptance,
             policy: GammaPolicy::Fixed,
-            draft_cost_frac: c_draft,
             measured_cost: None,
             switch: Default::default(),
-            drafter: None,
+            drafter: Some(DrafterCost::Fraction { frac: c_draft }),
         }),
         Policy::Budget(g) => Some(SpeculativeConfig {
             gamma: g,
             acceptance,
             policy: GammaPolicy::GoodputBudget,
-            draft_cost_frac: c_draft,
             measured_cost: None,
             switch: Default::default(),
-            drafter: None,
+            drafter: Some(DrafterCost::Fraction { frac: c_draft }),
         }),
     }
 }
@@ -130,14 +99,16 @@ fn run(conc: u32, isl: u32, osl: u32, p: Policy, alpha: f64, c_draft: f64) -> (f
     let warmup = conc / 2;
     let res = simulate_closed_loop(
         topology(),
-        conc,
-        isl,
-        osl,
-        total,
-        warmup,
-        spec_for(p, alpha, c_draft),
-        7,
-        true,
+        &ClosedLoop {
+            concurrency: conc,
+            isl,
+            osl,
+            num_completions: total,
+            warmup_completions: warmup,
+            spec: spec_for(p, alpha, c_draft),
+            seed: 7,
+            skip_prefill: true,
+        },
     )
     .expect("run");
     let dbatch = res

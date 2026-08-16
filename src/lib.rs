@@ -1,3 +1,4 @@
+pub mod catalog;
 pub mod compute;
 pub mod config;
 pub mod dataset;

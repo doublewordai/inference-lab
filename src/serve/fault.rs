@@ -278,12 +278,34 @@ pub fn invalid_fault(message: &str) -> (StatusCode, axum::Json<serde_json::Value
     )
 }
 
+/// Which endpoint's wire shape the faulting stream must speak.
+///
+/// Both are reachable: a mid-stream-continuation RESUME LEG is a streaming
+/// `/v1/completions` request, so chain-resume tests kill a `Completion`-flavored stream.
+/// The shapes differ in more than a field name — completions have no role frame and no
+/// delta object — so frame counts differ by one between the two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Flavor {
+    Chat,
+    Completion,
+}
+
+impl Flavor {
+    fn object(&self) -> &'static str {
+        match self {
+            Flavor::Chat => "chat.completion.chunk",
+            Flavor::Completion => "text_completion",
+        }
+    }
+}
+
 /// Per-request context the fault stream needs from the handler.
 pub struct StreamParams {
     pub id: String,
     pub model: String,
     pub prompt_tokens: u32,
     pub include_usage: bool,
+    pub flavor: Flavor,
 }
 
 /// Build the faulting SSE response. Headers match what axum's `Sse` sets, so up to the
@@ -332,6 +354,15 @@ const TOOL_CALL_NAME: &str = "get_current_weather";
 const TOOL_CALL_ID: &str = "call_fault_0";
 const TOOL_CALL_ARG_OPEN: &str = r#"{"location":"San Francisco, CA","notes":""#;
 
+/// `/v1/completions` has no delta object, so the reasoning/tool-call modes express the
+/// same partial payloads as RAW TEXT — which is exactly how they appear on a real
+/// base-model completions stream (an unterminated `<think>` block, or a tool call the
+/// model is still writing out as JSON). Both accumulate to something unparseable, which
+/// is the property those modes exist to produce.
+const COMPLETION_REASONING_OPEN: &str = "<think>";
+const COMPLETION_TOOL_CALL_OPEN: &str =
+    r#"{"name":"get_current_weather","arguments":{"location":"San Francisco, CA","notes":""#;
+
 fn sse_frame(json: &serde_json::Value) -> Bytes {
     Bytes::from(format!("data: {}\n\n", json))
 }
@@ -347,41 +378,49 @@ fn sse_raw(body: &str) -> Bytes {
 /// A chat.completion.chunk with the given delta. Null fields are omitted, matching the
 /// serializer conventions of the normal path (`types::ChunkDelta`).
 fn chunk(params: &StreamParams, created: u64, delta: serde_json::Value) -> serde_json::Value {
+    envelope(params, created, json!([{"index": 0, "delta": delta}]))
+}
+
+/// A text_completion chunk carrying the given text.
+fn text_chunk(params: &StreamParams, created: u64, text: String) -> serde_json::Value {
+    envelope(params, created, json!([{"index": 0, "text": text}]))
+}
+
+fn envelope(params: &StreamParams, created: u64, choices: serde_json::Value) -> serde_json::Value {
     json!({
         "id": params.id,
-        "object": "chat.completion.chunk",
+        "object": params.flavor.object(),
         "created": created,
         "model": params.model,
-        "choices": [{"index": 0, "delta": delta}],
+        "choices": choices,
     })
 }
 
-fn finish_chunk(
-    params: &StreamParams,
-    created: u64,
-    usage: bool,
-    chunks_sent: u32,
-) -> serde_json::Value {
-    let mut value = json!({
-        "id": params.id,
-        "object": "chat.completion.chunk",
-        "created": created,
-        "model": params.model,
-        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+/// The finish_reason frame — usage is NOT attached here; it follows as its own frame (see
+/// [`usage_frame`]), which is what both real continuation targets emit.
+fn finish_chunk(params: &StreamParams, created: u64) -> serde_json::Value {
+    let choice = match params.flavor {
+        Flavor::Chat => json!([{"index": 0, "delta": {}, "finish_reason": "stop"}]),
+        Flavor::Completion => json!([{"index": 0, "text": "", "finish_reason": "stop"}]),
+    };
+    envelope(params, created, choice)
+}
+
+/// The separate `"choices": []` usage frame that closes a healthy stream when
+/// `stream_options.include_usage` was set.
+fn usage_frame(params: &StreamParams, created: u64, chunks_sent: u32) -> serde_json::Value {
+    let mut value = envelope(params, created, json!([]));
+    // 1 placeholder word per chunk stands in for 1 completion token, like the engine
+    // path's word-per-token stream.
+    value["usage"] = json!({
+        "prompt_tokens": params.prompt_tokens,
+        "completion_tokens": chunks_sent,
+        "total_tokens": params.prompt_tokens + chunks_sent,
     });
-    if usage {
-        // 1 placeholder word per chunk stands in for 1 completion token, like the engine
-        // path's word-per-token stream.
-        value["usage"] = json!({
-            "prompt_tokens": params.prompt_tokens,
-            "completion_tokens": chunks_sent,
-            "total_tokens": params.prompt_tokens + chunks_sent,
-        });
-    }
     value
 }
 
-/// The i-th content-bearing delta frame for this mode.
+/// The i-th content-bearing frame for this mode and endpoint flavor.
 fn content_frame(
     spec: &FaultSpec,
     params: &StreamParams,
@@ -394,9 +433,20 @@ fn content_frame(
             PLACEHOLDER_WORDS[i as usize % PLACEHOLDER_WORDS.len()]
         )
     };
-    match spec.mode {
-        FaultMode::MidReasoning => chunk(params, created, json!({"reasoning_content": word()})),
-        FaultMode::MidToolCall if i == 0 => chunk(
+    match (spec.mode, params.flavor) {
+        (FaultMode::MidReasoning, Flavor::Chat) => {
+            chunk(params, created, json!({"reasoning_content": word()}))
+        }
+        (FaultMode::MidReasoning, Flavor::Completion) => text_chunk(
+            params,
+            created,
+            if i == 0 {
+                COMPLETION_REASONING_OPEN.to_string()
+            } else {
+                word()
+            },
+        ),
+        (FaultMode::MidToolCall, Flavor::Chat) if i == 0 => chunk(
             params,
             created,
             json!({"tool_calls": [{
@@ -406,17 +456,14 @@ fn content_frame(
                 "function": {"name": TOOL_CALL_NAME, "arguments": ""}
             }]}),
         ),
-        FaultMode::MidToolCall => {
+        (FaultMode::MidToolCall, Flavor::Chat) => {
             // Fragment 1 opens the arguments object; later fragments extend the
             // never-terminated notes string. JSON-string-escaped placeholder words are
             // plain ASCII, so raw concatenation is safe.
             let fragment = if i == 1 {
                 TOOL_CALL_ARG_OPEN.to_string()
             } else {
-                format!(
-                    "{} ",
-                    PLACEHOLDER_WORDS[i as usize % PLACEHOLDER_WORDS.len()]
-                )
+                word()
             };
             chunk(
                 params,
@@ -424,7 +471,17 @@ fn content_frame(
                 json!({"tool_calls": [{"index": 0, "function": {"arguments": fragment}}]}),
             )
         }
-        _ => chunk(params, created, json!({"content": word()})),
+        (FaultMode::MidToolCall, Flavor::Completion) => text_chunk(
+            params,
+            created,
+            if i == 0 {
+                COMPLETION_TOOL_CALL_OPEN.to_string()
+            } else {
+                word()
+            },
+        ),
+        (_, Flavor::Chat) => chunk(params, created, json!({"content": word()})),
+        (_, Flavor::Completion) => text_chunk(params, created, word()),
     }
 }
 
@@ -442,7 +499,10 @@ fn torn_frame_prefix(spec: &FaultSpec, params: &StreamParams, created: u64) -> B
             PLACEHOLDER_WORDS[spec.after_chunks as usize % PLACEHOLDER_WORDS.len()]
         )
     };
-    let full = sse_frame(&chunk(params, created, json!({"content": content})));
+    let full = sse_frame(&match params.flavor {
+        Flavor::Chat => chunk(params, created, json!({"content": content})),
+        Flavor::Completion => text_chunk(params, created, content),
+    });
     let cut = if spec.utf8 {
         full.iter()
             .position(|b| (b & 0xC0) == 0xC0)
@@ -493,10 +553,13 @@ pub(super) async fn run_script(
     let delay = Duration::from_millis(spec.delay_ms);
 
     // Initial role frame, exactly like the normal streaming path (not counted in
-    // after_chunks).
-    let role = chunk(&params, created, json!({"role": "assistant"}));
-    if !send(&tx, sse_frame(&role)).await {
-        return;
+    // after_chunks). Chat only: `/v1/completions` streams have no role frame, so a
+    // completions fault's first frame on the wire is already content.
+    if params.flavor == Flavor::Chat {
+        let role = chunk(&params, created, json!({"role": "assistant"}));
+        if !send(&tx, sse_frame(&role)).await {
+            return;
+        }
     }
 
     for i in 0..spec.after_chunks {
@@ -548,14 +611,20 @@ pub(super) async fn run_script(
             let _ = send(&tx, sse_raw(ERROR_400_IN_SSE)).await;
         }
         FaultMode::NoDone => {
-            // Everything a healthy stream ends with, except [DONE].
-            let finish = finish_chunk(&params, created, params.include_usage, spec.after_chunks);
-            let _ = send(&tx, sse_frame(&finish)).await;
+            // Everything a healthy stream ends with, except [DONE]: finish_reason frame,
+            // then the separate usage frame if it was asked for.
+            if !send(&tx, sse_frame(&finish_chunk(&params, created))).await {
+                return;
+            }
+            if params.include_usage {
+                let usage = usage_frame(&params, created, spec.after_chunks);
+                let _ = send(&tx, sse_frame(&usage)).await;
+            }
         }
         FaultMode::NoUsage => {
-            // finish_reason and [DONE], but usage never arrives even when requested.
-            let finish = finish_chunk(&params, created, false, spec.after_chunks);
-            if send(&tx, sse_frame(&finish)).await {
+            // finish_reason and [DONE], but the usage frame never arrives even though
+            // include_usage asked for it.
+            if send(&tx, sse_frame(&finish_chunk(&params, created))).await {
                 let _ = send(&tx, sse_done()).await;
             }
         }
@@ -576,6 +645,18 @@ mod tests {
             model: "test-model".to_string(),
             prompt_tokens: 7,
             include_usage: true,
+            flavor: Flavor::Chat,
+        }
+    }
+
+    /// `/v1/completions` flavor — the shape a mid-stream-continuation RESUME LEG dies in.
+    fn completion_params() -> StreamParams {
+        StreamParams {
+            id: "cmpl-test".to_string(),
+            model: "test-model".to_string(),
+            prompt_tokens: 7,
+            include_usage: true,
+            flavor: Flavor::Completion,
         }
     }
 
@@ -804,11 +885,19 @@ mod tests {
     async fn no_done_finishes_with_usage_but_never_done() {
         let items = collect(spec(FaultMode::NoDone), params()).await;
         let frames = frames(&items);
-        assert_eq!(frames.len(), 5); // role + 3 + finish; no [DONE]
+        assert_eq!(frames.len(), 6); // role + 3 + finish + usage; no [DONE]
         let finish = frame_json(&frames[4]);
         assert_eq!(finish["choices"][0]["finish_reason"], "stop");
-        assert_eq!(finish["usage"]["prompt_tokens"], 7);
-        assert_eq!(finish["usage"]["completion_tokens"], 3);
+        assert!(
+            finish.get("usage").is_none(),
+            "usage rides its own frame, never the finish_reason chunk"
+        );
+        // Usage arrives as the separate choices:[] frame both real continuation targets
+        // (dynamo, Fireworks) emit.
+        let usage = frame_json(&frames[5]);
+        assert_eq!(usage["choices"].as_array().unwrap().len(), 0);
+        assert_eq!(usage["usage"]["prompt_tokens"], 7);
+        assert_eq!(usage["usage"]["completion_tokens"], 3);
         assert!(!frames.iter().any(|f| f.contains("[DONE]")));
     }
 
@@ -816,11 +905,104 @@ mod tests {
     async fn no_usage_sends_done_but_drops_requested_usage() {
         let items = collect(spec(FaultMode::NoUsage), params()).await; // include_usage: true
         let frames = frames(&items);
-        assert_eq!(frames.len(), 6); // role + 3 + finish + [DONE]
+        assert_eq!(frames.len(), 6); // role + 3 + finish + [DONE]; the usage frame is missing
         let finish = frame_json(&frames[4]);
         assert_eq!(finish["choices"][0]["finish_reason"], "stop");
-        assert!(finish.get("usage").is_none());
+        assert!(!frames.iter().any(|f| f.contains("\"usage\"")));
         assert_eq!(frames[5], "data: [DONE]\n\n");
+    }
+
+    // --- Completion flavor (resume-leg deaths) ---
+
+    #[tokio::test]
+    async fn completion_flavor_emits_text_frames_with_no_role_frame() {
+        // A resume leg is a streaming /v1/completions request: text_completion frames
+        // carrying `text`, and no role frame at all — so `after_chunks=N` puts exactly N
+        // content frames on the wire before the death.
+        let items = collect(spec(FaultMode::CutBetweenFrames), completion_params()).await;
+        assert_eq!(items.len(), 4); // 3 content frames + Err, no role frame
+        assert!(items.last().unwrap().is_err());
+        for f in frames(&items[..3]) {
+            let json = frame_json(&f);
+            assert_eq!(json["object"], "text_completion");
+            assert!(json["choices"][0]["text"].is_string());
+            assert!(json["choices"][0].get("delta").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_flavor_no_done_ends_with_finish_then_usage() {
+        let items = collect(spec(FaultMode::NoDone), completion_params()).await;
+        let frames = frames(&items);
+        assert_eq!(frames.len(), 5); // 3 content + finish + usage; no [DONE]
+        let finish = frame_json(&frames[3]);
+        assert_eq!(finish["object"], "text_completion");
+        assert_eq!(finish["choices"][0]["finish_reason"], "stop");
+        assert_eq!(finish["choices"][0]["text"], "");
+        let usage = frame_json(&frames[4]);
+        assert_eq!(usage["choices"].as_array().unwrap().len(), 0);
+        assert_eq!(usage["usage"]["completion_tokens"], 3);
+    }
+
+    #[tokio::test]
+    async fn completion_flavor_error_envelope_and_499_bodies_are_unchanged() {
+        // The error bodies are downstream signatures, not endpoint shapes: they must be
+        // byte-identical on both endpoints so a client's death classifier works either way.
+        let envelope = collect(spec(FaultMode::ErrorEnvelope200), completion_params()).await;
+        let envelope_frames = frames(&envelope);
+        assert_eq!(envelope_frames.len(), 5); // 3 content + error + [DONE]
+        assert_eq!(frame_json(&envelope_frames[3])["error"]["code"], 502);
+        assert_eq!(envelope_frames[4], "data: [DONE]\n\n");
+
+        let cancelled = collect(spec(FaultMode::Cancelled499), completion_params()).await;
+        assert_eq!(
+            frames(&cancelled).last().unwrap(),
+            "data: {\"error\":{\"code\":499,\"message\":\"CancelledError: \",\"type\":\"request_cancelled\"}}\n\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn completion_flavor_cut_mid_frame_tears_a_text_frame() {
+        let items = collect(spec(FaultMode::CutMidFrame), completion_params()).await;
+        assert_eq!(items.len(), 5); // 3 content + torn prefix + Err
+        assert!(items.last().unwrap().is_err());
+        let torn = String::from_utf8(items[3].as_ref().unwrap().to_vec()).unwrap();
+        assert!(torn.starts_with("data: {"));
+        assert!(!torn.ends_with("\n\n"));
+        assert!(serde_json::from_str::<serde_json::Value>(&torn[6..]).is_err());
+    }
+
+    #[tokio::test]
+    async fn completion_flavor_reasoning_and_tool_call_accumulate_unterminated_text() {
+        // No delta object exists on /v1/completions, so these modes stream the same
+        // partial payloads as raw text — an unterminated <think> block and a tool call
+        // the model never finished writing.
+        let accumulate = |items: &[Result<Bytes, std::io::Error>]| -> String {
+            frames(&items[..items.len() - 1])
+                .iter()
+                .map(|f| {
+                    frame_json(f)["choices"][0]["text"]
+                        .as_str()
+                        .unwrap()
+                        .to_string()
+                })
+                .collect()
+        };
+
+        let reasoning = collect(spec(FaultMode::MidReasoning), completion_params()).await;
+        assert!(reasoning.last().unwrap().is_err());
+        let text = accumulate(&reasoning);
+        assert!(text.starts_with(COMPLETION_REASONING_OPEN), "got: {text}");
+        assert!(!text.contains("</think>"), "reasoning must stay open");
+
+        let tool_call = collect(spec(FaultMode::MidToolCall), completion_params()).await;
+        assert!(tool_call.last().unwrap().is_err());
+        let args = accumulate(&tool_call);
+        assert!(args.starts_with('{'));
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&args).is_err(),
+            "partial tool call must be unterminated JSON, got: {args}"
+        );
     }
 
     #[tokio::test]

@@ -1,0 +1,39 @@
+# Qwen/Qwen3.5-4B — DENSE hybrid (GatedDeltaNet linear + GQA full attention,
+# no MoE; model_type qwen3_5). From HF Qwen/Qwen3.5-4B config.json (text_config):
+#   32 layers, full_attention_interval 4 -> 8 full-attn + 24 linear;
+#   hidden 2560; full attn: 16 q / 4 kv heads, head_dim 256; linear:
+#   16 key / 32 value heads x 128, conv 4; dense MLP inter 9216 every
+#   layer; vocab 248320 (tied); 1 MTP layer (not modeled); max_pos 262144.
+# `qwen35` with zero experts (dense MLP counted in the non-expert stream).
+#
+# Param split (all non-expert; computed):
+#   full-attn layer = 2560*10240 = 26_214_400
+#   linear layer = 2560*16384 = 41_943_040
+#   MLP/layer = 3*2560*9216 = 70_778_880
+#   lm_head = 248320*2560 = 635_699_200
+#   active = 8*attn + 24*linear + 32*mlp + lm_head = 4_116_971_520
+#   resident = 4_116_971_520 (tied embeddings)
+#   Sanity vs checkpoint: ~8.2e9 B at bf16 (advertised 4B).
+
+name = "Qwen3.5-4B"
+hidden_dim = 2560
+max_seq_len = 262144
+attention_precision = "bf16"
+
+[[weights]]
+precision = "bf16"
+active_params = 4116971520
+resident_params = 4116971520
+
+[[layers]]
+kind = "attention"
+count = 8
+heads = 16
+head_dim = 256
+kv_heads = 4
+kv_precision = "bf16"
+
+[[layers]]
+kind = "linear"
+count = 24
+state_bytes = 1114112

@@ -1,0 +1,9 @@
+# NVIDIA GH200 Grace Hopper, 120 GB HBM3 variant (Hopper: fp4 runs at the fp8 rate).
+
+name = "GH200-120"
+flops_fp4 = 1.979e15
+flops_fp8 = 1.979e15
+flops_bf16 = 9.89e14
+flops_fp16 = 9.89e14
+memory_bandwidth = 4.0e12
+memory_capacity = 102642221056
