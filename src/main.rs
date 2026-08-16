@@ -53,6 +53,14 @@ struct ServeArgs {
     /// Path to tokenizer.json file (for accurate token counting)
     #[arg(short, long)]
     tokenizer: Option<PathBuf>,
+
+    /// Honor <<respond:{...}>> echo-directives in message text (scripted responses that
+    /// bypass the engine — see serve::directive) and the x-inference-lab-fault header
+    /// (mid-stream death injection — see serve::fault). Test-harness feature: leave OFF
+    /// anywhere untrusted clients can reach this server, or requests can spoof model
+    /// output and stall/abort connections at will.
+    #[arg(long, default_value_t = false)]
+    enable_directives: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -288,9 +296,14 @@ async fn main() {
                 }
             };
 
-            if let Err(e) =
-                inference_lab::serve::start_server(configs, args.host, args.port, args.tokenizer)
-                    .await
+            if let Err(e) = inference_lab::serve::start_server(
+                configs,
+                args.host,
+                args.port,
+                args.tokenizer,
+                args.enable_directives,
+            )
+            .await
             {
                 eprintln!("Server error: {}", e);
                 std::process::exit(1);

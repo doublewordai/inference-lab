@@ -72,5 +72,6 @@ pub fn closed_loop_config(
             seed: 7,
         },
         speculative: None,
+        fault: None,
     }
 }
