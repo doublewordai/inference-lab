@@ -22,13 +22,14 @@
 
 use inference_lab::compute::MeasuredCostTable;
 use inference_lab::config::{
-    ClusterSpec, Config, GammaPolicy, SpeculativeConfig, SwitchConstraints,
+    Deployment, GammaPolicy, ModelConfig, SpeculativeConfig, SwitchConstraints,
 };
-use inference_lab::simulation::{simulate_closed_loop, Topology};
+use inference_lab::simulation::{simulate_closed_loop, ClosedLoop, Topology};
 use rayon::prelude::*;
 use std::collections::BTreeMap;
 
-const CONFIG_PATH: &str = "configs/llama31-8b-eagle3-gh200.toml";
+const CONFIG_PATH: &str = "configs/llama-3.1-8b-instruct.toml";
+const HARDWARE: &str = "gh200-96";
 const CONCS: [u32; 3] = [1, 2, 4];
 // 2 and 3 added beyond the pre-registered {1,4,8,16,32}: the decay turned
 // out to complete before N=4, so the cliff needs the finer rungs.
@@ -38,32 +39,27 @@ const SS: [f64; 2] = [0.0, 0.5];
 const ISL: u32 = 1024;
 const OSL: u32 = 256;
 
-fn topology(cfg: &Config) -> Topology {
-    let cluster = ClusterSpec {
-        hardware: cfg.hardware.clone(),
-        parallel: cfg.parallel.clone(),
-        comms: None,
-        num_workers: 1,
-        node: 0,
-    };
-    Topology::aggregated(cluster, cfg.model.clone(), cfg.scheduler.clone()).expect("topo")
+fn topology(cfg: &Deployment) -> Topology {
+    Topology::aggregated(cfg.cluster(), cfg.model.clone(), cfg.scheduler.clone()).expect("topo")
 }
 
 /// Pure-decode target run, identical loop semantics (total, warmup, seed,
 /// prefilled arrivals) to `engine_target_sweep::run`.
-fn run(cfg: &Config, conc: u32, spec: SpeculativeConfig) -> f64 {
+fn run(cfg: &Deployment, conc: u32, spec: SpeculativeConfig) -> f64 {
     let total = (conc * 2).max(1000);
     let warmup = conc / 2;
     let res = simulate_closed_loop(
         topology(cfg),
-        conc,
-        ISL,
-        OSL,
-        total,
-        warmup,
-        Some(spec),
-        7,
-        true, // skip_prefill: pure-decode target
+        &ClosedLoop {
+            concurrency: conc,
+            isl: ISL,
+            osl: OSL,
+            num_completions: total,
+            warmup_completions: warmup,
+            spec: Some(spec),
+            seed: 7,
+            skip_prefill: true, // pure-decode target
+        },
     )
     .expect("run");
     res.throughput() * OSL as f64
@@ -74,7 +70,11 @@ enum Task {
     /// gamma = 0 (no speculation), priced from the table's plain-decode rows.
     NoSpec,
     Fixed(u32),
-    Constrained { n: u32, d: Option<u32>, s_ms: f64 },
+    Constrained {
+        n: u32,
+        d: Option<u32>,
+        s_ms: f64,
+    },
 }
 
 fn spec_for(t: Task, base: &SpeculativeConfig) -> SpeculativeConfig {
@@ -90,7 +90,11 @@ fn spec_for(t: Task, base: &SpeculativeConfig) -> SpeculativeConfig {
         }
         Task::Constrained { n, d, s_ms } => {
             s.policy = GammaPolicy::GatedAggregate;
-            s.switch = SwitchConstraints { cooldown_rounds: n, max_step: d, cost_ms: s_ms };
+            s.switch = SwitchConstraints {
+                cooldown_rounds: n,
+                max_step: d,
+                cost_ms: s_ms,
+            };
         }
     }
     s
@@ -104,17 +108,21 @@ fn d_label(d: Option<u32>) -> String {
 }
 
 fn main() {
-    let cfg = Config::from_file(CONFIG_PATH).expect("config");
+    let cfg = ModelConfig::from_file(CONFIG_PATH)
+        .expect("config")
+        .deployment(Some(HARDWARE))
+        .expect("hardware entry");
     let base = cfg.speculative.as_ref().expect("config has [speculative]");
     let gamma_max = base.gamma;
-    let mc = base.measured_cost.as_ref().expect("config has measured_cost");
+    let mc = base
+        .measured_cost
+        .as_ref()
+        .expect("config has measured_cost");
     let table = MeasuredCostTable::load(&mc.path).expect("measured cost table");
 
     // Same candidate exclusion as the engine: measured widths only.
     let fixed: Vec<u32> = (1..=gamma_max).filter(|&g| table.has_draft(g)).collect();
-    let cands: Vec<u32> = std::iter::once(0)
-        .chain(fixed.iter().copied())
-        .collect();
+    let cands: Vec<u32> = std::iter::once(0).chain(fixed.iter().copied()).collect();
 
     println!("Constrained GatedAggregate sweep: {}", cfg.model_name());
     println!(
@@ -172,7 +180,9 @@ fn main() {
                 }
             }
             Task::Constrained { n, d, s_ms } => {
-                grid.entry((n, d, s_ms.to_bits())).or_default().insert(conc, v);
+                grid.entry((n, d, s_ms.to_bits()))
+                    .or_default()
+                    .insert(conc, v);
             }
         }
     }
@@ -220,9 +230,8 @@ fn main() {
 trait ModelName {
     fn model_name(&self) -> &str;
 }
-impl ModelName for Config {
+impl ModelName for Deployment {
     fn model_name(&self) -> &str {
-        use inference_lab::config::ModelCosts;
-        self.model.name()
+        self.model.name.as_str()
     }
 }

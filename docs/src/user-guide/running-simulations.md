@@ -4,16 +4,16 @@ This guide covers how to run simulations and interpret results.
 
 ## Basic Usage
 
-Run a simulation with a configuration file:
+Run a model config on one of its hardware entries against a workload:
 
 ```bash
-inference-lab -c config.toml
+inference-lab -c configs/gpt-oss-120b.toml --hardware b200 -w workloads/chat-closed-256.toml
 ```
 
 For dataset mode, add tokenizer and chat template:
 
 ```bash
-inference-lab -c config.toml \
+inference-lab -c configs/llama-3-70b.toml -w workloads/dataset-poisson.toml \
   --tokenizer tokenizer.json \
   --chat-template None
 ```
@@ -41,43 +41,45 @@ Final output includes:
 Save results to a file:
 
 ```bash
-inference-lab -c config.toml -o results.json
+inference-lab -c configs/gpt-oss-120b.toml --hardware b200 -w workloads/chat-closed-256.toml -o results.json
 ```
 
 Combine with `-q` for batch processing:
 
 ```bash
-inference-lab -c config.toml -q -o results.json
+inference-lab -c configs/gpt-oss-120b.toml --hardware b200 -w workloads/chat-closed-256.toml -q -o results.json
 ```
 
 ## Running Multiple Experiments
 
-### Comparing Policies
+### Comparing Hardware
 
 ```bash
-for policy in fcfs sof sif lof; do
-  sed "s/policy = .*/policy = \"$policy\"/" config.toml > config_$policy.toml
-  inference-lab -c config_$policy.toml -q -o results_$policy.json
+for hw in b200 b300 gh200-120; do
+  inference-lab -c configs/gpt-oss-120b.toml --hardware $hw \
+    -w workloads/chat-closed-256.toml -q -o results_$hw.json
 done
 ```
 
-### Sweeping Parameters
+### Sweeping Engine Args
 
 ```bash
 for batch_size in 4096 8192 16384; do
   sed "s/max_num_batched_tokens = .*/max_num_batched_tokens = $batch_size/" \
-    config.toml > config_$batch_size.toml
-  inference-lab -c config_$batch_size.toml -o results_$batch_size.json
+    configs/gpt-oss-120b.toml > /tmp/gpt-oss-120b_$batch_size.toml
+  inference-lab -c /tmp/gpt-oss-120b_$batch_size.toml --hardware b200 \
+    -w workloads/chat-closed-256.toml -o results_$batch_size.json
 done
 ```
 
 ### Multiple Seeds
 
-Override the seed for reproducibility testing:
+Override the workload's seed:
 
 ```bash
 for seed in {1..10}; do
-  inference-lab -c config.toml --seed $seed -q -o results_$seed.json
+  inference-lab -c configs/gpt-oss-120b.toml --hardware b200 \
+    -w workloads/chat-closed-256.toml --seed $seed -q -o results_$seed.json
 done
 ```
 
@@ -139,10 +141,10 @@ Preemptions occur when new requests need memory but the KV cache is full:
 
 **Simulation running slowly?**
 - Reduce `num_requests` or use `-q` flag
-- Increase `log_interval` in config
+- Build with `--release`
 
 **Too many preemptions?**
-- Increase `kv_cache_capacity` in hardware config
+- Raise `gpu_memory_utilization` or set `kv_cache_capacity` in `[scheduler]`
 - Reduce `max_num_seqs` or `max_num_batched_tokens` in scheduler config
 
 **Dataset loading errors?**

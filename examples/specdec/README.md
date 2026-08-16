@@ -86,21 +86,6 @@ cp drafterGrid.json ../fergusfinn-blog/src/components/specdec/drafterGrid.json
 Then update `MTP_SURV` / `DF_SURV` (Step 3) and the `PricingEnvelope` arrays
 (Step 2) in the blog components. `DrafterCrossover` needs nothing.
 
-## Caveats / provenance
-
-- **Qualitative-only.** The HF dataset carries the SpeedBench *qualitative*
-  split. The originally-published numbers also mixed `throughput_1k..32k`
-  configs (no longer collected), so reproduced curves are *close but not
-  identical* — e.g. MTP `accept[0]` ≈ 0.779 here vs 0.813 as published. Update
-  the post's numbers (and the "~30k draft rounds" footnote) when regenerating.
-- The DFlash drafter is checkpoint `@42d3b34d`.
-- The simulator only consumes `commits`; the oracle `a_k` mask is unused by the
-  homogeneous policy. Use `--signal confidence` to build the conf banks for the
-  gated policies (`spec_gating_ladder`), not needed for these four figures.
-- `spec_drafter_grid.rs` produces everything the post charts. `spec_drafter_compare.rs`
-  (text head-to-head) and `spec_gating_ladder.rs` are companions that read the
-  same `data/banks/` files.
-
 ## Publishing the base data (maintainers)
 
 The HF dataset is produced from the local `data/` tree by

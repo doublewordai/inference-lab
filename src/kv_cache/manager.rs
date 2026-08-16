@@ -4,6 +4,10 @@ use crate::config::KVTier;
 use crate::request::{BlockId, Request};
 use std::collections::{HashMap, HashSet, VecDeque};
 
+/// Bytes of KV a sequence of `t` tokens occupies. Supplied by the model
+/// (`ModelSpec::kv_storage_bytes`); the manager quantises it into blocks.
+pub type KvBytesFn = Box<dyn Fn(u32) -> u64 + Send + Sync>;
+
 #[derive(Debug, Clone)]
 struct InFlightEntry {
     leader_id: String,
@@ -22,7 +26,7 @@ struct SpilloverTier {
     members: HashSet<u64>,
     /// Insertion order; front is oldest.
     order: VecDeque<u64>,
-    pub num_evictions: u64,
+    num_evictions: u64,
     link: Link,
 }
 
@@ -35,10 +39,6 @@ impl SpilloverTier {
             num_evictions: 0,
             link: Link::new(bandwidth_to_hbm),
         }
-    }
-
-    fn bandwidth_to_hbm(&self) -> f64 {
-        self.link.bandwidth()
     }
 
     fn contains(&self, hash: u64) -> bool {
@@ -90,9 +90,12 @@ pub struct PrefixCacheLookup {
     /// tier on behalf of another request. The current request can join
     /// that transfer at zero additional bandwidth cost.
     pub in_flight_tokens: u32,
-    /// Per-spillover-tier tokens that need to be promoted (bytes/bandwidth).
-    /// Indexed aligned with `KVCacheManager::tiers`.
+    /// Per-spillover-tier tokens that need to be promoted. Indexed aligned
+    /// with `KVCacheManager::tiers`.
     pub promote_tokens_per_tier: Vec<u32>,
+    /// Per-spillover-tier bytes that need to be promoted (the KV footprint of
+    /// the promoted token ranges, from the model's KV curve).
+    pub promote_bytes_per_tier: Vec<u64>,
     /// Identity of the leader transfer (if any) covering some portion of
     /// the in-flight region. The scheduler uses this to call `join_transfer`
     /// against the same leader rather than starting a redundant one. If
@@ -111,21 +114,36 @@ impl PrefixCacheLookup {
     }
 }
 
-/// Manages KV cache blocks for all requests
+/// Manages KV cache blocks for all requests on one worker.
+///
+/// Capacity and occupancy are counted in blocks. A block is the KV footprint
+/// of `block_size` tokens (`kv_bytes_at(block_size)`), and a sequence of `t`
+/// tokens occupies `ceil(kv_bytes_at(t) / bytes_per_block)` content blocks.
+/// For models whose KV is linear in position this is exactly
+/// `ceil(t / block_size)`; for models whose footprint is not (sliding window,
+/// DeepSeek-V4's window + compressed history) it charges the model's actual
+/// bytes. Sequences additionally hold `state_blocks` fixed blocks for
+/// length-independent per-sequence state (Mamba / GatedDeltaNet).
 pub struct KVCacheManager {
-    /// Block size in tokens
+    /// Block size in tokens.
     block_size: u32,
 
-    /// Total number of blocks available
+    /// KV bytes of a `t`-token sequence, from the model.
+    kv_bytes_at: KvBytesFn,
+
+    /// `kv_bytes_at(block_size)`: the unit of allocation.
+    bytes_per_block: u64,
+
+    /// Total number of blocks available.
     total_blocks: u32,
 
-    /// All blocks
+    /// All blocks.
     blocks: Vec<Block>,
 
-    /// Free blocks (indices into blocks vec)
+    /// Free blocks (indices into `blocks`).
     free_blocks: Vec<BlockId>,
 
-    /// Enable prefix caching
+    /// Enable prefix caching.
     enable_prefix_caching: bool,
 
     /// HBM tier: maps block hash -> block_id. The hashes are incremental
@@ -160,44 +178,84 @@ pub struct KVCacheManager {
     /// projected ready time stays in sync with its leader's.
     joiner_to_leader: HashMap<String, String>,
 
-    /// Bytes of KV per token (used to size tiers and compute promotion cost).
-    kv_cache_bytes_per_token: u64,
-
     /// Fixed blocks reserved per running sequence for length-independent state
     /// (Mamba/GatedDeltaNet recurrent state). Zero for pure-attention models.
     state_blocks: usize,
 
-    /// Metrics
-    pub num_prefix_cache_hits: u64,
-    pub num_prefix_cache_misses: u64,
-    pub hit_size_count: u64,
+    /// Prefix-cache lookup statistics, recorded via `record_prefix_lookup`.
+    stats: PrefixCacheStats,
+}
+
+/// Prefix-cache lookup counters. A lookup is a hit when any prefix tokens were
+/// cached (in HBM, in flight, or in a spillover tier).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PrefixCacheStats {
+    pub hits: u64,
+    pub misses: u64,
+    /// Sum of cached prefix lengths (tokens) over all lookups.
     pub hit_size_sum: u64,
+    /// Number of lookups (hits + misses).
+    pub lookups: u64,
+}
+
+impl PrefixCacheStats {
+    pub fn hit_rate(&self) -> f64 {
+        let n = self.hits + self.misses;
+        if n == 0 {
+            0.0
+        } else {
+            self.hits as f64 / n as f64
+        }
+    }
+
+    /// Mean cached prefix length per lookup, in tokens.
+    pub fn mean_hit_size(&self) -> f64 {
+        if self.lookups == 0 {
+            0.0
+        } else {
+            self.hit_size_sum as f64 / self.lookups as f64
+        }
+    }
+}
+
+impl std::ops::AddAssign for PrefixCacheStats {
+    fn add_assign(&mut self, o: Self) {
+        self.hits += o.hits;
+        self.misses += o.misses;
+        self.hit_size_sum += o.hit_size_sum;
+        self.lookups += o.lookups;
+    }
 }
 
 impl KVCacheManager {
-    /// Create a new KV cache manager with no spillover hierarchy.
+    /// Create a manager over `kv_cache_capacity` bytes of HBM with no
+    /// spillover hierarchy. `kv_bytes_at(t)` is the model's KV footprint of a
+    /// `t`-token sequence; `per_seq_state_bytes` is the model's fixed
+    /// per-sequence state.
     pub fn new(
         kv_cache_capacity: u64,
         block_size: u32,
-        kv_cache_bytes_per_token: u64,
+        kv_bytes_at: impl Fn(u32) -> u64 + Send + Sync + 'static,
         per_seq_state_bytes: u64,
         enable_prefix_caching: bool,
     ) -> Self {
-        let bytes_per_block = block_size as u64 * kv_cache_bytes_per_token;
-        let total_blocks = (kv_cache_capacity / bytes_per_block) as u32;
+        let bytes_per_block = kv_bytes_at(block_size);
+        let total_blocks = kv_cache_capacity.checked_div(bytes_per_block).unwrap_or(0) as u32;
         // Fixed per-sequence state (Mamba/GDN) padded up to a whole number of
-        // attention-sized blocks, vLLM-style. Held for the sequence's lifetime.
+        // blocks, vLLM-style. Held for the sequence's lifetime.
         let state_blocks = if bytes_per_block == 0 {
             0
         } else {
             per_seq_state_bytes.div_ceil(bytes_per_block) as usize
         };
 
-        let blocks = (0..total_blocks).map(Block::new).collect();
+        let blocks = vec![Block::default(); total_blocks as usize];
         let free_blocks = (0..total_blocks).collect();
 
         Self {
             block_size,
+            kv_bytes_at: Box::new(kv_bytes_at),
+            bytes_per_block,
             total_blocks,
             blocks,
             free_blocks,
@@ -208,13 +266,24 @@ impl KVCacheManager {
             leader_joiners: HashMap::new(),
             in_flight_cache: HashMap::new(),
             joiner_to_leader: HashMap::new(),
-            kv_cache_bytes_per_token,
             state_blocks,
-            num_prefix_cache_hits: 0,
-            num_prefix_cache_misses: 0,
-            hit_size_count: 0,
-            hit_size_sum: 0,
+            stats: PrefixCacheStats::default(),
         }
+    }
+
+    /// Attach a spillover hierarchy. Tier ordering is closest-to-HBM first.
+    pub fn with_tiers(mut self, tiers: &[KVTier]) -> Self {
+        self.tiers = tiers
+            .iter()
+            .map(|t| {
+                let capacity_blocks = t
+                    .capacity_bytes
+                    .checked_div(self.bytes_per_block)
+                    .unwrap_or(0) as u32;
+                SpilloverTier::new(capacity_blocks, t.bandwidth_to_hbm)
+            })
+            .collect();
+        self
     }
 
     /// Fixed blocks reserved per running sequence for length-independent state.
@@ -222,25 +291,37 @@ impl KVCacheManager {
         self.state_blocks
     }
 
-    /// Attach a spillover hierarchy. Tier ordering is closest-to-HBM first.
-    pub fn with_tiers(mut self, tiers: &[KVTier]) -> Self {
-        let bytes_per_block = self.block_size as u64 * self.kv_cache_bytes_per_token;
-        self.tiers = tiers
-            .iter()
-            .map(|t| {
-                let capacity_blocks = if bytes_per_block == 0 {
-                    0
-                } else {
-                    (t.capacity_bytes / bytes_per_block) as u32
-                };
-                SpilloverTier::new(capacity_blocks, t.bandwidth_to_hbm)
-            })
-            .collect();
-        self
+    /// Bytes per block: the KV footprint of a `block_size`-token sequence.
+    pub fn bytes_per_block(&self) -> u64 {
+        self.bytes_per_block
     }
 
-    pub fn num_tiers(&self) -> usize {
-        self.tiers.len()
+    /// KV bytes of a `tokens`-token sequence, per the model's curve.
+    pub fn kv_bytes_for_tokens(&self, tokens: u32) -> u64 {
+        (self.kv_bytes_at)(tokens)
+    }
+
+    /// Content blocks a sequence of `tokens` tokens occupies (state blocks
+    /// excluded).
+    pub fn content_blocks_for_tokens(&self, tokens: u32) -> usize {
+        if self.bytes_per_block == 0 {
+            return 0;
+        }
+        (self.kv_bytes_at)(tokens).div_ceil(self.bytes_per_block) as usize
+    }
+
+    /// Blocks a request must hold once it has `total_tokens` tokens of context:
+    /// the fixed per-sequence state plus the content blocks.
+    pub fn blocks_for_context(&self, total_tokens: u32) -> usize {
+        self.state_blocks + self.content_blocks_for_tokens(total_tokens)
+    }
+
+    /// New blocks `request` needs to grow its context by `num_new_tokens`
+    /// tokens beyond `num_computed_tokens`, given what it already holds.
+    pub fn blocks_needed(&self, request: &Request, num_new_tokens: u32) -> usize {
+        let total_tokens = request.num_computed_tokens + num_new_tokens;
+        self.blocks_for_context(total_tokens)
+            .saturating_sub(request.kv_blocks.len())
     }
 
     /// Push a hash down through the spillover hierarchy starting at tier 0.
@@ -265,8 +346,8 @@ impl KVCacheManager {
         }
     }
 
-    /// Try to allocate blocks for a request.
-    /// Returns Some(Vec<BlockId>) if successful, None if insufficient blocks.
+    /// Allocate the blocks `request` needs to grow by `num_tokens` positions.
+    /// `None` if there are not enough free blocks.
     pub fn allocate_blocks(&mut self, request: &Request, num_tokens: u32) -> Option<Vec<BlockId>> {
         self.allocate_blocks_inner(request, num_tokens, /*publish_to_hbm=*/ true)
     }
@@ -306,8 +387,22 @@ impl KVCacheManager {
         num_tokens: u32,
         publish_to_hbm: bool,
     ) -> Option<Vec<BlockId>> {
-        let blocks_needed = self.calculate_blocks_needed(request, num_tokens);
-        let hashes = request.get_prompt_block_hashes();
+        let blocks_needed = self.blocks_needed(request, num_tokens);
+        let hashes = request.prompt_block_hashes.as_slice();
+
+        // The i-th block allocated in this call continues the request's
+        // existing allocation. Its index into the prompt hashes must skip the
+        // per-sequence state blocks and the content blocks already held —
+        // otherwise an incremental (decode-step) allocation looks up hash 0
+        // and aliases the request's own first prompt block.
+        let state_blocks = self.state_blocks;
+        let already_allocated = request.kv_blocks.len();
+        let hash_at = |i: usize| {
+            (already_allocated + i)
+                .checked_sub(state_blocks)
+                .and_then(|idx| hashes.get(idx))
+                .copied()
+        };
 
         // Pass 1: decide for each requested block whether to ref an
         // existing block (HBM-resident or already in-flight for someone
@@ -320,7 +415,7 @@ impl KVCacheManager {
         let mut decisions: Vec<Decision> = Vec::with_capacity(blocks_needed);
         let mut fresh_needed = 0usize;
         for i in 0..blocks_needed {
-            let dec = match hashes.get(i).copied() {
+            let dec = match hash_at(i) {
                 Some(h) if self.enable_prefix_caching => {
                     if let Some(&block_id) = self.prefix_cache.get(&h) {
                         Decision::RefExisting(block_id)
@@ -352,11 +447,10 @@ impl KVCacheManager {
             match decision {
                 Decision::Fresh => {
                     let block_id = self.free_blocks.pop().unwrap();
-                    let evicted_hash =
-                        self.blocks[block_id as usize].allocate(hashes.get(i).cloned());
+                    let evicted_hash = self.blocks[block_id as usize].allocate(hash_at(i));
                     evicted_hashes.extend(evicted_hash);
                     allocated.push(block_id);
-                    if let Some(&h) = hashes.get(i) {
+                    if let Some(h) = hash_at(i) {
                         newly_allocated.push((h, block_id));
                     }
                 }
@@ -397,25 +491,10 @@ impl KVCacheManager {
         Some(allocated)
     }
 
-    /// Calculate how many new blocks are needed for a request
-    fn calculate_blocks_needed(&self, request: &Request, num_new_tokens: u32) -> usize {
-        let total_tokens = request.num_computed_tokens + num_new_tokens;
-        // Growing attention blocks + a fixed per-sequence state reservation
-        // (zero for pure-attention models). The state term is constant in
-        // sequence length, so once reserved it cancels against kv_blocks.len()
-        // on subsequent (incremental) calls and only attention blocks grow.
-        let total_blocks_needed =
-            self.state_blocks + total_tokens.div_ceil(self.block_size) as usize;
-        total_blocks_needed.saturating_sub(request.kv_blocks.len())
-    }
-
-    /// Free blocks from a request (due to preemption or completion)
+    /// Free blocks from a request (due to preemption or completion).
     pub fn free_blocks(&mut self, block_ids: &[BlockId]) {
         for &block_id in block_ids {
-            let block = &mut self.blocks[block_id as usize];
-            block.release();
-
-            if block.is_free {
+            if self.blocks[block_id as usize].release() {
                 self.free_blocks.push(block_id);
             }
         }
@@ -429,7 +508,11 @@ impl KVCacheManager {
         self.total_blocks as usize
     }
 
+    /// Fraction of blocks in use; 0 when the cache has no blocks.
     pub fn utilization(&self) -> f64 {
+        if self.total_blocks == 0 {
+            return 0.0;
+        }
         1.0 - (self.free_blocks.len() as f64 / self.total_blocks as f64)
     }
 
@@ -437,14 +520,16 @@ impl KVCacheManager {
     /// Walks the request's incremental block hashes from the start; for each
     /// block, records whether it lives in HBM, is currently in flight on
     /// behalf of another request, or sits in a spillover tier. Stops at the
-    /// first block that's nowhere.
-    pub fn peek_prefix_cache(&mut self, request: &Request) -> PrefixCacheLookup {
+    /// first block that's nowhere. Does not touch the lookup statistics; call
+    /// `record_prefix_lookup` when the lookup is acted on.
+    pub fn peek_prefix_cache(&self, request: &Request) -> PrefixCacheLookup {
         let n_tiers = self.tiers.len();
         let mut lookup = PrefixCacheLookup {
             total_cached_tokens: 0,
             hbm_tokens: 0,
             in_flight_tokens: 0,
             promote_tokens_per_tier: vec![0u32; n_tiers],
+            promote_bytes_per_tier: vec![0u64; n_tiers],
             join_leader: None,
         };
 
@@ -452,12 +537,7 @@ impl KVCacheManager {
             return lookup;
         }
 
-        let block_hashes = request.get_prompt_block_hashes();
-        if block_hashes.is_empty() {
-            return lookup;
-        }
-
-        for &hash in block_hashes {
+        for (k, &hash) in request.prompt_block_hashes.iter().enumerate() {
             if self.prefix_cache.contains_key(&hash) {
                 lookup.hbm_tokens += self.block_size;
                 lookup.total_cached_tokens += self.block_size;
@@ -469,16 +549,13 @@ impl KVCacheManager {
                 lookup.join_leader = Some(entry.leader_id.clone());
                 continue;
             }
-            let mut found_in_tier: Option<usize> = None;
-            for (idx, tier) in self.tiers.iter().enumerate() {
-                if tier.contains(hash) {
-                    found_in_tier = Some(idx);
-                    break;
-                }
-            }
-            match found_in_tier {
+            match self.tiers.iter().position(|tier| tier.contains(hash)) {
                 Some(idx) => {
+                    let start = k as u32 * self.block_size;
+                    let end = start + self.block_size;
                     lookup.promote_tokens_per_tier[idx] += self.block_size;
+                    lookup.promote_bytes_per_tier[idx] +=
+                        (self.kv_bytes_at)(end).saturating_sub((self.kv_bytes_at)(start));
                     lookup.total_cached_tokens += self.block_size;
                 }
                 None => break,
@@ -488,42 +565,24 @@ impl KVCacheManager {
         lookup
     }
 
-    /// Compatibility shim: returns the total cached prefix length in tokens
-    /// (HBM + spillover) and updates hit/miss counters.
-    pub fn query_prefix_cache(&mut self, request: &Request) -> u32 {
-        let lookup = self.peek_prefix_cache(request);
+    /// Record a prefix-cache lookup in the hit/miss statistics.
+    pub fn record_prefix_lookup(&mut self, lookup: &PrefixCacheLookup) {
         let tokens = lookup.total_cached_tokens;
-        self.hit_size_count += 1;
-        self.hit_size_sum += tokens as u64;
+        self.stats.lookups += 1;
+        self.stats.hit_size_sum += tokens as u64;
         if tokens == 0 {
-            self.num_prefix_cache_misses += 1;
+            self.stats.misses += 1;
         } else {
-            self.num_prefix_cache_hits += 1;
+            self.stats.hits += 1;
         }
-        tokens
     }
 
-    /// Time (seconds) the promotion described by `lookup` would take if it
-    /// were the *only* transfer in flight. Used as a baseline; the actual
-    /// time can be longer when other transfers contend for the same tier
-    /// bandwidth (see `advance_transfers`).
-    pub fn promotion_time(&self, lookup: &PrefixCacheLookup) -> f64 {
-        let mut t = 0.0;
-        for (idx, &tokens) in lookup.promote_tokens_per_tier.iter().enumerate() {
-            if tokens == 0 {
-                continue;
-            }
-            let bytes = tokens as u64 * self.kv_cache_bytes_per_token;
-            let bw = self.tiers[idx].bandwidth_to_hbm();
-            if bw > 0.0 {
-                t += bytes as f64 / bw;
-            }
-        }
-        t
+    pub fn prefix_cache_stats(&self) -> PrefixCacheStats {
+        self.stats
     }
 
     /// Begin tracking an in-flight transfer for `request_id`. Per-tier byte
-    /// counts come from `lookup.promote_tokens_per_tier`; each non-zero tier
+    /// counts come from `lookup.promote_bytes_per_tier`; each non-zero tier
     /// gets a submission on its `Link` (which divides bandwidth across all
     /// its in-flight transfers). The `in_flight_cache` entries are populated
     /// at reservation time by `reserve_blocks_for_transfer`; this method only
@@ -531,23 +590,22 @@ impl KVCacheManager {
     pub fn start_transfer(
         &mut self,
         request_id: String,
-        _prompt_block_hashes: &[u64],
         lookup: &PrefixCacheLookup,
         current_time: f64,
     ) {
         let mut active_tiers = 0u32;
-        for (i, &tokens) in lookup.promote_tokens_per_tier.iter().enumerate() {
-            if tokens == 0 {
+        for (i, &bytes) in lookup.promote_bytes_per_tier.iter().enumerate() {
+            if bytes == 0 {
                 continue;
             }
-            let bytes = tokens as u64 * self.kv_cache_bytes_per_token;
             self.tiers[i]
                 .link
                 .submit(request_id.clone(), bytes, current_time);
             active_tiers += 1;
         }
         if active_tiers > 0 {
-            self.leader_active_tiers.insert(request_id.clone(), active_tiers);
+            self.leader_active_tiers
+                .insert(request_id.clone(), active_tiers);
             self.leader_joiners.insert(request_id, Vec::new());
         }
     }
@@ -606,29 +664,24 @@ impl KVCacheManager {
         }
         // Tiers are modelled as serial in the cost projection: the request
         // must drain on each tier it has bytes on, and we sum those times.
-        let mut t = 0.0;
-        for tier in &self.tiers {
-            t += tier.link.estimate_remaining(leader);
-        }
-        t
+        self.tiers
+            .iter()
+            .map(|tier| tier.link.estimate_remaining(leader))
+            .sum()
     }
 
-    pub fn num_in_flight_transfers(&self) -> usize {
-        self.leader_active_tiers.len()
-    }
-
-    /// Inspect a block's current ref count. Primarily for tests.
-    pub fn block_ref_count(&self, block_id: BlockId) -> u32 {
+    #[cfg(test)]
+    pub(crate) fn block_ref_count(&self, block_id: BlockId) -> u32 {
         self.blocks[block_id as usize].ref_count
     }
 
-    /// Whether a hash is currently resident in HBM.
-    pub fn hbm_contains(&self, hash: u64) -> bool {
+    #[cfg(test)]
+    fn hbm_contains(&self, hash: u64) -> bool {
         self.prefix_cache.contains_key(&hash)
     }
 
-    /// Whether a hash is currently in flight (being promoted).
-    pub fn in_flight_contains(&self, hash: u64) -> bool {
+    #[cfg(test)]
+    fn in_flight_contains(&self, hash: u64) -> bool {
         self.in_flight_cache.contains_key(&hash)
     }
 }
@@ -643,7 +696,7 @@ mod tests {
 
     #[test]
     fn test_kv_cache_manager_creation() {
-        let manager = KVCacheManager::new(16000, 16, 100, 0, false);
+        let manager = KVCacheManager::new(16000, 16, |t| 100 * t as u64, 0, false);
         assert_eq!(manager.block_size, 16);
         assert_eq!(manager.total_blocks, 10);
         assert_eq!(manager.num_free_blocks(), 10);
@@ -651,8 +704,45 @@ mod tests {
     }
 
     #[test]
+    fn content_blocks_follow_the_kv_curve() {
+        // Linear curve: exactly ceil(t / block_size).
+        let m = KVCacheManager::new(16000, 16, |t| 100 * t as u64, 0, false);
+        assert_eq!(m.bytes_per_block(), 1600);
+        assert_eq!(m.content_blocks_for_tokens(0), 0);
+        assert_eq!(m.content_blocks_for_tokens(1), 1);
+        assert_eq!(m.content_blocks_for_tokens(16), 1);
+        assert_eq!(m.content_blocks_for_tokens(17), 2);
+        assert_eq!(m.content_blocks_for_tokens(160), 10);
+        // Windowed curve (32-token sliding window): a long sequence still
+        // occupies only two blocks' worth of bytes.
+        let m = KVCacheManager::new(16000, 16, |t| 100 * t.min(32) as u64, 0, false);
+        assert_eq!(m.content_blocks_for_tokens(1000), 2);
+        // Per-sequence state is padded to whole blocks and added on top.
+        let m = KVCacheManager::new(16000, 16, |t| 100 * t as u64, 1700, false);
+        assert_eq!(m.state_blocks(), 2);
+        assert_eq!(m.blocks_for_context(16), 3);
+    }
+
+    #[test]
+    fn incremental_allocation_does_not_alias_the_first_block() {
+        // Regression: a decode-step allocation must take a fresh block, not
+        // re-reference the request's own hash-0 block.
+        let mut m = KVCacheManager::new(16 * 100 * 100, 16, |t| 100 * t as u64, 0, true);
+        let mut req = create_test_request("a", 64);
+        req.prompt_block_hashes = vec![1, 2, 3, 4];
+        let first = m.allocate_blocks(&req, 64).unwrap();
+        assert_eq!(first.len(), 4);
+        req.kv_blocks.extend(first.iter().copied());
+        req.num_computed_tokens = 64;
+        let next = m.allocate_blocks(&req, 1).unwrap();
+        assert_eq!(next.len(), 1);
+        assert!(!first.contains(&next[0]));
+        assert_eq!(m.num_free_blocks(), 100 - 5);
+    }
+
+    #[test]
     fn test_block_allocation() {
-        let mut manager = KVCacheManager::new(16000, 16, 100, 0, false);
+        let mut manager = KVCacheManager::new(16000, 16, |t| 100 * t as u64, 0, false);
         let mut request = create_test_request("req-1", 32);
 
         let allocated = manager.allocate_blocks(&request, 32);
@@ -673,7 +763,7 @@ mod tests {
 
     #[test]
     fn test_block_allocation_failure() {
-        let mut manager = KVCacheManager::new(1600, 16, 100, 0, false);
+        let mut manager = KVCacheManager::new(1600, 16, |t| 100 * t as u64, 0, false);
         assert_eq!(manager.total_blocks, 1);
 
         let request = create_test_request("req-1", 32);
@@ -683,7 +773,7 @@ mod tests {
 
     #[test]
     fn test_block_free() {
-        let mut manager = KVCacheManager::new(16000, 16, 100, 0, false);
+        let mut manager = KVCacheManager::new(16000, 16, |t| 100 * t as u64, 0, false);
         let request = create_test_request("req-1", 32);
 
         let blocks = manager.allocate_blocks(&request, 32).unwrap();
@@ -696,7 +786,7 @@ mod tests {
 
     #[test]
     fn test_utilization() {
-        let mut manager = KVCacheManager::new(16000, 16, 100, 0, false);
+        let mut manager = KVCacheManager::new(16000, 16, |t| 100 * t as u64, 0, false);
         assert_eq!(manager.utilization(), 0.0);
 
         let request = create_test_request("req-1", 32);
@@ -711,39 +801,43 @@ mod tests {
 
     #[test]
     fn test_prefix_caching() {
-        let mut manager = KVCacheManager::new(16000, 16, 100, 0, true);
+        let mut manager = KVCacheManager::new(16000, 16, |t| 100 * t as u64, 0, true);
 
         let mut request1 = create_test_request("req-1", 16);
         request1.prompt_block_hashes = vec![12345];
 
-        let cached = manager.query_prefix_cache(&request1);
-        assert_eq!(cached, 0);
-        assert_eq!(manager.num_prefix_cache_misses, 1);
+        let lookup = manager.peek_prefix_cache(&request1);
+        manager.record_prefix_lookup(&lookup);
+        assert_eq!(lookup.total_cached_tokens, 0);
+        assert_eq!(manager.stats.misses, 1);
 
         let blocks1 = manager.allocate_blocks(&request1, 16).unwrap();
         request1.kv_blocks.extend(blocks1);
 
         let mut request2 = create_test_request("req-2", 16);
         request2.prompt_block_hashes = vec![12345];
-        let cached = manager.query_prefix_cache(&request2);
-        assert_eq!(cached, 16);
-        assert_eq!(manager.num_prefix_cache_hits, 1);
+        let lookup = manager.peek_prefix_cache(&request2);
+        manager.record_prefix_lookup(&lookup);
+        assert_eq!(lookup.total_cached_tokens, 16);
+        assert_eq!(manager.stats.hits, 1);
 
         let mut request3 = create_test_request("req-3", 16);
         request3.prompt_block_hashes = vec![67890];
-        let cached = manager.query_prefix_cache(&request3);
-        assert_eq!(cached, 0);
-        assert_eq!(manager.num_prefix_cache_misses, 2);
+        let lookup = manager.peek_prefix_cache(&request3);
+        manager.record_prefix_lookup(&lookup);
+        assert_eq!(lookup.total_cached_tokens, 0);
+        assert_eq!(manager.stats.misses, 2);
     }
 
     #[test]
     fn test_spillover_demotion_on_eviction() {
         // 2 HBM blocks, 1 host-RAM tier of 2 blocks.
-        let mut manager = KVCacheManager::new(2 * 16 * 100, 16, 100, 0, true).with_tiers(&[KVTier {
-            name: "host_ram".into(),
-            capacity_bytes: 2 * 16 * 100,
-            bandwidth_to_hbm: 64e9,
-        }]);
+        let mut manager = KVCacheManager::new(2 * 16 * 100, 16, |t| 100 * t as u64, 0, true)
+            .with_tiers(&[KVTier {
+                name: "host_ram".into(),
+                capacity_bytes: 2 * 16 * 100,
+                bandwidth_to_hbm: 64e9,
+            }]);
 
         // Fill HBM with two requests' hashes.
         let mut req_a = create_test_request("a", 16);
@@ -776,61 +870,65 @@ mod tests {
     }
 
     #[test]
-    fn test_promotion_time() {
-        let manager = KVCacheManager::new(16000, 16, 100, 0, true).with_tiers(&[
+    fn test_peek_reports_promotion_bytes_from_kv_curve() {
+        // Two spillover tiers; a nonlinear KV curve (bytes = 100 * t^2 / 16 so
+        // block k costs more than block k-1) checks that promotion bytes are
+        // charged from the curve, not from a per-token constant.
+        let curve = |t: u32| (100.0 * (t as f64).powi(2) / 16.0) as u64;
+        let mut manager = KVCacheManager::new(curve(1024), 16, curve, 0, true).with_tiers(&[
             KVTier {
                 name: "host_ram".into(),
                 capacity_bytes: 1_000_000,
-                bandwidth_to_hbm: 1e10, // 10 GB/s
+                bandwidth_to_hbm: 1e10,
             },
             KVTier {
                 name: "nvme".into(),
                 capacity_bytes: 10_000_000,
-                bandwidth_to_hbm: 1e9, // 1 GB/s
+                bandwidth_to_hbm: 1e9,
             },
         ]);
-
-        let lookup = PrefixCacheLookup {
-            total_cached_tokens: 256,
-            hbm_tokens: 0,
-            in_flight_tokens: 0,
-            promote_tokens_per_tier: vec![128, 128], // 128 tokens from each tier
-            join_leader: None,
-        };
-        // bytes per token = 100 in this manager
-        // tier 0: 128*100 / 1e10 = 1.28e-6
-        // tier 1: 128*100 / 1e9  = 1.28e-5
-        let t = manager.promotion_time(&lookup);
-        let expected = (128.0 * 100.0) / 1e10 + (128.0 * 100.0) / 1e9;
-        assert!((t - expected).abs() < 1e-12);
+        // Hash 1 (tokens 0..16) in tier 0, hash 2 (tokens 16..32) in tier 1.
+        manager.tiers[0].insert(1);
+        manager.tiers[1].insert(2);
+        let mut req = create_test_request("a", 32);
+        req.prompt_block_hashes = vec![1, 2];
+        let lookup = manager.peek_prefix_cache(&req);
+        assert_eq!(lookup.total_cached_tokens, 32);
+        assert_eq!(lookup.promote_tokens_per_tier, vec![16, 16]);
+        assert_eq!(
+            lookup.promote_bytes_per_tier,
+            vec![curve(16) - curve(0), curve(32) - curve(16)]
+        );
     }
 
     #[test]
     fn test_concurrent_transfers_share_bandwidth() {
         // 1 GB/s tier; one transfer of 1 GB should take 1.0s alone, but two
         // concurrent equal-size transfers should each take ~2.0s.
-        let mut manager = KVCacheManager::new(16_000, 16, 100, 0, true).with_tiers(&[KVTier {
-            name: "host_ram".into(),
-            capacity_bytes: 10_000_000_000,
-            bandwidth_to_hbm: 1e9,
-        }]);
+        let mut manager =
+            KVCacheManager::new(16_000, 16, |t| 100 * t as u64, 0, true).with_tiers(&[KVTier {
+                name: "host_ram".into(),
+                capacity_bytes: 10_000_000_000,
+                bandwidth_to_hbm: 1e9,
+            }]);
         let one_gb_in_tokens = 1_000_000_000 / 100; // 10 million tokens at 100 bytes/token
         let lookup = PrefixCacheLookup {
             total_cached_tokens: one_gb_in_tokens,
             hbm_tokens: 0,
             in_flight_tokens: 0,
             promote_tokens_per_tier: vec![one_gb_in_tokens],
+            promote_bytes_per_tier: vec![1_000_000_000],
             join_leader: None,
         };
 
         // First transfer alone: 1 GB / 1 GB/s = 1.0s
-        manager.start_transfer("a".into(), &[], &lookup, 0.0);
+        manager.start_transfer("a".into(), &lookup, 0.0);
         let est_a_alone = manager.estimate_remaining_time("a");
         assert!((est_a_alone - 1.0).abs() < 1e-3);
 
         // Second transfer admitted at the same instant: each gets half
         // bandwidth, so each individually projects 2.0s remaining.
-        manager.start_transfer("b".into(), &[], &lookup, 0.0);
+        manager.start_transfer("b".into(), &lookup, 0.0);
         let est_a_shared = manager.estimate_remaining_time("a");
         let est_b_shared = manager.estimate_remaining_time("b");
         assert!((est_a_shared - 2.0).abs() < 1e-3);
@@ -848,14 +946,14 @@ mod tests {
         let completed = manager.advance_transfers(2.0);
         assert!(completed.contains("a"));
         assert!(completed.contains("b"));
-        assert_eq!(manager.num_in_flight_transfers(), 0);
+        assert_eq!(manager.leader_active_tiers.len(), 0);
     }
 
     #[test]
     fn test_hbm_hit_ref_bumps_existing_block() {
         // Two requests with the same prefix. The second should ref-bump
         // the first one's blocks rather than allocating fresh ones.
-        let mut manager = KVCacheManager::new(16_000, 16, 100, 0, true);
+        let mut manager = KVCacheManager::new(16_000, 16, |t| 100 * t as u64, 0, true);
         let mut a = create_test_request("a", 32);
         a.prompt_block_hashes = vec![1, 2];
         let blocks_a = manager.allocate_blocks(&a, 32).unwrap();
@@ -877,7 +975,7 @@ mod tests {
 
     #[test]
     fn test_shared_blocks_outlive_first_releaser() {
-        let mut manager = KVCacheManager::new(16_000, 16, 100, 0, true);
+        let mut manager = KVCacheManager::new(16_000, 16, |t| 100 * t as u64, 0, true);
         let mut a = create_test_request("a", 16);
         a.prompt_block_hashes = vec![42];
         let blocks_a = manager.allocate_blocks(&a, 16).unwrap();
@@ -907,11 +1005,12 @@ mod tests {
     #[test]
     fn test_in_flight_join_refs_leader_block() {
         // Set up a host-RAM tier and seed a prefix into it.
-        let mut manager = KVCacheManager::new(2 * 16 * 100, 16, 100, 0, true).with_tiers(&[KVTier {
-            name: "host_ram".into(),
-            capacity_bytes: 8 * 16 * 100,
-            bandwidth_to_hbm: 1e9,
-        }]);
+        let mut manager = KVCacheManager::new(2 * 16 * 100, 16, |t| 100 * t as u64, 0, true)
+            .with_tiers(&[KVTier {
+                name: "host_ram".into(),
+                capacity_bytes: 8 * 16 * 100,
+                bandwidth_to_hbm: 1e9,
+            }]);
         let prefix_hash = 0x1234u64;
         // Get prefix_hash into host_ram by allocating then evicting.
         let mut seed = create_test_request("seed", 16);
@@ -932,7 +1031,7 @@ mod tests {
         let lookup_l = manager.peek_prefix_cache(&leader);
         assert!(lookup_l.needs_promotion());
         let leader_blocks = manager.reserve_blocks_for_transfer(&leader, 16).unwrap();
-        manager.start_transfer("leader".into(), &leader.prompt_block_hashes, &lookup_l, 0.0);
+        manager.start_transfer("leader".into(), &lookup_l, 0.0);
         let free_after_leader = manager.num_free_blocks();
         assert_eq!(manager.block_ref_count(leader_blocks[0]), 1);
         assert!(manager.in_flight_contains(prefix_hash));
@@ -955,11 +1054,12 @@ mod tests {
 
     #[test]
     fn test_publish_after_transfer_makes_prefix_hbm_resident() {
-        let mut manager = KVCacheManager::new(16_000, 16, 100, 0, true).with_tiers(&[KVTier {
-            name: "host_ram".into(),
-            capacity_bytes: 16_000,
-            bandwidth_to_hbm: 1e9,
-        }]);
+        let mut manager =
+            KVCacheManager::new(16_000, 16, |t| 100 * t as u64, 0, true).with_tiers(&[KVTier {
+                name: "host_ram".into(),
+                capacity_bytes: 16_000,
+                bandwidth_to_hbm: 1e9,
+            }]);
         let mut req = create_test_request("a", 16);
         req.prompt_block_hashes = vec![0xC0FFE];
         // Manually plant the hash in spillover to simulate a prior eviction.
@@ -968,7 +1068,7 @@ mod tests {
         let lookup = manager.peek_prefix_cache(&req);
         assert!(lookup.needs_promotion());
         let blocks = manager.reserve_blocks_for_transfer(&req, 16).unwrap();
-        manager.start_transfer("a".into(), &req.prompt_block_hashes, &lookup, 0.0);
+        manager.start_transfer("a".into(), &lookup, 0.0);
         assert!(manager.in_flight_contains(0xC0FFE));
         assert!(!manager.hbm_contains(0xC0FFE));
 
@@ -981,7 +1081,7 @@ mod tests {
 
     #[test]
     fn test_lookup_hbm_only_when_no_tiers() {
-        let mut manager = KVCacheManager::new(16000, 16, 100, 0, true);
+        let mut manager = KVCacheManager::new(16000, 16, |t| 100 * t as u64, 0, true);
         let mut req = create_test_request("a", 16);
         req.prompt_block_hashes = vec![100];
         let blocks = manager.allocate_blocks(&req, 16).unwrap();

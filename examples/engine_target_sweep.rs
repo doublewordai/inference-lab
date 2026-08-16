@@ -21,9 +21,10 @@
 //!     fantasy column priced from the optimistic roofline otherwise wins)
 //!   - GoodputBudget   (homogeneous width, bank-mean acceptance signal)
 //!   - GatedAggregate  (per-sequence signal, one batch-uniform width -- the
-//!                      engine-realizable aggregation)
+//!     engine-realizable aggregation)
 //!   - GatedBudget     (per-sequence signal, ragged per-sequence widths --
-//!                      the unconstrained upper reference)
+//!     the unconstrained upper reference)
+//!
 //! and reports GatedAggregate's headroom over the best fixed k.
 //!
 //! The scenario comes entirely from the config file: acceptance is the real
@@ -39,24 +40,26 @@
 //! Run: `cargo run --release --example engine_target_sweep --no-default-features`
 //!
 //! Config selection: `SWEEP_CONFIG=<path>` env var, else the first CLI arg,
-//! else the default Llama config. The Part 1 validation tables (measured
+//! else the default Llama config; `SWEEP_HARDWARE=<name>` picks the
+//! `[hardware.<name>]` entry (default `gh200-96`). The Part 1 validation tables (measured
 //! ShareGPT envelope, native-k acceptance) are ground truth for the default
 //! Llama/EAGLE3 deployment only and are skipped for any other config; the
 //! bank acceptance summary and Part 2 target sweep run for every config.
 
 use inference_lab::compute::MeasuredCostTable;
 use inference_lab::config::{
-    AcceptanceModel, ClusterSpec, Config, GammaPolicy, SpeculativeConfig, TraceBank,
+    AcceptanceModel, Deployment, GammaPolicy, ModelConfig, SpeculativeConfig, TraceBank,
 };
 use inference_lab::request::Request;
-use inference_lab::simulation::{simulate_closed_loop, Engine, Topology};
+use inference_lab::simulation::{simulate_closed_loop, ClosedLoop, Engine, Topology};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use rand_distr::{Distribution, LogNormal};
 use rayon::prelude::*;
 use std::collections::BTreeMap;
 
-const DEFAULT_CONFIG_PATH: &str = "configs/llama31-8b-eagle3-gh200.toml";
+const DEFAULT_CONFIG_PATH: &str = "configs/llama-3.1-8b-instruct.toml";
+const DEFAULT_HARDWARE: &str = "gh200-96";
 
 /// `SWEEP_CONFIG` env var, else first CLI arg, else the default Llama config.
 fn config_path() -> String {
@@ -84,8 +87,13 @@ const MEASURED_TPS: [[f64; 7]; 5] = [
 // Realized per-rung mean (ISL, OSL) of the bench's ShareGPT sample, read
 // from the bench jsonl metadata (total_input_tokens / completed etc. of the
 // k=0 legs). The bench reuses one prompt sample per rung across k.
-const RUNG_LENS: [(f64, f64); 5] =
-    [(304.0, 211.0), (304.0, 211.0), (316.0, 211.0), (289.0, 189.0), (313.0, 190.0)];
+const RUNG_LENS: [(f64, f64); 5] = [
+    (304.0, 211.0),
+    (304.0, 211.0),
+    (316.0, 211.0),
+    (289.0, 189.0),
+    (313.0, 190.0),
+];
 // ShareGPT length spread: sigma of log-length, assumed 1.0 for both ISL and
 // OSL. Cross-checked against the bench's mean/median E2E ratio at conc=1
 // (1183ms/695ms -> sigma_log(OSL) ~ 1.04).
@@ -93,18 +101,17 @@ const SIGMA_LOG: f64 = 1.0;
 // Engine-measured native-k acceptance, EXCLUDING the bonus token: the bench
 // jsonl's accept_length - 1, averaged over the five concurrencies of each
 // static-k leg (same job). Conc-variation is < +/-1%.
-const NATIVE_ACCEPT: [(u32, f64); 6] =
-    [(1, 0.508), (2, 0.763), (3, 0.887), (4, 0.963), (6, 1.035), (8, 1.057)];
+const NATIVE_ACCEPT: [(u32, f64); 6] = [
+    (1, 0.508),
+    (2, 0.763),
+    (3, 0.887),
+    (4, 0.963),
+    (6, 1.035),
+    (8, 1.057),
+];
 
-fn topology(cfg: &Config) -> Topology {
-    let cluster = ClusterSpec {
-        hardware: cfg.hardware.clone(),
-        parallel: cfg.parallel.clone(),
-        comms: None,
-        num_workers: 1,
-        node: 0,
-    };
-    Topology::aggregated(cluster, cfg.model.clone(), cfg.scheduler.clone()).expect("topo")
+fn topology(cfg: &Deployment) -> Topology {
+    Topology::aggregated(cfg.cluster(), cfg.model.clone(), cfg.scheduler.clone()).expect("topo")
 }
 
 #[derive(Clone, Copy)]
@@ -139,23 +146,30 @@ fn spec_for(p: Policy, base: &SpeculativeConfig) -> Option<SpeculativeConfig> {
 
 /// -> (decode tokens/s, mean decode batch). Pure-decode target: fixed-shape
 /// requests arriving prefilled, steady-state window.
-fn run(cfg: &Config, conc: u32, isl: u32, osl: u32, p: Policy) -> (f64, f64) {
+fn run(cfg: &Deployment, conc: u32, isl: u32, osl: u32, p: Policy) -> (f64, f64) {
     let base = cfg.speculative.as_ref().expect("config has [speculative]");
     let total = (conc * 2).max(1000);
     let warmup = conc / 2;
     let res = simulate_closed_loop(
         topology(cfg),
-        conc,
-        isl,
-        osl,
-        total,
-        warmup,
-        spec_for(p, base),
-        7,
-        true, // skip_prefill: pure-decode target, prefill not competing
+        &ClosedLoop {
+            concurrency: conc,
+            isl,
+            osl,
+            num_completions: total,
+            warmup_completions: warmup,
+            spec: spec_for(p, base),
+            seed: 7,
+            skip_prefill: true, // pure-decode target, prefill not competing
+        },
     )
     .expect("run");
-    let dbatch = res.mean_batch_per_pool.first().copied().flatten().unwrap_or(0.0);
+    let dbatch = res
+        .mean_batch_per_pool
+        .first()
+        .copied()
+        .flatten()
+        .unwrap_or(0.0);
     (res.throughput() * osl as f64, dbatch)
 }
 
@@ -169,7 +183,7 @@ fn run(cfg: &Config, conc: u32, isl: u32, osl: u32, p: Policy) -> (f64, f64) {
 /// response-transfer + next-request turnaround per completion — so the sim
 /// is expected to sit slightly above the bench at high churn.
 fn run_validation(
-    cfg: &Config,
+    cfg: &Deployment,
     conc: u32,
     k: u32,
     mean_isl: f64,
@@ -178,9 +192,15 @@ fn run_validation(
     seed: u64,
 ) -> f64 {
     let base = cfg.speculative.as_ref().expect("config has [speculative]");
-    let p = if k == 0 { Policy::NoSpec } else { Policy::Fixed(k) };
+    let p = if k == 0 {
+        Policy::NoSpec
+    } else {
+        Policy::Fixed(k)
+    };
     let mut engine = Engine::new(topology(cfg));
-    engine.enable_speculative(spec_for(p, base).expect("spec"), seed);
+    engine
+        .enable_speculative(spec_for(p, base).expect("spec"), seed)
+        .expect("enable speculative decoding");
 
     let isl_dist =
         LogNormal::new(mean_isl.ln() - SIGMA_LOG * SIGMA_LOG / 2.0, SIGMA_LOG).expect("isl dist");
@@ -240,11 +260,22 @@ fn main() {
     // to the default Llama/EAGLE3 GH200 deployment; for any other config the
     // validation part is skipped rather than compared against the wrong bench.
     let is_default_config = config_path == DEFAULT_CONFIG_PATH;
-    let cfg = Config::from_file(&config_path).expect("config");
+    let cfg = ModelConfig::from_file(&config_path)
+        .expect("config")
+        .deployment(
+            std::env::var("SWEEP_HARDWARE")
+                .ok()
+                .as_deref()
+                .or(Some(DEFAULT_HARDWARE)),
+        )
+        .expect("hardware entry");
     let base = cfg.speculative.as_ref().expect("config has [speculative]");
     let gamma_max = base.gamma;
 
-    let mc = base.measured_cost.as_ref().expect("config has measured_cost");
+    let mc = base
+        .measured_cost
+        .as_ref()
+        .expect("config has measured_cost");
     let table = MeasuredCostTable::load(&mc.path).expect("measured cost table");
     let bank_path = match &base.acceptance {
         AcceptanceModel::TraceRounds { path } => path.clone(),
@@ -266,8 +297,8 @@ fn main() {
     println!("Engine-target sweep + validation: {}", cfg.model_name());
     println!("config:        {config_path}");
     println!(
-        "{} TP{}, gamma_max={gamma_max} c_draft={}",
-        cfg.hardware.name, cfg.parallel.tp, base.draft_cost_frac
+        "{} TP{}, gamma_max={gamma_max} drafter={:?}",
+        cfg.hardware.name, cfg.parallel.tp, base.drafter
     );
     println!("acceptance:    trace_rounds ({bank_path})");
     println!(
@@ -293,7 +324,10 @@ fn main() {
     // g=8.
     // -----------------------------------------------------------------
     println!("E[accepted | g] (excl. bonus): trace bank vs engine native-k");
-    println!("{:>3} {:>10} {:>10} {:>8}", "g", "bank", "native-k", "d(1+E)%");
+    println!(
+        "{:>3} {:>10} {:>10} {:>8}",
+        "g", "bank", "native-k", "d(1+E)%"
+    );
     // NATIVE_ACCEPT is the default Llama deployment's bench; for other
     // configs only the bank column is meaningful.
     let native: BTreeMap<u32, f64> = if is_default_config {
@@ -358,7 +392,7 @@ fn main() {
 
 /// Part 1: sim vs the measured ShareGPT static-k envelope of the default
 /// Llama/EAGLE3 GH200 deployment (MEASURED_TPS, calib-5175604).
-fn validate_against_llama_bench(cfg: &Config) {
+fn validate_against_llama_bench(cfg: &Deployment) {
     let val_tasks: Vec<(usize, usize)> = (0..VAL_CONCS.len())
         .flat_map(|ci| (0..VAL_KS.len()).map(move |ki| (ci, ki)))
         .collect();
@@ -391,13 +425,13 @@ fn validate_against_llama_bench(cfg: &Config) {
     println!("{}", "-".repeat(14 + 9 * VAL_KS.len()));
     for (ci, &conc) in VAL_CONCS.iter().enumerate() {
         print!("{conc:>5} {:>6} |", "sim");
-        for ki in 0..VAL_KS.len() {
-            print!(" {:>8.0}", sim_tps[ci][ki]);
+        for v in sim_tps[ci].iter().take(VAL_KS.len()) {
+            print!(" {v:>8.0}");
         }
         println!();
         print!("{:>5} {:>6} |", "", "meas");
-        for ki in 0..VAL_KS.len() {
-            print!(" {:>8.0}", MEASURED_TPS[ci][ki]);
+        for v in MEASURED_TPS[ci].iter().take(VAL_KS.len()) {
+            print!(" {v:>8.0}");
         }
         println!();
         print!("{:>5} {:>6} |", "", "resid");
@@ -431,7 +465,7 @@ fn validate_against_llama_bench(cfg: &Config) {
 
 /// Part 2: the decode-pool target sweep (pure decode, prefilled arrivals,
 /// the cost table's native calibration shape).
-fn target_sweep(cfg: &Config, table: &MeasuredCostTable, gamma_max: u32, fixed: &[u32]) {
+fn target_sweep(cfg: &Deployment, table: &MeasuredCostTable, gamma_max: u32, fixed: &[u32]) {
     let isl = 1024u32;
     let osl = 256u32;
     let concs = [1u32, 2, 4, 8, 16, 32, 64, 128, 256];
@@ -518,10 +552,18 @@ fn target_sweep(cfg: &Config, table: &MeasuredCostTable, gamma_max: u32, fixed: 
         }
         let (bud, agg, gat) = (row[col_bud], row[col_agg], row[col_gat]);
         let d = 100.0 * (agg - best) / best;
-        let label = if bestk == 0 { "nospec".into() } else { format!("k{bestk}") };
+        let label = if bestk == 0 {
+            "nospec".into()
+        } else {
+            format!("k{bestk}")
+        };
         let conc_s = format!(
             "{conc}{}",
-            if provisional.contains_key(&conc) { "*" } else { "" }
+            if provisional.contains_key(&conc) {
+                "*"
+            } else {
+                ""
+            }
         );
         println!(
             "{conc_s:>5} {:>7.1} | {ns:>8.0} | {label:>5} {best:>7.0} | {bud:>8.0} {agg:>9.0} {gat:>8.0} | {d:>+7.2}",
@@ -546,9 +588,8 @@ fn target_sweep(cfg: &Config, table: &MeasuredCostTable, gamma_max: u32, fixed: 
 trait ModelName {
     fn model_name(&self) -> &str;
 }
-impl ModelName for Config {
+impl ModelName for Deployment {
     fn model_name(&self) -> &str {
-        use inference_lab::config::ModelCosts;
-        self.model.name()
+        self.model.name.as_str()
     }
 }

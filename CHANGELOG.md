@@ -1,5 +1,60 @@
 # Changelog
 
+## [0.10.0](https://github.com/doublewordai/inference-lab/compare/inference-lab-v0.9.0...inference-lab-v0.10.0) (2026-08-12)
+
+
+### Features
+
+* OpenAI compat resume target ([#72](https://github.com/doublewordai/inference-lab/issues/72)) ([0654c03](https://github.com/doublewordai/inference-lab/commit/0654c037d9cb7c4a5c0cff9cd95b887c5f430115))
+
+## [0.9.0](https://github.com/doublewordai/inference-lab/compare/inference-lab-v0.8.2...inference-lab-v0.9.0) (2026-08-11)
+
+
+### Features
+
+* fault injection for midstream error testing ([#69](https://github.com/doublewordai/inference-lab/issues/69)) ([c817058](https://github.com/doublewordai/inference-lab/commit/c817058f36fc73c6044cb8852f5173fd378aba9c))
+
+## [0.8.2](https://github.com/doublewordai/inference-lab/compare/inference-lab-v0.8.1...inference-lab-v0.8.2) (2026-08-06)
+
+
+### Bug Fixes
+
+* report chat prompt_tokens with simulated template overhead ([#67](https://github.com/doublewordai/inference-lab/issues/67)) ([1601616](https://github.com/doublewordai/inference-lab/commit/16016168a414dfea065b569a270f24ba7bd5c102))
+
+## [0.8.1](https://github.com/doublewordai/inference-lab/compare/inference-lab-v0.8.0...inference-lab-v0.8.1) (2026-07-31)
+
+
+### Bug Fixes
+
+* count tool definitions and tool_calls in serve prompt_tokens ([#64](https://github.com/doublewordai/inference-lab/issues/64)) ([aaa8ce9](https://github.com/doublewordai/inference-lab/commit/aaa8ce90fd7e1180f6acf225729fa32dd17a1072))
+
+## [0.8.0](https://github.com/doublewordai/inference-lab/compare/inference-lab-v0.7.1...inference-lab-v0.8.0) (2026-07-28)
+
+
+### Features
+
+* echo directive ([#62](https://github.com/doublewordai/inference-lab/issues/62)) ([dcc7f2d](https://github.com/doublewordai/inference-lab/commit/dcc7f2d53e70ff4978b1a6ee6be0e7a1217065ab))
+
+## [0.7.1](https://github.com/doublewordai/inference-lab/compare/inference-lab-v0.7.0...inference-lab-v0.7.1) (2026-07-15)
+
+
+### Bug Fixes
+
+* allow content array blocks as input ([#60](https://github.com/doublewordai/inference-lab/issues/60)) ([2e51610](https://github.com/doublewordai/inference-lab/commit/2e516101f20c643b541abb107f3636f31164e033))
+
+## [0.7.0](https://github.com/doublewordai/inference-lab/compare/inference-lab-v0.6.2...inference-lab-v0.7.0) (2026-06-22)
+
+
+### Features
+
+* model KV cache hierarchy, cascade attention, and async promotions ([#44](https://github.com/doublewordai/inference-lab/issues/44)) ([59e7ac1](https://github.com/doublewordai/inference-lab/commit/59e7ac1aad90dd9782bd7271cc7cd7be52af23d7))
+* **spec:** speculative-decoding simulator + calibration package + figure tooling ([#53](https://github.com/doublewordai/inference-lab/issues/53)) ([299a718](https://github.com/doublewordai/inference-lab/commit/299a718fad5124c420392eb7a81d3c3de0153f7d))
+
+
+### Bug Fixes
+
+* **deepseek-v4-pro:** correct per-layer-class counts ([#49](https://github.com/doublewordai/inference-lab/issues/49)) ([5ed8b94](https://github.com/doublewordai/inference-lab/commit/5ed8b94621a4498cebaceba0eb93831598534891))
+
 ## [0.6.2](https://github.com/doublewordai/inference-lab/compare/inference-lab-v0.6.1...inference-lab-v0.6.2) (2026-03-25)
 
 

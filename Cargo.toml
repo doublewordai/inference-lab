@@ -1,6 +1,6 @@
 [package]
 name = "inference-lab"
-version = "0.6.2"
+version = "0.10.0"
 edition = "2021"
 authors = ["Doubleword"]
 description = "High-performance LLM inference simulator for analyzing serving systems"
@@ -9,10 +9,15 @@ repository = "https://github.com/doublewordai/inference-lab"
 readme = "README.md"
 keywords = ["llm", "inference", "simulator", "performance"]
 categories = ["simulation", "wasm"]
-exclude = ["pkg/", ".npmrc", "node_modules/"]
+exclude = ["pkg/", ".npmrc", "node_modules/", "calibration/"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "inference-lab"
+path = "src/main.rs"
+required-features = ["cli"]
 
 [dependencies]
 toml = "0.8"
@@ -33,6 +38,12 @@ axum = { version = "0.8", optional = true }
 tower-http = { version = "0.6", features = ["cors"], optional = true }
 uuid = { version = "1", features = ["v4"], optional = true }
 tokio-stream = { version = "0.1", optional = true }
+# Serve runs its own hyper accept loop (instead of axum::serve) so fault injection can
+# reach the raw TCP socket — see serve::fault (`reset` mode needs SO_LINGER=0).
+hyper = { version = "1", features = ["http1", "http2", "server"], optional = true }
+hyper-util = { version = "0.1", features = ["http1", "http2", "server-auto", "tokio"], optional = true }
+tower = { version = "0.5", features = ["util"], optional = true }
+socket2 = { version = "0.6", optional = true }
 wasm-bindgen = "0.2"
 serde-wasm-bindgen = "0.6"
 js-sys = "0.3"
@@ -46,7 +57,18 @@ rayon = "1"
 [features]
 default = ["cli"]
 cli = ["clap", "env_logger", "tabled", "colored", "tokenizers", "minijinja"]
-serve = ["cli", "tokio", "axum", "tower-http", "uuid", "tokio-stream"]
+serve = [
+    "cli",
+    "tokio",
+    "axum",
+    "tower-http",
+    "uuid",
+    "tokio-stream",
+    "hyper",
+    "hyper-util",
+    "tower",
+    "socket2",
+]
 
 [profile.release]
 opt-level = "s" # Optimize for size in WASM
