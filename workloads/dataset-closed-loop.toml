@@ -1,0 +1,16 @@
+# 10 closed-loop users, 100 requests; prompts from examples/sample_dataset.jsonl.
+
+dataset_path = "examples/sample_dataset.jsonl"
+arrival_pattern = "closed_loop"
+num_concurrent_users = 10
+num_requests = 100
+seed = 42
+
+[input_len_dist]
+type = "fixed"
+value = 100
+
+[output_len_dist]
+type = "lognormal"
+mean = 5.3
+std_dev = 0.8

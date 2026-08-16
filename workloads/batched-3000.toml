@@ -1,0 +1,16 @@
+# all requests at t=0, 3000 requests; median ISL 3328 / OSL 5432 tokens.
+
+arrival_pattern = "batched"
+arrival_rate = 5.0
+num_requests = 3000
+seed = 42
+
+[input_len_dist]
+type = "lognormal"
+mean = 8.11
+std_dev = 0.5
+
+[output_len_dist]
+type = "lognormal"
+mean = 8.6
+std_dev = 0.4
