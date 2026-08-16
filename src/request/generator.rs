@@ -5,7 +5,7 @@
 use super::Request;
 use crate::config::{ArrivalPattern, RateSchedule, WorkloadConfig};
 use crate::dataset::{BatchTokenizerFn, DatasetEntry, UnparsedEntry};
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand::{rngs::StdRng, RngExt, SeedableRng};
 use rand_distr::{Distribution, Exp};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -118,7 +118,7 @@ impl RequestGenerator {
             pending_closed_loop = (0..workload.num_concurrent_users.unwrap_or(0))
                 .map(|_| {
                     if jitter > 0.0 {
-                        rng.gen_range(0.0..jitter)
+                        rng.random_range(0.0..jitter)
                     } else {
                         0.0
                     }
@@ -301,10 +301,10 @@ impl RequestGenerator {
             ArrivalPattern::Poisson => current_time + Exp::new(rate).unwrap().sample(rng),
             ArrivalPattern::Uniform => current_time + 1.0 / rate,
             ArrivalPattern::Burst => {
-                if rng.gen_bool(0.2) {
-                    current_time + rng.gen_range(0.001..0.01)
+                if rng.random_bool(0.2) {
+                    current_time + rng.random_range(0.001..0.01)
                 } else {
-                    current_time + rng.gen_range(0.5..2.0)
+                    current_time + rng.random_range(0.5..2.0)
                 }
             }
             ArrivalPattern::Batched => 0.0,

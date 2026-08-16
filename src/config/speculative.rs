@@ -1,4 +1,4 @@
-use rand::Rng;
+use rand::{Rng, RngExt};
 use serde::Deserialize;
 
 /// How the target accepts a draft. The acceptance model is the knob you vary to
@@ -120,7 +120,7 @@ impl AcceptanceModel {
     pub fn sample_accepted(&self, gamma: u32, rng: &mut impl Rng) -> u32 {
         let mut n = 0;
         for d in 0..gamma as usize {
-            if rng.gen::<f64>() < self.a_d(d) {
+            if rng.random::<f64>() < self.a_d(d) {
                 n += 1;
             } else {
                 break;

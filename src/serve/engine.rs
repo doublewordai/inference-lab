@@ -204,7 +204,7 @@ impl RealtimeEngine {
         let target_output_tokens = match &self.workload {
             Some(w) => w
                 .output_len_dist
-                .sample(&mut rand::thread_rng())
+                .sample(&mut rand::rng())
                 .min(engine_req.max_output_tokens),
             None => engine_req.max_output_tokens,
         };

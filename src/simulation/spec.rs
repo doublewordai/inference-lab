@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 use crate::compute::MeasuredCostTable;
 use crate::config::{
@@ -82,7 +82,7 @@ impl Acceptance {
                 commits: model.sample_accepted(*max_depth, rng),
             },
             Self::Trace(bank) => {
-                let r = &bank.rounds[rng.gen_range(0..bank.rounds.len())];
+                let r = &bank.rounds[rng.random_range(0..bank.rounds.len())];
                 Round {
                     a_hat: r.a_hat.clone(),
                     commits: r.commits,
