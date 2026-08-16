@@ -308,15 +308,14 @@ fn main() {
 
 fn run_sim(args: SimArgs) {
     let verbosity = args.verbosity_level();
-    let use_color = !args.no_color;
+    if args.no_color {
+        // One switch for every `.color()` call below.
+        colored::control::set_override(false);
+    }
 
     // Header
     if verbosity >= VerbosityLevel::Normal {
-        if use_color {
-            println!("{}", "LLM Inference Simulator".bright_cyan().bold());
-        } else {
-            println!("LLM Inference Simulator");
-        }
+        println!("{}", "LLM Inference Simulator".bright_cyan().bold());
         println!("Loading configuration from: {:?}\n", args.config);
     }
 
@@ -395,11 +394,7 @@ fn run_sim(args: SimArgs) {
 
     // Print configuration summary (after simulator creation to show updated dataset entry count)
     if verbosity >= VerbosityLevel::Normal {
-        if use_color {
-            println!("{}", "Configuration:".green().bold());
-        } else {
-            println!("Configuration:");
-        }
+        println!("{}", "Configuration:".green().bold());
         println!("  Hardware: {}", config.hardware.name);
         println!("  Model: {}", config.model.name());
         println!(
@@ -445,10 +440,10 @@ fn run_sim(args: SimArgs) {
             run_quiet(&mut simulator);
         }
         VerbosityLevel::Normal => {
-            run_with_dashboard(&mut simulator, use_color, &config);
+            run_with_dashboard(&mut simulator, &config);
         }
         VerbosityLevel::Verbose => {
-            run_verbose(&mut simulator, use_color, &config);
+            run_verbose(&mut simulator, &config);
         }
         VerbosityLevel::Debug => {
             // Debug mode with no progress callbacks
@@ -471,13 +466,7 @@ fn run_sim(args: SimArgs) {
 
     // Print final metrics
     let summary = simulator.summary();
-    print_final_metrics(
-        &summary,
-        simulator.current_time(),
-        elapsed,
-        verbosity,
-        use_color,
-    );
+    print_final_metrics(&summary, simulator.current_time(), elapsed);
 
     // Save to JSON if requested
     if let Some(output_path) = args.output {
@@ -542,18 +531,12 @@ fn run_quiet(simulator: &mut Simulator) {
         .unwrap();
 }
 
-fn run_with_dashboard(simulator: &mut Simulator, use_color: bool, config: &Config) {
+fn run_with_dashboard(simulator: &mut Simulator, config: &Config) {
     let total_requests = config.workload.num_requests.unwrap_or(1000) as u64;
 
-    if use_color {
-        println!("{}", "━".repeat(60).bright_black());
-        println!("{}", "Simulation Progress".bright_cyan().bold());
-        println!("{}", "━".repeat(60).bright_black());
-    } else {
-        println!("{}", "━".repeat(60));
-        println!("Simulation Progress");
-        println!("{}", "━".repeat(60));
-    }
+    println!("{}", "━".repeat(60).bright_black());
+    println!("{}", "Simulation Progress".bright_cyan().bold());
+    println!("{}", "━".repeat(60).bright_black());
 
     let mut first_update = true;
     let num_lines = 5; // Number of lines the dashboard uses (including final separator)
@@ -573,49 +556,32 @@ fn run_with_dashboard(simulator: &mut Simulator, use_color: bool, config: &Confi
             }
             first_update = false;
 
-            if use_color {
-                println!(
-                    "  Progress: [{}] {}/{} ({:.0}%)",
-                    bar.cyan(),
-                    progress.completed_requests,
-                    total_requests,
-                    percent
-                );
-                println!(
-                    "  Time:     {}s simulated",
-                    format!("{:.1}", progress.current_time).yellow()
-                );
-                println!(
-                    "  Queue:    {} running, {} waiting",
-                    progress.running.to_string().green(),
-                    progress.waiting.to_string().blue()
-                );
-                println!(
-                    "  KV Cache: {:.1}% utilized",
-                    (progress.kv_cache_util * 100.0).to_string().magenta()
-                );
-                println!("{}", "━".repeat(60).bright_black());
-            } else {
-                println!(
-                    "  Progress: [{}] {}/{} ({:.0}%)",
-                    bar, progress.completed_requests, total_requests, percent
-                );
-                println!("  Time:     {:.1}s simulated", progress.current_time);
-                println!(
-                    "  Queue:    {} running, {} waiting",
-                    progress.running, progress.waiting
-                );
-                println!(
-                    "  KV Cache: {:.1}% utilized",
-                    progress.kv_cache_util * 100.0
-                );
-                println!("{}", "━".repeat(60));
-            }
+            println!(
+                "  Progress: [{}] {}/{} ({:.0}%)",
+                bar.cyan(),
+                progress.completed_requests,
+                total_requests,
+                percent
+            );
+            println!(
+                "  Time:     {}s simulated",
+                format!("{:.1}", progress.current_time).yellow()
+            );
+            println!(
+                "  Queue:    {} running, {} waiting",
+                progress.running.to_string().green(),
+                progress.waiting.to_string().blue()
+            );
+            println!(
+                "  KV Cache: {:.1}% utilized",
+                (progress.kv_cache_util * 100.0).to_string().magenta()
+            );
+            println!("{}", "━".repeat(60).bright_black());
         })
         .unwrap();
 }
 
-fn run_verbose(simulator: &mut Simulator, _use_color: bool, config: &Config) {
+fn run_verbose(simulator: &mut Simulator, config: &Config) {
     println!("Starting simulation...");
 
     simulator
@@ -646,33 +612,17 @@ fn print_final_metrics(
     summary: &inference_lab::metrics::MetricsSummary,
     sim_time: f64,
     real_time: std::time::Duration,
-    _verbosity: VerbosityLevel,
-    use_color: bool,
 ) {
-    // Header
-    if use_color {
-        println!(
-            "\n{} ({:.1}s simulated, {:.2}s real)",
-            "Simulation Complete".bright_green().bold(),
-            sim_time,
-            real_time.as_secs_f64()
-        );
-        println!("{}", "━".repeat(80).bright_black());
-    } else {
-        println!(
-            "\nSimulation Complete ({:.1}s simulated, {:.2}s real)",
-            sim_time,
-            real_time.as_secs_f64()
-        );
-        println!("{}", "━".repeat(80));
-    }
+    println!(
+        "\n{} ({:.1}s simulated, {:.2}s real)",
+        "Simulation Complete".bright_green().bold(),
+        sim_time,
+        real_time.as_secs_f64()
+    );
+    println!("{}", "━".repeat(80).bright_black());
 
     // Latency Metrics Table
-    if use_color {
-        println!("\n{}", "LATENCY METRICS".yellow().bold());
-    } else {
-        println!("\nLATENCY METRICS");
-    }
+    println!("\n{}", "LATENCY METRICS".yellow().bold());
 
     let row = |metric: &str, l: &inference_lab::metrics::LatencyStats| LatencyRow {
         metric: metric.to_string(),
@@ -693,11 +643,7 @@ fn print_final_metrics(
     println!("{}", latency_table);
 
     // Throughput Metrics Table
-    if use_color {
-        println!("\n{}", "THROUGHPUT METRICS".yellow().bold());
-    } else {
-        println!("\nTHROUGHPUT METRICS");
-    }
+    println!("\n{}", "THROUGHPUT METRICS".yellow().bold());
 
     let throughput_rows = vec![
         ThroughputRow {
@@ -720,11 +666,7 @@ fn print_final_metrics(
     println!("{}", throughput_table);
 
     // Utilization Section
-    if use_color {
-        println!("\n{}", "UTILIZATION".yellow().bold());
-    } else {
-        println!("\nUTILIZATION");
-    }
+    println!("\n{}", "UTILIZATION".yellow().bold());
     let util = &summary.utilization;
     println!("  • KV Cache:  {:.1}% avg", util.avg_kv_cache_util * 100.0);
     println!("  • FLOPS:     {:.1}% avg", util.avg_flops_util * 100.0);
@@ -735,11 +677,7 @@ fn print_final_metrics(
     );
 
     // Summary Section
-    if use_color {
-        println!("\n{}", "SUMMARY".yellow().bold());
-    } else {
-        println!("\nSUMMARY");
-    }
+    println!("\n{}", "SUMMARY".yellow().bold());
     println!(
         "  • Total Requests: {} completed",
         summary.requests.completed
@@ -750,11 +688,7 @@ fn print_final_metrics(
     // Prefix Cache Section
     let pc = &summary.prefix_cache;
     if pc.hits + pc.misses > 0 {
-        if use_color {
-            println!("\n{}", "PREFIX CACHE".yellow().bold());
-        } else {
-            println!("\nPREFIX CACHE");
-        }
+        println!("\n{}", "PREFIX CACHE".yellow().bold());
         println!("  • Hits:      {}", pc.hits);
         println!("  • Misses:    {}", pc.misses);
         println!("  • Avg hit size: {:.1} tokens", pc.mean_hit_size);
@@ -767,8 +701,6 @@ fn print_final_metrics(
     summary: &inference_lab::metrics::MetricsSummary,
     sim_time: f64,
     _real_time: std::time::Duration,
-    _verbosity: VerbosityLevel,
-    _use_color: bool,
 ) {
     // Fallback for when CLI features are not available
     println!("\nSimulation Complete ({:.1}s)", sim_time);

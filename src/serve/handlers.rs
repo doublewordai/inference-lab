@@ -26,10 +26,7 @@ pub async fn health() -> Json<serde_json::Value> {
 }
 
 pub async fn list_models(State(state): State<Arc<AppState>>) -> Json<ModelList> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
+    let now = unix_now();
 
     let data = state
         .model_names
@@ -48,16 +45,130 @@ pub async fn list_models(State(state): State<Arc<AppState>>) -> Json<ModelList> 
     })
 }
 
+type ErrorResponse = (StatusCode, Json<serde_json::Value>);
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+fn usage(prompt_tokens: u32, completion_tokens: u32) -> Usage {
+    Usage {
+        prompt_tokens,
+        completion_tokens,
+        total_tokens: prompt_tokens + completion_tokens,
+    }
+}
+
+/// A finished (non-streamed) generation.
+struct Completed {
+    text: String,
+    usage: Usage,
+}
+
+/// Collect a request's token events into its final text and usage.
+async fn collect_completion(
+    rx: &mut mpsc::Receiver<TokenEvent>,
+    prompt_tokens: u32,
+) -> Result<Completed, ErrorResponse> {
+    let mut text = String::new();
+    let mut final_prompt_tokens = prompt_tokens;
+    let mut completion_tokens = 0u32;
+    while let Some(event) = rx.recv().await {
+        match event {
+            TokenEvent::FirstToken => {}
+            TokenEvent::Token { text: t } => text.push_str(&t),
+            TokenEvent::Done {
+                prompt_tokens: pt,
+                completion_tokens: ct,
+            } => {
+                final_prompt_tokens = pt;
+                completion_tokens = ct;
+                break;
+            }
+            TokenEvent::Error { message } => {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": message})),
+                ));
+            }
+        }
+    }
+    Ok(Completed {
+        text: text.trim_end().to_string(),
+        usage: usage(final_prompt_tokens, completion_tokens),
+    })
+}
+
+/// What a streamed response renders as it goes: an opening chunk (before any
+/// token), one chunk per token, and a closing chunk carrying usage when the
+/// client asked for it. `render` returns the SSE data for each, or `None` to
+/// emit nothing for that item.
+enum StreamItem {
+    Start,
+    Token(String),
+    Done { usage: Option<Usage> },
+}
+
+fn sse_response<F>(
+    mut rx: mpsc::Receiver<TokenEvent>,
+    include_usage: bool,
+    mut render: F,
+) -> axum::response::Response
+where
+    F: FnMut(StreamItem) -> Option<String> + Send + 'static,
+{
+    let (stream_tx, stream_rx) = mpsc::channel::<Result<Event, Infallible>>(64);
+    tokio::spawn(async move {
+        let send = |data: String| {
+            let tx = stream_tx.clone();
+            async move {
+                let _ = tx.send(Ok(Event::default().data(data))).await;
+            }
+        };
+        if let Some(data) = render(StreamItem::Start) {
+            send(data).await;
+        }
+        while let Some(event) = rx.recv().await {
+            match event {
+                TokenEvent::FirstToken => {}
+                TokenEvent::Token { text } => {
+                    if let Some(data) = render(StreamItem::Token(text)) {
+                        send(data).await;
+                    }
+                }
+                TokenEvent::Done {
+                    prompt_tokens,
+                    completion_tokens,
+                } => {
+                    let usage = include_usage.then(|| usage(prompt_tokens, completion_tokens));
+                    if let Some(data) = render(StreamItem::Done { usage }) {
+                        send(data).await;
+                    }
+                    send("[DONE]".to_string()).await;
+                    break;
+                }
+                TokenEvent::Error { message } => {
+                    send(serde_json::json!({ "error": message }).to_string()).await;
+                    break;
+                }
+            }
+        }
+    });
+    Sse::new(ReceiverStream::new(stream_rx)).into_response()
+}
+
 pub async fn chat_completions(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChatCompletionRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<impl IntoResponse, ErrorResponse> {
     let prompt_tokens = count_prompt_tokens(&state, &req.messages);
     let include_usage = req
         .stream_options
         .as_ref()
-        .map(|options| options.include_usage)
-        .unwrap_or(false);
+        .is_some_and(|options| options.include_usage);
     let (request_id, mut rx) = submit_engine_request(
         &state,
         &req.model,
@@ -66,310 +177,123 @@ pub async fn chat_completions(
         "chatcmpl",
     )
     .await?;
+    let now = unix_now();
 
     if req.stream {
-        // Streaming response
-        let model_name = req.model.clone();
-        let id = request_id.clone();
-
-        let (stream_tx, stream_rx) = mpsc::channel::<Result<Event, Infallible>>(64);
-
-        tokio::spawn(async move {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
-
-            // Send initial chunk with role
-            let initial_chunk = ChatCompletionChunk {
-                id: id.clone(),
+        let model = req.model.clone();
+        let chunk = move |delta: ChunkDelta, finish_reason: Option<&'static str>, usage| {
+            let chunk = ChatCompletionChunk {
+                id: request_id.clone(),
                 object: "chat.completion.chunk",
                 created: now,
-                model: model_name.clone(),
+                model: model.clone(),
                 choices: vec![ChunkChoice {
                     index: 0,
-                    delta: ChunkDelta {
-                        role: Some("assistant"),
-                        content: None,
-                    },
-                    finish_reason: None,
+                    delta,
+                    finish_reason,
                 }],
-                usage: None,
+                usage,
             };
-            let _ = stream_tx
-                .send(Ok(
-                    Event::default().data(serde_json::to_string(&initial_chunk).unwrap())
-                ))
-                .await;
-
-            // Stream tokens
-            while let Some(event) = rx.recv().await {
-                match event {
-                    TokenEvent::FirstToken => {
-                        // No output needed; first content token follows
-                    }
-                    TokenEvent::Token { text } => {
-                        let chunk = ChatCompletionChunk {
-                            id: id.clone(),
-                            object: "chat.completion.chunk",
-                            created: now,
-                            model: model_name.clone(),
-                            choices: vec![ChunkChoice {
-                                index: 0,
-                                delta: ChunkDelta {
-                                    role: None,
-                                    content: Some(text),
-                                },
-                                finish_reason: None,
-                            }],
-                            usage: None,
-                        };
-                        let _ = stream_tx
-                            .send(Ok(
-                                Event::default().data(serde_json::to_string(&chunk).unwrap())
-                            ))
-                            .await;
-                    }
-                    TokenEvent::Done {
-                        prompt_tokens,
-                        completion_tokens,
-                    } => {
-                        let chunk = ChatCompletionChunk {
-                            id: id.clone(),
-                            object: "chat.completion.chunk",
-                            created: now,
-                            model: model_name.clone(),
-                            choices: vec![ChunkChoice {
-                                index: 0,
-                                delta: ChunkDelta {
-                                    role: None,
-                                    content: None,
-                                },
-                                finish_reason: Some("stop"),
-                            }],
-                            usage: include_usage.then_some(Usage {
-                                prompt_tokens,
-                                completion_tokens,
-                                total_tokens: prompt_tokens + completion_tokens,
-                            }),
-                        };
-                        let _ = stream_tx
-                            .send(Ok(
-                                Event::default().data(serde_json::to_string(&chunk).unwrap())
-                            ))
-                            .await;
-                        let _ = stream_tx.send(Ok(Event::default().data("[DONE]"))).await;
-                        break;
-                    }
-                    TokenEvent::Error { message } => {
-                        let _ = stream_tx
-                            .send(Ok(
-                                Event::default().data(format!("{{\"error\": \"{}\"}}", message))
-                            ))
-                            .await;
-                        break;
-                    }
-                }
-            }
-        });
-
-        let stream = ReceiverStream::new(stream_rx);
-        Ok(Sse::new(stream).into_response())
-    } else {
-        // Non-streaming: collect all tokens
-        let mut content = String::new();
-        let mut completion_tokens = 0u32;
-        let mut final_prompt_tokens = prompt_tokens;
-
-        while let Some(event) = rx.recv().await {
-            match event {
-                TokenEvent::FirstToken => {}
-                TokenEvent::Token { text } => {
-                    content.push_str(&text);
-                }
-                TokenEvent::Done {
-                    prompt_tokens: pt,
-                    completion_tokens: ct,
-                } => {
-                    final_prompt_tokens = pt;
-                    completion_tokens = ct;
-                    break;
-                }
-                TokenEvent::Error { message } => {
-                    return Err((
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({"error": message})),
-                    ));
-                }
-            }
-        }
-
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        let response = ChatCompletionResponse {
-            id: request_id,
-            object: "chat.completion",
-            created: now,
-            model: req.model,
-            choices: vec![Choice {
-                index: 0,
-                message: ChoiceMessage {
-                    role: "assistant",
-                    content: content.trim_end().to_string(),
-                },
-                finish_reason: "stop",
-            }],
-            usage: Usage {
-                prompt_tokens: final_prompt_tokens,
-                completion_tokens,
-                total_tokens: final_prompt_tokens + completion_tokens,
-            },
+            Some(serde_json::to_string(&chunk).unwrap())
         };
-
-        Ok(Json(response).into_response())
+        return Ok(sse_response(rx, include_usage, move |item| match item {
+            StreamItem::Start => chunk(
+                ChunkDelta {
+                    role: Some("assistant"),
+                    content: None,
+                },
+                None,
+                None,
+            ),
+            StreamItem::Token(text) => chunk(
+                ChunkDelta {
+                    role: None,
+                    content: Some(text),
+                },
+                None,
+                None,
+            ),
+            StreamItem::Done { usage } => chunk(
+                ChunkDelta {
+                    role: None,
+                    content: None,
+                },
+                Some("stop"),
+                usage,
+            ),
+        }));
     }
+
+    let done = collect_completion(&mut rx, prompt_tokens).await?;
+    let response = ChatCompletionResponse {
+        id: request_id,
+        object: "chat.completion",
+        created: now,
+        model: req.model,
+        choices: vec![Choice {
+            index: 0,
+            message: ChoiceMessage {
+                role: "assistant",
+                content: done.text,
+            },
+            finish_reason: "stop",
+        }],
+        usage: done.usage,
+    };
+    Ok(Json(response).into_response())
 }
 
 pub async fn completions(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CompletionRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<impl IntoResponse, ErrorResponse> {
     let prompt_tokens = count_text_prompt_tokens(&state, &req.prompt);
     let include_usage = req
         .stream_options
         .as_ref()
-        .map(|options| options.include_usage)
-        .unwrap_or(false);
+        .is_some_and(|options| options.include_usage);
     let (request_id, mut rx) =
         submit_engine_request(&state, &req.model, prompt_tokens, req.max_tokens, "cmpl").await?;
+    let now = unix_now();
 
     if req.stream {
-        let model_name = req.model.clone();
-        let id = request_id.clone();
-        let (stream_tx, stream_rx) = mpsc::channel::<Result<Event, Infallible>>(64);
-
-        tokio::spawn(async move {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
-
-            while let Some(event) = rx.recv().await {
-                match event {
-                    TokenEvent::FirstToken => {}
-                    TokenEvent::Token { text } => {
-                        let chunk = CompletionChunk {
-                            id: id.clone(),
-                            object: "text_completion",
-                            created: now,
-                            model: model_name.clone(),
-                            choices: vec![CompletionChunkChoice {
-                                text,
-                                index: 0,
-                                finish_reason: None,
-                            }],
-                            usage: None,
-                        };
-                        let _ = stream_tx
-                            .send(Ok(
-                                Event::default().data(serde_json::to_string(&chunk).unwrap())
-                            ))
-                            .await;
-                    }
-                    TokenEvent::Done {
-                        prompt_tokens,
-                        completion_tokens,
-                    } => {
-                        let chunk = CompletionChunk {
-                            id: id.clone(),
-                            object: "text_completion",
-                            created: now,
-                            model: model_name.clone(),
-                            choices: vec![CompletionChunkChoice {
-                                text: String::new(),
-                                index: 0,
-                                finish_reason: Some("stop"),
-                            }],
-                            usage: include_usage.then_some(Usage {
-                                prompt_tokens,
-                                completion_tokens,
-                                total_tokens: prompt_tokens + completion_tokens,
-                            }),
-                        };
-                        let _ = stream_tx
-                            .send(Ok(
-                                Event::default().data(serde_json::to_string(&chunk).unwrap())
-                            ))
-                            .await;
-                        let _ = stream_tx.send(Ok(Event::default().data("[DONE]"))).await;
-                        break;
-                    }
-                    TokenEvent::Error { message } => {
-                        let _ = stream_tx
-                            .send(Ok(
-                                Event::default().data(format!("{{\"error\": \"{}\"}}", message))
-                            ))
-                            .await;
-                        break;
-                    }
-                }
-            }
-        });
-
-        Ok(Sse::new(ReceiverStream::new(stream_rx)).into_response())
-    } else {
-        let mut content = String::new();
-        let mut completion_tokens = 0u32;
-        let mut final_prompt_tokens = prompt_tokens;
-
-        while let Some(event) = rx.recv().await {
-            match event {
-                TokenEvent::FirstToken => {}
-                TokenEvent::Token { text } => content.push_str(&text),
-                TokenEvent::Done {
-                    prompt_tokens: pt,
-                    completion_tokens: ct,
-                } => {
-                    final_prompt_tokens = pt;
-                    completion_tokens = ct;
-                    break;
-                }
-                TokenEvent::Error { message } => {
-                    return Err((
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({"error": message})),
-                    ));
-                }
-            }
-        }
-
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        let response = CompletionResponse {
-            id: request_id,
-            object: "text_completion",
-            created: now,
-            model: req.model,
-            choices: vec![CompletionChoice {
-                text: content.trim_end().to_string(),
-                index: 0,
-                finish_reason: "stop",
-            }],
-            usage: Usage {
-                prompt_tokens: final_prompt_tokens,
-                completion_tokens,
-                total_tokens: final_prompt_tokens + completion_tokens,
-            },
+        let model = req.model.clone();
+        let chunk = move |text: String, finish_reason: Option<&'static str>, usage| {
+            let chunk = CompletionChunk {
+                id: request_id.clone(),
+                object: "text_completion",
+                created: now,
+                model: model.clone(),
+                choices: vec![CompletionChunkChoice {
+                    text,
+                    index: 0,
+                    finish_reason,
+                }],
+                usage,
+            };
+            Some(serde_json::to_string(&chunk).unwrap())
         };
-
-        Ok(Json(response).into_response())
+        return Ok(sse_response(rx, include_usage, move |item| match item {
+            StreamItem::Start => None,
+            StreamItem::Token(text) => chunk(text, None, None),
+            StreamItem::Done { usage } => chunk(String::new(), Some("stop"), usage),
+        }));
     }
+
+    let done = collect_completion(&mut rx, prompt_tokens).await?;
+    let response = CompletionResponse {
+        id: request_id,
+        object: "text_completion",
+        created: now,
+        model: req.model,
+        choices: vec![CompletionChoice {
+            text: done.text,
+            index: 0,
+            finish_reason: "stop",
+        }],
+        usage: done.usage,
+    };
+    Ok(Json(response).into_response())
 }
 
 async fn submit_engine_request(
@@ -378,7 +302,7 @@ async fn submit_engine_request(
     prompt_tokens: u32,
     max_output_tokens: u32,
     request_prefix: &str,
-) -> Result<(String, mpsc::Receiver<TokenEvent>), (StatusCode, Json<serde_json::Value>)> {
+) -> Result<(String, mpsc::Receiver<TokenEvent>), ErrorResponse> {
     let engine_tx = state.engines.get(model).ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
