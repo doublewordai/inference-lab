@@ -1,0 +1,19 @@
+# Source: examples/qwen3_30b_a3b.toml
+
+name = "Qwen3-30B-A3B"
+hidden_dim = 2048
+max_seq_len = 32768
+attention_precision = "bf16"
+
+[[weights]]
+precision = "bf16"
+active_params = 3340000000
+resident_params = 30500000000
+
+[[layers]]
+kind = "attention"
+count = 48
+heads = 32
+head_dim = 64
+kv_heads = 4
+kv_precision = "bf16"

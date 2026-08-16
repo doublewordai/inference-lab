@@ -1,124 +1,124 @@
 # Configuration
 
-Inference Lab uses TOML configuration files to define your simulation parameters. A configuration file has five main sections: hardware, model, scheduler, workload, and simulation.
+A simulation is a **model config** × one of its **hardware entries** × a
+**workload**. Model configs live in `configs/`, one file per model
+deployment; workloads in `workloads/`. Unknown fields in either are rejected.
 
-## Configuration Sections Overview
-
-- **[hardware]** - GPU specifications (compute, memory, bandwidth)
-- **[model]** - LLM architecture (layers, parameters, dimensions)
-- **[scheduler]** - Scheduling policy and batching behavior
-- **[workload]** - Request arrival patterns and distributions
-- **[simulation]** - Logging and output options
-
-## Quick Start Example
-
-Here's a minimal configuration to get started:
-
-```toml
-[hardware]
-name = "H100"
-compute_flops = 1.513e15        # 1513 TFLOPS bf16
-memory_bandwidth = 3.35e12      # 3.35 TB/s
-memory_capacity = 85899345920   # 80 GB
-bytes_per_param = 2             # bf16
-
-[model]
-name = "Llama-3-70B"
-num_parameters = 70000000000
-num_layers = 80
-hidden_dim = 8192
-num_heads = 64
-num_kv_heads = 8                # GQA with 8 KV heads
-max_seq_len = 8192
-
-[scheduler]
-max_num_batched_tokens = 8192
-max_num_seqs = 256
-policy = "fcfs"
-enable_chunked_prefill = true
-block_size = 16
-
-[workload]
-arrival_pattern = "poisson"
-arrival_rate = 5.0              # 5 requests/sec
-num_requests = 100
-seed = 42
-
-[workload.input_len_dist]
-type = "lognormal"
-mean = 6.9                      # ~1000 tokens median
-std_dev = 0.7
-
-[workload.output_len_dist]
-type = "lognormal"
-mean = 5.3                      # ~200 tokens median
-std_dev = 0.8
-
-[simulation]
-log_interval = 5
+```bash
+inference-lab --config configs/qwen3.6-35b-a3b-fp8.toml --hardware b200 \
+              --workload workloads/chat-closed-256.toml
 ```
 
-## Hardware Configuration
-
-The hardware section defines your GPU specifications:
+## Model config
 
 ```toml
-[hardware]
+model = "qwen3.6-35b-a3b-fp8"   # catalog preset, or an inline [model] table
+
+[scheduler]                     # engine args shared by every hardware entry
+max_num_batched_tokens = 16384
+max_num_seqs = 4096
+policy = "priority"
+enable_chunked_prefill = true
+block_size = 64
+
+[hardware.b200]                 # one entry per hardware this model runs on
+tp = 1
+
+[hardware.b300]
+tp = 1
+
+[hardware.gh200-120]
+tp = 1
+scheduler = { max_num_batched_tokens = 8192 }   # per-entry override
+```
+
+- **model** — a catalog preset name or an inline `[model]` table: weight
+  streams and token-mixing layer classes.
+- **[scheduler]** — engine arguments: batching, KV blocks, memory
+  utilisation, scheduling policy.
+- **[hardware.\<name\>]** — one per hardware the model is deployed on. The
+  name is a hardware preset (`b200`, `b300`, `gh200-120`, `gh200-96`,
+  `b200-datasheet`, `h100`) unless the entry sets `spec`. Each entry gives
+  the parallel layout (`tp`, `ep`, `dp_attention`) and may override
+  `scheduler` keys or carry its own `speculative` block.
+- **[speculative]** — speculative decoding, optional; a shared default that
+  an entry's `speculative` replaces (acceptance traces and measured step
+  costs are per hardware).
+
+`--hardware` picks the entry; it can be omitted when a file has one.
+`inference-lab serve --config configs/ --hardware b200` serves every model
+with a `b200` entry.
+
+### Hardware
+
+Name a shipped preset as the entry:
+
+```toml
+[hardware.b200]
+tp = 2
+```
+
+or point an entry at another preset, or at an inline per-GPU spec (a FLOP
+rate for every precision the model uses, bandwidth, capacity, optional
+spillover `kv_tiers`):
+
+```toml
+[hardware.isambard]
+spec = "gh200-120"
+tp = 4
+
+[hardware.custom]
+tp = 1
+[hardware.custom.spec]
 name = "H100"
-compute_flops = 1.513e15        # bf16 TFLOPS
+flops_fp8 = 1.979e15            # dense FLOP/s at fp8
+flops_bf16 = 9.895e14           # dense FLOP/s at bf16
 memory_bandwidth = 3.35e12      # bytes/sec
 memory_capacity = 85899345920   # 80 GB
-bytes_per_param = 2             # 2 for bf16, 1 for fp8
 ```
 
-Optional fields:
-- `kv_cache_capacity` - Explicit KV cache size (otherwise computed automatically)
-- `gpu_memory_utilization` - Fraction of memory to use (default: 0.9)
+How much of that memory the engine may use, and how much goes to KV, are
+deployment settings and live in `[scheduler]` (`gpu_memory_utilization`,
+`kv_cache_capacity`).
 
-## Model Configuration
+### Model
 
-Define your LLM architecture:
+Name a shipped preset:
+
+```toml
+model = "gemma-4-31b-it"
+```
+
+or describe the architecture inline as weight streams plus layer classes:
 
 ```toml
 [model]
 name = "Llama-3-70B"
-num_parameters = 70000000000
-num_layers = 80
 hidden_dim = 8192
-num_heads = 64
-num_kv_heads = 8                # For GQA (omit for MHA)
 max_seq_len = 8192
+attention_precision = "fp8"
+
+[[model.weights]]               # one per-token GEMM stream per precision
+precision = "fp8"
+active_params = 70000000000
+resident_params = 70000000000
+
+[[model.layers]]                # token-mixing layer classes
+kind = "attention"              # or "mla", "linear"
+count = 80
+heads = 64
+head_dim = 128
+kv_heads = 8                    # GQA
+kv_precision = "fp8"
 ```
 
-### Grouped Query Attention (GQA)
+MoE adds `routing = { routed_experts, experts_per_tok, moe_layers }` to the
+expert stream; sliding-window layers are an `attention` class with
+`window`; MLA / DeepSeek sparse attention is the `mla` kind; GatedDeltaNet or
+Mamba layers are `linear` with their per-sequence `state_bytes`. See the
+[Configuration Reference](../reference/config.md) for every field.
 
-For models using GQA, set `num_kv_heads` to the number of KV heads:
-
-```toml
-num_kv_heads = 8  # Llama 3 uses 8 KV heads
-```
-
-Omit `num_kv_heads` for standard multi-head attention (MHA) models.
-
-### Mixture of Experts (MoE)
-
-For MoE models, specify active parameters separately:
-
-```toml
-num_parameters = 140000000000      # Total params
-num_active_parameters = 12000000000 # Active per forward pass
-```
-
-### Sliding Window Attention
-
-For models like GPT-OSS with sliding window attention:
-
-```toml
-sliding_window = 4096
-num_sliding_layers = 28  # Number of layers using sliding window
-```
-
-## Scheduler Configuration
+### Scheduler
 
 Control request scheduling and batching:
 
@@ -131,7 +131,7 @@ enable_chunked_prefill = true
 block_size = 16
 ```
 
-### Scheduling Policies
+#### Scheduling Policies
 
 Available policies:
 - `fcfs` - First-Come-First-Served (default)
@@ -142,7 +142,7 @@ Available policies:
 - `lof` - Longest Output First
 - `ltf` - Longest Total First
 
-### Chunked Prefill
+#### Chunked Prefill
 
 Enable chunked prefill to allow interleaving prompt processing with generation:
 
@@ -152,7 +152,7 @@ long_prefill_token_threshold = 512  # Optional: chunk size limit
 max_num_partial_prefills = 1        # Max concurrent partial prefills
 ```
 
-### Preemption-Free Mode
+#### Preemption-Free Mode
 
 Enable conservative admission control to guarantee zero preemptions:
 
@@ -160,25 +160,26 @@ Enable conservative admission control to guarantee zero preemptions:
 enable_preemption_free = true
 ```
 
-## Workload Configuration
+## Workload
 
-Define how requests arrive and their characteristics.
+A workload file is the workload table at top level: how requests arrive and
+their shapes.
 
 ### Synthetic Workload
 
 ```toml
-[workload]
+# workloads/chat-poisson-5rps.toml
 arrival_pattern = "poisson"
 arrival_rate = 5.0
 num_requests = 100
 seed = 42
 
-[workload.input_len_dist]
+[input_len_dist]
 type = "lognormal"
 mean = 6.9
 std_dev = 0.7
 
-[workload.output_len_dist]
+[output_len_dist]
 type = "lognormal"
 mean = 5.3
 std_dev = 0.8
@@ -199,14 +200,14 @@ Four distribution types are supported:
 
 **Fixed:**
 ```toml
-[workload.input_len_dist]
+[input_len_dist]
 type = "fixed"
 value = 1000
 ```
 
 **Uniform:**
 ```toml
-[workload.input_len_dist]
+[input_len_dist]
 type = "uniform"
 min = 100
 max = 2000
@@ -214,7 +215,7 @@ max = 2000
 
 **Normal:**
 ```toml
-[workload.input_len_dist]
+[input_len_dist]
 type = "normal"
 mean = 1000.0
 std_dev = 200.0
@@ -222,7 +223,7 @@ std_dev = 200.0
 
 **LogNormal:**
 ```toml
-[workload.input_len_dist]
+[input_len_dist]
 type = "lognormal"
 mean = 6.9      # ln(1000)
 std_dev = 0.7
@@ -233,7 +234,6 @@ std_dev = 0.7
 Use real request traces instead of synthetic workloads:
 
 ```toml
-[workload]
 dataset_path = "path/to/dataset.jsonl"
 arrival_pattern = "poisson"
 arrival_rate = 1.0
@@ -253,7 +253,7 @@ Example:
 
 **Tokenizer:** Dataset mode requires a tokenizer file to convert text to tokens. You'll need to provide this via the `--tokenizer` flag:
 ```bash
-inference-lab -c config.toml --tokenizer tokenizer.json
+inference-lab -c configs/llama-3-70b.toml -w workloads/dataset-poisson.toml --tokenizer tokenizer.json
 ```
 
 The tokenizer should be a HuggingFace tokenizers JSON file (typically `tokenizer.json` from the model repository).
@@ -266,7 +266,7 @@ The tokenizer should be a HuggingFace tokenizers JSON file (typically `tokenizer
 
 Example with no template:
 ```bash
-inference-lab -c config.toml \
+inference-lab -c configs/llama-3-70b.toml -w workloads/dataset-poisson.toml \
   --tokenizer tokenizer.json \
   --chat-template None
 ```
@@ -276,19 +276,10 @@ inference-lab -c config.toml \
 Simulate a fixed number of concurrent users:
 
 ```toml
-[workload]
 arrival_pattern = "closed_loop"
-num_concurrent_users = 10
+num_concurrent_users = 256
+closed_loop_jitter_secs = 0.05  # stagger the initial arrivals
 # ... length distributions ...
-```
-
-## Simulation Configuration
-
-Control logging and output:
-
-```toml
-[simulation]
-log_interval = 5  # Log every 5 iterations
 ```
 
 ## Common Configuration Patterns
@@ -320,10 +311,8 @@ policy = "sof"  # Shortest Output First
 Limit KV cache usage:
 
 ```toml
-[hardware]
-kv_cache_capacity = 34359738368  # 32 GB explicit limit
-
 [scheduler]
+kv_cache_capacity = 34359738368  # 32 GB explicit limit
 max_num_seqs = 128
 ```
 

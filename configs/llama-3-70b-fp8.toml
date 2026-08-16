@@ -1,0 +1,11 @@
+model = "llama-3-70b-fp8"
+
+[scheduler]
+max_num_batched_tokens = 8192
+max_num_seqs = 100
+policy = "fcfs"
+enable_chunked_prefill = true
+block_size = 16
+
+[hardware.h100]
+tp = 1

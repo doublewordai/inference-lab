@@ -9,6 +9,7 @@ fn default_dim() -> u32 {
 /// `ClusterSpec` use these to scale per-GPU hardware figures up to cluster
 /// totals.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ParallelConfig {
     /// Tensor-parallel group size. Defaults to 1.
     #[serde(default = "default_dim")]
@@ -42,6 +43,7 @@ impl Default for ParallelConfig {
 /// iteration. Optional on `ClusterSpec` and top-level `Config`; if absent
 /// the simulator contributes zero collective time (current behaviour).
 #[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct CommsConfig {
     /// Per-GPU bandwidth available for collective operations, in bytes/sec.
     /// On NVL72 this is the NVLink5 bidirectional limit (~900 GB/s).

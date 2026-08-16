@@ -1,109 +1,72 @@
-/// Summary of all metrics from the simulation
-#[derive(Debug)]
+use serde::Serialize;
+
+/// Min / mean / quantiles of one latency measure, in milliseconds.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct LatencyStats {
+    pub min: f64,
+    pub mean: f64,
+    pub p50: f64,
+    pub p90: f64,
+    pub p99: f64,
+}
+
+/// End-of-run (or snapshot) summary of a simulation. Serialises to the
+/// `--output` JSON layout.
+#[derive(Debug, Clone, Serialize)]
 pub struct MetricsSummary {
-    // Latency metrics (in milliseconds)
-    pub ttft_min: f64,
-    pub ttft_mean: f64,
-    pub ttft_p50: f64,
-    pub ttft_p90: f64,
-    pub ttft_p99: f64,
+    pub latency_metrics: LatencyMetrics,
+    pub throughput_metrics: ThroughputMetrics,
+    pub utilization: Utilization,
+    pub preemptions: Preemptions,
+    pub requests: RequestCounts,
+    pub prefix_cache: PrefixCacheMetrics,
+}
 
-    pub e2e_min: f64,
-    pub e2e_mean: f64,
-    pub e2e_p50: f64,
-    pub e2e_p90: f64,
-    pub e2e_p99: f64,
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct LatencyMetrics {
+    /// Time to first token, over completed requests.
+    pub ttft_ms: LatencyStats,
+    /// Arrival to completion, over completed requests.
+    pub e2e_ms: LatencyStats,
+    /// Per-request mean time per output token (decode span over output
+    /// tokens after the first), over completed requests with more than one
+    /// output token.
+    pub per_token_ms: LatencyStats,
+}
 
-    pub per_token_min: f64,
-    pub per_token_mean: f64,
-    pub per_token_p50: f64,
-    pub per_token_p90: f64,
-    pub per_token_p99: f64,
-
-    // Throughput metrics
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct ThroughputMetrics {
     pub input_tokens_per_sec: f64,
     pub output_tokens_per_sec: f64,
     pub requests_per_sec: f64,
+}
 
-    // Resource utilization (average over all samples)
+/// Means over iterations of the per-iteration utilisation figures.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct Utilization {
     pub avg_kv_cache_util: f64,
     pub avg_flops_util: f64,
     pub avg_bandwidth_util: f64,
-
-    // Preemption metrics
-    pub total_preemptions: u64,
-    pub preemptions_per_request_mean: f64,
-
-    // Request counts
-    pub completed_requests: u64,
-    pub total_requests: u64,
-
-    // Prefix cache metrics
-    pub prefix_cache_hits: u64,
-    pub prefix_cache_misses: u64,
-    pub prefix_cache_hit_rate: f64,
-    pub prefix_cache_hit_size_sum: u64,
-    pub prefix_cache_hit_size_count: u64,
 }
 
-impl MetricsSummary {
-    pub fn print(&self) {
-        println!("\n=== Final Metrics ===\n");
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct Preemptions {
+    /// Preemptions suffered by completed requests.
+    pub total: u64,
+    pub per_request_mean: f64,
+}
 
-        println!("Latency Metrics (ms):");
-        println!(
-            "  TTFT: min={:.2}, mean={:.2}, p50={:.2}, p90={:.2}, p99={:.2}",
-            self.ttft_min, self.ttft_mean, self.ttft_p50, self.ttft_p90, self.ttft_p99
-        );
-        println!(
-            "  E2E:  min={:.2}, mean={:.2}, p50={:.2}, p90={:.2}, p99={:.2}",
-            self.e2e_min, self.e2e_mean, self.e2e_p50, self.e2e_p90, self.e2e_p99
-        );
-        println!(
-            "  Per-token: min={:.2}, mean={:.2}, p50={:.2}, p90={:.2}, p99={:.2}",
-            self.per_token_min,
-            self.per_token_mean,
-            self.per_token_p50,
-            self.per_token_p90,
-            self.per_token_p99
-        );
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct RequestCounts {
+    pub completed: u64,
+    pub total: u64,
+}
 
-        println!("\nThroughput Metrics:");
-        println!("  Input tokens/sec:  {:.2}", self.input_tokens_per_sec);
-        println!("  Output tokens/sec: {:.2}", self.output_tokens_per_sec);
-        println!("  Requests/sec:      {:.2}", self.requests_per_sec);
-
-        println!("\nResource Utilization:");
-        println!(
-            "  Avg KV cache:      {:.1}%",
-            self.avg_kv_cache_util * 100.0
-        );
-        println!("  Avg FLOPS:         {:.1}%", self.avg_flops_util * 100.0);
-        println!(
-            "  Avg bandwidth:     {:.1}%",
-            self.avg_bandwidth_util * 100.0
-        );
-
-        println!("\nPreemption Metrics:");
-        println!("  Total preemptions: {}", self.total_preemptions);
-        println!(
-            "  Avg per request:   {:.2}",
-            self.preemptions_per_request_mean
-        );
-
-        println!("\nRequest Statistics:");
-        println!(
-            "  Completed: {}/{}",
-            self.completed_requests, self.total_requests
-        );
-
-        println!("\nPrefix Cache:");
-        println!("  Hits:       {}", self.prefix_cache_hits);
-        println!("  Misses:     {}", self.prefix_cache_misses);
-        println!(
-            "  Average hit size {}",
-            self.prefix_cache_hit_size_sum / self.prefix_cache_hit_size_count
-        );
-        println!("  Hit rate:   {:.1}%", self.prefix_cache_hit_rate * 100.0);
-    }
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct PrefixCacheMetrics {
+    pub hits: u64,
+    pub misses: u64,
+    pub hit_rate: f64,
+    /// Mean cached prefix length per lookup, in tokens.
+    pub mean_hit_size: f64,
 }
