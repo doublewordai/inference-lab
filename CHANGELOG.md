@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.10.0](https://github.com/doublewordai/inference-lab/compare/inference-lab-v0.9.0...inference-lab-v0.10.0) (2026-08-12)
+
+
+### Features
+
+* OpenAI compat resume target ([#72](https://github.com/doublewordai/inference-lab/issues/72)) ([0654c03](https://github.com/doublewordai/inference-lab/commit/0654c037d9cb7c4a5c0cff9cd95b887c5f430115))
+
+## [0.9.0](https://github.com/doublewordai/inference-lab/compare/inference-lab-v0.8.2...inference-lab-v0.9.0) (2026-08-11)
+
+
+### Features
+
+* fault injection for midstream error testing ([#69](https://github.com/doublewordai/inference-lab/issues/69)) ([c817058](https://github.com/doublewordai/inference-lab/commit/c817058f36fc73c6044cb8852f5173fd378aba9c))
+
+## [0.8.2](https://github.com/doublewordai/inference-lab/compare/inference-lab-v0.8.1...inference-lab-v0.8.2) (2026-08-06)
+
+
+### Bug Fixes
+
+* report chat prompt_tokens with simulated template overhead ([#67](https://github.com/doublewordai/inference-lab/issues/67)) ([1601616](https://github.com/doublewordai/inference-lab/commit/16016168a414dfea065b569a270f24ba7bd5c102))
+
 ## [0.8.1](https://github.com/doublewordai/inference-lab/compare/inference-lab-v0.8.0...inference-lab-v0.8.1) (2026-07-31)
 
 

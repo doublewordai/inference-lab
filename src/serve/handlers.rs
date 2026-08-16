@@ -1,10 +1,11 @@
 use axum::{
     extract::State,
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{
         sse::{Event, Sse},
         IntoResponse, Json,
     },
+    Extension,
 };
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -13,6 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
+use super::fault;
 use super::types::*;
 
 pub struct AppState {
@@ -22,6 +24,10 @@ pub struct AppState {
     /// Honor echo-directives (serve::directive). Explicitly opt-in: a scripted-response
     /// bypass reachable by untrusted clients would be a response-spoofing vector.
     pub enable_directives: bool,
+    /// Static per-model fault injection (serve::fault), keyed by model name. The
+    /// fallback trigger for clients that can't set the fault header; validated at
+    /// server startup.
+    pub model_faults: HashMap<String, fault::FaultSpec>,
 }
 
 pub async fn health() -> Json<serde_json::Value> {
@@ -53,6 +59,8 @@ pub async fn list_models(State(state): State<Arc<AppState>>) -> Json<ModelList> 
 
 pub async fn chat_completions(
     State(state): State<Arc<AppState>>,
+    connection: Option<Extension<Arc<fault::FaultConnection>>>,
+    headers: HeaderMap,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let prompt_tokens = count_prompt_tokens(&state, &req.messages, req.tools.as_ref());
@@ -61,6 +69,29 @@ pub async fn chat_completions(
         .as_ref()
         .map(|options| options.include_usage)
         .unwrap_or(false);
+
+    // Fault injection (serve::fault): per-request header first, per-model static config
+    // as the fallback. Takes precedence over echo-directives — a faulting stream is
+    // about wire behavior, not content. With neither trigger present this block is
+    // inert and the request takes the unchanged normal path.
+    if let Some(spec) = resolve_fault(&state, &headers, req.stream, &req.model)? {
+        // The model must still exist so an unknown-model request fails identically to
+        // the normal path (directive-mode precedent).
+        if !state.engines.contains_key(&req.model) {
+            return Err(model_not_found(&state, &req.model));
+        }
+        return Ok(fault::fault_response(
+            spec,
+            fault::StreamParams {
+                id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
+                model: req.model.clone(),
+                prompt_tokens,
+                include_usage,
+                flavor: fault::Flavor::Chat,
+            },
+            connection.map(|Extension(conn)| conn),
+        ));
+    }
 
     // Echo-directive mode (see serve::directive): a scripted response bypasses the engine —
     // deterministic content/tool_calls, immediate return. The model must still exist so an
@@ -94,6 +125,7 @@ pub async fn chat_completions(
         // Streaming response
         let model_name = req.model.clone();
         let id = request_id.clone();
+        let max_tokens = req.max_tokens;
 
         let (stream_tx, stream_rx) = mpsc::channel::<Result<Event, Infallible>>(64);
 
@@ -127,12 +159,16 @@ pub async fn chat_completions(
                 .await;
 
             // Stream tokens
+            let mut streamed_tokens = 0u32;
+            let mut completed: Option<(u32, u32)> = None;
+            let mut errored = false;
             while let Some(event) = rx.recv().await {
                 match event {
                     TokenEvent::FirstToken => {
                         // No output needed; first content token follows
                     }
                     TokenEvent::Token { text } => {
+                        streamed_tokens += 1;
                         let chunk = ChatCompletionChunk {
                             id: id.clone(),
                             object: "chat.completion.chunk",
@@ -159,32 +195,7 @@ pub async fn chat_completions(
                         prompt_tokens,
                         completion_tokens,
                     } => {
-                        let chunk = ChatCompletionChunk {
-                            id: id.clone(),
-                            object: "chat.completion.chunk",
-                            created: now,
-                            model: model_name.clone(),
-                            choices: vec![ChunkChoice {
-                                index: 0,
-                                delta: ChunkDelta {
-                                    role: None,
-                                    content: None,
-                                    tool_calls: None,
-                                },
-                                finish_reason: Some("stop"),
-                            }],
-                            usage: include_usage.then_some(Usage {
-                                prompt_tokens,
-                                completion_tokens,
-                                total_tokens: prompt_tokens + completion_tokens,
-                            }),
-                        };
-                        let _ = stream_tx
-                            .send(Ok(
-                                Event::default().data(serde_json::to_string(&chunk).unwrap())
-                            ))
-                            .await;
-                        let _ = stream_tx.send(Ok(Event::default().data("[DONE]"))).await;
+                        completed = Some((prompt_tokens, completion_tokens));
                         break;
                     }
                     TokenEvent::Error { message } => {
@@ -193,8 +204,27 @@ pub async fn chat_completions(
                                 Event::default().data(format!("{{\"error\": \"{}\"}}", message))
                             ))
                             .await;
+                        errored = true;
                         break;
                     }
+                }
+            }
+
+            if !errored {
+                let (final_prompt, final_completion) =
+                    completed.unwrap_or((prompt_tokens, streamed_tokens));
+                for event in terminal_chat_events(
+                    &id,
+                    &model_name,
+                    now,
+                    finish_reason(final_completion, max_tokens),
+                    include_usage.then_some(Usage {
+                        prompt_tokens: final_prompt,
+                        completion_tokens: final_completion,
+                        total_tokens: final_prompt + final_completion,
+                    }),
+                ) {
+                    let _ = stream_tx.send(Ok(event)).await;
                 }
             }
         });
@@ -247,7 +277,7 @@ pub async fn chat_completions(
                     content: Some(content.trim_end().to_string()),
                     tool_calls: None,
                 },
-                finish_reason: "stop",
+                finish_reason: finish_reason(completion_tokens, req.max_tokens),
             }],
             usage: Usage {
                 prompt_tokens: final_prompt_tokens,
@@ -260,22 +290,165 @@ pub async fn chat_completions(
     }
 }
 
+/// Why generation stopped, by the rule real engines use: hitting the cap is `length`,
+/// anything else is `stop`. The sim previously reported `stop` unconditionally, so a
+/// length-capped stream was indistinguishable from a natural one.
+fn finish_reason(completion_tokens: u32, max_tokens: u32) -> &'static str {
+    if completion_tokens >= max_tokens {
+        "length"
+    } else {
+        "stop"
+    }
+}
+
+/// How a healthy chat stream ends: the finish_reason chunk, then — only when
+/// `stream_options.include_usage` asked for it — usage as its OWN frame carrying
+/// `"choices": []`, then `[DONE]`.
+///
+/// The separate usage frame is what both real continuation targets emit (dynamo AND
+/// Fireworks); the sim used to hang `usage` off the finish_reason chunk, which no
+/// real engine does.
+fn terminal_chat_events(
+    id: &str,
+    model: &str,
+    created: u64,
+    finish_reason: &'static str,
+    usage: Option<Usage>,
+) -> Vec<Event> {
+    let mut events = vec![sse_json(&ChatCompletionChunk {
+        id: id.to_string(),
+        object: "chat.completion.chunk",
+        created,
+        model: model.to_string(),
+        choices: vec![ChunkChoice {
+            index: 0,
+            delta: ChunkDelta {
+                role: None,
+                content: None,
+                tool_calls: None,
+            },
+            finish_reason: Some(finish_reason),
+        }],
+        usage: None,
+    })];
+    if let Some(usage) = usage {
+        events.push(sse_json(&ChatCompletionChunk {
+            id: id.to_string(),
+            object: "chat.completion.chunk",
+            created,
+            model: model.to_string(),
+            choices: Vec::new(),
+            usage: Some(usage),
+        }));
+    }
+    events.push(Event::default().data("[DONE]"));
+    events
+}
+
+/// `/v1/completions` counterpart of [`terminal_chat_events`] — same sequence, in
+/// `text_completion` shape.
+fn terminal_completion_events(
+    id: &str,
+    model: &str,
+    created: u64,
+    finish_reason: &'static str,
+    usage: Option<Usage>,
+) -> Vec<Event> {
+    let mut events = vec![sse_json(&CompletionChunk {
+        id: id.to_string(),
+        object: "text_completion",
+        created,
+        model: model.to_string(),
+        choices: vec![CompletionChunkChoice {
+            text: String::new(),
+            index: 0,
+            finish_reason: Some(finish_reason),
+        }],
+        usage: None,
+    })];
+    if let Some(usage) = usage {
+        events.push(sse_json(&CompletionChunk {
+            id: id.to_string(),
+            object: "text_completion",
+            created,
+            model: model.to_string(),
+            choices: Vec::new(),
+            usage: Some(usage),
+        }));
+    }
+    events.push(Event::default().data("[DONE]"));
+    events
+}
+
+fn sse_json<T: serde::Serialize>(value: &T) -> Event {
+    Event::default().data(serde_json::to_string(value).expect("response types serialize"))
+}
+
 pub async fn completions(
     State(state): State<Arc<AppState>>,
+    connection: Option<Extension<Arc<fault::FaultConnection>>>,
+    headers: HeaderMap,
     Json(req): Json<CompletionRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    let prompt_tokens = count_text_prompt_tokens(&state, &req.prompt);
+    // Batched prompts would each need their own choice; this sim serves batch-of-one,
+    // like the engines behind the continuation targets. Reject anything else explicitly
+    // instead of silently answering only the first — and that includes the EMPTY batch
+    // (`"prompt": []`), which a `> 1` check waved through to be served as a zero-token
+    // prompt despite there being no prompt at all.
+    let batch_len = req.prompt.batch_len();
+    if batch_len != 1 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "message": format!("expected exactly 1 prompt, got {}", batch_len),
+                    "type": "invalid_request_error",
+                    "code": "invalid_prompt"
+                }
+            })),
+        ));
+    }
+
+    // Token-id prompts report their id COUNT verbatim. This is load-bearing: the
+    // continuation billing merge derives `prompt = P_reported − seg` from it, so an
+    // estimate here would corrupt every resumed request's accounting.
+    let prompt_tokens = match req.prompt.token_ids() {
+        Some(ids) => ids.len() as u32,
+        None => count_text_prompt_tokens(&state, req.prompt.text()),
+    };
     let include_usage = req
         .stream_options
         .as_ref()
         .map(|options| options.include_usage)
         .unwrap_or(false);
+
+    // Fault injection (serve::fault), same rules as chat completions: resume legs ARE
+    // streaming completions requests, so every death mode has to be reachable here or
+    // chain-resume tests have nothing to kill.
+    if let Some(spec) = resolve_fault(&state, &headers, req.stream, &req.model)? {
+        if !state.engines.contains_key(&req.model) {
+            return Err(model_not_found(&state, &req.model));
+        }
+        return Ok(fault::fault_response(
+            spec,
+            fault::StreamParams {
+                id: format!("cmpl-{}", uuid::Uuid::new_v4()),
+                model: req.model.clone(),
+                prompt_tokens,
+                include_usage,
+                flavor: fault::Flavor::Completion,
+            },
+            connection.map(|Extension(conn)| conn),
+        ));
+    }
+
     let (request_id, mut rx) =
         submit_engine_request(&state, &req.model, prompt_tokens, req.max_tokens, "cmpl").await?;
 
     if req.stream {
         let model_name = req.model.clone();
         let id = request_id.clone();
+        let max_tokens = req.max_tokens;
         let (stream_tx, stream_rx) = mpsc::channel::<Result<Event, Infallible>>(64);
 
         tokio::spawn(async move {
@@ -284,10 +457,14 @@ pub async fn completions(
                 .unwrap()
                 .as_secs();
 
+            let mut streamed_tokens = 0u32;
+            let mut completed: Option<(u32, u32)> = None;
+            let mut errored = false;
             while let Some(event) = rx.recv().await {
                 match event {
                     TokenEvent::FirstToken => {}
                     TokenEvent::Token { text } => {
+                        streamed_tokens += 1;
                         let chunk = CompletionChunk {
                             id: id.clone(),
                             object: "text_completion",
@@ -310,28 +487,7 @@ pub async fn completions(
                         prompt_tokens,
                         completion_tokens,
                     } => {
-                        let chunk = CompletionChunk {
-                            id: id.clone(),
-                            object: "text_completion",
-                            created: now,
-                            model: model_name.clone(),
-                            choices: vec![CompletionChunkChoice {
-                                text: String::new(),
-                                index: 0,
-                                finish_reason: Some("stop"),
-                            }],
-                            usage: include_usage.then_some(Usage {
-                                prompt_tokens,
-                                completion_tokens,
-                                total_tokens: prompt_tokens + completion_tokens,
-                            }),
-                        };
-                        let _ = stream_tx
-                            .send(Ok(
-                                Event::default().data(serde_json::to_string(&chunk).unwrap())
-                            ))
-                            .await;
-                        let _ = stream_tx.send(Ok(Event::default().data("[DONE]"))).await;
+                        completed = Some((prompt_tokens, completion_tokens));
                         break;
                     }
                     TokenEvent::Error { message } => {
@@ -340,8 +496,27 @@ pub async fn completions(
                                 Event::default().data(format!("{{\"error\": \"{}\"}}", message))
                             ))
                             .await;
+                        errored = true;
                         break;
                     }
+                }
+            }
+
+            if !errored {
+                let (final_prompt, final_completion) =
+                    completed.unwrap_or((prompt_tokens, streamed_tokens));
+                for event in terminal_completion_events(
+                    &id,
+                    &model_name,
+                    now,
+                    finish_reason(final_completion, max_tokens),
+                    include_usage.then_some(Usage {
+                        prompt_tokens: final_prompt,
+                        completion_tokens: final_completion,
+                        total_tokens: final_prompt + final_completion,
+                    }),
+                ) {
+                    let _ = stream_tx.send(Ok(event)).await;
                 }
             }
         });
@@ -378,15 +553,28 @@ pub async fn completions(
             .unwrap()
             .as_secs();
 
+        // `echo` on a text prompt prepends the prompt to the completion (classic OpenAI
+        // behavior); on an id prompt the sim cannot detokenize, so the ids come back
+        // verbatim as `prompt_token_ids` instead (Fireworks behavior).
+        let echoed_ids = req
+            .echo
+            .then(|| req.prompt.token_ids().map(<[u32]>::to_vec))
+            .flatten();
+        let text = match (req.echo, req.prompt.token_ids()) {
+            (true, None) => format!("{}{}", req.prompt.text(), content.trim_end()),
+            _ => content.trim_end().to_string(),
+        };
+
         let response = CompletionResponse {
             id: request_id,
             object: "text_completion",
             created: now,
             model: req.model,
             choices: vec![CompletionChoice {
-                text: content.trim_end().to_string(),
+                text,
                 index: 0,
-                finish_reason: "stop",
+                finish_reason: finish_reason(completion_tokens, req.max_tokens),
+                prompt_token_ids: echoed_ids,
             }],
             usage: Usage {
                 prompt_tokens: final_prompt_tokens,
@@ -397,6 +585,43 @@ pub async fn completions(
 
         Ok(Json(response).into_response())
     }
+}
+
+/// The fault directive for this request, if any. Header wins over static model config;
+/// a malformed header is a 400 (never a silent no-op — a typo'd e2e test must fail
+/// loudly). Fault modes are mid-STREAM deaths: an explicit header on a non-streaming
+/// request is rejected, while static model config simply doesn't apply there (a fault
+/// model must still serve normal non-streaming traffic).
+///
+/// The header is client-controlled and lets any caller stall or abort connections, so
+/// it sits behind `--enable-directives` — the same "untrusted clients must not reach
+/// this" trust boundary as echo-directives (rejected loudly when off, never ignored).
+/// Static `[fault]` config is operator input validated at boot and is not gated.
+fn resolve_fault(
+    state: &AppState,
+    headers: &HeaderMap,
+    stream: bool,
+    model: &str,
+) -> Result<Option<fault::FaultSpec>, (StatusCode, Json<serde_json::Value>)> {
+    if let Some(value) = headers.get(fault::FAULT_HEADER) {
+        if !state.enable_directives {
+            return Err(fault::invalid_fault(
+                "fault injection via header requires --enable-directives",
+            ));
+        }
+        let spec = value
+            .to_str()
+            .map_err(|_| "header value must be visible ASCII".to_string())
+            .and_then(fault::FaultSpec::parse_header)
+            .map_err(|e| fault::invalid_fault(&e))?;
+        if !stream {
+            return Err(fault::invalid_fault(
+                "fault modes are mid-stream deaths; set \"stream\": true",
+            ));
+        }
+        return Ok(Some(spec));
+    }
+    Ok(state.model_faults.get(model).filter(|_| stream).cloned())
 }
 
 fn model_not_found(state: &AppState, model: &str) -> (StatusCode, Json<serde_json::Value>) {
@@ -570,13 +795,30 @@ async fn submit_engine_request(
     Ok((request_id, rx))
 }
 
+/// Simulated chat-template overhead applied to the reported chat prompt count (percent).
+///
+/// Real engines report `prompt_tokens` from their chat-template RENDERING, which adds
+/// role headers and section scaffolding on top of the raw content — a few percent on
+/// typical prompts. This fake counts raw content, so a template-exact meter upstream
+/// (dwctl's render-counting cache classifier) legitimately counts a fully-marked
+/// prefix ABOVE our reported prompt and trips its creations-vs-prompt corrupt guard.
+/// Inflating the reported prompt by a bounded margin keeps that guard armed but not
+/// hair-triggered: template counts within +5% of raw pass; anything drifting further
+/// still zeroes the split and turns the cache-parity board red. Deliberately NOT
+/// sourced from tokenizer-svc — the fake must remain an independent count or the
+/// comparison stops testing anything. Floor arithmetic, so tiny prompts (< 20 tokens)
+/// round to no overhead. Applies to chat completions only; raw /v1/completions
+/// prompts are not chat-templated by real engines either.
+const PROMPT_TEMPLATE_OVERHEAD_PCT: u64 = 5;
+
 fn count_prompt_tokens(
     state: &AppState,
     messages: &[ChatMessage],
     tools: Option<&serde_json::Value>,
 ) -> u32 {
     let text = prompt_text(messages, tools);
-    count_text_prompt_tokens(state, &text)
+    let raw = u64::from(count_text_prompt_tokens(state, &text));
+    (raw * (100 + PROMPT_TEMPLATE_OVERHEAD_PCT) / 100) as u32
 }
 
 fn count_text_prompt_tokens(state: &AppState, prompt: &str) -> u32 {
@@ -637,6 +879,7 @@ mod tests {
             model_names: vec!["test-model".to_string()],
             tokenizer: None,
             enable_directives: true,
+            model_faults: HashMap::new(),
         })
     }
 
@@ -646,7 +889,65 @@ mod tests {
             model_names: vec!["test-model".to_string()],
             tokenizer: None,
             enable_directives: false,
+            model_faults: HashMap::new(),
         })
+    }
+
+    /// A `/v1/completions` request with the sim's defaults; tests override the fields
+    /// they care about.
+    fn completion_request(prompt: CompletionPrompt) -> CompletionRequest {
+        CompletionRequest {
+            model: "test-model".to_string(),
+            prompt,
+            stream: false,
+            max_tokens: 4,
+            stream_options: None,
+            priority: None,
+            echo: false,
+        }
+    }
+
+    fn text_prompt(text: &str) -> CompletionPrompt {
+        CompletionPrompt::Text(text.to_string())
+    }
+
+    /// Answer the engine request with a fixed completion, so a handler test can assert on
+    /// the wire shape without a simulator.
+    fn answer_engine(
+        mut engine_rx: mpsc::Receiver<EngineRequest>,
+        tokens: &'static [&'static str],
+        prompt_tokens: u32,
+        completion_tokens: u32,
+    ) -> tokio::task::JoinHandle<EngineRequest> {
+        tokio::spawn(async move {
+            let engine_req = engine_rx.recv().await.expect("engine path must be taken");
+            let _ = engine_req.tx.send(TokenEvent::FirstToken).await;
+            for token in tokens {
+                let _ = engine_req
+                    .tx
+                    .send(TokenEvent::Token {
+                        text: token.to_string(),
+                    })
+                    .await;
+            }
+            let _ = engine_req
+                .tx
+                .send(TokenEvent::Done {
+                    prompt_tokens,
+                    completion_tokens,
+                })
+                .await;
+            engine_req
+        })
+    }
+
+    /// Parse the SSE data frames that are JSON (everything but `[DONE]`).
+    fn json_frames(events: &[String]) -> Vec<serde_json::Value> {
+        events
+            .iter()
+            .filter(|e| *e != "[DONE]")
+            .map(|e| serde_json::from_str(e).unwrap())
+            .collect()
     }
 
     async fn response_json(response: Response) -> serde_json::Value {
@@ -656,8 +957,27 @@ mod tests {
 
     async fn response_sse_events(response: Response) -> Vec<String> {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        String::from_utf8(body.to_vec())
-            .unwrap()
+        sse_data_frames(&body)
+    }
+
+    /// Collect a body that ABORTS: fault modes end the stream with an error instead of a
+    /// clean close, which `to_bytes` refuses outright, so read until the abort and keep
+    /// whatever reached the wire first.
+    async fn response_sse_events_until_abort(response: Response) -> Vec<String> {
+        use tokio_stream::StreamExt;
+        let mut stream = response.into_body().into_data_stream();
+        let mut buf = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(bytes) => buf.extend_from_slice(&bytes),
+                Err(_) => break,
+            }
+        }
+        sse_data_frames(&buf)
+    }
+
+    fn sse_data_frames(body: &[u8]) -> Vec<String> {
+        String::from_utf8_lossy(body)
             .split("\n\n")
             .filter_map(|chunk| chunk.strip_prefix("data: ").map(str::to_string))
             .collect()
@@ -769,7 +1089,7 @@ mod tests {
             ]
         }))
         .unwrap();
-        let response = chat_completions(State(state), Json(req))
+        let response = chat_completions(State(state), None, HeaderMap::new(), Json(req))
             .await
             .unwrap()
             .into_response();
@@ -811,7 +1131,7 @@ mod tests {
             ]
         }))
         .unwrap();
-        let response = chat_completions(State(state), Json(req))
+        let response = chat_completions(State(state), None, HeaderMap::new(), Json(req))
             .await
             .unwrap()
             .into_response();
@@ -836,7 +1156,7 @@ mod tests {
             ]
         }))
         .unwrap();
-        let response = chat_completions(State(state), Json(req))
+        let response = chat_completions(State(state), None, HeaderMap::new(), Json(req))
             .await
             .unwrap()
             .into_response();
@@ -872,7 +1192,7 @@ mod tests {
             "messages": [{"role": "user", "content": "<<respond:{\"text\":\"hi\"}>>"}]
         }))
         .unwrap();
-        let response = chat_completions(State(state), Json(req))
+        let response = chat_completions(State(state), None, HeaderMap::new(), Json(req))
             .await
             .unwrap()
             .into_response();
@@ -915,7 +1235,7 @@ mod tests {
             "messages": [{"role": "user", "content": "<<respond:{\"text\":\"spoof\"}>>"}]
         }))
         .unwrap();
-        let response = chat_completions(State(state), Json(req))
+        let response = chat_completions(State(state), None, HeaderMap::new(), Json(req))
             .await
             .unwrap()
             .into_response();
@@ -934,7 +1254,7 @@ mod tests {
             "messages": [{"role": "user", "content": "<<respond:{\"text\":\"x\"}>>"}]
         }))
         .unwrap();
-        let err = chat_completions(State(state), Json(req))
+        let err = chat_completions(State(state), None, HeaderMap::new(), Json(req))
             .await
             .err()
             .unwrap();
@@ -976,13 +1296,9 @@ mod tests {
 
         let response = completions(
             State(state),
-            Json(CompletionRequest {
-                model: "test-model".to_string(),
-                prompt: "hello world".to_string(),
-                stream: false,
-                max_tokens: 4,
-                stream_options: None,
-            }),
+            None,
+            HeaderMap::new(),
+            Json(completion_request(text_prompt("hello world"))),
         )
         .await
         .unwrap()
@@ -1032,6 +1348,8 @@ mod tests {
 
         let response = chat_completions(
             State(state),
+            None,
+            HeaderMap::new(),
             Json(ChatCompletionRequest {
                 model: "test-model".to_string(),
                 messages: vec![ChatMessage {
@@ -1084,14 +1402,14 @@ mod tests {
 
         let response = completions(
             State(state),
+            None,
+            HeaderMap::new(),
             Json(CompletionRequest {
-                model: "test-model".to_string(),
-                prompt: "hello world".to_string(),
                 stream: true,
-                max_tokens: 4,
                 stream_options: Some(StreamOptions {
                     include_usage: true,
                 }),
+                ..completion_request(text_prompt("hello world"))
             }),
         )
         .await
@@ -1099,19 +1417,21 @@ mod tests {
         .into_response();
 
         let events = response_sse_events(response).await;
-        let final_chunk: serde_json::Value = serde_json::from_str(
-            events
-                .iter()
-                .rev()
-                .find(|event| *event != "[DONE]")
-                .unwrap(),
-        )
-        .unwrap();
+        assert_eq!(events.last().map(String::as_str), Some("[DONE]"));
+        let frames = json_frames(&events);
 
-        assert_eq!(final_chunk["choices"][0]["finish_reason"], "stop");
-        assert_eq!(final_chunk["usage"]["prompt_tokens"], 3);
-        assert_eq!(final_chunk["usage"]["completion_tokens"], 1);
-        assert_eq!(final_chunk["usage"]["total_tokens"], 4);
+        // Real engines put usage in its OWN final frame with choices:[], AFTER the
+        // finish_reason chunk — never hanging off the finish chunk itself.
+        let finish = &frames[frames.len() - 2];
+        assert_eq!(finish["choices"][0]["finish_reason"], "stop");
+        assert!(finish.get("usage").is_none());
+
+        let usage = frames.last().unwrap();
+        assert_eq!(usage["object"], "text_completion");
+        assert_eq!(usage["choices"].as_array().unwrap().len(), 0);
+        assert_eq!(usage["usage"]["prompt_tokens"], 3);
+        assert_eq!(usage["usage"]["completion_tokens"], 1);
+        assert_eq!(usage["usage"]["total_tokens"], 4);
     }
 
     #[tokio::test]
@@ -1140,6 +1460,8 @@ mod tests {
 
         let response = chat_completions(
             State(state),
+            None,
+            HeaderMap::new(),
             Json(ChatCompletionRequest {
                 model: "test-model".to_string(),
                 messages: vec![ChatMessage {
@@ -1160,19 +1482,19 @@ mod tests {
         .into_response();
 
         let events = response_sse_events(response).await;
-        let final_chunk: serde_json::Value = serde_json::from_str(
-            events
-                .iter()
-                .rev()
-                .find(|event| *event != "[DONE]")
-                .unwrap(),
-        )
-        .unwrap();
+        assert_eq!(events.last().map(String::as_str), Some("[DONE]"));
+        let frames = json_frames(&events);
 
-        assert_eq!(final_chunk["choices"][0]["finish_reason"], "stop");
-        assert_eq!(final_chunk["usage"]["prompt_tokens"], 5);
-        assert_eq!(final_chunk["usage"]["completion_tokens"], 1);
-        assert_eq!(final_chunk["usage"]["total_tokens"], 6);
+        let finish = &frames[frames.len() - 2];
+        assert_eq!(finish["choices"][0]["finish_reason"], "stop");
+        assert!(finish.get("usage").is_none());
+
+        let usage = frames.last().unwrap();
+        assert_eq!(usage["object"], "chat.completion.chunk");
+        assert_eq!(usage["choices"].as_array().unwrap().len(), 0);
+        assert_eq!(usage["usage"]["prompt_tokens"], 5);
+        assert_eq!(usage["usage"]["completion_tokens"], 1);
+        assert_eq!(usage["usage"]["total_tokens"], 6);
     }
 
     #[tokio::test]
@@ -1194,12 +1516,11 @@ mod tests {
 
         let response = completions(
             State(state),
+            None,
+            HeaderMap::new(),
             Json(CompletionRequest {
-                model: "test-model".to_string(),
-                prompt: "hello world".to_string(),
                 stream: true,
-                max_tokens: 4,
-                stream_options: None,
+                ..completion_request(text_prompt("hello world"))
             }),
         )
         .await
@@ -1207,17 +1528,15 @@ mod tests {
         .into_response();
 
         let events = response_sse_events(response).await;
-        let final_chunk: serde_json::Value = serde_json::from_str(
-            events
-                .iter()
-                .rev()
-                .find(|event| *event != "[DONE]")
-                .unwrap(),
-        )
-        .unwrap();
+        let frames = json_frames(&events);
 
-        assert_eq!(final_chunk["choices"][0]["finish_reason"], "stop");
-        assert!(final_chunk.get("usage").is_none());
+        // No include_usage means no usage frame at all — the stream ends finish -> [DONE].
+        assert_eq!(events.last().map(String::as_str), Some("[DONE]"));
+        assert_eq!(
+            frames.last().unwrap()["choices"][0]["finish_reason"],
+            "stop"
+        );
+        assert!(!frames.iter().any(|f| f.get("usage").is_some()));
     }
 
     #[tokio::test]
@@ -1239,14 +1558,14 @@ mod tests {
 
         let response = completions(
             State(state),
+            None,
+            HeaderMap::new(),
             Json(CompletionRequest {
-                model: "test-model".to_string(),
-                prompt: "hello world".to_string(),
                 stream: true,
-                max_tokens: 4,
                 stream_options: Some(StreamOptions {
                     include_usage: false,
                 }),
+                ..completion_request(text_prompt("hello world"))
             }),
         )
         .await
@@ -1254,17 +1573,14 @@ mod tests {
         .into_response();
 
         let events = response_sse_events(response).await;
-        let final_chunk: serde_json::Value = serde_json::from_str(
-            events
-                .iter()
-                .rev()
-                .find(|event| *event != "[DONE]")
-                .unwrap(),
-        )
-        .unwrap();
+        let frames = json_frames(&events);
 
-        assert_eq!(final_chunk["choices"][0]["finish_reason"], "stop");
-        assert!(final_chunk.get("usage").is_none());
+        assert_eq!(events.last().map(String::as_str), Some("[DONE]"));
+        assert_eq!(
+            frames.last().unwrap()["choices"][0]["finish_reason"],
+            "stop"
+        );
+        assert!(!frames.iter().any(|f| f.get("usage").is_some()));
     }
 
     #[tokio::test]
@@ -1286,6 +1602,8 @@ mod tests {
 
         let response = chat_completions(
             State(state),
+            None,
+            HeaderMap::new(),
             Json(ChatCompletionRequest {
                 model: "test-model".to_string(),
                 messages: vec![ChatMessage {
@@ -1336,6 +1654,8 @@ mod tests {
 
         let response = chat_completions(
             State(state),
+            None,
+            HeaderMap::new(),
             Json(ChatCompletionRequest {
                 model: "test-model".to_string(),
                 messages: vec![ChatMessage {
@@ -1369,6 +1689,33 @@ mod tests {
         assert!(final_chunk.get("usage").is_none());
     }
 
+    #[test]
+    fn chat_prompt_count_includes_template_overhead() {
+        let state = Arc::new(AppState {
+            engines: HashMap::new(),
+            model_names: vec!["m".to_string()],
+            tokenizer: None,
+            enable_directives: false,
+            model_faults: HashMap::new(),
+        });
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            tool_calls: None,
+            content: Some(MessageContent::Text("x".repeat(400))),
+        }];
+        let raw = u64::from(count_text_prompt_tokens(
+            &state,
+            &prompt_text(&messages, None),
+        ));
+        assert!(
+            raw >= 20,
+            "prompt must be large enough for the floor overhead to bite"
+        );
+        let expected = (raw * (100 + PROMPT_TEMPLATE_OVERHEAD_PCT) / 100) as u32;
+        assert_eq!(count_prompt_tokens(&state, &messages, None), expected);
+        assert!(u64::from(count_prompt_tokens(&state, &messages, None)) > raw);
+    }
+
     #[tokio::test]
     async fn completions_returns_model_not_found_error() {
         let state = Arc::new(AppState {
@@ -1376,16 +1723,16 @@ mod tests {
             model_names: vec!["other-model".to_string()],
             tokenizer: None,
             enable_directives: false,
+            model_faults: HashMap::new(),
         });
 
         let error = match completions(
             State(state),
+            None,
+            HeaderMap::new(),
             Json(CompletionRequest {
                 model: "missing-model".to_string(),
-                prompt: "hello".to_string(),
-                stream: false,
-                max_tokens: 4,
-                stream_options: None,
+                ..completion_request(text_prompt("hello"))
             }),
         )
         .await
@@ -1403,6 +1750,806 @@ mod tests {
             .contains("missing-model"));
     }
 
+    fn fault_header(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(fault::FAULT_HEADER, value.parse().unwrap());
+        headers
+    }
+
+    fn chat_request(stream: bool) -> ChatCompletionRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "stream": stream,
+            "stream_options": {"include_usage": true},
+            "messages": [{"role": "user", "content": "hello world"}]
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn fault_header_on_non_streaming_request_is_400() {
+        let (engine_tx, _engine_rx) = mpsc::channel::<EngineRequest>(1);
+        let state = test_state(engine_tx);
+        let err = chat_completions(
+            State(state),
+            None,
+            fault_header("cut_between_frames"),
+            Json(chat_request(false)),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        let body = serde_json::to_value(err.1 .0).unwrap();
+        assert_eq!(body["error"]["code"], "invalid_fault_directive");
+    }
+
+    #[tokio::test]
+    async fn malformed_fault_header_is_400_not_a_silent_noop() {
+        let (engine_tx, _engine_rx) = mpsc::channel::<EngineRequest>(1);
+        let state = test_state(engine_tx);
+        let err = chat_completions(
+            State(state),
+            None,
+            fault_header("cut_betwen_frames"), // typo'd mode
+            Json(chat_request(true)),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn fault_header_with_unknown_model_is_404() {
+        let (engine_tx, _engine_rx) = mpsc::channel::<EngineRequest>(1);
+        let state = test_state(engine_tx);
+        let mut req = chat_request(true);
+        req.model = "nope".to_string();
+        let err = chat_completions(State(state), None, fault_header("no_usage"), Json(req))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn fault_header_streams_the_death_without_touching_the_engine() {
+        // Channel with NO consumer: completing at all proves the engine bypass, like the
+        // directive tests.
+        let (engine_tx, _engine_rx) = mpsc::channel::<EngineRequest>(1);
+        let state = test_state(engine_tx);
+        let response = chat_completions(
+            State(state),
+            None,
+            fault_header("no_usage;after_chunks=2;delay_ms=0"),
+            Json(chat_request(true)),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[axum::http::header::CONTENT_TYPE],
+            "text/event-stream"
+        );
+
+        let events = response_sse_events(response).await;
+        // role + 2 content + finish + [DONE]
+        assert_eq!(events.len(), 5);
+        assert_eq!(events.last().map(String::as_str), Some("[DONE]"));
+        let finish: serde_json::Value = serde_json::from_str(&events[3]).unwrap();
+        assert_eq!(finish["choices"][0]["finish_reason"], "stop");
+        // The whole point of no_usage: include_usage was requested and never honored.
+        assert!(finish.get("usage").is_none());
+    }
+
+    #[tokio::test]
+    async fn fault_header_without_enable_directives_is_400() {
+        // The header is client-controlled and can stall/abort connections, so it sits
+        // behind the same trust gate as echo-directives — and fails loudly, so an e2e
+        // test pointed at a mis-deployed sim can't chase a phantom pass.
+        let (engine_tx, _engine_rx) = mpsc::channel::<EngineRequest>(1);
+        let state = test_state_directives_off(engine_tx);
+        let err = chat_completions(
+            State(state),
+            None,
+            fault_header("cut_between_frames"),
+            Json(chat_request(true)),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        let body = serde_json::to_value(err.1 .0).unwrap();
+        assert_eq!(body["error"]["code"], "invalid_fault_directive");
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("--enable-directives"));
+    }
+
+    #[tokio::test]
+    async fn static_model_fault_applies_without_header() {
+        let (engine_tx, _engine_rx) = mpsc::channel::<EngineRequest>(1);
+        // Directives OFF: static [fault] config is operator input validated at boot,
+        // not client input — it is deliberately NOT behind the directives gate.
+        let mut state = test_state_directives_off(engine_tx);
+        let spec = fault::FaultSpec::parse_header("no_done;after_chunks=1;delay_ms=0").unwrap();
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .model_faults
+            .insert("test-model".to_string(), spec);
+
+        let response = chat_completions(
+            State(state),
+            None,
+            HeaderMap::new(),
+            Json(chat_request(true)),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        let events = response_sse_events(response).await;
+        // role + 1 content + finish + usage, and no [DONE] — the configured death.
+        assert_eq!(events.len(), 4);
+        assert!(!events.iter().any(|e| e == "[DONE]"));
+        let finish: serde_json::Value = serde_json::from_str(&events[2]).unwrap();
+        assert_eq!(finish["choices"][0]["finish_reason"], "stop");
+        assert!(finish.get("usage").is_none());
+        let usage: serde_json::Value = serde_json::from_str(&events[3]).unwrap();
+        assert_eq!(usage["choices"].as_array().unwrap().len(), 0);
+        assert!(usage["usage"]["prompt_tokens"].as_u64().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn fault_header_takes_precedence_over_directive() {
+        let (engine_tx, _engine_rx) = mpsc::channel::<EngineRequest>(1);
+        let state = test_state(engine_tx); // directives enabled
+        let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "stream": true,
+            "messages": [{"role": "user", "content": "<<respond:{\"text\":\"scripted\"}>>"}]
+        }))
+        .unwrap();
+        let response = chat_completions(
+            State(state),
+            None,
+            fault_header("cancelled_499;after_chunks=1;delay_ms=0"),
+            Json(req),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        let events = response_sse_events(response).await;
+        assert_eq!(
+            events.last().map(String::as_str),
+            Some(
+                r#"{"error":{"code":499,"message":"CancelledError: ","type":"request_cancelled"}}"#
+            )
+        );
+        assert!(!events.iter().any(|e| e.contains("scripted")));
+    }
+
+    // --- Fault injection on streaming /v1/completions (resume-leg deaths) ---
+
+    /// A streaming completions request carrying whatever a resume leg carries.
+    fn streaming_completion_request() -> CompletionRequest {
+        CompletionRequest {
+            stream: true,
+            stream_options: Some(StreamOptions {
+                include_usage: true,
+            }),
+            priority: Some(0),
+            ..completion_request(text_prompt("hello world"))
+        }
+    }
+
+    #[tokio::test]
+    async fn completions_fault_cut_between_frames_emits_n_frames_then_dies() {
+        // Chain-resume tests kill a RESUME LEG mid-stream, and resume legs are streaming
+        // completions requests. No engine consumer: completing at all proves the bypass.
+        let (engine_tx, _engine_rx) = mpsc::channel::<EngineRequest>(1);
+        let state = test_state(engine_tx);
+        let response = completions(
+            State(state),
+            None,
+            fault_header("cut_between_frames;after_chunks=2;delay_ms=0"),
+            Json(streaming_completion_request()),
+        )
+        .await
+        .unwrap()
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[axum::http::header::CONTENT_TYPE],
+            "text/event-stream"
+        );
+
+        let events = response_sse_events_until_abort(response).await;
+        // Exactly 2 content frames, no role frame, and no terminator of any kind.
+        assert_eq!(events.len(), 2);
+        assert!(!events.iter().any(|e| e == "[DONE]"));
+        for frame in json_frames(&events) {
+            assert_eq!(frame["object"], "text_completion");
+            assert!(frame["choices"][0]["text"].is_string());
+            assert!(frame["choices"][0].get("finish_reason").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn completions_fault_error_envelope_200_streams_the_provider_error() {
+        let (engine_tx, _engine_rx) = mpsc::channel::<EngineRequest>(1);
+        let state = test_state(engine_tx);
+        let response = completions(
+            State(state),
+            None,
+            fault_header("error_envelope_200;after_chunks=1;delay_ms=0"),
+            Json(streaming_completion_request()),
+        )
+        .await
+        .unwrap()
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let events = response_sse_events(response).await;
+        assert_eq!(events.len(), 3); // 1 content + error envelope + [DONE]
+        assert_eq!(events.last().map(String::as_str), Some("[DONE]"));
+        let envelope: serde_json::Value = serde_json::from_str(&events[1]).unwrap();
+        assert_eq!(envelope["error"]["code"], 502);
+    }
+
+    #[tokio::test]
+    async fn completions_fault_stall_holds_the_connection_open() {
+        let (engine_tx, _engine_rx) = mpsc::channel::<EngineRequest>(1);
+        let state = test_state(engine_tx);
+        let response = completions(
+            State(state),
+            None,
+            fault_header("stall;after_chunks=1;delay_ms=0"),
+            Json(streaming_completion_request()),
+        )
+        .await
+        .unwrap()
+        .into_response();
+
+        // The body never completes, so collecting it must time out rather than end.
+        let body = response.into_body();
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(250),
+                to_bytes(body, usize::MAX)
+            )
+            .await
+            .is_err(),
+            "stall must leave the connection open with no terminator"
+        );
+    }
+
+    #[tokio::test]
+    async fn completions_fault_on_non_streaming_request_is_400() {
+        // Faults are mid-STREAM deaths; a non-streaming request asking for one is a
+        // loud 400 on both endpoints, never a silently healthy response.
+        let (engine_tx, _engine_rx) = mpsc::channel::<EngineRequest>(1);
+        let state = test_state(engine_tx);
+        let err = completions(
+            State(state),
+            None,
+            fault_header("cut_between_frames"),
+            Json(completion_request(text_prompt("hello"))),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        let body = serde_json::to_value(err.1 .0).unwrap();
+        assert_eq!(body["error"]["code"], "invalid_fault_directive");
+    }
+
+    #[tokio::test]
+    async fn completions_fault_header_without_enable_directives_is_400() {
+        let (engine_tx, _engine_rx) = mpsc::channel::<EngineRequest>(1);
+        let state = test_state_directives_off(engine_tx);
+        let err = completions(
+            State(state),
+            None,
+            fault_header("cut_between_frames"),
+            Json(streaming_completion_request()),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(serde_json::to_value(err.1 .0).unwrap()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("--enable-directives"));
+    }
+
+    #[tokio::test]
+    async fn completions_fault_reports_id_prompt_token_count() {
+        // The death happens on a resume leg whose prompt is token ids, and the usage that
+        // does arrive must still carry the id-exact prompt count.
+        let (engine_tx, _engine_rx) = mpsc::channel::<EngineRequest>(1);
+        let state = test_state(engine_tx);
+        let response = completions(
+            State(state),
+            None,
+            fault_header("no_done;after_chunks=2;delay_ms=0"),
+            Json(CompletionRequest {
+                prompt: CompletionPrompt::Ids(vec![9, 8, 7, 6, 5]),
+                ..streaming_completion_request()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+
+        let events = response_sse_events(response).await;
+        let frames = json_frames(&events);
+        let usage = frames.last().unwrap();
+        assert_eq!(usage["choices"].as_array().unwrap().len(), 0);
+        assert_eq!(usage["usage"]["prompt_tokens"], 5);
+    }
+
+    // --- Token-id prompts ---
+
+    #[tokio::test]
+    async fn id_prompt_reports_exact_id_count_as_prompt_tokens() {
+        // Load-bearing: the continuation billing merge computes `prompt = P_reported − seg`
+        // from this number, so it must be the id COUNT, never a char estimate. The four
+        // ids here estimate to a very different number through the text path.
+        let (engine_tx, engine_rx) = mpsc::channel::<EngineRequest>(1);
+        let state = test_state(engine_tx);
+        let answered = answer_engine(engine_rx, &["Hello", " world"], 4, 2);
+
+        let response = completions(
+            State(state),
+            None,
+            HeaderMap::new(),
+            Json(completion_request(CompletionPrompt::Ids(vec![1, 2, 3, 4]))),
+        )
+        .await
+        .unwrap()
+        .into_response();
+
+        let engine_req = answered.await.unwrap();
+        assert_eq!(
+            engine_req.prompt_tokens, 4,
+            "the engine must be told the id count"
+        );
+
+        let json = response_json(response).await;
+        assert_eq!(json["usage"]["prompt_tokens"], 4);
+        // Text is simulated exactly as for a string prompt: this deployment mounts no
+        // tokenizer, so ids are never detokenized — only the accounting is id-exact.
+        assert_eq!(json["choices"][0]["text"], "Hello world");
+    }
+
+    #[tokio::test]
+    async fn id_prompt_batch_of_one_counts_the_inner_list() {
+        let (engine_tx, engine_rx) = mpsc::channel::<EngineRequest>(1);
+        let state = test_state(engine_tx);
+        let answered = answer_engine(engine_rx, &["x"], 6, 1);
+
+        let response = completions(
+            State(state),
+            None,
+            HeaderMap::new(),
+            Json(completion_request(CompletionPrompt::IdBatch(vec![vec![
+                11, 12, 13, 14, 15, 16,
+            ]]))),
+        )
+        .await
+        .unwrap()
+        .into_response();
+
+        assert_eq!(answered.await.unwrap().prompt_tokens, 6);
+        assert_eq!(response_json(response).await["usage"]["prompt_tokens"], 6);
+    }
+
+    #[test]
+    fn prompt_deserializes_every_accepted_shape() {
+        let parse = |value: serde_json::Value| -> CompletionRequest {
+            serde_json::from_value(serde_json::json!({"model": "m", "prompt": value}))
+                .expect("prompt shape must deserialize")
+        };
+        // string
+        assert!(parse(serde_json::json!("hi")).prompt.token_ids().is_none());
+        // int[]
+        assert_eq!(
+            parse(serde_json::json!([1, 2, 3])).prompt.token_ids(),
+            Some(&[1u32, 2, 3][..])
+        );
+        // int[][] (batch of one)
+        assert_eq!(
+            parse(serde_json::json!([[4, 5]])).prompt.token_ids(),
+            Some(&[4u32, 5][..])
+        );
+        // string[] — accepted like a real engine; still a text prompt
+        let texts = parse(serde_json::json!(["hi"]));
+        assert!(texts.prompt.token_ids().is_none());
+        assert_eq!(texts.prompt.text(), "hi");
+    }
+
+    #[tokio::test]
+    async fn batched_prompt_larger_than_one_is_rejected() {
+        // Batches would need one choice per prompt; answering only the first silently
+        // would be worse than a clear 400.
+        let (engine_tx, _engine_rx) = mpsc::channel::<EngineRequest>(1);
+        let state = test_state(engine_tx);
+        let err = completions(
+            State(state),
+            None,
+            HeaderMap::new(),
+            Json(completion_request(CompletionPrompt::IdBatch(vec![
+                vec![1, 2],
+                vec![3, 4],
+            ]))),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        let body = serde_json::to_value(err.1 .0).unwrap();
+        assert_eq!(body["error"]["code"], "invalid_prompt");
+        assert!(body["error"]["message"].as_str().unwrap().contains("got 2"));
+    }
+
+    #[tokio::test]
+    async fn empty_prompt_batch_is_rejected() {
+        // `"prompt": []` is not a batch of one — it is no prompt at all. A `> 1` check
+        // waved it through to be served as a zero-token prompt.
+        let (engine_tx, _engine_rx) = mpsc::channel::<EngineRequest>(1);
+        let state = test_state(engine_tx);
+
+        // On the wire an empty array lands on Texts (untagged variants are tried in
+        // order), so that is the shape a client can actually send.
+        let wire: CompletionRequest =
+            serde_json::from_value(serde_json::json!({"model": "test-model", "prompt": []}))
+                .unwrap();
+        assert!(
+            matches!(wire.prompt, CompletionPrompt::Texts(ref v) if v.is_empty()),
+            "empty array must deserialize to an empty Texts batch"
+        );
+
+        // Both empty batch shapes must be rejected identically.
+        for prompt in [
+            CompletionPrompt::Texts(Vec::new()),
+            CompletionPrompt::IdBatch(Vec::new()),
+        ] {
+            assert_eq!(prompt.batch_len(), 0);
+            let err = completions(
+                State(state.clone()),
+                None,
+                HeaderMap::new(),
+                Json(completion_request(prompt)),
+            )
+            .await
+            .err()
+            .expect("an empty prompt batch must not be served");
+            assert_eq!(err.0, StatusCode::BAD_REQUEST);
+            let body = serde_json::to_value(err.1 .0).unwrap();
+            assert_eq!(body["error"]["code"], "invalid_prompt");
+            assert!(body["error"]["message"].as_str().unwrap().contains("got 0"));
+        }
+    }
+
+    #[tokio::test]
+    async fn single_prompts_pass_the_batch_gate() {
+        // The other side of `batch_len != 1`: the non-batch variants report 1 and must
+        // still reach the engine. A batch-of-one id list counts as single too.
+        for prompt in [
+            text_prompt("hello world"),
+            CompletionPrompt::Ids(vec![1, 2, 3]),
+            CompletionPrompt::Texts(vec!["hello world".to_string()]),
+            CompletionPrompt::IdBatch(vec![vec![1, 2, 3]]),
+        ] {
+            assert_eq!(prompt.batch_len(), 1);
+            let (engine_tx, engine_rx) = mpsc::channel::<EngineRequest>(1);
+            let state = test_state(engine_tx);
+            let answered = answer_engine(engine_rx, &["ok"], 3, 1);
+
+            let response = completions(
+                State(state),
+                None,
+                HeaderMap::new(),
+                Json(completion_request(prompt)),
+            )
+            .await
+            .expect("a single prompt must pass the batch gate")
+            .into_response();
+
+            answered.await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response_json(response).await["choices"][0]["text"], "ok");
+        }
+    }
+
+    /// An empty string and an empty id list are real, servable prompts — they are a batch
+    /// of ONE that happens to be empty, not an absent prompt, and must not be swept up by
+    /// the empty-batch rejection.
+    #[tokio::test]
+    async fn empty_single_prompt_is_still_served() {
+        for prompt in [
+            text_prompt(""),
+            CompletionPrompt::Ids(Vec::new()),
+            CompletionPrompt::IdBatch(vec![Vec::new()]),
+        ] {
+            assert_eq!(prompt.batch_len(), 1);
+            let (engine_tx, engine_rx) = mpsc::channel::<EngineRequest>(1);
+            let state = test_state(engine_tx);
+            let answered = answer_engine(engine_rx, &["ok"], 0, 1);
+
+            let response = completions(
+                State(state),
+                None,
+                HeaderMap::new(),
+                Json(completion_request(prompt)),
+            )
+            .await
+            .expect("an empty single prompt is servable")
+            .into_response();
+
+            assert_eq!(answered.await.unwrap().prompt_tokens, 0);
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+    }
+
+    #[tokio::test]
+    async fn echo_on_id_prompt_returns_the_received_ids() {
+        let (engine_tx, engine_rx) = mpsc::channel::<EngineRequest>(1);
+        let state = test_state(engine_tx);
+        let answered = answer_engine(engine_rx, &["out"], 3, 1);
+
+        let response = completions(
+            State(state),
+            None,
+            HeaderMap::new(),
+            Json(CompletionRequest {
+                echo: true,
+                ..completion_request(CompletionPrompt::Ids(vec![7, 8, 9]))
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+
+        answered.await.unwrap();
+        let json = response_json(response).await;
+        assert_eq!(
+            json["choices"][0]["prompt_token_ids"],
+            serde_json::json!([7, 8, 9])
+        );
+        assert_eq!(json["choices"][0]["text"], "out");
+    }
+
+    #[tokio::test]
+    async fn echo_is_absent_and_ids_omitted_by_default() {
+        let (engine_tx, engine_rx) = mpsc::channel::<EngineRequest>(1);
+        let state = test_state(engine_tx);
+        let answered = answer_engine(engine_rx, &["out"], 3, 1);
+
+        let response = completions(
+            State(state),
+            None,
+            HeaderMap::new(),
+            Json(completion_request(CompletionPrompt::Ids(vec![7, 8, 9]))),
+        )
+        .await
+        .unwrap()
+        .into_response();
+
+        answered.await.unwrap();
+        let json = response_json(response).await;
+        assert!(json["choices"][0].get("prompt_token_ids").is_none());
+    }
+
+    #[tokio::test]
+    async fn priority_and_stream_options_are_tolerated_on_completions() {
+        // Every resume leg carries both; a serde error on either would 400 the resume
+        // before it reached the engine.
+        let req: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "prompt": [1, 2, 3],
+            "max_tokens": 8,
+            "priority": 0,
+            "stream": true,
+            "stream_options": {"include_usage": true}
+        }))
+        .expect("priority + stream_options must deserialize");
+        assert_eq!(req.priority, Some(0));
+        assert!(req.stream_options.unwrap().include_usage);
+
+        // A non-zero priority is equally fine, and otherwise ignored by the sim.
+        let req: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "prompt": "hi",
+            "priority": 100
+        }))
+        .unwrap();
+        assert_eq!(req.priority, Some(100));
+    }
+
+    // --- Length-capped termination ---
+
+    #[tokio::test]
+    async fn completions_length_capped_stream_terminates_with_length_then_usage_then_done() {
+        // The bug this covers: a max_tokens-capped stream used to stop dead with no
+        // finish_reason, no usage and no [DONE] — byte-indistinguishable from a
+        // mid-stream death, which poisons every test using max_tokens as a stop.
+        let (engine_tx, engine_rx) = mpsc::channel::<EngineRequest>(1);
+        let state = test_state(engine_tx);
+        let answered = answer_engine(engine_rx, &["a ", "b ", "c "], 4, 3);
+
+        let response = completions(
+            State(state),
+            None,
+            HeaderMap::new(),
+            Json(CompletionRequest {
+                stream: true,
+                max_tokens: 3, // completion_tokens == max_tokens -> length
+                stream_options: Some(StreamOptions {
+                    include_usage: true,
+                }),
+                ..completion_request(CompletionPrompt::Ids(vec![1, 2, 3, 4]))
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+
+        answered.await.unwrap();
+        let events = response_sse_events(response).await;
+        assert_eq!(events.last().map(String::as_str), Some("[DONE]"));
+        let frames = json_frames(&events);
+
+        let finish = &frames[frames.len() - 2];
+        assert_eq!(finish["choices"][0]["finish_reason"], "length");
+        assert!(finish.get("usage").is_none());
+
+        let usage = frames.last().unwrap();
+        assert_eq!(usage["choices"].as_array().unwrap().len(), 0);
+        assert_eq!(usage["usage"]["prompt_tokens"], 4);
+        assert_eq!(usage["usage"]["completion_tokens"], 3);
+    }
+
+    #[tokio::test]
+    async fn chat_length_capped_stream_terminates_with_length_then_usage_then_done() {
+        let (engine_tx, engine_rx) = mpsc::channel::<EngineRequest>(1);
+        let state = test_state(engine_tx);
+        let answered = answer_engine(engine_rx, &["a ", "b "], 5, 2);
+
+        let response = chat_completions(
+            State(state),
+            None,
+            HeaderMap::new(),
+            Json(ChatCompletionRequest {
+                max_tokens: 2,
+                ..chat_request(true)
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+
+        answered.await.unwrap();
+        let events = response_sse_events(response).await;
+        assert_eq!(events.last().map(String::as_str), Some("[DONE]"));
+        let frames = json_frames(&events);
+
+        let finish = &frames[frames.len() - 2];
+        assert_eq!(finish["choices"][0]["finish_reason"], "length");
+        assert!(finish.get("usage").is_none());
+        assert_eq!(frames.last().unwrap()["usage"]["completion_tokens"], 2);
+    }
+
+    #[tokio::test]
+    async fn natural_stop_still_reports_stop() {
+        // The other side of the finish_reason rule: under the cap is an ordinary stop.
+        let (engine_tx, engine_rx) = mpsc::channel::<EngineRequest>(1);
+        let state = test_state(engine_tx);
+        let answered = answer_engine(engine_rx, &["a "], 4, 1);
+
+        let response = completions(
+            State(state),
+            None,
+            HeaderMap::new(),
+            Json(CompletionRequest {
+                stream: true,
+                max_tokens: 64,
+                ..completion_request(text_prompt("hello world"))
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+
+        answered.await.unwrap();
+        let frames = json_frames(&response_sse_events(response).await);
+        assert_eq!(
+            frames.last().unwrap()["choices"][0]["finish_reason"],
+            "stop"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_streaming_length_cap_reports_length() {
+        let (engine_tx, engine_rx) = mpsc::channel::<EngineRequest>(1);
+        let state = test_state(engine_tx);
+        let answered = answer_engine(engine_rx, &["a ", "b "], 4, 2);
+
+        let response = completions(
+            State(state),
+            None,
+            HeaderMap::new(),
+            Json(CompletionRequest {
+                max_tokens: 2,
+                ..completion_request(text_prompt("hello world"))
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+
+        answered.await.unwrap();
+        assert_eq!(
+            response_json(response).await["choices"][0]["finish_reason"],
+            "length"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_terminates_even_when_the_engine_never_reports_done() {
+        // The engine used to drop events on a full channel, losing the terminating Done
+        // and leaving the stream to just stop. Whatever the cause, a stream must never
+        // end without a terminator — explicit fault modes are how deaths are requested.
+        let (engine_tx, mut engine_rx) = mpsc::channel::<EngineRequest>(1);
+        let state = test_state(engine_tx);
+
+        let answered = tokio::spawn(async move {
+            let engine_req = engine_rx.recv().await.unwrap();
+            for token in ["a ", "b "] {
+                let _ = engine_req
+                    .tx
+                    .send(TokenEvent::Token {
+                        text: token.to_string(),
+                    })
+                    .await;
+            }
+            // Channel closes with no Done: the request vanished mid-generation.
+            drop(engine_req);
+        });
+
+        let response = completions(
+            State(state),
+            None,
+            HeaderMap::new(),
+            Json(CompletionRequest {
+                stream: true,
+                max_tokens: 2,
+                stream_options: Some(StreamOptions {
+                    include_usage: true,
+                }),
+                ..completion_request(text_prompt("hello world"))
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+
+        answered.await.unwrap();
+        let events = response_sse_events(response).await;
+        assert_eq!(events.last().map(String::as_str), Some("[DONE]"));
+        let frames = json_frames(&events);
+
+        // Counts fall back to what actually went out on the wire.
+        let finish = &frames[frames.len() - 2];
+        assert_eq!(finish["choices"][0]["finish_reason"], "length");
+        assert_eq!(frames.last().unwrap()["usage"]["completion_tokens"], 2);
+    }
+
     #[test]
     fn prompt_token_estimation_supports_raw_text() {
         let state = AppState {
@@ -1410,6 +2557,7 @@ mod tests {
             model_names: Vec::new(),
             tokenizer: None,
             enable_directives: false,
+            model_faults: HashMap::new(),
         };
 
         assert_eq!(count_text_prompt_tokens(&state, "hello world"), 3);

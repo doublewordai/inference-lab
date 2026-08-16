@@ -22,110 +22,10 @@
 //!
 //! Run: `cargo run --release --example spec_c1_gamma_sweep --no-default-features`
 
-use inference_lab::config::{
-    AcceptanceModel, Config, DeepseekV4Model, GammaPolicy, HardwareConfig, LengthDistribution,
-    ModelConfig, ParallelConfig, Precision, SchedulerConfig, SimulationConfig, SpeculativeConfig,
-    WorkloadConfig,
-};
+mod common;
+
+use inference_lab::config::{AcceptanceModel, DrafterCost, GammaPolicy, SpeculativeConfig};
 use inference_lab::simulation::Simulator;
-
-fn b200_per_gpu() -> HardwareConfig {
-    // B200 dense peaks ÷ 8 TB/s give the post's ridges: fp4 1125, fp8 563, bf16 281.
-    HardwareConfig {
-        name: "B200".into(),
-        flops_fp4: Some(9.0e15),
-        flops_fp8: Some(4.5e15),
-        flops_bf16: Some(2.25e15),
-        flops_fp16: Some(2.25e15),
-        memory_bandwidth: 8.0e12,
-        memory_capacity: 206_158_430_208, // 192 GiB HBM3e
-        kv_cache_capacity: 0,
-        gpu_memory_utilization: 0.9,
-        kv_tiers: Vec::new(),
-    }
-}
-
-fn deepseek_v4_flash() -> ModelConfig {
-    // Architecture + param counts derived from the HF `deepseek-ai/DeepSeek-V4-Flash`
-    // config.json and the actual safetensors weight shapes (not estimated). The
-    // backbone is 43 MoE layers: 2 dense-attention (compress_ratio 0), 21 near
-    // (4) + indexer, 20 far (128). Expert FFN 3·4096·2048 = 25.17M params each;
-    // 256 routed + 1 shared. Non-expert (per-token GEMM) is attention QKVO
-    // projections (106.9M/layer) + indexer + compressor + gate + head. MTP head
-    // excluded (base-model decode), matching the Pro convention.
-    ModelConfig::DeepseekV4(DeepseekV4Model {
-        name: "DeepSeek-V4-Flash".into(),
-        num_layers: 43,
-        hidden_dim: 4096,
-        num_heads: 64,
-        max_seq_len: 1_048_576,
-        kv_latent_dim: 512, // head_dim
-        qk_rope_head_dim: 64,
-        kv_precision: Precision::Fp8,
-        num_active_expert_params: 7_574_913_024, // (6+1)·25.17M·43
-        num_active_non_expert_params: 5_660_947_776, // attn+indexer+compressor+gate+head
-        num_resident_expert_params: 278_107_521_024, // (256+1)·25.17M·43
-        num_resident_non_expert_params: 6_225_000_000,
-        expert_precision: Precision::Fp4,
-        non_expert_precision: Precision::Fp8,
-        window_size: 128,
-        num_dense_layers: 2,
-        num_near_layers: 21,
-        num_far_layers: 20,
-        near_compress_ratio: 4,
-        far_compress_ratio: 128,
-        index_topk: 512,
-        index_n_heads: 64,
-        index_head_dim: 128,
-        index_kv_precision: None,
-        num_experts_per_tok: 6,
-        num_routed_experts: 256,
-        num_moe_layers: 43,
-    })
-}
-
-fn base_config(conc: usize, isl: u32, osl: u32) -> Config {
-    Config {
-        hardware: b200_per_gpu(),
-        // Single B200, TP1/EP1 -- matches the post's per-GPU roofline (the
-        // ~145GB of fp4 weights + small KV fit in 192GB). One pool, one device.
-        parallel: ParallelConfig {
-            tp: 1,
-            ep: 1,
-            dp_attention: false,
-        },
-        model: deepseek_v4_flash(),
-        scheduler: SchedulerConfig {
-            max_num_batched_tokens: 8192,
-            max_num_seqs: 32768,
-            enable_chunked_prefill: true,
-            long_prefill_token_threshold: 0,
-            max_num_partial_prefills: 1,
-            block_size: 64,
-            policy: "fcfs".into(),
-            enable_preemption_free: true,
-            enable_cascade_attention: false,
-        },
-        workload: WorkloadConfig {
-            dataset_path: None,
-            arrival_pattern: "closed_loop".into(),
-            arrival_rate: 1.0,
-            rate_schedule: None,
-            num_concurrent_users: Some(conc),
-            // Break the synchronized-arrival regime so the decode batch is a
-            // realistic fluctuating quantity, not a lockstep pulse.
-            closed_loop_jitter_secs: Some(0.5e-3),
-            input_len_dist: LengthDistribution::Fixed { value: isl },
-            output_len_dist: LengthDistribution::Fixed { value: osl },
-            // Long enough that steady state dominates the t=0 transient.
-            num_requests: Some((conc * 20).max(2000)),
-            duration_secs: None,
-            seed: 7,
-        },
-        simulation: SimulationConfig::default(),
-        speculative: None,
-    }
-}
 
 #[derive(Clone, Copy)]
 enum Policy {
@@ -143,19 +43,17 @@ impl Policy {
                 gamma: g,
                 acceptance,
                 policy: GammaPolicy::Fixed,
-                draft_cost_frac: c_draft,
                 measured_cost: None,
                 switch: Default::default(),
-                drafter: None,
+                drafter: Some(DrafterCost::Fraction { frac: c_draft }),
             }),
             Policy::Budget(g) => Some(SpeculativeConfig {
                 gamma: g,
                 acceptance,
                 policy: GammaPolicy::GoodputBudget,
-                draft_cost_frac: c_draft,
                 measured_cost: None,
                 switch: Default::default(),
-                drafter: None,
+                drafter: Some(DrafterCost::Fraction { frac: c_draft }),
             }),
         }
     }
@@ -170,17 +68,17 @@ fn run_point(
     c_draft: f64,
     p: Policy,
 ) -> (f64, f64, f64, f64) {
-    let mut config = base_config(conc, isl, osl);
+    let mut config = common::closed_loop_config(common::deepseek_v4_flash(), 8192, conc, isl, osl);
     config.speculative = p.spec(alpha, c_draft);
     config.finalize();
-    let (mut sim, _cfg) = Simulator::new(config, None).expect("build sim");
+    let mut sim = Simulator::new(config, None).expect("build sim");
     sim.run_with_callback(|_| {}).expect("run");
-    let s = sim.get_metrics_summary();
+    let s = sim.summary();
     (
-        s.output_tokens_per_sec,
-        s.per_token_mean * 1000.0,
-        s.avg_bandwidth_util,
-        s.avg_flops_util,
+        s.throughput_metrics.output_tokens_per_sec,
+        s.latency_metrics.per_token_ms.mean * 1000.0,
+        s.utilization.avg_bandwidth_util,
+        s.utilization.avg_flops_util,
     )
 }
 

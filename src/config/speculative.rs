@@ -4,10 +4,10 @@ use serde::Deserialize;
 /// How the target accepts a draft. The acceptance model is the knob you vary to
 /// study the simulated benefit of speculation under different draft qualities.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AcceptanceModel {
     /// i.i.d. per-position acceptance probability `alpha`. The classic Leviathan
-    /// model: E[accepted] = (1 - alpha^(gamma+1)) / (1 - alpha) - 1 over the
+    /// model: `E[accepted] = (1 - alpha^(gamma+1)) / (1 - alpha) - 1` over the
     /// draft, geometric in depth.
     Constant { alpha: f64 },
     /// Empirical per-position conditional acceptance `a[d]` = P(accept the draft
@@ -91,13 +91,13 @@ impl TraceBank {
 }
 
 impl AcceptanceModel {
-    /// Conditional acceptance at draft depth `d` (0-based).
-    fn a_d(&self, d: usize) -> f64 {
+    /// Conditional acceptance at draft depth `d` (0-based) for the analytic
+    /// models. `TraceRounds` has no closed form: its rounds are replayed by
+    /// the planner, and this returns 0.
+    pub fn a_d(&self, d: usize) -> f64 {
         match self {
             AcceptanceModel::Constant { alpha } => *alpha,
             AcceptanceModel::PerPosition { a } => a.get(d).copied().unwrap_or(0.0),
-            // TraceRounds outcomes are realised from drawn rounds in the
-            // engine, not from this curve; unreachable in normal operation.
             AcceptanceModel::TraceRounds { .. } => 0.0,
         }
     }
@@ -130,10 +130,6 @@ impl AcceptanceModel {
     }
 }
 
-/// Speculative decoding configuration. Top-level (a serving-strategy choice).
-/// When present, each decode step verifies `gamma + 1` tokens per sequence (the
-/// cost) and advances by `accepted + 1` tokens (the progress), with `accepted`
-/// drawn from `acceptance`.
 /// How the draft length is chosen each step.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -188,6 +184,7 @@ pub enum GammaPolicy {
 /// `batch_size,num_draft_tokens,step_seconds`, one row per measured grid
 /// point. See [`crate::compute::MeasuredCostTable`].
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeasuredCostConfig {
     pub path: String,
     /// Mean KV length (tokens of context per sequence) at which the table's
@@ -208,6 +205,7 @@ pub struct MeasuredCostConfig {
 /// Defaults are fully unconstrained (the raw aggregated gate, bit-identical
 /// to the policy without this struct).
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SwitchConstraints {
     /// Re-evaluate the batch width only every this-many decode rounds
     /// (0 or 1 = every round). Between re-evaluations the previous width
@@ -237,10 +235,11 @@ impl SwitchConstraints {
 /// only difference is how many times that sweep is paid for a draft of `gamma`.
 /// See the drafter-roofline section of the post.
 #[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum DrafterCost {
-    /// Legacy scalar: overhead = `frac · gamma · verify_cost`. Reproduces the old
-    /// multiplicative `(1 + frac·gamma)` exactly when added to the verify cost.
+    /// Fixed fraction of the verify step per draft token: overhead =
+    /// `frac · gamma · verify_cost` (the multiplicative `(1 + frac·gamma)`
+    /// model when added to the verify cost).
     Fraction { frac: f64 },
     /// Autoregressive head (MTP / EAGLE): `gamma` serial single-token passes,
     /// each streaming the drafter's weights, so cost is LINEAR in `gamma` and the
@@ -289,15 +288,10 @@ impl DrafterCost {
                 experts_per_tok,
                 shared_experts,
             } => {
-                let e = num_experts as f64;
                 let k = experts_per_tok as f64;
                 let shared = shared_experts as f64;
                 // Coupon-collector: distinct routed experts touched by b·k draws.
-                let loaded = if e > 0.0 {
-                    e * (1.0 - (1.0 - 1.0 / e).powf(b * k))
-                } else {
-                    0.0
-                };
+                let loaded = super::model::expected_distinct_experts(num_experts, b * k);
                 let resident = dense_params + (shared + loaded) * expert_params; // bytes
                 let active = dense_params + (k + shared) * expert_params; // FLOPs/token
                 let per_pass = ((2.0 * active * b) / peak).max((2.0 * resident) / bw);
@@ -356,7 +350,12 @@ impl DrafterCost {
     }
 }
 
+/// Speculative decoding configuration. Top-level (a serving-strategy choice).
+/// When present, each decode step verifies `gamma + 1` tokens per sequence (the
+/// cost) and advances by `accepted + 1` tokens (the progress), with `accepted`
+/// drawn from `acceptance`.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SpeculativeConfig {
     /// Draft length under `Fixed`; the maximum candidate `G` under `GoodputBudget`.
     /// The verify pass processes `gamma + 1` positions per sequence.
@@ -366,11 +365,6 @@ pub struct SpeculativeConfig {
     /// Draft-length policy. Defaults to `Fixed`.
     #[serde(default)]
     pub policy: GammaPolicy,
-    /// Drafter overhead as a fraction of the verify step *per draft token*,
-    /// charged on each speculated decode step (total overhead = frac × gamma).
-    /// ~0.0 for our validation (free MTP head). Defaults to 0.
-    #[serde(default)]
-    pub draft_cost_frac: f64,
     /// Optional measured step-cost table. When set, the policy decision's
     /// cost curve `C(g)` is looked up from the table (at the current decode
     /// batch size) instead of the analytic roofline, and pure-decode steps'
@@ -378,7 +372,7 @@ pub struct SpeculativeConfig {
     /// `num_draft_tokens = 1` rows), so speculative and no-spec steps are
     /// commensurate. Entries the table lacks fall back to the roofline.
     /// Measured rows embody the full engine step including the drafter, so
-    /// `draft_cost_frac` should be 0 with a table (it is not applied to
+    /// the drafter model should be free with a table (it is not applied to
     /// table-priced steps).
     #[serde(default)]
     pub measured_cost: Option<MeasuredCostConfig>,
@@ -387,18 +381,16 @@ pub struct SpeculativeConfig {
     /// aggregated gate. Ignored by the other policies.
     #[serde(default)]
     pub switch: SwitchConstraints,
-    /// Drafter cost model. When set, it prices the drafter as an absolute time
-    /// added to the verify step (roofline-aware, batch-dependent), replacing the
-    /// scalar `draft_cost_frac`. When unset, the drafter falls back to the legacy
-    /// `Fraction { frac: draft_cost_frac }` so old configs are unchanged.
+    /// Drafter cost model: the time to produce the speculated tokens, added
+    /// to the verify step. Unset means a free drafter.
     #[serde(default)]
     pub drafter: Option<DrafterCost>,
 }
 
 impl SpeculativeConfig {
-    /// Drafter time (seconds) for this step, dispatching to the configured
-    /// `drafter` model or the legacy `draft_cost_frac` fraction. Added to the
-    /// verify cost wherever the engine or a budget policy prices a draft.
+    /// Drafter time (seconds) for this step under the configured `drafter`
+    /// model (zero when unset). Added to the verify cost wherever the engine
+    /// or a budget policy prices a draft.
     pub fn drafter_seconds(
         &self,
         gamma: u32,
@@ -437,9 +429,7 @@ impl SpeculativeConfig {
     }
 
     fn resolved_drafter(&self) -> DrafterCost {
-        self.drafter.unwrap_or(DrafterCost::Fraction {
-            frac: self.draft_cost_frac,
-        })
+        self.drafter.unwrap_or(DrafterCost::Fraction { frac: 0.0 })
     }
 }
 

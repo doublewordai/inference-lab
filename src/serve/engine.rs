@@ -6,13 +6,14 @@ use std::collections::HashMap;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
 
-use crate::config::{ClusterSpec, Config};
+use crate::config::{Deployment, WorkloadConfig};
 use crate::request::Request;
 use crate::simulation::{Engine, StepKind, Topology};
 
 use super::types::{EngineRequest, TokenEvent};
 
-const PLACEHOLDER_WORDS: &[&str] = &[
+/// Also cycled by serve::fault for the deterministic partial output ahead of a death.
+pub(crate) const PLACEHOLDER_WORDS: &[&str] = &[
     "the", "of", "and", "to", "in", "a", "is", "that", "for", "it", "was", "on", "are", "be",
     "with", "as", "at", "this", "have", "from", "or", "an", "by", "not", "but", "what", "all",
     "were", "when", "we", "there", "can", "which", "their", "if", "do", "will", "each", "about",
@@ -27,7 +28,10 @@ struct LiveRequest {
 
 pub struct RealtimeEngine {
     engine: Engine,
-    config: Config,
+    /// Output lengths are sampled from this workload's `output_len_dist`
+    /// (capped at the request's `max_tokens`); without one every request
+    /// runs to `max_tokens`.
+    workload: Option<WorkloadConfig>,
     rx: mpsc::Receiver<EngineRequest>,
     live_requests: HashMap<String, LiveRequest>,
     /// Wall-clock-anchored offset from sim-time to real-time. Set on the
@@ -37,19 +41,19 @@ pub struct RealtimeEngine {
 }
 
 impl RealtimeEngine {
-    pub fn new(config: Config, rx: mpsc::Receiver<EngineRequest>) -> Result<Self, String> {
-        let cluster = ClusterSpec {
-            hardware: config.hardware.clone(),
-            parallel: config.parallel.clone(),
-            comms: None,
-            num_workers: 1,
-            node: 0,
-        };
-        let topology =
-            Topology::aggregated(cluster, config.model.clone(), config.scheduler.clone())?;
+    pub fn new(
+        deployment: &Deployment,
+        workload: Option<WorkloadConfig>,
+        rx: mpsc::Receiver<EngineRequest>,
+    ) -> Result<Self, String> {
+        let topology = Topology::aggregated(
+            deployment.cluster(),
+            deployment.model.clone(),
+            deployment.scheduler.clone(),
+        )?;
         Ok(Self {
             engine: Engine::new(topology),
-            config,
+            workload,
             rx,
             live_requests: HashMap::new(),
             epoch: None,
@@ -103,7 +107,7 @@ impl RealtimeEngine {
                             // Loop and re-evaluate.
                         }
                         _ = tokio::time::sleep_until(wake) => {
-                            self.advance_one_step();
+                            self.advance_one_step().await;
                         }
                     }
                 }
@@ -111,7 +115,16 @@ impl RealtimeEngine {
         }
     }
 
-    fn advance_one_step(&mut self) {
+    /// Emit one engine step's token events to their HTTP clients.
+    ///
+    /// Sends BLOCK on a full client channel rather than dropping (this used to be
+    /// `try_send`, which silently discarded everything past the channel's 64 slots — the
+    /// terminating `Done` included, so a client saw the stream stop dead at exactly 64
+    /// frames with no finish_reason, no usage and no [DONE], byte-indistinguishable from
+    /// a mid-stream death). Blocking makes a slow reader back-pressure generation, which
+    /// is what a real engine does; a client that has actually gone away closes the
+    /// channel, and [`Self::deliver`] reports that so the request is dropped promptly.
+    async fn advance_one_step(&mut self) {
         let outcome = match self.engine.step() {
             Ok(o) => o,
             Err(e) => {
@@ -123,26 +136,38 @@ impl RealtimeEngine {
         if matches!(outcome.kind, StepKind::Iteration) {
             if let Some(iter) = outcome.iteration {
                 for prog in &iter.progress {
-                    let live = match self.live_requests.get_mut(&prog.request_id) {
-                        Some(l) => l,
-                        None => continue,
-                    };
-
-                    // First token marks prefill→decode boundary.
-                    if !live.first_token_sent && !prog.was_prefill {
-                        live.first_token_sent = true;
-                        let _ = live.tx.try_send(TokenEvent::FirstToken);
+                    // `num_output` is what the client sees: 1 when this step
+                    // completed prefill (the first token comes out of the
+                    // prefill pass), `1 + accepted` per decode step, 0 for a
+                    // prefill chunk that did not finish the prompt.
+                    if prog.num_output == 0 || !self.live_requests.contains_key(&prog.request_id) {
+                        continue;
                     }
 
-                    // Emit decode tokens only. Prefill iterations advance
-                    // num_computed_tokens but don't yield user-visible text.
-                    if !prog.was_prefill {
-                        for _ in 0..prog.num_tokens {
-                            let word = PLACEHOLDER_WORDS[live.word_index % PLACEHOLDER_WORDS.len()];
-                            live.word_index += 1;
-                            let _ = live.tx.try_send(TokenEvent::Token {
-                                text: format!("{} ", word),
-                            });
+                    // First token marks the prefill→decode boundary.
+                    let first = !self.live_requests[&prog.request_id].first_token_sent;
+                    if first {
+                        self.live_requests
+                            .get_mut(&prog.request_id)
+                            .expect("presence checked above")
+                            .first_token_sent = true;
+                        if !self.deliver(&prog.request_id, TokenEvent::FirstToken).await {
+                            continue;
+                        }
+                    }
+
+                    for _ in 0..prog.num_output {
+                        let live = match self.live_requests.get_mut(&prog.request_id) {
+                            Some(l) => l,
+                            None => break,
+                        };
+                        let word = PLACEHOLDER_WORDS[live.word_index % PLACEHOLDER_WORDS.len()];
+                        live.word_index += 1;
+                        let event = TokenEvent::Token {
+                            text: format!("{} ", word),
+                        };
+                        if !self.deliver(&prog.request_id, event).await {
+                            break;
                         }
                     }
                 }
@@ -151,22 +176,38 @@ impl RealtimeEngine {
 
         for done in outcome.completions {
             if let Some(live) = self.live_requests.remove(&done.request_id) {
-                let _ = live.tx.try_send(TokenEvent::Done {
-                    prompt_tokens: done.num_prompt_tokens,
-                    completion_tokens: done.num_output_tokens,
-                });
+                let _ = live
+                    .tx
+                    .send(TokenEvent::Done {
+                        prompt_tokens: done.num_prompt_tokens,
+                        completion_tokens: done.num_output_tokens,
+                    })
+                    .await;
             }
         }
     }
 
+    /// Send one event to a live request, waiting for room. Returns false (and forgets the
+    /// request) once its client is gone, so a disconnected stream stops costing sends.
+    async fn deliver(&mut self, request_id: &str, event: TokenEvent) -> bool {
+        let Some(live) = self.live_requests.get(request_id) else {
+            return false;
+        };
+        if live.tx.send(event).await.is_ok() {
+            return true;
+        }
+        self.live_requests.remove(request_id);
+        false
+    }
+
     fn admit_request(&mut self, engine_req: EngineRequest) {
-        let mut rng = rand::thread_rng();
-        let target_output_tokens = self
-            .config
-            .workload
-            .output_len_dist
-            .sample(&mut rng)
-            .min(engine_req.max_output_tokens);
+        let target_output_tokens = match &self.workload {
+            Some(w) => w
+                .output_len_dist
+                .sample(&mut rand::thread_rng())
+                .min(engine_req.max_output_tokens),
+            None => engine_req.max_output_tokens,
+        };
 
         let now = self.engine.current_time();
         let request = Request::new_with_target(

@@ -1,5 +1,5 @@
 use clap::Parser;
-use inference_lab::config::{Config, ModelCosts};
+use inference_lab::config::{ArrivalPattern, Config, Deployment, ModelConfig, WorkloadConfig};
 use inference_lab::dataset::{BatchTokenizerFn, Message, PromptInput};
 use inference_lab::simulation::Simulator;
 use std::path::PathBuf;
@@ -38,9 +38,21 @@ enum Commands {
 #[cfg(feature = "serve")]
 #[derive(Parser, Debug)]
 struct ServeArgs {
-    /// Path to a TOML config file or directory of TOML configs (one per model)
+    /// Model config file, or a directory of them (one model each)
     #[arg(short, long, default_value = "config.toml")]
     config: PathBuf,
+
+    /// Hardware entry to serve each model on ([hardware.<name>] in the model
+    /// config). Optional when a config has exactly one entry; with a
+    /// directory, models without this entry are skipped.
+    #[arg(long)]
+    hardware: Option<String>,
+
+    /// Workload file whose output_len_dist samples each response's length
+    /// (capped at the request's max_tokens). Without it responses run to
+    /// max_tokens.
+    #[arg(short, long)]
+    workload: Option<PathBuf>,
 
     /// Port to listen on
     #[arg(short, long, default_value_t = 8080)]
@@ -55,8 +67,10 @@ struct ServeArgs {
     tokenizer: Option<PathBuf>,
 
     /// Honor <<respond:{...}>> echo-directives in message text (scripted responses that
-    /// bypass the engine — see serve::directive). Test-harness feature: leave OFF anywhere
-    /// untrusted clients can reach this server, or requests can spoof model output.
+    /// bypass the engine — see serve::directive) and the x-inference-lab-fault header
+    /// (mid-stream death injection — see serve::fault). Test-harness feature: leave OFF
+    /// anywhere untrusted clients can reach this server, or requests can spoof model
+    /// output and stall/abort connections at will.
     #[arg(long, default_value_t = false)]
     enable_directives: bool,
 }
@@ -64,9 +78,18 @@ struct ServeArgs {
 #[derive(Parser, Debug)]
 #[cfg_attr(not(feature = "serve"), command(author, version, about = "LLM Inference Simulator", long_about = None))]
 struct SimArgs {
-    /// Path to the TOML configuration file
+    /// Model config file
     #[arg(short, long, default_value = "config.toml")]
     config: PathBuf,
+
+    /// Hardware entry to run on ([hardware.<name>] in the model config).
+    /// Optional when the config has exactly one entry.
+    #[arg(long)]
+    hardware: Option<String>,
+
+    /// Workload file
+    #[arg(short, long)]
+    workload: PathBuf,
 
     /// Path to tokenizer.json file (required if dataset_path is set in config)
     #[arg(short, long)]
@@ -256,46 +279,58 @@ async fn main() {
     match cli.command {
         Commands::Sim(args) => run_sim(args),
         Commands::Serve(args) => {
-            let configs = if args.config.is_dir() {
-                // Load all .toml files from directory
-                let mut configs = Vec::new();
-                let entries = match std::fs::read_dir(&args.config) {
-                    Ok(entries) => entries,
+            let workload = args.workload.as_ref().map(|p| {
+                WorkloadConfig::from_file(p).unwrap_or_else(|e| {
+                    eprintln!("Error loading workload: {e}");
+                    std::process::exit(1);
+                })
+            });
+            let deployments = if args.config.is_dir() {
+                let mut paths: Vec<PathBuf> = match std::fs::read_dir(&args.config) {
+                    Ok(entries) => entries
+                        .flatten()
+                        .map(|e| e.path())
+                        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("toml"))
+                        .collect(),
                     Err(e) => {
                         eprintln!("Error reading config directory {:?}: {}", args.config, e);
                         std::process::exit(1);
                     }
                 };
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.extension().and_then(|e| e.to_str()) == Some("toml") {
-                        match Config::from_file(&path) {
-                            Ok(config) => configs.push(config),
-                            Err(e) => {
-                                eprintln!("Error loading config {:?}: {}", path, e);
-                                std::process::exit(1);
-                            }
+                paths.sort();
+                let mut deployments = Vec::new();
+                for path in &paths {
+                    let cfg = ModelConfig::from_file(path).unwrap_or_else(|e| {
+                        eprintln!("Error loading config: {e}");
+                        std::process::exit(1);
+                    });
+                    match &args.hardware {
+                        Some(hw) if !cfg.hardware_names().contains(&hw.as_str()) => {
+                            println!("  Skipping {}: no [hardware.{hw}] entry", path.display());
                         }
+                        hw => deployments.push(load_deployment(&cfg, path, hw.as_deref())),
                     }
                 }
-                if configs.is_empty() {
-                    eprintln!("No .toml config files found in {:?}", args.config);
+                if deployments.is_empty() {
+                    eprintln!("No model configs to serve in {:?}", args.config);
                     std::process::exit(1);
                 }
-                configs
+                deployments
             } else {
-                // Single config file
-                match Config::from_file(&args.config) {
-                    Ok(config) => vec![config],
-                    Err(e) => {
-                        eprintln!("Error loading configuration: {}", e);
-                        std::process::exit(1);
-                    }
-                }
+                let cfg = ModelConfig::from_file(&args.config).unwrap_or_else(|e| {
+                    eprintln!("Error loading config: {e}");
+                    std::process::exit(1);
+                });
+                vec![load_deployment(
+                    &cfg,
+                    &args.config,
+                    args.hardware.as_deref(),
+                )]
             };
 
             if let Err(e) = inference_lab::serve::start_server(
-                configs,
+                deployments,
+                workload,
                 args.host,
                 args.port,
                 args.tokenizer,
@@ -317,28 +352,49 @@ fn main() {
     run_sim(args);
 }
 
+/// Resolve one hardware entry of a model config, exiting with the loader's
+/// message on failure.
+fn load_deployment(
+    cfg: &ModelConfig,
+    path: &std::path::Path,
+    hardware: Option<&str>,
+) -> Deployment {
+    cfg.deployment(hardware).unwrap_or_else(|e| {
+        eprintln!("Error in {}: {e}", path.display());
+        if hardware.is_none() {
+            eprintln!("Pass --hardware <name>.");
+        }
+        std::process::exit(1);
+    })
+}
+
 fn run_sim(args: SimArgs) {
     let verbosity = args.verbosity_level();
-    let use_color = !args.no_color;
+    if args.no_color {
+        // One switch for every `.color()` call below.
+        colored::control::set_override(false);
+    }
 
     // Header
     if verbosity >= VerbosityLevel::Normal {
-        if use_color {
-            println!("{}", "LLM Inference Simulator".bright_cyan().bold());
-        } else {
-            println!("LLM Inference Simulator");
-        }
-        println!("Loading configuration from: {:?}\n", args.config);
+        println!("{}", "LLM Inference Simulator".bright_cyan().bold());
+        println!(
+            "Loading configuration from: {:?} (workload {:?})\n",
+            args.config, args.workload
+        );
     }
 
-    // Load configuration
-    let mut config = match Config::from_file(&args.config) {
-        Ok(config) => config,
-        Err(e) => {
-            eprintln!("Error loading configuration: {}", e);
-            std::process::exit(1);
-        }
-    };
+    // Load configuration: model config × hardware entry × workload.
+    let model_config = ModelConfig::from_file(&args.config).unwrap_or_else(|e| {
+        eprintln!("Error loading configuration: {e}");
+        std::process::exit(1);
+    });
+    let deployment = load_deployment(&model_config, &args.config, args.hardware.as_deref());
+    let workload = WorkloadConfig::from_file(&args.workload).unwrap_or_else(|e| {
+        eprintln!("Error loading workload: {e}");
+        std::process::exit(1);
+    });
+    let mut config = Config::new(deployment, workload);
 
     // Override seed if provided via CLI
     if let Some(seed) = args.seed {
@@ -394,44 +450,40 @@ fn run_sim(args: SimArgs) {
     #[cfg(not(feature = "cli"))]
     let tokenizer = None;
 
-    // Create simulator (returns updated config with counted dataset entries if applicable)
-    let (mut simulator, config) = match Simulator::new(config, tokenizer) {
-        Ok((sim, cfg)) => (sim, cfg),
+    let mut simulator = match Simulator::new(config, tokenizer) {
+        Ok(sim) => sim,
         Err(e) => {
             eprintln!("Error creating simulator: {}", e);
             std::process::exit(1);
         }
     };
+    // The simulator may have filled in `num_requests` from a counted dataset.
+    let config = simulator.config().clone();
 
     // Print configuration summary (after simulator creation to show updated dataset entry count)
     if verbosity >= VerbosityLevel::Normal {
-        if use_color {
-            println!("{}", "Configuration:".green().bold());
-        } else {
-            println!("Configuration:");
-        }
+        println!("{}", "Configuration:".green().bold());
         println!("  Hardware: {}", config.hardware.name);
-        println!("  Model: {}", config.model.name());
+        println!("  Model: {}", config.model.name);
         println!(
             "  Max batched tokens: {}",
             config.scheduler.max_num_batched_tokens
         );
 
-        // Print arrival pattern with relevant details
-        match config.workload.arrival_pattern.to_lowercase().as_str() {
-            "closed_loop" => {
+        match config.workload.arrival_pattern {
+            ArrivalPattern::ClosedLoop => {
                 if let Some(users) = config.workload.num_concurrent_users {
                     println!("  Arrival: closed-loop ({} concurrent users)", users);
                 } else {
                     println!("  Arrival: closed-loop");
                 }
             }
-            "batched" => {
+            ArrivalPattern::Batched => {
                 println!("  Arrival: batched (all requests at t=0)");
             }
             pattern => {
                 println!(
-                    "  Arrival: {} ({} req/sec)",
+                    "  Arrival: {:?} ({} req/sec)",
                     pattern, config.workload.arrival_rate
                 );
             }
@@ -456,10 +508,10 @@ fn run_sim(args: SimArgs) {
             run_quiet(&mut simulator);
         }
         VerbosityLevel::Normal => {
-            run_with_dashboard(&mut simulator, use_color, &config);
+            run_with_dashboard(&mut simulator, &config);
         }
         VerbosityLevel::Verbose => {
-            run_verbose(&mut simulator, use_color, &config);
+            run_verbose(&mut simulator, &config);
         }
         VerbosityLevel::Debug => {
             // Debug mode with no progress callbacks
@@ -472,9 +524,8 @@ fn run_sim(args: SimArgs) {
                     elapsed.as_secs_f64()
                 );
             }
-            // Print final metrics for debug mode
-            let summary = simulator.get_metrics_summary();
-            summary.print();
+            let summary = simulator.summary();
+            println!("{}", serde_json::to_string_pretty(&summary).unwrap());
             return;
         }
     }
@@ -482,14 +533,8 @@ fn run_sim(args: SimArgs) {
     let elapsed = start_time.elapsed();
 
     // Print final metrics
-    let summary = simulator.get_metrics_summary();
-    print_final_metrics(
-        &summary,
-        simulator.get_current_time(),
-        elapsed,
-        verbosity,
-        use_color,
-    );
+    let summary = simulator.summary();
+    print_final_metrics(&summary, simulator.current_time(), elapsed);
 
     // Save to JSON if requested
     if let Some(output_path) = args.output {
@@ -508,22 +553,34 @@ fn run_sim(args: SimArgs) {
     // Save per-request CSV if requested (plus a sibling .depth.csv with the
     // per-second mean chosen draft depth and decode batch, when speculating)
     if let Some(csv_path) = args.request_csv {
-        let depth = simulator.get_spec_depth_series();
+        let depth = simulator.spec_depth_series();
         if !depth.is_empty() {
             let mut d = String::from("second,mean_draft,mean_decode_batch\n");
-            for (s, md, mb) in &depth {
-                d.push_str(&format!("{s},{md:.4},{mb:.2}\n"));
+            for p in &depth {
+                d.push_str(&format!(
+                    "{},{:.4},{:.2}\n",
+                    p.second, p.mean_draft, p.mean_decode_batch
+                ));
             }
             let dp = csv_path.with_extension("depth.csv");
             if let Err(e) = std::fs::write(&dp, d) {
                 eprintln!("Error saving depth CSV: {}", e);
             }
         }
-        let mut out =
-            String::from("arrival,completion,ttft,e2e,mean_tpot,prompt_toks,output_toks\n");
-        for (arr, comp, ttft, e2e, tpot, pt, ot) in simulator.get_request_rows() {
+        let mut out = String::from(
+            "arrival,completion,ttft,e2e,mean_tpot,prompt_toks,output_toks,preemptions\n",
+        );
+        for r in simulator.request_rows() {
             out.push_str(&format!(
-                "{arr:.4},{comp:.4},{ttft:.5},{e2e:.4},{tpot:.6},{pt},{ot}\n"
+                "{:.4},{:.4},{:.5},{:.4},{:.6},{},{},{}\n",
+                r.arrival,
+                r.completion,
+                r.ttft,
+                r.e2e,
+                r.mean_tpot,
+                r.prompt_tokens,
+                r.output_tokens,
+                r.num_preemptions
             ));
         }
         match std::fs::write(&csv_path, out) {
@@ -545,18 +602,12 @@ fn run_quiet(simulator: &mut Simulator) {
         .unwrap();
 }
 
-fn run_with_dashboard(simulator: &mut Simulator, use_color: bool, config: &Config) {
+fn run_with_dashboard(simulator: &mut Simulator, config: &Config) {
     let total_requests = config.workload.num_requests.unwrap_or(1000) as u64;
 
-    if use_color {
-        println!("{}", "━".repeat(60).bright_black());
-        println!("{}", "Simulation Progress".bright_cyan().bold());
-        println!("{}", "━".repeat(60).bright_black());
-    } else {
-        println!("{}", "━".repeat(60));
-        println!("Simulation Progress");
-        println!("{}", "━".repeat(60));
-    }
+    println!("{}", "━".repeat(60).bright_black());
+    println!("{}", "Simulation Progress".bright_cyan().bold());
+    println!("{}", "━".repeat(60).bright_black());
 
     let mut first_update = true;
     let num_lines = 5; // Number of lines the dashboard uses (including final separator)
@@ -576,49 +627,32 @@ fn run_with_dashboard(simulator: &mut Simulator, use_color: bool, config: &Confi
             }
             first_update = false;
 
-            if use_color {
-                println!(
-                    "  Progress: [{}] {}/{} ({:.0}%)",
-                    bar.cyan(),
-                    progress.completed_requests,
-                    total_requests,
-                    percent
-                );
-                println!(
-                    "  Time:     {}s simulated",
-                    format!("{:.1}", progress.current_time).yellow()
-                );
-                println!(
-                    "  Queue:    {} running, {} waiting",
-                    progress.running.to_string().green(),
-                    progress.waiting.to_string().blue()
-                );
-                println!(
-                    "  KV Cache: {:.1}% utilized",
-                    (progress.kv_cache_util * 100.0).to_string().magenta()
-                );
-                println!("{}", "━".repeat(60).bright_black());
-            } else {
-                println!(
-                    "  Progress: [{}] {}/{} ({:.0}%)",
-                    bar, progress.completed_requests, total_requests, percent
-                );
-                println!("  Time:     {:.1}s simulated", progress.current_time);
-                println!(
-                    "  Queue:    {} running, {} waiting",
-                    progress.running, progress.waiting
-                );
-                println!(
-                    "  KV Cache: {:.1}% utilized",
-                    progress.kv_cache_util * 100.0
-                );
-                println!("{}", "━".repeat(60));
-            }
+            println!(
+                "  Progress: [{}] {}/{} ({:.0}%)",
+                bar.cyan(),
+                progress.completed_requests,
+                total_requests,
+                percent
+            );
+            println!(
+                "  Time:     {}s simulated",
+                format!("{:.1}", progress.current_time).yellow()
+            );
+            println!(
+                "  Queue:    {} running, {} waiting",
+                progress.running.to_string().green(),
+                progress.waiting.to_string().blue()
+            );
+            println!(
+                "  KV Cache: {:.1}% utilized",
+                (progress.kv_cache_util * 100.0).to_string().magenta()
+            );
+            println!("{}", "━".repeat(60).bright_black());
         })
         .unwrap();
 }
 
-fn run_verbose(simulator: &mut Simulator, _use_color: bool, config: &Config) {
+fn run_verbose(simulator: &mut Simulator, config: &Config) {
     println!("Starting simulation...");
 
     simulator
@@ -637,8 +671,8 @@ fn run_verbose(simulator: &mut Simulator, _use_color: bool, config: &Config) {
                 progress.running,
                 progress.waiting,
                 progress.kv_cache_util * 100.0,
-                progress.metrics.as_ref().map(|m| m.avg_flops_util * 100.0).unwrap_or(0.0),
-                progress.metrics.as_ref().map(|m| m.avg_bandwidth_util * 100.0).unwrap_or(0.0),
+                progress.metrics.utilization.avg_flops_util * 100.0,
+                progress.metrics.utilization.avg_bandwidth_util * 100.0,
             );
         })
         .unwrap();
@@ -649,83 +683,51 @@ fn print_final_metrics(
     summary: &inference_lab::metrics::MetricsSummary,
     sim_time: f64,
     real_time: std::time::Duration,
-    _verbosity: VerbosityLevel,
-    use_color: bool,
 ) {
-    // Header
-    if use_color {
-        println!(
-            "\n{} ({:.1}s simulated, {:.2}s real)",
-            "Simulation Complete".bright_green().bold(),
-            sim_time,
-            real_time.as_secs_f64()
-        );
-        println!("{}", "━".repeat(80).bright_black());
-    } else {
-        println!(
-            "\nSimulation Complete ({:.1}s simulated, {:.2}s real)",
-            sim_time,
-            real_time.as_secs_f64()
-        );
-        println!("{}", "━".repeat(80));
-    }
+    println!(
+        "\n{} ({:.1}s simulated, {:.2}s real)",
+        "Simulation Complete".bright_green().bold(),
+        sim_time,
+        real_time.as_secs_f64()
+    );
+    println!("{}", "━".repeat(80).bright_black());
 
     // Latency Metrics Table
-    if use_color {
-        println!("\n{}", "LATENCY METRICS".yellow().bold());
-    } else {
-        println!("\nLATENCY METRICS");
-    }
+    println!("\n{}", "LATENCY METRICS".yellow().bold());
 
+    let row = |metric: &str, l: &inference_lab::metrics::LatencyStats| LatencyRow {
+        metric: metric.to_string(),
+        min: format!("{:.2}", l.min),
+        mean: format!("{:.2}", l.mean),
+        p50: format!("{:.2}", l.p50),
+        p90: format!("{:.2}", l.p90),
+        p99: format!("{:.2}", l.p99),
+    };
+    let lat = &summary.latency_metrics;
     let latency_rows = vec![
-        LatencyRow {
-            metric: "TTFT (ms)".to_string(),
-            min: format!("{:.2}", summary.ttft_min),
-            mean: format!("{:.2}", summary.ttft_mean),
-            p50: format!("{:.2}", summary.ttft_p50),
-            p90: format!("{:.2}", summary.ttft_p90),
-            p99: format!("{:.2}", summary.ttft_p99),
-        },
-        LatencyRow {
-            metric: "E2E Latency (ms)".to_string(),
-            min: format!("{:.2}", summary.e2e_min),
-            mean: format!("{:.2}", summary.e2e_mean),
-            p50: format!("{:.2}", summary.e2e_p50),
-            p90: format!("{:.2}", summary.e2e_p90),
-            p99: format!("{:.2}", summary.e2e_p99),
-        },
-        LatencyRow {
-            metric: "Per-Token Latency (ms)".to_string(),
-            min: format!("{:.2}", summary.per_token_min),
-            mean: format!("{:.2}", summary.per_token_mean),
-            p50: format!("{:.2}", summary.per_token_p50),
-            p90: format!("{:.2}", summary.per_token_p90),
-            p99: format!("{:.2}", summary.per_token_p99),
-        },
+        row("TTFT (ms)", &lat.ttft_ms),
+        row("E2E Latency (ms)", &lat.e2e_ms),
+        row("Per-Token Latency (ms)", &lat.per_token_ms),
     ];
 
     let latency_table = Table::new(&latency_rows).with(Style::rounded()).to_string();
     println!("{}", latency_table);
 
     // Throughput Metrics Table
-    if use_color {
-        println!("\n{}", "THROUGHPUT METRICS".yellow().bold());
-    } else {
-        println!("\nTHROUGHPUT METRICS");
-    }
+    println!("\n{}", "THROUGHPUT METRICS".yellow().bold());
 
     let throughput_rows = vec![
         ThroughputRow {
             metric: "Input Tokens/sec".to_string(),
-            value: format!("{:.2}", summary.input_tokens_per_sec),
+            value: format!("{:.2}", summary.throughput_metrics.input_tokens_per_sec),
         },
         ThroughputRow {
             metric: "Output Tokens/sec".to_string(),
-            value: format!("{:.2}", summary.output_tokens_per_sec),
+            value: format!("{:.2}", summary.throughput_metrics.output_tokens_per_sec),
         },
         ThroughputRow {
             metric: "Requests/sec".to_string(),
-            value: format!("{:.2}", summary.requests_per_sec),
+            value: format!("{:.2}", summary.throughput_metrics.requests_per_sec),
         },
     ];
 
@@ -735,57 +737,33 @@ fn print_final_metrics(
     println!("{}", throughput_table);
 
     // Utilization Section
-    if use_color {
-        println!("\n{}", "UTILIZATION".yellow().bold());
-    } else {
-        println!("\nUTILIZATION");
-    }
-    println!(
-        "  • KV Cache:  {:.1}% avg",
-        summary.avg_kv_cache_util * 100.0
-    );
-    println!("  • FLOPS:     {:.1}% avg", summary.avg_flops_util * 100.0);
-    println!(
-        "  • Bandwidth: {:.1}% avg",
-        summary.avg_bandwidth_util * 100.0
-    );
+    println!("\n{}", "UTILIZATION".yellow().bold());
+    let util = &summary.utilization;
+    println!("  • KV Cache:  {:.1}% avg", util.avg_kv_cache_util * 100.0);
+    println!("  • FLOPS:     {:.1}% avg", util.avg_flops_util * 100.0);
+    println!("  • Bandwidth: {:.1}% avg", util.avg_bandwidth_util * 100.0);
     println!(
         "  • Preemptions: {} total ({:.2} per request avg)",
-        summary.total_preemptions, summary.preemptions_per_request_mean
+        summary.preemptions.total, summary.preemptions.per_request_mean
     );
 
     // Summary Section
-    if use_color {
-        println!("\n{}", "SUMMARY".yellow().bold());
-    } else {
-        println!("\nSUMMARY");
-    }
+    println!("\n{}", "SUMMARY".yellow().bold());
     println!(
         "  • Total Requests: {} completed",
-        summary.completed_requests
+        summary.requests.completed
     );
     println!("  • Simulation Time: {:.1}s", sim_time);
     println!("  • Real Time: {:.2}s", real_time.as_secs_f64());
 
     // Prefix Cache Section
-    if summary.prefix_cache_hits + summary.prefix_cache_misses > 0 {
-        if use_color {
-            println!("\n{}", "PREFIX CACHE".yellow().bold());
-        } else {
-            println!("\nPREFIX CACHE");
-        }
-        println!("  • Hits:      {}", summary.prefix_cache_hits);
-        println!("  • Misses:    {}", summary.prefix_cache_misses);
-        println!(
-            "  • Avg hit size: {}/{}={}",
-            summary.prefix_cache_hit_size_sum,
-            summary.prefix_cache_hit_size_count,
-            summary.prefix_cache_hit_size_sum / summary.prefix_cache_hit_size_count
-        );
-        println!(
-            "  • Hit Rate:  {:.1}%",
-            summary.prefix_cache_hit_rate * 100.0
-        );
+    let pc = &summary.prefix_cache;
+    if pc.hits + pc.misses > 0 {
+        println!("\n{}", "PREFIX CACHE".yellow().bold());
+        println!("  • Hits:      {}", pc.hits);
+        println!("  • Misses:    {}", pc.misses);
+        println!("  • Avg hit size: {:.1} tokens", pc.mean_hit_size);
+        println!("  • Hit Rate:  {:.1}%", pc.hit_rate * 100.0);
     }
 }
 
@@ -794,76 +772,21 @@ fn print_final_metrics(
     summary: &inference_lab::metrics::MetricsSummary,
     sim_time: f64,
     _real_time: std::time::Duration,
-    _verbosity: VerbosityLevel,
-    _use_color: bool,
 ) {
     // Fallback for when CLI features are not available
     println!("\nSimulation Complete ({:.1}s)", sim_time);
+    let l = &summary.latency_metrics;
     println!(
         "TTFT: {:.2}ms (p50: {:.2}ms)",
-        summary.ttft_mean, summary.ttft_p50
+        l.ttft_ms.mean, l.ttft_ms.p50
     );
-    println!(
-        "E2E: {:.2}ms (p50: {:.2}ms)",
-        summary.e2e_mean, summary.e2e_p50
-    );
+    println!("E2E: {:.2}ms (p50: {:.2}ms)", l.e2e_ms.mean, l.e2e_ms.p50);
 }
 
 fn save_metrics_json(
     summary: &inference_lab::metrics::MetricsSummary,
     path: &PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use serde_json::json;
-
-    let json_data = json!({
-        "latency_metrics": {
-            "ttft_ms": {
-                "min": summary.ttft_min,
-                "mean": summary.ttft_mean,
-                "p50": summary.ttft_p50,
-                "p90": summary.ttft_p90,
-                "p99": summary.ttft_p99,
-            },
-            "e2e_ms": {
-                "min": summary.e2e_min,
-                "mean": summary.e2e_mean,
-                "p50": summary.e2e_p50,
-                "p90": summary.e2e_p90,
-                "p99": summary.e2e_p99,
-            },
-            "per_token_ms": {
-                "min": summary.per_token_min,
-                "mean": summary.per_token_mean,
-                "p50": summary.per_token_p50,
-                "p90": summary.per_token_p90,
-                "p99": summary.per_token_p99,
-            },
-        },
-        "throughput_metrics": {
-            "input_tokens_per_sec": summary.input_tokens_per_sec,
-            "output_tokens_per_sec": summary.output_tokens_per_sec,
-            "requests_per_sec": summary.requests_per_sec,
-        },
-        "utilization": {
-            "avg_kv_cache_util": summary.avg_kv_cache_util,
-            "avg_flops_util": summary.avg_flops_util,
-            "avg_bandwidth_util": summary.avg_bandwidth_util,
-        },
-        "preemptions": {
-            "total": summary.total_preemptions,
-            "per_request_mean": summary.preemptions_per_request_mean,
-        },
-        "requests": {
-            "completed": summary.completed_requests,
-            "total": summary.total_requests,
-        },
-        "prefix_cache": {
-            "hits": summary.prefix_cache_hits,
-            "misses": summary.prefix_cache_misses,
-            "hit_rate": summary.prefix_cache_hit_rate,
-        },
-    });
-
-    std::fs::write(path, serde_json::to_string_pretty(&json_data)?)?;
+    std::fs::write(path, serde_json::to_string_pretty(summary)?)?;
     Ok(())
 }
