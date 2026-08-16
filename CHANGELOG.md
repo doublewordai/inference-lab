@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.0](https://github.com/doublewordai/inference-lab/compare/inference-lab-v0.9.0...inference-lab-v0.10.0) (2026-08-12)
+
+
+### Features
+
+* OpenAI compat resume target ([#72](https://github.com/doublewordai/inference-lab/issues/72)) ([0654c03](https://github.com/doublewordai/inference-lab/commit/0654c037d9cb7c4a5c0cff9cd95b887c5f430115))
+
 ## [0.9.0](https://github.com/doublewordai/inference-lab/compare/inference-lab-v0.8.2...inference-lab-v0.9.0) (2026-08-11)
 
 
