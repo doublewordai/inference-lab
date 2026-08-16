@@ -8,11 +8,11 @@ pub mod topology;
 pub mod workload;
 
 pub use deployment::{Deployment, DeploymentError, ModelConfig};
-pub use hardware::{HardwareConfig, KVTier, Precision};
+pub use hardware::{FabricConfig, FabricLink, HardwareConfig, KVTier, Precision};
 pub use model::{
     expected_distinct_experts, History, Indexer, LayerClass, ModelSpec, Routing, WeightStream,
 };
-pub use parallel::{CommsConfig, ParallelConfig};
+pub use parallel::ParallelConfig;
 pub use scheduler::SchedulerConfig;
 pub use speculative::{
     AcceptanceModel, DrafterCost, GammaPolicy, MeasuredCostConfig, SpeculativeConfig,
@@ -134,13 +134,11 @@ impl Config {
     }
 
     /// The single worker pool this config describes: its hardware and
-    /// parallel layout as one `ClusterSpec` (no collective-comms model, one
-    /// worker).
+    /// parallel layout as one `ClusterSpec` (one worker).
     pub fn cluster(&self) -> ClusterSpec {
         ClusterSpec {
             hardware: self.hardware.clone(),
             parallel: self.parallel.clone(),
-            comms: None,
             num_workers: 1,
         }
     }
@@ -159,6 +157,7 @@ impl Config {
             memory_bandwidth: 1e12,
             memory_capacity: 80_000_000_000,
             kv_tiers: Vec::new(),
+            fabric: None,
         };
         let parallel = ParallelConfig::default();
 

@@ -61,9 +61,9 @@ hardware preset unless `spec` says otherwise.
 | `scheduler` | Table | `{}` | Keys merged over the shared `[scheduler]` for this entry |
 | `speculative` | Table | shared `[speculative]` | Replaces the shared block for this entry |
 
-Collective comms (`allreduce`/`alltoall` latency and link bandwidth) are only
-modelled when a `ClusterSpec` carries a `comms` block, which the library API
-exposes; model configs have none.
+TP all-reduces and EP all-to-alls are priced on the hardware's `[fabric]`
+(below); an entry with `tp > 1` or `ep > 1` on hardware without one is
+rejected.
 
 ### Hardware spec
 
@@ -80,9 +80,29 @@ an inline `spec` table.
 | `memory_bandwidth` | Float | — | HBM bandwidth, bytes/s |
 | `memory_capacity` | U64 | — | HBM capacity, bytes |
 | `kv_tiers` | Array | `[]` | Spillover tiers below HBM, closest first: `{ name, capacity_bytes, bandwidth_to_hbm }`. Evicted KV blocks fall through the tiers and can be promoted back over the tier's bandwidth instead of being recomputed |
+| `fabric` | Table | unset | Collective fabric, see below |
+
+#### `[fabric]`
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `gpus_per_node` | U32 | — | GPUs sharing one scale-up domain; parallel groups are packed node by node |
+| `scale_up` | Table | — | Inside a node (NVLink / NVSwitch): `{ bandwidth, latency, in_network_reduction }` — per-GPU injection bytes/s per direction, seconds per collective call, and whether the switch reduces in-network (NVLink SHARP) |
+| `scale_out` | Table | unset | Across nodes, rail-optimised (GPU *i* drives NIC *i*): same fields. Required for a group wider than `gpus_per_node` |
+
+Cost per collective, added serially to the step (no overlap): a TP
+all-reduce of `V` bytes over `g ≤ gpus_per_node` ranks is `latency + f·V /
+bandwidth` with `f = 2(g−1)/g` (ring) or `1` (in-network reduction); over
+more ranks it is reduce-scatter and all-gather inside each node around an
+all-reduce of the `V/k` shard across the `n` nodes on the NIC. An EP
+all-to-all moves each rank's `(g−1)/g` share at the scale-up rate, or, across
+nodes, its in-node and cross-node shares concurrently on their own links.
+`dp_attention` skips the per-layer all-reduce.
 
 Shipped presets: `b200` (180 GiB / 7.7 TB/s as reported on the fleet),
-`b200-datasheet` (192 GB / 8 TB/s), `b300`, `gh200-120`, `gh200-96`, `h100`.
+`b200-datasheet` (192 GB / 8 TB/s), `b300`, `gh200-120`, `gh200-96`, `h100`;
+each carries its node's fabric (8-GPU NVSwitch + CX-7/CX-8 for the HGX
+boxes, 4-GPU NVLink + Slingshot for GH200).
 
 ---
 

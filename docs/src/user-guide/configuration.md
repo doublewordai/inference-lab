@@ -81,6 +81,12 @@ How much of that memory the engine may use, and how much goes to KV, are
 deployment settings and live in `[scheduler]` (`gpu_memory_utilization`,
 `kv_cache_capacity`).
 
+A preset also carries its node's collective fabric — `gpus_per_node`,
+`scale_up` (NVLink: bandwidth, latency, in-network reduction) and
+`scale_out` (per-GPU NIC across nodes) — which prices the TP all-reduces and
+EP all-to-alls of any entry with `tp > 1` or `ep > 1`. An inline spec that
+omits `[fabric]` can only be used with `tp = 1`, `ep = 1`.
+
 ### Model
 
 Name a shipped preset:

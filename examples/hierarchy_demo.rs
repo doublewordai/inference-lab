@@ -30,6 +30,7 @@ fn run_for_batch(num_concurrent: usize, share_prefix: bool) -> Vec<f64> {
             capacity_bytes: 100_000_000_000,
             bandwidth_to_hbm: 1e9,
         }],
+        fabric: None,
     };
     // A dense 70B-class model from the catalog; only its KV footprint matters here.
     let model = catalog::model("llama-3-70b").expect("catalog preset");

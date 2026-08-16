@@ -5,14 +5,13 @@
 //! traffic flows through one HBM, so weight bytes for each precision plus KV
 //! bytes (charged to the attention stream) all share the same bandwidth.
 
-use crate::config::{CommsConfig, HardwareConfig, ModelSpec, ParallelConfig, Precision};
+use crate::config::{HardwareConfig, ModelSpec, ParallelConfig, Precision};
 use crate::request::Request;
 
 pub struct ComputeEngine {
     hardware: HardwareConfig,
     parallel: ParallelConfig,
     model: ModelSpec,
-    comms: Option<CommsConfig>,
     block_size: u32,
     enable_cascade_attention: bool,
 }
@@ -53,17 +52,9 @@ impl ComputeEngine {
             hardware,
             parallel,
             model,
-            comms: None,
             block_size: 0,
             enable_cascade_attention: false,
         }
-    }
-
-    /// Enable the collective-comms time term. Without this, `calculate_iteration_time`
-    /// contributes zero for TP all-reduce / EP all-to-all (the previous default).
-    pub fn with_comms(mut self, comms: CommsConfig) -> Self {
-        self.comms = Some(comms);
-        self
     }
 
     fn aggregate_flop_rate(&self, prec: Precision) -> Option<f64> {
@@ -90,43 +81,36 @@ impl ComputeEngine {
         self.aggregate_memory_bandwidth()
     }
 
-    /// Estimated time spent in TP all-reduce + EP all-to-all collectives for a
-    /// batch of `total_tokens` tokens. Returns 0 if no `CommsConfig` is set or
-    /// `link_bw` is non-positive. Each collective is modelled as
-    /// `latency + bytes / link_bw`, summed over all calls in a forward pass.
-    /// The result is added to the per-stream max(compute, memory) sum — i.e.,
-    /// we assume collectives do not overlap with compute/memory work.
+    /// Time spent in TP all-reduces and EP all-to-alls for a step of
+    /// `total_tokens` tokens, priced on the hardware's [`FabricConfig`]
+    /// (zero when the hardware declares none — `ClusterSpec::validate`
+    /// rejects that for tp/ep > 1). Collectives are added serially to the
+    /// compute/memory time: no overlap is modelled.
     fn collective_time(&self, total_tokens: u32) -> f64 {
-        let Some(comms) = &self.comms else { return 0.0 };
-        if comms.link_bw <= 0.0 {
+        let Some(fabric) = &self.hardware.fabric else {
             return 0.0;
-        }
-
+        };
         let tokens = total_tokens as f64;
         let mut total = 0.0;
 
-        // TP all-reduce: per-rank ring traffic = 2(tp-1)/tp × volume.
-        // Skipped under DP-attention — each rank owns its sequence shard and
-        // needs no per-layer allreduce.
+        // TP all-reduce of the full hidden-wide activation, twice per layer.
+        // Skipped under DP-attention: each rank owns its sequence shard and
+        // needs no per-layer all-reduce.
         let tp = self.parallel.tp;
         if tp > 1 && !self.parallel.dp_attention {
-            let ring_factor = 2.0 * (tp - 1) as f64 / tp as f64;
-            let bytes_per_call =
-                ring_factor * tokens * self.model.allreduce_bytes_per_token() as f64;
+            let bytes = tokens * self.model.allreduce_bytes_per_token() as f64;
             let calls = self.model.num_tp_allreduces_per_pass() as f64;
-            total += calls * (comms.allreduce_latency + bytes_per_call / comms.link_bw);
+            total += calls * fabric.allreduce_time(tp, bytes);
         }
 
-        // EP all-to-all: per-rank send = (ep-1)/ep × per-rank-data, where
-        // per-rank-data = V_global / ep (tokens distributed across ranks).
-        // So per-rank send = (ep-1)/ep² × V_global. Without the extra /ep we'd
-        // be charging the global cross-rank volume at the per-rank link rate.
+        // EP all-to-all: the step's dispatched activations are spread over
+        // the ep ranks; each rank exchanges its share (dispatch + combine per
+        // MoE layer).
         let ep = self.parallel.ep;
         if ep > 1 {
-            let factor = (ep - 1) as f64 / (ep as f64 * ep as f64);
-            let bytes_per_call = factor * tokens * self.model.alltoall_bytes_per_token() as f64;
+            let per_rank = tokens * self.model.alltoall_bytes_per_token() as f64 / ep as f64;
             let calls = self.model.num_ep_alltoalls_per_pass() as f64;
-            total += calls * (comms.alltoall_latency + bytes_per_call / comms.link_bw);
+            total += calls * fabric.alltoall_time(ep, per_rank);
         }
 
         total
@@ -292,6 +276,48 @@ mod tests {
     fn create_test_engine() -> ComputeEngine {
         let config = Config::test_default();
         ComputeEngine::new(config.hardware, config.parallel, config.model)
+    }
+
+    /// TP all-reduces are priced on the hardware fabric and added serially:
+    /// tp=2 with a fabric costs the tp=1 step (at twice the resources)
+    /// plus 2 × layers calls of `latency + factor × bytes / bandwidth`.
+    #[test]
+    fn tp_collectives_add_fabric_time() {
+        use crate::config::{FabricConfig, FabricLink};
+        let base = Config::test_default();
+        let mut hw = base.hardware.clone();
+        hw.fabric = Some(FabricConfig {
+            gpus_per_node: 8,
+            scale_up: FabricLink {
+                bandwidth: 1e12,
+                latency: 1e-6,
+                in_network_reduction: false,
+            },
+            scale_out: None,
+        });
+        let mut par = base.parallel.clone();
+        par.tp = 2;
+        let tp2 = ComputeEngine::new(hw.clone(), par.clone(), base.model.clone());
+        let mut hw_silent = hw.clone();
+        hw_silent.fabric = None;
+        let tp2_silent = ComputeEngine::new(hw_silent, par.clone(), base.model.clone());
+
+        let req = create_test_request("r", 0, 1024);
+        let with = tp2.calculate_iteration_time(&[&req], &[1024]);
+        let without = tp2_silent.calculate_iteration_time(&[&req], &[1024]);
+        // 1024 tokens × 4096 hidden × 2 B = 8 MiB per call; ring 2(1/2) = 1×;
+        // 64 calls (2 per layer × 32 layers).
+        let per_call = 1e-6 + 1024.0 * 4096.0 * 2.0 / 1e12;
+        assert!(
+            (with - without - 64.0 * per_call).abs() < 1e-9,
+            "{with} {without}"
+        );
+
+        // DP-attention drops the per-layer all-reduce.
+        par.dp_attention = true;
+        let dpa = ComputeEngine::new(hw, par, base.model.clone());
+        let t = dpa.calculate_iteration_time(&[&req], &[1024]);
+        assert!((t - without).abs() < 1e-12);
     }
 
     fn create_test_request(id: &str, computed: u32, prompt: u32) -> Request {

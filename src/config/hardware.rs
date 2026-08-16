@@ -63,6 +63,109 @@ impl Precision {
     }
 }
 
+/// One tier of the collective fabric: what a GPU can inject into it and
+/// what a collective call costs before any byte moves.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct FabricLink {
+    /// Per-GPU injection bandwidth, bytes/s per direction.
+    pub bandwidth: f64,
+    /// Fixed cost per collective call, seconds (launch + synchronisation).
+    #[serde(default)]
+    pub latency: f64,
+    /// The fabric reduces in-network (NVLink SHARP / NVLS, IB SHARP): an
+    /// all-reduce moves each rank's vector once in and once out, `bytes /
+    /// bandwidth`, instead of the ring's `2(g-1)/g × bytes`.
+    #[serde(default)]
+    pub in_network_reduction: bool,
+}
+
+impl FabricLink {
+    /// Bytes each rank moves per direction in an all-reduce of `bytes` over
+    /// `g` ranks, as a multiple of `bytes`.
+    fn allreduce_factor(&self, g: u32) -> f64 {
+        if self.in_network_reduction {
+            1.0
+        } else {
+            2.0 * (g - 1) as f64 / g as f64
+        }
+    }
+}
+
+/// The collective fabric a GPU sits in. `scale_up` is the switched fabric
+/// inside a node (NVLink / NVSwitch: any GPU reaches any peer at its
+/// injection rate); `scale_out` is the rail-optimised network across nodes
+/// (GPU *i* drives NIC *i*, so cross-node traffic is bounded per GPU by its
+/// NIC). Ranks of a parallel group are assumed packed node by node; a group
+/// larger than `gpus_per_node` runs hierarchical collectives and needs
+/// `scale_out`.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct FabricConfig {
+    /// GPUs sharing one scale-up domain.
+    pub gpus_per_node: u32,
+    pub scale_up: FabricLink,
+    #[serde(default)]
+    pub scale_out: Option<FabricLink>,
+}
+
+impl FabricConfig {
+    /// Whether a group of `g` ranks can be priced: it fits one node, or
+    /// `scale_out` is given.
+    pub fn supports_group(&self, g: u32) -> bool {
+        g <= self.gpus_per_node.max(1) || self.scale_out.is_some()
+    }
+
+    /// Time of one all-reduce of a `bytes`-long vector held by every one of
+    /// `g` ranks. Inside a node: one call at the scale-up rate moving
+    /// `allreduce_factor × bytes` per rank (ring `2(g-1)/g`, or 1 with
+    /// in-network reduction). Across nodes: reduce-scatter and all-gather
+    /// inside each node (`(k-1)/k × bytes` each) around an all-reduce of the
+    /// `bytes/k` shard over the `n = ceil(g/k)` nodes on each rank's NIC.
+    pub fn allreduce_time(&self, g: u32, bytes: f64) -> f64 {
+        if g <= 1 {
+            return 0.0;
+        }
+        let k = self.gpus_per_node.max(1);
+        let up = self.scale_up;
+        if g <= k {
+            return up.latency + up.allreduce_factor(g) * bytes / up.bandwidth;
+        }
+        let out = self
+            .scale_out
+            .expect("group spans nodes: validated by ClusterSpec::validate");
+        let n = g.div_ceil(k);
+        let kf = k as f64;
+        2.0 * (up.latency + (kf - 1.0) / kf * bytes / up.bandwidth)
+            + out.latency
+            + out.allreduce_factor(n) * (bytes / kf) / out.bandwidth
+    }
+
+    /// Time of one all-to-all where each of `g` ranks holds `per_rank_bytes`
+    /// and sends an equal `1/g` share to every rank. Inside a node:
+    /// `(g-1)/g × per_rank_bytes` at the scale-up rate. Across nodes the
+    /// in-node share (`(k-1)/g`) and the cross-node share (`(g-k)/g`) move
+    /// concurrently on their own links; the slower one bounds the call.
+    pub fn alltoall_time(&self, g: u32, per_rank_bytes: f64) -> f64 {
+        if g <= 1 {
+            return 0.0;
+        }
+        let k = self.gpus_per_node.max(1);
+        let up = self.scale_up;
+        let gf = g as f64;
+        if g <= k {
+            return up.latency + (gf - 1.0) / gf * per_rank_bytes / up.bandwidth;
+        }
+        let out = self
+            .scale_out
+            .expect("group spans nodes: validated by ClusterSpec::validate");
+        let kf = k as f64;
+        let intra = up.latency + (kf - 1.0) / gf * per_rank_bytes / up.bandwidth;
+        let inter = out.latency + (gf - kf) / gf * per_rank_bytes / out.bandwidth;
+        intra.max(inter)
+    }
+}
+
 /// Per-GPU physical spec: what the accelerator can do, independent of how
 /// it is deployed. Parallelism (TP / EP group sizes) lives on
 /// `ParallelConfig`, memory-utilisation settings on `SchedulerConfig`, and
@@ -99,6 +202,12 @@ pub struct HardwareConfig {
     /// Empty means single-tier (HBM only).
     #[serde(default)]
     pub kv_tiers: Vec<KVTier>,
+
+    /// Collective fabric (see [`FabricConfig`]). Required to price TP / EP
+    /// collectives: a deployment with `tp > 1` or `ep > 1` on hardware
+    /// without one is rejected.
+    #[serde(default)]
+    pub fabric: Option<FabricConfig>,
 }
 
 impl HardwareConfig {
@@ -114,5 +223,67 @@ impl HardwareConfig {
             // ratio); otherwise unknown.
             Precision::Fp32 => self.flops_fp16.map(|x| x / 2.0),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fabric(in_network: bool) -> FabricConfig {
+        FabricConfig {
+            gpus_per_node: 8,
+            scale_up: FabricLink {
+                bandwidth: 1e12,
+                latency: 1e-6,
+                in_network_reduction: in_network,
+            },
+            scale_out: Some(FabricLink {
+                bandwidth: 1e11,
+                latency: 1e-5,
+                in_network_reduction: false,
+            }),
+        }
+    }
+
+    #[test]
+    fn allreduce_inside_a_node_is_one_call() {
+        // Ring: 2(g-1)/g × 8 MB at 1 TB/s = 14 µs, plus 1 µs latency.
+        let t = fabric(false).allreduce_time(8, 8e6);
+        assert!((t - 15e-6).abs() < 1e-12, "{t}");
+        // In-network reduction: the vector moves once, 8 µs + 1 µs.
+        let t = fabric(true).allreduce_time(8, 8e6);
+        assert!((t - 9e-6).abs() < 1e-12, "{t}");
+        assert_eq!(fabric(true).allreduce_time(1, 8e6), 0.0);
+    }
+
+    #[test]
+    fn allreduce_across_nodes_is_hierarchical() {
+        // 16 ranks on 8-GPU nodes: two in-node phases of 7/8 × 8 MB at 1 TB/s
+        // (7 µs + 1 µs each) around a 2-node ring of the 1 MB shard on the
+        // NIC: 2(1/2) × 1 MB / 100 GB/s = 10 µs + 10 µs latency.
+        let t = fabric(false).allreduce_time(16, 8e6);
+        assert!((t - (2.0 * 8e-6 + 20e-6)).abs() < 1e-12, "{t}");
+    }
+
+    #[test]
+    fn alltoall_splits_between_fabrics() {
+        // In node: 7/8 × 8 MB per rank at 1 TB/s = 7 µs + 1 µs.
+        let t = fabric(false).alltoall_time(8, 8e6);
+        assert!((t - 8e-6).abs() < 1e-12, "{t}");
+        // 16 ranks: 7/16 of 8 MB stays in-node (3.5 µs + 1), 8/16 crosses
+        // (4 MB / 100 GB/s = 40 µs + 10); the NIC bounds the call.
+        let t = fabric(false).alltoall_time(16, 8e6);
+        assert!((t - 50e-6).abs() < 1e-12, "{t}");
+    }
+
+    #[test]
+    fn groups_beyond_a_node_need_scale_out() {
+        let mut f = fabric(false);
+        assert!(f.supports_group(8));
+        assert!(f.supports_group(16));
+        f.scale_out = None;
+        assert!(f.supports_group(8));
+        assert!(!f.supports_group(9));
     }
 }

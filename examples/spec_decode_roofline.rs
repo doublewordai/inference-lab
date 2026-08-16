@@ -33,6 +33,7 @@ fn b200_unlimited_kv() -> HardwareConfig {
         memory_bandwidth: 8.0e12,
         memory_capacity: 1_000_000_000_000_000, // 1 PB -> KV cap never binds
         kv_tiers: Vec::new(),
+        fabric: None,
     }
 }
 
@@ -44,7 +45,6 @@ fn topology() -> Topology {
             ep: 1,
             dp_attention: false,
         },
-        comms: None,
         num_workers: 1,
     };
     let sched = SchedulerConfig {
