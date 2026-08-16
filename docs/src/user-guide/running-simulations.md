@@ -139,7 +139,7 @@ Preemptions occur when new requests need memory but the KV cache is full:
 
 **Simulation running slowly?**
 - Reduce `num_requests` or use `-q` flag
-- Increase `log_interval` in config
+- Build with `--release`
 
 **Too many preemptions?**
 - Increase `kv_cache_capacity` in hardware config

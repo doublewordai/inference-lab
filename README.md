@@ -8,13 +8,19 @@ performance modeling.
 
 ## Features
 
-- **Accurate Performance Modeling**: Models compute (FLOPS) and memory bandwidth constraints
-- **Multiple Scheduling Policies**: FCFS, Priority, SJF, and more
-- **Chunked Prefill**: Simulates realistic request interleaving
-- **KV Cache Management**: Models GPU memory and KV cache utilization
-- **Workload Generation**: Supports Poisson, Gamma, and closed-loop patterns
-- **WebAssembly Support**: Run simulations in the browser via WASM
-- **CLI Tool**: Standalone binary for command-line usage
+- **Roofline performance model**: per-precision compute streams and memory
+  bandwidth, MoE expert loading, MLA / sliding-window / hybrid-linear KV,
+  TP / EP collectives
+- **vLLM-style scheduling**: chunked prefill, preemption with recompute,
+  FCFS / priority / length-based policies, preemption-free admission
+- **KV cache**: block allocation from each model's exact KV footprint,
+  prefix caching with block sharing, spillover tiers, cascade attention
+- **Disaggregated serving**: prefill and decode pools with a shared hand-off link
+- **Speculative decoding**: analytic or trace-replayed acceptance, fixed and
+  goodput-adaptive draft policies, measured step-cost tables
+- **Workloads**: Poisson / uniform / burst / batched / closed-loop arrivals,
+  synthetic length distributions or real datasets
+- **CLI, Rust library and WebAssembly package**
 
 ## How does it work?
 
@@ -61,8 +67,8 @@ cargo install inference-lab
 **Note:** The CLI tool is only available if you install it using `cargo install inference-lab` (see above).
 
 ```bash
-# Run with default configuration
-inference-lab --config configs/config.toml
+# Run a configuration
+inference-lab --config examples/config.toml
 
 # Example output shows TTFT, E2E latency, throughput, and utilization metrics
 ```
@@ -70,16 +76,17 @@ inference-lab --config configs/config.toml
 ### Rust Library
 
 ```rust
+use inference_lab::config::Config;
 use inference_lab::simulation::Simulator;
-use inference_lab::config::SimulationConfig;
 
-let config = SimulationConfig::from_file("config.toml")?;
-let mut simulator = Simulator::new(config);
-let results = simulator.run();
+let config = Config::from_file("config.toml")?;
+let mut simulator = Simulator::new(config, None)?;
+simulator.run_with_callback(|_| {})?;
+let summary = simulator.summary();
 
-println!("Mean TTFT: {:.2}ms", results.ttft_mean * 1000.0);
-println!("P99 E2E: {:.2}ms", results.e2e_p99 * 1000.0);
-println!("Throughput: {:.1} tok/s", results.throughput);
+println!("Mean TTFT: {:.2}ms", summary.latency_metrics.ttft_ms.mean);
+println!("P99 E2E: {:.2}ms", summary.latency_metrics.e2e_ms.p99);
+println!("Throughput: {:.1} tok/s", summary.throughput_metrics.output_tokens_per_sec);
 ```
 
 ### WebAssembly
@@ -92,12 +99,14 @@ await init();
 const config = {
   hardware: {
     name: "H100",
-    compute_flops: 1.513e15,
+    flops_fp8: 1.979e15,
+    flops_bf16: 9.895e14,
     memory_bandwidth: 3.35e12,
-    memory_capacity: 85899345920,
-    bytes_per_param: 2
+    memory_capacity: 85899345920
   },
   model: {
+    type: "dense",
+    precision: "fp8",
     name: "Llama-3-70B",
     num_parameters: 70000000000,
     num_layers: 80,
@@ -145,11 +154,9 @@ Configuration files use TOML format and specify:
 - **Scheduler**: Policies, max tokens, chunked prefill settings
 - **Workload**: Request arrival patterns and distributions
 
-Example configurations are in the `configs/` directory:
-
-- `config.toml` - Default H100 + Llama-3-70B setup
-- `test_blog.toml` - Closed-loop benchmark (64 users)
-- `qwen3_30b_a3b.toml` - Qwen model configuration
+Example configurations are in `examples/*.toml` (small H100 / Llama and
+Qwen setups) and `configs/` (production-shaped DeepSeek-V4, Qwen3.5/3.6,
+GLM-5.2 and estate catalogs).
 
 ## Building
 
@@ -157,7 +164,7 @@ Example configurations are in the `configs/` directory:
 
 ```bash
 cargo build --release
-./target/release/inference-lab --config configs/config.toml
+./target/release/inference-lab --config examples/config.toml
 ```
 
 ### WASM Package

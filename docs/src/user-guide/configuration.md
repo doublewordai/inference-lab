@@ -1,14 +1,14 @@
 # Configuration
 
-Inference Lab uses TOML configuration files to define your simulation parameters. A configuration file has five main sections: hardware, model, scheduler, workload, and simulation.
+Inference Lab uses TOML configuration files to define your simulation parameters. A configuration file has four required sections — hardware, model, scheduler, workload — plus optional `[parallel]` and `[speculative]` sections. Unknown fields are rejected.
 
 ## Configuration Sections Overview
 
-- **[hardware]** - GPU specifications (compute, memory, bandwidth)
-- **[model]** - LLM architecture (layers, parameters, dimensions)
+- **[hardware]** - per-GPU specifications (FLOP rates per precision, memory, bandwidth, optional KV tiers)
+- **[model]** - LLM architecture cost model, chosen by `type`
 - **[scheduler]** - Scheduling policy and batching behavior
 - **[workload]** - Request arrival patterns and distributions
-- **[simulation]** - Logging and output options
+- **[speculative]** - Speculative decoding (optional)
 
 ## Quick Start Example
 
@@ -17,12 +17,14 @@ Here's a minimal configuration to get started:
 ```toml
 [hardware]
 name = "H100"
-compute_flops = 1.513e15        # 1513 TFLOPS bf16
+flops_fp8 = 1.979e15            # 1979 TFLOPS fp8
+flops_bf16 = 9.895e14           # 990 TFLOPS bf16
 memory_bandwidth = 3.35e12      # 3.35 TB/s
 memory_capacity = 85899345920   # 80 GB
-bytes_per_param = 2             # bf16
 
 [model]
+type = "dense"
+precision = "fp8"
 name = "Llama-3-70B"
 num_parameters = 70000000000
 num_layers = 80
@@ -53,9 +55,6 @@ std_dev = 0.7
 type = "lognormal"
 mean = 5.3                      # ~200 tokens median
 std_dev = 0.8
-
-[simulation]
-log_interval = 5
 ```
 
 ## Hardware Configuration
@@ -65,15 +64,21 @@ The hardware section defines your GPU specifications:
 ```toml
 [hardware]
 name = "H100"
-compute_flops = 1.513e15        # bf16 TFLOPS
+flops_fp8 = 1.979e15            # dense FLOP/s at fp8
+flops_bf16 = 9.895e14           # dense FLOP/s at bf16
 memory_bandwidth = 3.35e12      # bytes/sec
 memory_capacity = 85899345920   # 80 GB
-bytes_per_param = 2             # 2 for bf16, 1 for fp8
 ```
+
+Give a FLOP rate for every precision the model uses (`flops_fp4`,
+`flops_fp8`, `flops_bf16`, `flops_fp16`); a mixed-precision MoE model needs
+both its expert and non-expert precisions.
 
 Optional fields:
 - `kv_cache_capacity` - Explicit KV cache size (otherwise computed automatically)
 - `gpu_memory_utilization` - Fraction of memory to use (default: 0.9)
+- `kv_tiers` - Spillover KV tiers below HBM (host RAM, NVMe): evicted blocks
+  fall through them and can be promoted back over the tier bandwidth
 
 ## Model Configuration
 
@@ -81,6 +86,8 @@ Define your LLM architecture:
 
 ```toml
 [model]
+type = "dense"                  # or "deepseek_v4", "qwen35"
+precision = "fp8"               # weights, attention compute and KV
 name = "Llama-3-70B"
 num_parameters = 70000000000
 num_layers = 80
@@ -89,6 +96,12 @@ num_heads = 64
 num_kv_heads = 8                # For GQA (omit for MHA)
 max_seq_len = 8192
 ```
+
+`type` picks the architecture cost model. `dense` covers dense and
+sliding-window transformers; `deepseek_v4` covers DeepSeek-V4 / GLM-5.2
+style MoE + MLA with compressed-history attention; `qwen35` covers the
+Qwen3.5 hybrid (GQA + GatedDeltaNet + MoE). See the
+[Configuration Reference](../reference/config.md) for their fields.
 
 ### Grouped Query Attention (GQA)
 
@@ -100,14 +113,18 @@ num_kv_heads = 8  # Llama 3 uses 8 KV heads
 
 Omit `num_kv_heads` for standard multi-head attention (MHA) models.
 
-### Mixture of Experts (MoE)
+### Sparse activation in a dense-style model
 
-For MoE models, specify active parameters separately:
+For a model whose per-token compute touches only part of the weights, set
+`num_active_parameters`; the resident weights stay `num_parameters`:
 
 ```toml
 num_parameters = 140000000000      # Total params
 num_active_parameters = 12000000000 # Active per forward pass
 ```
+
+For MoE models with expert-parallel routing, coupon-collector expert
+loading and mixed precisions, use `type = "deepseek_v4"` or `type = "qwen35"`.
 
 ### Sliding Window Attention
 
@@ -280,15 +297,6 @@ Simulate a fixed number of concurrent users:
 arrival_pattern = "closed_loop"
 num_concurrent_users = 10
 # ... length distributions ...
-```
-
-## Simulation Configuration
-
-Control logging and output:
-
-```toml
-[simulation]
-log_interval = 5  # Log every 5 iterations
 ```
 
 ## Common Configuration Patterns

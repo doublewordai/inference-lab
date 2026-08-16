@@ -1,249 +1,175 @@
 # Configuration File Reference
 
-Complete field-by-field reference for Inference Lab configuration files.
-
-## Top-Level Structure
+Field-by-field reference for the TOML (or, for WASM, JSON) configuration a
+simulation takes. Unknown fields anywhere in the file are rejected.
 
 ```toml
-[hardware]
-# ... hardware configuration ...
-
-[model]
-# ... model configuration ...
-
-[scheduler]
-# ... scheduler configuration ...
-
-[workload]
-# ... workload configuration ...
-
-[simulation]
-# ... simulation configuration ...
+[hardware]     # per-GPU spec
+[parallel]     # optional: TP / EP layout
+[model]        # architecture cost model, chosen by `type`
+[scheduler]    # batching, KV blocks, policy
+[workload]     # arrivals and request shapes
+[speculative]  # optional: speculative decoding
 ```
 
 ---
 
 ## [hardware]
 
-GPU and accelerator specifications.
-
-### Required Fields
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `name` | String | Accelerator name (e.g., "H100", "A100") |
-| `compute_flops` | Float | Compute capacity in FLOPS for the specified precision |
-| `memory_bandwidth` | Float | Memory bandwidth in bytes/second |
-| `memory_capacity` | U64 | Total GPU memory capacity in bytes |
-| `bytes_per_param` | U32 | Bytes per parameter (1 for fp8, 2 for bf16/fp16) |
-
-### Optional Fields
+Per-GPU spec. Aggregate figures across a TP group are derived from
+`[parallel]`.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `kv_cache_capacity` | U64 | Computed | KV cache capacity in bytes. If not specified, calculated as `(memory_capacity * gpu_memory_utilization) - model_size` |
-| `gpu_memory_utilization` | Float | 0.9 | Fraction of GPU memory to use. Used to compute `kv_cache_capacity` if not explicitly set |
-
-### Example
+| `name` | String | — | Accelerator name |
+| `flops_fp4` | Float | unset | Dense FLOP/s at FP4. Unset means the hardware has no FP4 rate; a model that declares an FP4 stream then fails at run time |
+| `flops_fp8` | Float | unset | Dense FLOP/s at FP8 |
+| `flops_bf16` | Float | unset | Dense FLOP/s at BF16 |
+| `flops_fp16` | Float | unset | Dense FLOP/s at FP16 (FP32 is taken as half of it) |
+| `memory_bandwidth` | Float | — | HBM bandwidth, bytes/s |
+| `memory_capacity` | U64 | — | HBM capacity, bytes |
+| `kv_cache_capacity` | U64 | 0 | KV cache bytes. 0 means `aggregate_capacity × gpu_memory_utilization − model weights` |
+| `gpu_memory_utilization` | Float | 0.9 | Fraction of memory the engine may use (vLLM's `--gpu-memory-utilization`) |
+| `kv_tiers` | Array | `[]` | Spillover tiers below HBM, closest first: `{ name, capacity_bytes, bandwidth_to_hbm }`. Evicted KV blocks fall through the tiers and can be promoted back over the tier's bandwidth instead of being recomputed |
 
 ```toml
 [hardware]
-name = "H100"
-compute_flops = 1.513e15
-memory_bandwidth = 3.35e12
-memory_capacity = 85899345920
-bytes_per_param = 2
+name = "B200"
+flops_fp4 = 9.0e15
+flops_fp8 = 4.5e15
+flops_bf16 = 2.25e15
+memory_bandwidth = 8.0e12
+memory_capacity = 206158430208
+gpu_memory_utilization = 0.9
 ```
+
+## [parallel]
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `tp` | U32 | 1 | Tensor-parallel group size: FLOP rate, bandwidth and memory scale by `tp` |
+| `ep` | U32 | 1 | Expert-parallel group size (MoE all-to-all volume) |
+| `dp_attention` | Bool | false | DP-attention layout: no per-layer TP all-reduce |
+
+Collective comms (`allreduce`/`alltoall` latency and link bandwidth) are only
+modelled when a `ClusterSpec` carries a `comms` block, which the library API
+exposes; the single-cluster TOML has none.
 
 ---
 
 ## [model]
 
-LLM architecture parameters.
+`type` selects the architecture; each has its own fields.
 
-### Required Fields
+### `type = "dense"` (also accepted as `"sliding"`)
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `name` | String | Model name |
-| `num_parameters` | U64 | Total number of parameters (for MoE: all experts) |
-| `num_layers` | U32 | Number of transformer layers |
-| `hidden_dim` | U32 | Hidden dimension size |
-| `num_heads` | U32 | Number of attention heads |
-| `max_seq_len` | U32 | Maximum sequence length supported by the model |
-
-### Optional Fields
+Dense / GQA transformer, optionally with sliding-window layers.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `num_active_parameters` | U64 | `num_parameters` | Active parameters per forward pass (for MoE models with sparse activation) |
-| `num_kv_heads` | U32 | `num_heads` | Number of KV heads. Set for GQA/MQA, omit for MHA |
-| `sliding_window` | U32 | None | Sliding window size for sliding window attention layers |
-| `num_sliding_layers` | U32 | 0 | Number of layers using sliding window attention (rest use full attention) |
+| `name` | String | — | |
+| `num_parameters` | U64 | — | Resident parameters |
+| `num_active_parameters` | U64 | `num_parameters` | Parameters touched per token (sparse models) |
+| `num_layers` | U32 | — | |
+| `hidden_dim` | U32 | — | |
+| `num_heads` | U32 | — | |
+| `num_kv_heads` | U32 | `num_heads` | GQA / MQA |
+| `head_dim` | U32 | `hidden_dim / num_heads` | |
+| `max_seq_len` | U32 | — | |
+| `sliding_window` | U32 | 0 | Window of the windowed layers; 0 = none |
+| `num_sliding_layers` | U32 | 0 | Layers attending only the last `sliding_window` tokens |
+| `precision` | `"fp4"`,`"fp8"`,`"bf16"`,`"fp16"`,`"fp32"` | `"bf16"` | Weights, attention compute and KV |
 
-### Example
+### `type = "deepseek_v4"`
 
-```toml
-[model]
-name = "Llama-3-70B"
-num_parameters = 70000000000
-num_layers = 80
-hidden_dim = 8192
-num_heads = 64
-num_kv_heads = 8
-max_seq_len = 8192
-```
+MoE + MLA with per-layer compressed-history attention (DeepSeek-V4, GLM-5.2).
+Expert GEMMs and everything else are separate precision streams.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `name`, `num_layers`, `hidden_dim`, `num_heads`, `max_seq_len` | | — | |
+| `kv_latent_dim` | U32 | — | MLA latent width stored per token per layer |
+| `qk_rope_head_dim` | U32 | 0 | RoPE'd K width stored alongside the latent |
+| `kv_precision` | Precision | `"fp8"` | KV cache precision |
+| `num_active_expert_params` | U64 | — | Expert params per token (routed + shared) |
+| `num_active_non_expert_params` | U64 | — | Non-expert params per token (attention, indexer, dense FFN, head) |
+| `num_resident_expert_params` | U64 | — | All experts' resident params |
+| `num_resident_non_expert_params` | U64 | — | |
+| `expert_precision` | Precision | `"fp4"` | |
+| `non_expert_precision` | Precision | `"fp8"` | |
+| `window_size` | U32 | — | Recent-token window every layer attends |
+| `num_dense_layers` | U32 | — | Layers with window only |
+| `num_near_layers` | U32 | — | Layers with window + indexer-selected compressed history |
+| `num_far_layers` | U32 | — | Layers with window + full stride-compressed history |
+| `near_compress_ratio`, `far_compress_ratio` | U32 | — | Compression strides |
+| `index_topk` | U32 | — | Indexer top-k cap on near layers |
+| `index_n_heads`, `index_head_dim` | U32 | — | Indexer scoring shape |
+| `indexer_retained_layers` | U32 | all near layers | Near layers running their own indexer (others reuse a neighbour's scores) |
+| `index_kv_precision` | Precision | `kv_precision` | |
+| `num_experts_per_tok` | U32 | — | Routed experts per token |
+| `num_routed_experts` | U32 | 0 | Routed-expert pool; when set, per-step expert weight traffic follows coupon-collector growth with batch tokens |
+| `num_moe_layers` | U32 | — | Layers doing EP routing |
+
+### `type = "qwen35"`
+
+Hybrid MoE: a minority of full-attention (GQA) layers with a growing KV
+cache, the rest GatedDeltaNet linear layers with a fixed per-sequence state.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `name`, `num_layers`, `hidden_dim`, `max_seq_len` | | — | |
+| `num_attention_layers` | U32 | — | Full-attention layers |
+| `num_attention_heads`, `num_kv_heads`, `attn_head_dim` | U32 | — | |
+| `linear_num_value_heads`, `linear_num_key_heads`, `linear_key_head_dim`, `linear_value_head_dim`, `linear_conv_kernel` | U32 | — | GatedDeltaNet state shape |
+| `num_active_expert_params`, `num_active_non_expert_params`, `num_resident_expert_params`, `num_resident_non_expert_params` | U64 | — | As for `deepseek_v4` |
+| `num_experts_per_tok`, `num_routed_experts`, `num_moe_layers` | U32 | — / 0 / — | As for `deepseek_v4` |
+| `expert_precision`, `non_expert_precision`, `kv_precision` | Precision | `"bf16"` | |
 
 ---
 
 ## [scheduler]
 
-Request scheduling and batching configuration.
-
-### Required Fields
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `max_num_batched_tokens` | U32 | Maximum number of tokens processed in a single iteration |
-| `max_num_seqs` | U32 | Maximum number of sequences that can run concurrently |
-| `policy` | String | Scheduling policy: `"fcfs"`, `"sof"`, `"sif"`, `"stf"`, `"lif"`, `"lof"`, or `"ltf"` |
-| `enable_chunked_prefill` | Bool | Enable chunked prefilling to interleave prompt processing with generation |
-| `block_size` | U32 | Block size for KV cache management (in tokens) |
-
-### Optional Fields
-
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `long_prefill_token_threshold` | U32 | 0 or 4% of `max_seq_len` | Maximum tokens to prefill in a single iteration. Defaults to 0 (no chunking within request) unless `max_num_partial_prefills > 1`, then defaults to 4% of `max_seq_len` |
-| `max_num_partial_prefills` | U32 | 1 | Maximum number of sequences that can be partially prefilled concurrently. Limits how many new waiting requests can start prefilling per iteration |
-| `enable_preemption_free` | Bool | false | Enable preemption-free scheduling mode with conservative admission control |
-
-### Scheduling Policy Values
-
-- `fcfs` - First-Come-First-Served
-- `sof` - Shortest Output First
-- `sif` - Shortest Input First
-- `stf` - Shortest Total First
-- `lif` - Longest Input First
-- `lof` - Longest Output First
-- `ltf` - Longest Total First
-
-### Example
-
-```toml
-[scheduler]
-max_num_batched_tokens = 8192
-max_num_seqs = 256
-policy = "fcfs"
-enable_chunked_prefill = true
-block_size = 16
-```
+| `max_num_batched_tokens` | U32 | — | Token budget per iteration |
+| `max_num_seqs` | U32 | — | Running-request cap |
+| `policy` | String | — | `fcfs`, `priority`, `sif`, `lif`, `sof`, `lof`, `stf`, `ltf` (`sjf` = `sof`) |
+| `enable_chunked_prefill` | Bool | — | Split long prefills across iterations |
+| `long_prefill_token_threshold` | U32 | 0 | Prefill chunk cap; 0 = no cap. Defaults to 4% of `max_seq_len` when `max_num_partial_prefills > 1` |
+| `max_num_partial_prefills` | U32 | 1 | vLLM's knob; only its effect on the threshold default is modelled |
+| `block_size` | U32 | — | KV block size, tokens |
+| `enable_preemption_free` | Bool | false | Admit only what can grow to `prompt + max_output` without preemption |
+| `enable_cascade_attention` | Bool | false | Load a batch's shared prompt prefix once per iteration |
 
 ---
 
 ## [workload]
 
-Request arrival patterns and length distributions.
-
-### Required Fields
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `arrival_pattern` | String | Arrival pattern: `"poisson"`, `"uniform"`, `"burst"`, `"fixed_rate"`, `"closed_loop"`, or `"batched"` |
-| `arrival_rate` | Float | Mean arrival rate in requests per second |
-| `input_len_dist` | Distribution | Input sequence length distribution (ignored in dataset mode) |
-| `output_len_dist` | Distribution | Output sequence length distribution (in dataset mode: samples actual generation length) |
-| `seed` | U64 | Random seed for reproducibility |
-
-### Optional Fields
-
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `dataset_path` | String | None | Path to dataset file in OpenAI batch API format (JSONL). If provided, uses dataset mode instead of synthetic workload |
-| `num_requests` | Usize | None | Total number of requests to simulate. If None, runs until `duration_secs` |
-| `duration_secs` | Float | None | Simulation duration in seconds. If None, runs until `num_requests` |
-| `num_concurrent_users` | Usize | None | Number of concurrent users for `closed_loop` pattern. Each user immediately sends a new request when their previous one completes |
-
-### Length Distribution Types
-
-Distributions are specified using TOML tables with a `type` field:
-
-**Fixed:**
-```toml
-input_len_dist = { type = "fixed", value = 1000 }
-```
-
-**Uniform:**
-```toml
-input_len_dist = { type = "uniform", min = 100, max = 2000 }
-```
-
-**Normal:**
-```toml
-input_len_dist = { type = "normal", mean = 1000.0, std_dev = 200.0 }
-```
-
-**LogNormal:**
-```toml
-input_len_dist = { type = "lognormal", mean = 6.9, std_dev = 0.7 }
-```
-
-Or using TOML section syntax:
-
-```toml
-[workload.input_len_dist]
-type = "lognormal"
-mean = 6.9
-std_dev = 0.7
-```
-
-### Example
-
-```toml
-[workload]
-arrival_pattern = "poisson"
-arrival_rate = 5.0
-num_requests = 100
-seed = 42
-
-[workload.input_len_dist]
-type = "lognormal"
-mean = 6.9
-std_dev = 0.7
-
-[workload.output_len_dist]
-type = "lognormal"
-mean = 5.3
-std_dev = 0.8
-```
+| `arrival_pattern` | String | — | `poisson`, `uniform` (= `fixed_rate`), `burst`, `closed_loop`, `batched` |
+| `arrival_rate` | Float | 1.0 | Requests/s for the open-loop patterns |
+| `rate_schedule` | Table | unset | Time-varying rate: `{ type = "sine", min, max, period_secs }`, `{ type = "square", low, high, period_secs, duty }`, or `{ type = "trace", points = [[t, rate], ...] }` |
+| `num_concurrent_users` | U32 | unset | Users for `closed_loop` |
+| `closed_loop_jitter_secs` | Float | unset | Uniform stagger of the initial closed-loop arrivals |
+| `input_len_dist`, `output_len_dist` | Table | — | `{ type = "fixed", value }`, `{ type = "uniform", min, max }`, `{ type = "normal", mean, std_dev }`, `{ type = "lognormal", mean, std_dev }` (ignored in dataset mode for input) |
+| `num_requests` | U32 | unset | Stop after this many; unset = run the dataset out |
+| `duration_secs` | Float | unset | Reserved |
+| `dataset_path` | String | unset | JSONL in OpenAI batch format; prompts are tokenised with `--tokenizer` and hashed per KV block so shared prefixes hit the prefix cache |
+| `seed` | U64 | — | |
 
 ---
 
-## [simulation]
+## [speculative]
 
-Simulation control and logging.
-
-### Optional Fields
+Optional. Decode steps then verify `1 + draft` positions and advance by
+`1 + accepted`.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `log_interval` | U64 | 100 | Log progress every N iterations |
-
-### Example
-
-```toml
-[simulation]
-log_interval = 5
-```
-
----
-
-## Type Reference
-
-- **String**: Text string
-- **Float**: 64-bit floating point number
-- **U32**: 32-bit unsigned integer
-- **U64**: 64-bit unsigned integer
-- **Usize**: Platform-dependent unsigned integer
-- **Bool**: Boolean (`true` or `false`)
-- **Distribution**: Length distribution object (see [Length Distribution Types](#length-distribution-types))
+| `gamma` | U32 | — | Draft length (`fixed`) or maximum candidate depth (budget policies) |
+| `acceptance` | Table | — | `{ kind = "constant", alpha }`, `{ kind = "per_position", a = [...] }`, or `{ kind = "trace_rounds", path }` (CSV bank of real rounds: `commits,category,a0..aD-1`) |
+| `policy` | String | `"fixed"` | `fixed`, `goodput_budget`, `gated_budget`, `gated_aggregate` |
+| `measured_cost` | Table | unset | `{ path, ref_seq_len }`: measured `(batch_size, num_draft_tokens, step_seconds)` grid that prices decode steps and the policy's cost curve instead of the roofline |
+| `switch` | Table | unconstrained | `{ cooldown_rounds, max_step, cost_ms }` for `gated_aggregate` |
+| `drafter` | Table | free drafter | `{ kind = "fraction", frac }`, `{ kind = "autoregressive", dense_params, expert_params, num_experts, experts_per_tok, shared_experts }`, or `{ kind = "block_parallel", params, block }` |
