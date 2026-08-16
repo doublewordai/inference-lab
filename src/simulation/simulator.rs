@@ -181,12 +181,16 @@ impl Simulator {
                     self.emit_progress(&mut callback);
                     break;
                 }
-                // Nothing to do but no termination yet — bump sim a bit and
-                // re-poll the generator. This guards against weird states
-                // where a closed-loop generator has nothing pending and the
-                // engine is empty but `is_finished` is false.
-                self.engine.advance_to(self.engine.current_time() + 1e-3);
-                continue;
+                // No pending event, no arrival to jump to, and work still in
+                // the system: nothing can ever make progress (a request that
+                // can never be scheduled, e.g. a prompt longer than the KV
+                // cache, or a closed loop with no users).
+                return Err(format!(
+                    "simulation stalled at t={:.3}: {} running, {} waiting, no pending events",
+                    self.engine.current_time(),
+                    self.engine.aggregate_running(),
+                    self.engine.aggregate_waiting()
+                ));
             }
 
             let outcome = self.engine.step()?;
@@ -329,6 +333,15 @@ impl Simulator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{LengthDistribution, ModelCosts};
+
+    #[test]
+    fn kv_cache_smaller_than_a_block_is_a_config_error() {
+        let mut config = create_minimal_test_config();
+        config.hardware.kv_cache_capacity = 1;
+        let err = Simulator::new(config, None).err().unwrap();
+        assert!(err.contains("less than one"), "{err}");
+    }
 
     fn create_minimal_test_config() -> Config {
         let mut config = Config::test_default();
@@ -398,6 +411,19 @@ mod tests {
         let decode_total: u64 = ts.iter().map(|p| p.decode_tokens as u64).sum();
         let output_total: u64 = simulator.output_lengths().iter().map(|&x| x as u64).sum();
         assert_eq!(decode_total, output_total);
+    }
+
+    #[test]
+    fn unschedulable_request_is_an_error_not_a_hang() {
+        let mut config = create_minimal_test_config();
+        // A prompt longer than the whole KV cache (64 blocks of 16 tokens)
+        // can never be admitted.
+        config.hardware.kv_cache_capacity = 64 * config.model.kv_storage_bytes(16);
+        config.workload.input_len_dist = LengthDistribution::Fixed { value: 4096 };
+        config.workload.num_requests = Some(1);
+        let mut simulator = Simulator::new(config, None).unwrap();
+        let err = simulator.run_with_callback(|_| {}).unwrap_err();
+        assert!(err.contains("stalled"), "{err}");
     }
 
     #[test]

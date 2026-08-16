@@ -87,6 +87,15 @@ impl Worker {
             true,
         )
         .with_tiers(&cluster.hardware.kv_tiers);
+        if kv_cache_manager.total_blocks() == 0 {
+            return Err(format!(
+                "KV cache capacity ({} bytes) holds less than one {}-token block ({} bytes) of {}",
+                cluster.hardware.kv_cache_capacity,
+                scheduler_config.block_size,
+                kv_cache_manager.bytes_per_block(),
+                model.name()
+            ));
+        }
 
         let scheduler = Scheduler::new(scheduler_config.clone(), kv_cache_manager);
         let compute_engine = cluster.compute_engine(model).with_cascade_attention(
@@ -646,9 +655,9 @@ impl Engine {
             .scheduler
             .earliest_pending_ready()
         {
-            // Nothing ran, but a request is parked on a KV transfer (swap-in
-            // or tier promotion). Re-arm at its completion time so the
-            // engine doesn't stall waiting for an arrival.
+            // Nothing ran, but a request is parked on a KV tier promotion.
+            // Re-arm at its completion time so the engine doesn't stall
+            // waiting for an arrival.
             self.maybe_wake_worker(pool, worker, ready.max(now));
         }
         (outcome.iteration, timings)

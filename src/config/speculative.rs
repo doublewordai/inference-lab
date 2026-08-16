@@ -237,8 +237,9 @@ impl SwitchConstraints {
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum DrafterCost {
-    /// Legacy scalar: overhead = `frac · gamma · verify_cost`. Reproduces the old
-    /// multiplicative `(1 + frac·gamma)` exactly when added to the verify cost.
+    /// Fixed fraction of the verify step per draft token: overhead =
+    /// `frac · gamma · verify_cost` (the multiplicative `(1 + frac·gamma)`
+    /// model when added to the verify cost).
     Fraction { frac: f64 },
     /// Autoregressive head (MTP / EAGLE): `gamma` serial single-token passes,
     /// each streaming the drafter's weights, so cost is LINEAR in `gamma` and the

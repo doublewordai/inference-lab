@@ -145,7 +145,7 @@ mod tests {
             "LTF".parse::<SchedulingPolicy>().unwrap(),
             SchedulingPolicy::LTF
         );
-        // Test backward compatibility
+        // "sjf" is an alias of "sof".
         assert_eq!(
             "sjf".parse::<SchedulingPolicy>().unwrap(),
             SchedulingPolicy::SOF
