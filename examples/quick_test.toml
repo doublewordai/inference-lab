@@ -1,24 +1,10 @@
 # Quick test config for CLI testing
 # H100 with small number of requests
 
-[hardware]
-name = "H100"
-flops_fp8 = 1.979e15        # 1979 TFLOPS FP8
-flops_bf16 = 9.895e+14    # half FP8 rate
-memory_bandwidth = 3.35e12     # 3.35 TB/s
-memory_capacity = 85899345920  # 80 GB
-gpu_memory_utilization = 0.9
-
-[model]
-type = "dense"
-precision = "fp8"
-name = "Llama-3-70B"
-num_parameters = 70000000000
-num_layers = 80
-hidden_dim = 8192
-num_heads = 64
-num_kv_heads = 8             # GQA
-max_seq_len = 8192
+# Presets ship in the crate catalog (inference_lab::catalog); replace either with an
+# inline [hardware] / [model] table to override.
+hardware = "h100"
+model = "llama-3-70b-fp8"
 
 [scheduler]
 max_num_batched_tokens = 8192

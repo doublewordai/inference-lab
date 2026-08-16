@@ -1,91 +1,17 @@
 # === Estate serving config: zai-org/GLM-5.2-FP8 on 8x B200 (tp=8) ===
-# Hardware: B200 (dense datasheet: fp4 9.0e15 / fp8 4.5e15 / bf16 2.25e15 FLOP/s, 7.7e12 B/s, 180 GB).
 # Scheduler: deadline-priority admission as the estate dispatches.
 # The [workload] block is required by the config loader but unused by
 # estate-lab (arrivals come from the replayed trace).
-#
-# zai-org/GLM-5.2-FP8 — MLA + DeepSeek-style sparse attention (DSA) + MoE.
-# From HF zai-org/GLM-5.2-FP8 config.json (model_type glm_moe_dsa):
-#   78 layers, hidden 6144, 64 heads; MLA kv_lora_rank 512 + qk_rope 64
-#   (qk_nope 192, v_head 256); DSA indexer: 32 heads x 128, index_topk 2048;
-#   indexer_types: 21 'full' indexers + 57 'shared' (reuse a neighbour's
-#   scores) -> indexer_retained_layers = 21;
-#   MoE: first 3 layers dense (inter 12288), 75 MoE layers with 256 routed +
-#   1 shared expert, 8 per token, moe_intermediate 2048; vocab 154880; 1 MTP
-#   layer (not modeled). NOTE: the archive/task label "GQA MoE" does not match
-#   the HF config — this is an MLA+DSA model, hence the deepseek_v4 variant.
-#
-# deepseek_v4 mapping: DSA = "near" layers with compress_ratio 1 (indexer
-# scores every raw token, attention reads min(t, 2048) selected tokens);
-# no sliding window, no far/compressed hierarchy. KV/token/layer = MLA
-# latent 512 + rope 64 at bf16.
-# Known bias: attention FLOPs are charged as 4*hidden*s*t' (t'=attended);
-# true MLA inner dim is 64*(256 qk + 256 v) = 32768 vs hidden 6144 — the
-# attention-compute stream is undercounted ~2.7x (same class of bias the
-# DSv4 configs accept); step time is dominated by the weight/KV byte streams.
-#
-# Param split (computed, FP8 weights incl. shared expert; KV bf16):
-#   per expert = 3*6144*2048 = 37_748_736
-#   active expert  = (8+1 shared) * per * 75 = 25_480_396_800
-#   resident expert= (256+1)      * per * 75 = 727_606_886_400
-#   per-layer MLA (q_a 6144x2048 + q_b 2048x16384 + kv_a 6144x576 +
-#     kv_b 512x28672 + o 16384x6144) = 165_019_648
-#   per-full-indexer params (q 6144x4096 + k 6144x128) = 25_952_256
-#   dense FFN (3 layers x 3*6144*12288) = 679_477_248
-#   router (75*6144*256) = 117_964_800;  lm_head (154880*6144) = 951_582_720
-#   active non-exp = 15_165_554_688;  resident non-exp (+embedding) = 16_117_137_408
-#   Sanity: resident total at fp8 ~= 743_724_023_808 B vs checkpoint
-#   755_617_140_416 B (gap = MTP layer + quantization scales).
 
-[hardware]
-name = "B200"
-flops_fp4 = 9.0e15
-flops_fp8 = 4.5e15
-flops_bf16 = 2.25e15
-flops_fp16 = 2.25e15
-memory_bandwidth = 7.7e12
-memory_capacity = 193273528320   # 180 GB
-kv_cache_capacity = 0            # auto: mem * util - weights
-gpu_memory_utilization = 0.9
+# Presets ship in the crate catalog (inference_lab::catalog); replace either with an
+# inline [hardware] / [model] table to override.
+hardware = "b200"
+model = "glm-5.2-fp8"
 
 [parallel]
 tp = 8
 ep = 1
 
-[model]
-type = "deepseek_v4"
-name = "GLM-5.2-FP8"
-num_layers = 78
-hidden_dim = 6144
-num_heads = 64
-max_seq_len = 1048576
-kv_latent_dim = 512
-qk_rope_head_dim = 64
-kv_precision = "bf16"
-num_active_expert_params = 25480396800
-num_active_non_expert_params = 15165554688
-num_resident_expert_params = 727606886400
-num_resident_non_expert_params = 16117137408
-expert_precision = "fp8"
-non_expert_precision = "fp8"
-# DSA: no sliding window; every layer does top-k sparse attention over the
-# UNCOMPRESSED history (near layers with compress_ratio 1), indexer-selected.
-window_size = 0
-num_dense_layers = 0
-num_near_layers = 78
-num_far_layers = 0
-near_compress_ratio = 1
-far_compress_ratio = 128
-index_topk = 2048
-index_n_heads = 32
-index_head_dim = 128
-indexer_retained_layers = 21
-num_experts_per_tok = 8
-num_routed_experts = 256
-num_moe_layers = 75
-
-# Engine args from internal/inference/node catalogs (b200; backend sglang; backend defaults for chunked_prefill):
-# mem-fraction/chunked-prefill/max-running -> 0.9/8192/256
 [scheduler]
 max_num_batched_tokens = 8192
 max_num_seqs = 256

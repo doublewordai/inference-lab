@@ -6,7 +6,7 @@
 
 use serde::Deserialize;
 
-use super::{CommsConfig, HardwareConfig, ModelConfig, ParallelConfig};
+use super::{CommsConfig, HardwareConfig, ModelSpec, ParallelConfig, SchedulerConfig};
 use crate::compute::ComputeEngine;
 
 /// A worker pool: one or more identically-shaped workers running the same
@@ -14,7 +14,9 @@ use crate::compute::ComputeEngine;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClusterSpec {
-    /// Per-GPU hardware spec.
+    /// Per-GPU hardware spec: a catalog name (`hardware = "b200"`) or an
+    /// inline table.
+    #[serde(deserialize_with = "super::hardware_ref")]
     pub hardware: HardwareConfig,
     /// TP / EP layout across the cluster.
     #[serde(default)]
@@ -47,7 +49,7 @@ impl ClusterSpec {
 
     /// The roofline cost model for `model` on this cluster (its hardware,
     /// parallel layout and, when configured, collective comms).
-    pub fn compute_engine(&self, model: ModelConfig) -> ComputeEngine {
+    pub fn compute_engine(&self, model: ModelSpec) -> ComputeEngine {
         let mut engine = ComputeEngine::new(self.hardware.clone(), self.parallel.clone(), model);
         if let Some(comms) = self.comms.clone() {
             engine = engine.with_comms(comms);
@@ -55,16 +57,17 @@ impl ClusterSpec {
         engine
     }
 
-    /// Fill in `hardware.kv_cache_capacity` from `aggregate_memory_capacity *
-    /// gpu_memory_utilization - model_size_bytes` if it's still at the
-    /// sentinel 0. Matches vLLM's behaviour: requested_memory minus
-    /// non-KV-cache memory (approximated as just the model weights).
-    pub fn compute_kv_cache_capacity(&mut self, model_size_bytes: u64) {
-        if self.hardware.kv_cache_capacity == 0 {
-            let requested = (self.aggregate_memory_capacity() as f64
-                * self.hardware.gpu_memory_utilization) as u64;
-            self.hardware.kv_cache_capacity = requested.saturating_sub(model_size_bytes);
+    /// KV cache bytes available to one worker of this cluster:
+    /// `scheduler.kv_cache_capacity` when set, else what
+    /// `aggregate_memory_capacity × gpu_memory_utilization` leaves after
+    /// `model_size_bytes` of weights (vLLM's rule).
+    pub fn kv_cache_capacity(&self, scheduler: &SchedulerConfig, model_size_bytes: u64) -> u64 {
+        if scheduler.kv_cache_capacity > 0 {
+            return scheduler.kv_cache_capacity;
         }
+        let requested =
+            (self.aggregate_memory_capacity() as f64 * scheduler.gpu_memory_utilization) as u64;
+        requested.saturating_sub(model_size_bytes)
     }
 }
 

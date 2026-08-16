@@ -20,6 +20,8 @@ performance modeling.
   goodput-adaptive draft policies, measured step-cost tables
 - **Workloads**: Poisson / uniform / burst / batched / closed-loop arrivals,
   synthetic length distributions or real datasets
+- **Shipped catalog**: hardware presets (B200/B300/GH200/H100) and ~40
+  model presets with their HF-derived numbers, referenced by name from configs
 - **CLI, Rust library and WebAssembly package**
 
 ## How does it work?
@@ -79,6 +81,7 @@ inference-lab --config examples/config.toml
 use inference_lab::config::Config;
 use inference_lab::simulation::Simulator;
 
+// Presets: inference_lab::catalog::hardware("b200"), catalog::model("gemma-4-31b-it")
 let config = Config::from_file("config.toml")?;
 let mut simulator = Simulator::new(config, None)?;
 simulator.run_with_callback(|_| {})?;
@@ -97,24 +100,8 @@ import init, { run_simulation } from '@doubleword/inference-lab';
 await init();
 
 const config = {
-  hardware: {
-    name: "H100",
-    flops_fp8: 1.979e15,
-    flops_bf16: 9.895e14,
-    memory_bandwidth: 3.35e12,
-    memory_capacity: 85899345920
-  },
-  model: {
-    type: "dense",
-    precision: "fp8",
-    name: "Llama-3-70B",
-    num_parameters: 70000000000,
-    num_layers: 80,
-    hidden_dim: 8192,
-    num_heads: 64,
-    num_kv_heads: 8,
-    max_seq_len: 8192
-  },
+  hardware: "h100",              // catalog preset (or an inline object)
+  model: "llama-3-70b-fp8",      // catalog preset (or an inline object)
   scheduler: {
     max_num_batched_tokens: 8192,
     max_num_seqs: 256,
@@ -149,10 +136,13 @@ console.log('Throughput:', results.metrics.output_tokens_per_sec);
 
 Configuration files use TOML format and specify:
 
-- **Hardware**: GPU specs (FLOPS, bandwidth, VRAM)
-- **Model**: LLM architecture (parameters, layers, heads)
-- **Scheduler**: Policies, max tokens, chunked prefill settings
+- **Hardware**: a catalog preset name or GPU specs (FLOP rates, bandwidth, VRAM)
+- **Model**: a catalog preset name or the architecture as weight streams + layer classes
+- **Scheduler**: engine args (batching, KV blocks, memory utilisation, policy)
 - **Workload**: Request arrival patterns and distributions
+
+The catalog lives in `catalog/{hardware,models}/*.toml` and is compiled into
+the crate (`inference_lab::catalog`).
 
 Example configurations are in `examples/*.toml` (small H100 / Llama and
 Qwen setups) and `configs/` (production-shaped DeepSeek-V4, Qwen3.5/3.6,

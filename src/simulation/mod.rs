@@ -161,13 +161,13 @@ fn mean<I: Iterator<Item = f64>>(iter: I) -> f64 {
 mod tests {
     use super::*;
     use crate::config::{
-        AcceptanceModel, ClusterSpec, DenseModel, DisaggTopology, GammaPolicy, HardwareConfig,
-        MeasuredCostConfig, ModelConfig, ModelCosts, ParallelConfig, Precision, SchedulerConfig,
-        SpeculativeConfig,
+        AcceptanceModel, ClusterSpec, DisaggTopology, GammaPolicy, HardwareConfig, LayerClass,
+        MeasuredCostConfig, ModelSpec, ParallelConfig, Precision, SchedulerConfig,
+        SpeculativeConfig, WeightStream,
     };
     use crate::scheduler::SchedulingPolicy;
 
-    fn small_dense_parts() -> (ClusterSpec, ModelConfig, SchedulerConfig) {
+    fn small_dense_parts() -> (ClusterSpec, ModelSpec, SchedulerConfig) {
         let hardware = HardwareConfig {
             name: "test".into(),
             flops_fp4: None,
@@ -176,24 +176,30 @@ mod tests {
             flops_fp16: Some(1e15),
             memory_bandwidth: 1e12,
             memory_capacity: 80_000_000_000,
-            kv_cache_capacity: 0,
-            gpu_memory_utilization: 0.9,
             kv_tiers: Vec::new(),
         };
-        let model = ModelConfig::Dense(DenseModel {
+        let model = ModelSpec {
             name: "test-dense".into(),
-            num_parameters: 1_000_000_000,
-            num_active_parameters: None,
-            num_layers: 8,
             hidden_dim: 1024,
-            num_heads: 8,
-            num_kv_heads: None,
-            head_dim: None,
             max_seq_len: 4096,
-            sliding_window: 0,
-            num_sliding_layers: 0,
-            precision: Precision::Bf16,
-        });
+            attention_precision: Precision::Bf16,
+            activation_bytes: 2,
+            weights: vec![WeightStream {
+                precision: Precision::Bf16,
+                active_params: 1_000_000_000,
+                resident_params: 1_000_000_000,
+                routing: None,
+            }],
+            layers: vec![LayerClass::Attention {
+                count: 8,
+                heads: 8,
+                head_dim: 128,
+                kv_heads: 8,
+                kv_shared: false,
+                window: 0,
+                kv_precision: Precision::Bf16,
+            }],
+        };
         let sched = SchedulerConfig {
             max_num_batched_tokens: 8192,
             max_num_seqs: 256,
@@ -201,6 +207,9 @@ mod tests {
             long_prefill_token_threshold: 0,
             max_num_partial_prefills: 1,
             block_size: 16,
+            gpu_memory_utilization: 0.9,
+            kv_cache_capacity: 0,
+            max_model_len: None,
             policy: SchedulingPolicy::FCFS,
             enable_preemption_free: false,
             enable_cascade_attention: false,
@@ -304,7 +313,7 @@ mod tests {
             kv_link_bw: model.kv_storage_bytes(prompt) as f64,
         }
     }
-    fn model_of() -> ModelConfig {
+    fn model_of() -> ModelSpec {
         small_dense_parts().1
     }
     fn sched_of() -> SchedulerConfig {

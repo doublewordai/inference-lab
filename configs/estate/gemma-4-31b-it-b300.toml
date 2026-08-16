@@ -1,90 +1,17 @@
 # === Estate serving config: google/gemma-4-31B-it on 2x B300 (tp=2) ===
-# Hardware: B300 (dense datasheet: fp4 13.5e15 / fp8 4.5e15 / bf16 2.25e15 FLOP/s, 8.0e12 B/s, 288 GB).
 # Scheduler: deadline-priority admission as the estate dispatches.
 # The [workload] block is required by the config loader but unused by
 # estate-lab (arrivals come from the replayed trace).
-#
-# google/gemma-4-31B-it — dense hybrid: 50 sliding(1024) + 10 full-attention
-# layers, no MoE. Architecture from HF google/gemma-4-31B-it config.json
-# (gated repo, fetched with the local HF token):
-#   60 layers (layer_types: 50 sliding_attention + 10 full_attention), hidden 5376,
-#   32 q heads; sliding layers: head_dim 256, 16 KV heads; full layers:
-#   global_head_dim 512, 4 global KV heads; attention_k_eq_v=true (K and V share
-#   one tensor -> KV cache is half the usual 2x); sliding_window 1024;
-#   MLP gated GeGLU intermediate 21504; vocab 262144, tied embeddings.
-#
-# Modeled by the `qwen35` variant with zero experts:
-#   - the 10 full-attention layers are the growing-KV "attention" layers.
-#     Effective heads chosen to reproduce the true arithmetic: H=32 x head_dim
-#     512 matches Q*K/AV flop volume; num_kv_heads=1... see below: KV/token/layer
-#     actual = 4 heads x 512 (k_eq_v single tensor) = 2048 elems = 2*kv_heads*512
-#     with kv_heads=2. -> num_kv_heads=2, attn_head_dim=512.
-#   - the 50 sliding layers are mapped to fixed per-sequence state ("linear"
-#     layers): a full 1024-token window of k_eq_v KV = 1024 x (16*256) =
-#     4_194_304 elems/layer = 8.39 MB/layer/seq at bf16, encoded as
-#     value_heads=256 x 128 x 128. Known bias: the state is reserved at full
-#     window size from t=0 (overcounts short sequences) and sliding-layer
-#     attention FLOPs are dropped (bounded by the 1024 window; small next to
-#     the ~30B-param matmul stream).
-#
-# Param split (all non-expert; computed, bf16 deployment):
-#   sliding layer attn (q 32x256 + kv 16x256 k_eq_v + o) = 5376*24576 = 110_100_480
-#   full layer attn (q 32x512 + kv 4x512 k_eq_v + o)     = 5376*35840 = 187_170_816
-#   MLP (gated, inter 21504) = 3*5376*21504               = 346_816_512
-#   embedding (tied, = lm_head) = 262144*5376              = 1_409_286_144
-#   active = 50*(sl+mlp) + 10*(fl+mlp) + lm_head           = 29_595_009_024
-#   resident = checkpoint total_size 62_546_177_752 B / 2  = 31_273_088_876
-#     (safetensors index; includes vision tower + norms the sum above omits)
 
-[hardware]
-name = "B300"
-flops_fp4 = 13.5e15
-flops_fp8 = 4.5e15
-flops_bf16 = 2.25e15
-flops_fp16 = 2.25e15
-memory_bandwidth = 8.0e12
-memory_capacity = 309237645312   # 288 GB
-kv_cache_capacity = 0            # auto: mem * util - weights
-gpu_memory_utilization = 0.9
+# Presets ship in the crate catalog (inference_lab::catalog); replace either with an
+# inline [hardware] / [model] table to override.
+hardware = "b300"
+model = "gemma-4-31b-it"
 
 [parallel]
 tp = 2
 ep = 1
 
-[model]
-type = "qwen35"
-name = "gemma-4-31B-it"
-num_layers = 60
-hidden_dim = 5376
-max_seq_len = 262144
-
-num_attention_layers = 10
-num_attention_heads = 32
-num_kv_heads = 2
-attn_head_dim = 512
-
-# Sliding layers as fixed-size state (see header).
-linear_num_value_heads = 256
-linear_num_key_heads = 0
-linear_key_head_dim = 128
-linear_value_head_dim = 128
-linear_conv_kernel = 0
-
-num_active_expert_params = 0
-num_active_non_expert_params = 29595009024
-num_resident_expert_params = 0
-num_resident_non_expert_params = 31273088876
-
-num_experts_per_tok = 0
-num_routed_experts = 0
-num_moe_layers = 0
-
-expert_precision = "bf16"
-non_expert_precision = "bf16"
-kv_precision = "bf16"
-
-# Engine args from internal/inference/node catalogs (b300; backend sglang; backend defaults for chunked_prefill, max_running):
-# mem-fraction/chunked-prefill/max-running -> 0.9/8192/4096
 [scheduler]
 max_num_batched_tokens = 8192
 max_num_seqs = 4096

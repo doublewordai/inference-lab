@@ -1,76 +1,24 @@
 # === Estate serving config: deepseek-ai/DeepSeek-V4-Flash on 4x B300 (tp=4) ===
-# Hardware: B300 (dense datasheet: fp4 13.5e15 / fp8 4.5e15 / bf16 2.25e15 FLOP/s, 8.0e12 B/s, 288 GB).
 # Scheduler: deadline-priority admission as the estate dispatches.
 # The [workload] block is required by the config loader but unused by
 # estate-lab (arrivals come from the replayed trace).
-#
-# deepseek-ai/DeepSeek-V4-Flash — MLA MoE with hybrid sparse attention.
-# Model arithmetic identical to configs/deepseek-v4-flash.toml (HF
-# deepseek-ai/DeepSeek-V4-Flash config.json): 43 layers, hidden 4096, 64 heads,
-# MLA latent 512 + qk_rope 64; compress_ratios -> 2 dense + 21 near(4) +
-# 20 far(128) (+1 trailing 0 = the MTP head, not in the backbone); sliding
-# window 128 in every layer; indexer 64 heads x 128, top-k 512; MoE 256 routed
-# + 1 shared, 6 per token, moe_intermediate 2048. expert_dtype fp4 (native),
-# attention/dense fp8, KV cache fp8 (deployed inference stack).
-# Param split (as in configs/deepseek-v4-flash.toml):
-#   per expert = 3*4096*2048 = 25_165_824
-#   active expert  = (6 routed + 1 shared) * per * 43 = 7_574_913_024
-#   resident expert= (256 + 1 shared)      * per * 43 = 278_107_521_024
-#   active non-exp (MLA q/kv/o low-rank projections, indexer, dense FFN,
-#   lm_head) = 5_660_947_776; resident non-exp = 6_225_000_000.
 
-[hardware]
-name = "B300"
-flops_fp4 = 13.5e15
-flops_fp8 = 4.5e15
-flops_bf16 = 2.25e15
-flops_fp16 = 2.25e15
-memory_bandwidth = 8.0e12
-memory_capacity = 309237645312   # 288 GB
-kv_cache_capacity = 0            # auto: mem * util - weights
-gpu_memory_utilization = 0.8
+# Presets ship in the crate catalog (inference_lab::catalog); replace either with an
+# inline [hardware] / [model] table to override.
+hardware = "b300"
+model = "deepseek-v4-flash"
 
 [parallel]
 tp = 4
 ep = 1
 
-[model]
-type = "deepseek_v4"
-name = "DeepSeek-V4-Flash"
-num_layers = 43
-hidden_dim = 4096
-num_heads = 64
-max_seq_len = 1048576
-kv_latent_dim = 512
-qk_rope_head_dim = 64
-kv_precision = "fp8"
-num_active_expert_params = 7574913024
-num_active_non_expert_params = 5660947776
-num_resident_expert_params = 278107521024
-num_resident_non_expert_params = 6225000000
-expert_precision = "fp4"
-non_expert_precision = "fp8"
-window_size = 128
-num_dense_layers = 2
-num_near_layers = 21
-num_far_layers = 20
-near_compress_ratio = 4
-far_compress_ratio = 128
-index_topk = 512
-index_n_heads = 64
-index_head_dim = 128
-num_experts_per_tok = 6
-num_routed_experts = 256
-num_moe_layers = 43
-
-# Engine args from internal/inference/node catalogs (b300; backend sglang; backend defaults for max_running):
-# mem-fraction/chunked-prefill/max-running -> 0.8/4096/4096
 [scheduler]
 max_num_batched_tokens = 4096
 max_num_seqs = 4096
 policy = "priority"
 enable_chunked_prefill = true
 block_size = 64
+gpu_memory_utilization = 0.8
 
 [workload]
 arrival_pattern = "closed_loop"

@@ -3,24 +3,10 @@
 # Architecture: Mixture-of-Experts with 128 experts, 8 active per token
 # Total: ~30B parameters, Active: ~3.3B parameters per token
 
-[hardware]
-name = "H100"
-flops_bf16 = 1.513e15       # 1513 TFLOPS bf16
-memory_bandwidth = 3.35e12      # 3.35 TB/s
-memory_capacity = 85899345920   # 80 GB
-kv_cache_capacity = 68719476736 # 64 GB
-
-[model]
-type = "dense"
-precision = "bf16"
-name = "Qwen3-30B-A3B"
-num_parameters = 30500000000       # ~30.5B total params (all 128 experts)
-num_active_parameters = 3340000000 # ~3.34B active params (8 out of 128 experts)
-num_layers = 48
-hidden_dim = 2048
-num_heads = 32
-num_kv_heads = 4                   # GQA: 4 KV heads
-max_seq_len = 32768                # Supports up to 32K context
+# Presets ship in the crate catalog (inference_lab::catalog); replace either with an
+# inline [hardware] / [model] table to override.
+hardware = "h100"
+model = "qwen3-30b-a3b"
 
 [scheduler]
 max_num_batched_tokens = 16384 # Doubled token budget to allocate faster
@@ -28,6 +14,7 @@ max_num_seqs = 650             # Increased to saturate KV cache
 policy = "fcfs"                # or "priority"
 enable_chunked_prefill = true  # Disable chunked prefill to allocate full prompts immediately
 block_size = 16
+kv_cache_capacity = 68719476736
 
 [workload]
 arrival_pattern = "batched" # All requests arrive at t=0 to fill cache quickly

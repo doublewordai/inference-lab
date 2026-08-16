@@ -1,0 +1,54 @@
+# Source: configs/estate/nemotron-3-super-120b-b200.toml
+# nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 — NemotronH hybrid: Mamba2 + attention +
+# latent-MoE FFN layers. From HF config.json (model_type nemotron_h):
+#   88 layers total: 40 mamba (M) + 8 attention (*) + 40 MoE-FFN (E);
+#   hidden 4096; attention 32 heads x 128, 2 KV heads; mamba: 128 heads x 64
+#   (d_inner 8192), ssm_state 128, 8 groups, conv 4, fp32 ssm cache;
+#   MoE (latent): experts act on moe_latent_size 1024 with inter 2688,
+#   relu^2 (non-gated, 2 matrices/expert), 512 routed + 1 shared (inter
+#   5376), 22 per token; vocab 131072; 1 MTP layer (not modeled);
+#   NVFP4 expert weights, bf16 elsewhere; max_pos 262144.
+#
+# Param split (computed; shared expert kept in the fp4 expert bucket —
+# NVFP4 checkpoints quantize it too):
+#   per routed expert (2 matrices, latent 1024 x inter 2688) = 5_505_024
+#   shared expert total = 40*2*1024*5376 = 440_401_920
+#   active expert  = 22*per*40 + shared = 5_284_823_040
+#   resident expert= 512*per*40 + shared = 113_183_293_440
+#   mamba layer (in_proj 4096x18560 + out 8192x4096) = 109_576_192
+#   attn layer = 35_651_584; latent up/down proj = 335_544_320
+#   router = 83_886_080; lm_head = 536_870_912
+#   active non-exp = 5_624_561_664; resident non-exp = 6_161_432_576
+#   Sanity: fp4+bf16 residency ~= 68_914_511_872 B vs
+#   checkpoint 80_297_329_824 B (gap = NVFP4 scales + MTP).
+#
+# Modelled directly: 8 attention layers (32 x 128, 2 KV heads) and 40 Mamba2 layers as linear state (fp32 ssm 8192x128 + conv 40960, 4_358_144 B/layer/seq); the 40 FFN-only layers have no token mixing and appear only in the weight streams.
+
+name = "NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
+hidden_dim = 4096
+max_seq_len = 262144
+attention_precision = "bf16"
+
+[[weights]]
+precision = "fp4"
+active_params = 5284823040
+resident_params = 113183293440
+routing = { routed_experts = 512, experts_per_tok = 22, moe_layers = 40 }
+
+[[weights]]
+precision = "bf16"
+active_params = 5624561664
+resident_params = 6161432576
+
+[[layers]]
+kind = "attention"
+count = 8
+heads = 32
+head_dim = 128
+kv_heads = 2
+kv_precision = "bf16"
+
+[[layers]]
+kind = "linear"
+count = 40
+state_bytes = 4358144

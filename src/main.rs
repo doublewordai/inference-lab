@@ -1,5 +1,5 @@
 use clap::Parser;
-use inference_lab::config::{ArrivalPattern, Config, ModelCosts};
+use inference_lab::config::{ArrivalPattern, Config};
 use inference_lab::dataset::{BatchTokenizerFn, Message, PromptInput};
 use inference_lab::simulation::Simulator;
 use std::path::PathBuf;
@@ -396,7 +396,7 @@ fn run_sim(args: SimArgs) {
     if verbosity >= VerbosityLevel::Normal {
         println!("{}", "Configuration:".green().bold());
         println!("  Hardware: {}", config.hardware.name);
-        println!("  Model: {}", config.model.name());
+        println!("  Model: {}", config.model.name);
         println!(
             "  Max batched tokens: {}",
             config.scheduler.max_num_batched_tokens

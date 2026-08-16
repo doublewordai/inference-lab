@@ -5,7 +5,7 @@ use crate::request::{BlockId, Request};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Bytes of KV a sequence of `t` tokens occupies. Supplied by the model
-/// (`ModelCosts::kv_storage_bytes`); the manager quantises it into blocks.
+/// (`ModelSpec::kv_storage_bytes`); the manager quantises it into blocks.
 pub type KvBytesFn = Box<dyn Fn(u32) -> u64 + Send + Sync>;
 
 #[derive(Debug, Clone)]

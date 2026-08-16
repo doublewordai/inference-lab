@@ -1,80 +1,24 @@
 # === Estate serving config: Qwen/Qwen3.5-4B on 1x GH200 (tp=1) ===
-# Hardware: GH200-120 (fp8/fp4 1.979e15, bf16 0.989e15 FLOP/s, 4.0e12 B/s, 96 GB usable).
 # Scheduler: deadline-priority admission as the estate dispatches.
 # The [workload] block is required by the config loader but unused by
 # estate-lab (arrivals come from the replayed trace).
-#
-# Qwen/Qwen3.5-4B — DENSE hybrid (GatedDeltaNet linear + GQA full attention,
-# no MoE; model_type qwen3_5). From HF Qwen/Qwen3.5-4B config.json (text_config):
-#   32 layers, full_attention_interval 4 -> 8 full-attn + 24 linear;
-#   hidden 2560; full attn: 16 q / 4 kv heads, head_dim 256; linear:
-#   16 key / 32 value heads x 128, conv 4; dense MLP inter 9216 every
-#   layer; vocab 248320 (tied); 1 MTP layer (not modeled); max_pos 262144.
-# `qwen35` with zero experts (dense MLP counted in the non-expert stream).
-#
-# Param split (all non-expert; computed):
-#   full-attn layer = 2560*10240 = 26_214_400
-#   linear layer = 2560*16384 = 41_943_040
-#   MLP/layer = 3*2560*9216 = 70_778_880
-#   lm_head = 248320*2560 = 635_699_200
-#   active = 8*attn + 24*linear + 32*mlp + lm_head = 4_116_971_520
-#   resident = 4_116_971_520 (tied embeddings)
-#   Sanity vs checkpoint: ~8.2e9 B at bf16 (advertised 4B).
 
-[hardware]
-name = "GH200-120"
-flops_fp4 = 1.979e15
-flops_fp8 = 1.979e15
-flops_bf16 = 0.989e15
-flops_fp16 = 0.989e15
-memory_bandwidth = 4.0e12
-memory_capacity = 102642221056   # 96 GB usable of 120
-kv_cache_capacity = 0            # auto: mem * util - weights
-gpu_memory_utilization = 0.8
+# Presets ship in the crate catalog (inference_lab::catalog); replace either with an
+# inline [hardware] / [model] table to override.
+hardware = "gh200-120"
+model = "qwen3.5-4b"
 
 [parallel]
 tp = 1
 ep = 1
 
-[model]
-type = "qwen35"
-name = "Qwen3.5-4B"
-num_layers = 32
-hidden_dim = 2560
-max_seq_len = 262144
-
-num_attention_layers = 8
-num_attention_heads = 16
-num_kv_heads = 4
-attn_head_dim = 256
-
-linear_num_value_heads = 32
-linear_num_key_heads = 16
-linear_key_head_dim = 128
-linear_value_head_dim = 128
-linear_conv_kernel = 4
-
-num_active_expert_params = 0
-num_active_non_expert_params = 4116971520
-num_resident_expert_params = 0
-num_resident_non_expert_params = 4116971520
-
-num_experts_per_tok = 0
-num_routed_experts = 0
-num_moe_layers = 0
-
-expert_precision = "bf16"
-non_expert_precision = "bf16"
-kv_precision = "bf16"
-
-# Engine args from internal/inference/node catalogs (b200, gh200 = b200 prod-parity; backend sglang; backend defaults for chunked_prefill):
-# mem-fraction/chunked-prefill/max-running -> 0.8/8192/2048
 [scheduler]
 max_num_batched_tokens = 8192
 max_num_seqs = 2048
 policy = "priority"
 enable_chunked_prefill = true
 block_size = 64
+gpu_memory_utilization = 0.8
 
 [workload]
 arrival_pattern = "closed_loop"

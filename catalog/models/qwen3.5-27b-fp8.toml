@@ -1,0 +1,40 @@
+# Source: configs/estate/qwen3.5-27b-fp8-b200.toml
+# Qwen/Qwen3.5-27B-FP8 — DENSE hybrid (GatedDeltaNet linear + GQA full attention,
+# no MoE; model_type qwen3_5). From HF Qwen/Qwen3.5-27B-FP8 config.json (text_config):
+#   64 layers, full_attention_interval 4 -> 16 full-attn + 48 linear;
+#   hidden 5120; full attn: 24 q / 4 kv heads, head_dim 256; linear:
+#   16 key / 48 value heads x 128, conv 4; dense MLP inter 17408 every
+#   layer; vocab 248320 (untied); 1 MTP layer (not modeled); max_pos 262144.
+# `qwen35` with zero experts (dense MLP counted in the non-expert stream).
+#
+# Param split (all non-expert; computed):
+#   full-attn layer = 5120*14336 = 73_400_320
+#   linear layer = 5120*22528 = 115_343_360
+#   MLP/layer = 3*5120*17408 = 267_386_880
+#   lm_head = 248320*5120 = 1_271_398_400
+#   active = 16*attn + 48*linear + 64*mlp + lm_head = 25_095_045_120
+#   resident = 26_366_443_520 (untied embeddings)
+#   Sanity vs checkpoint: 30_866_680_160 B at fp8.
+
+name = "Qwen3.5-27B-FP8"
+hidden_dim = 5120
+max_seq_len = 262144
+attention_precision = "bf16"
+
+[[weights]]
+precision = "fp8"
+active_params = 25095045120
+resident_params = 26366443520
+
+[[layers]]
+kind = "attention"
+count = 16
+heads = 24
+head_dim = 256
+kv_heads = 4
+kv_precision = "bf16"
+
+[[layers]]
+kind = "linear"
+count = 48
+state_bytes = 1654784

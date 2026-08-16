@@ -1,0 +1,28 @@
+# Source: configs/llama31-8b-eagle3-gh200.toml
+# Llama-3.1-8B-Instruct + EAGLE3 drafter on a single GH200 (96 GB HBM3).
+# Dense GQA transformer modeled by the generic `dense` variant:
+#   32 layers, hidden 4096, 32 q / 8 kv heads, head_dim 128, 8.03B params, bf16.
+#   matmul flops = 2 * params / token; weights = params * 2 B per step (no MoE);
+#   KV = 2 * layers * kv_heads * head_dim * seq_len * 2 B.
+# This is the engine target for the measured-cost-table work: a benchmarked
+# (batch_size, num_draft_tokens) -> step_seconds grid ([speculative.measured_cost]
+# below) prices both the policy's C(g) and pure-decode step wall time; the
+# analytic roofline is the off-grid fallback.
+
+name = "Llama-3.1-8B-Instruct"
+hidden_dim = 4096
+max_seq_len = 131072
+attention_precision = "bf16"
+
+[[weights]]
+precision = "bf16"
+active_params = 8030000000
+resident_params = 8030000000
+
+[[layers]]
+kind = "attention"
+count = 32
+heads = 32
+head_dim = 128
+kv_heads = 8
+kv_precision = "bf16"

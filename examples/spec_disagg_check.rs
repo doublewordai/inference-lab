@@ -34,8 +34,6 @@ fn b200() -> HardwareConfig {
         flops_fp16: Some(2.25e15),
         memory_bandwidth: 8.0e12,
         memory_capacity: 206_158_430_208,
-        kv_cache_capacity: 0,
-        gpu_memory_utilization: 0.9,
         kv_tiers: Vec::new(),
     }
 }
@@ -48,6 +46,9 @@ fn scheduler() -> SchedulerConfig {
         long_prefill_token_threshold: 0,
         max_num_partial_prefills: 1,
         block_size: 64,
+        gpu_memory_utilization: 0.9,
+        kv_cache_capacity: 0,
+        max_model_len: None,
         policy: SchedulingPolicy::FCFS,
         enable_preemption_free: true,
         enable_cascade_attention: false,

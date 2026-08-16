@@ -586,7 +586,6 @@ trait ModelName {
 }
 impl ModelName for Config {
     fn model_name(&self) -> &str {
-        use inference_lab::config::ModelCosts;
-        self.model.name()
+        self.model.name.as_str()
     }
 }

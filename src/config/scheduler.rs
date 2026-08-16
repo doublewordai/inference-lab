@@ -31,6 +31,23 @@ pub struct SchedulerConfig {
     /// Block size for KV cache (in tokens)
     pub block_size: u32,
 
+    /// Fraction of GPU memory the engine may use (vLLM's
+    /// `--gpu-memory-utilization`, default 0.9). The KV cache gets what is
+    /// left after the model weights.
+    #[serde(default = "default_gpu_memory_utilization")]
+    pub gpu_memory_utilization: f64,
+
+    /// Explicit KV cache capacity in bytes (across the TP group). 0 (default)
+    /// derives it: `memory_capacity × tp × gpu_memory_utilization − weights`.
+    #[serde(default)]
+    pub kv_cache_capacity: u64,
+
+    /// Serving-time context limit (vLLM's `--max-model-len`). Defaults to
+    /// the model's `max_seq_len`; only the chunked-prefill threshold default
+    /// depends on it.
+    #[serde(default)]
+    pub max_model_len: Option<u32>,
+
     /// Enable preemption-free scheduling mode
     /// When enabled, uses conservative admission control to guarantee zero preemptions
     #[serde(default)]
@@ -45,6 +62,10 @@ pub struct SchedulerConfig {
 
 fn default_max_num_partial_prefills() -> u32 {
     1
+}
+
+fn default_gpu_memory_utilization() -> f64 {
+    0.9
 }
 
 impl SchedulerConfig {

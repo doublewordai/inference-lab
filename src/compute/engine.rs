@@ -5,15 +5,13 @@
 //! traffic flows through one HBM, so weight bytes for each precision plus KV
 //! bytes (charged to the attention stream) all share the same bandwidth.
 
-use crate::config::{
-    CommsConfig, HardwareConfig, ModelConfig, ModelCosts, ParallelConfig, Precision,
-};
+use crate::config::{CommsConfig, HardwareConfig, ModelSpec, ParallelConfig, Precision};
 use crate::request::Request;
 
 pub struct ComputeEngine {
     hardware: HardwareConfig,
     parallel: ParallelConfig,
-    model: ModelConfig,
+    model: ModelSpec,
     comms: Option<CommsConfig>,
     block_size: u32,
     enable_cascade_attention: bool,
@@ -50,7 +48,7 @@ pub struct StepCost {
 }
 
 impl ComputeEngine {
-    pub fn new(hardware: HardwareConfig, parallel: ParallelConfig, model: ModelConfig) -> Self {
+    pub fn new(hardware: HardwareConfig, parallel: ParallelConfig, model: ModelSpec) -> Self {
         Self {
             hardware,
             parallel,
@@ -161,7 +159,7 @@ impl ComputeEngine {
             streams[prec.index()].bytes += b as f64;
         }
 
-        let attn = &mut streams[self.model.attention_precision().index()];
+        let attn = &mut streams[self.model.attention_precision.index()];
 
         // With cascade attention, the KV bytes for the shared prompt prefix
         // are loaded once per iteration instead of once per request.

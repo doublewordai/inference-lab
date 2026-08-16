@@ -9,9 +9,7 @@ use std::collections::{BinaryHeap, HashMap};
 
 use super::spec::{DepthSample, PlanCosts, SpecPlanner};
 use crate::compute::ComputeEngine;
-use crate::config::{
-    ClusterSpec, DisaggTopology, ModelConfig, ModelCosts, SchedulerConfig, SpeculativeConfig,
-};
+use crate::config::{ClusterSpec, DisaggTopology, ModelSpec, SchedulerConfig, SpeculativeConfig};
 use crate::kv_cache::{KVCacheManager, Link, PrefixCacheStats};
 use crate::request::Request;
 use crate::scheduler::Scheduler;
@@ -67,12 +65,11 @@ pub(crate) struct Worker {
 impl Worker {
     pub fn new(
         cluster: &ClusterSpec,
-        model: ModelConfig,
+        model: ModelSpec,
         scheduler_config: SchedulerConfig,
     ) -> Result<Self, String> {
-        let mut cluster = cluster.clone();
-        let model_size_bytes = model.weight_residency_bytes();
-        cluster.compute_kv_cache_capacity(model_size_bytes);
+        let kv_capacity =
+            cluster.kv_cache_capacity(&scheduler_config, model.weight_residency_bytes());
 
         // Blocks are charged from the model's exact KV curve: linear-KV
         // models get ceil(t / block_size), models whose footprint is
@@ -80,7 +77,7 @@ impl Worker {
         // compressed history) get their real bytes.
         let kv_model = model.clone();
         let kv_cache_manager = KVCacheManager::new(
-            cluster.hardware.kv_cache_capacity,
+            kv_capacity,
             scheduler_config.block_size,
             move |t| kv_model.kv_storage_bytes(t),
             model.per_sequence_state_bytes(),
@@ -90,10 +87,10 @@ impl Worker {
         if kv_cache_manager.total_blocks() == 0 {
             return Err(format!(
                 "KV cache capacity ({} bytes) holds less than one {}-token block ({} bytes) of {}",
-                cluster.hardware.kv_cache_capacity,
+                kv_capacity,
                 scheduler_config.block_size,
                 kv_cache_manager.bytes_per_block(),
-                model.name()
+                model.name
             ));
         }
 
@@ -152,13 +149,13 @@ pub struct Topology {
     pub(crate) pools: Vec<WorkerPool>,
     pub(crate) links: Vec<Link>,
     pub(crate) roles: Roles,
-    model: ModelConfig,
+    model: ModelSpec,
 }
 
 impl Topology {
     pub fn aggregated(
         cluster: ClusterSpec,
-        model: ModelConfig,
+        model: ModelSpec,
         scheduler_config: SchedulerConfig,
     ) -> Result<Self, String> {
         let n = cluster.num_workers.max(1) as usize;
@@ -180,7 +177,7 @@ impl Topology {
 
     pub fn from_disagg(
         topology: &DisaggTopology,
-        model: ModelConfig,
+        model: ModelSpec,
         scheduler_config: SchedulerConfig,
     ) -> Result<Self, String> {
         let p_count = topology.prefill.num_workers.max(1) as usize;

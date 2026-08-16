@@ -4,20 +4,28 @@ Field-by-field reference for the TOML (or, for WASM, JSON) configuration a
 simulation takes. Unknown fields anywhere in the file are rejected.
 
 ```toml
-[hardware]     # per-GPU spec
+hardware = "b200"              # catalog preset, or an inline [hardware] table
+model = "deepseek-v4-flash"    # catalog preset, or an inline [model] table
+
 [parallel]     # optional: TP / EP layout
-[model]        # architecture cost model, chosen by `type`
-[scheduler]    # batching, KV blocks, policy
+[scheduler]    # engine args: batching, KV blocks, memory, policy
 [workload]     # arrivals and request shapes
 [speculative]  # optional: speculative decoding
 ```
 
----
+## Catalog presets
+
+Hardware and model presets ship inside the crate (`catalog/hardware/*.toml`,
+`catalog/models/*.toml`, embedded at build time). A config names one with
+`hardware = "<name>"` / `model = "<name>"`; `inference_lab::catalog::
+{hardware_names, model_names, hardware, model}` list and load them from
+Rust. Presets carry only the physical hardware spec and the model
+architecture; everything about a deployment (TP, memory utilisation, batch
+limits) is in the config. To tweak a preset, copy its table inline.
 
 ## [hardware]
 
-Per-GPU spec. Aggregate figures across a TP group are derived from
-`[parallel]`.
+Per-GPU physical spec.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -28,20 +36,10 @@ Per-GPU spec. Aggregate figures across a TP group are derived from
 | `flops_fp16` | Float | unset | Dense FLOP/s at FP16 (FP32 is taken as half of it) |
 | `memory_bandwidth` | Float | — | HBM bandwidth, bytes/s |
 | `memory_capacity` | U64 | — | HBM capacity, bytes |
-| `kv_cache_capacity` | U64 | 0 | KV cache bytes. 0 means `aggregate_capacity × gpu_memory_utilization − model weights` |
-| `gpu_memory_utilization` | Float | 0.9 | Fraction of memory the engine may use (vLLM's `--gpu-memory-utilization`) |
 | `kv_tiers` | Array | `[]` | Spillover tiers below HBM, closest first: `{ name, capacity_bytes, bandwidth_to_hbm }`. Evicted KV blocks fall through the tiers and can be promoted back over the tier's bandwidth instead of being recomputed |
 
-```toml
-[hardware]
-name = "B200"
-flops_fp4 = 9.0e15
-flops_fp8 = 4.5e15
-flops_bf16 = 2.25e15
-memory_bandwidth = 8.0e12
-memory_capacity = 206158430208
-gpu_memory_utilization = 0.9
-```
+Shipped presets: `b200` (180 GiB / 7.7 TB/s as reported on the fleet),
+`b200-datasheet` (192 GB / 8 TB/s), `b300`, `gh200-120`, `gh200-96`, `h100`.
 
 ## [parallel]
 
@@ -59,71 +57,69 @@ exposes; the single-cluster TOML has none.
 
 ## [model]
 
-`type` selects the architecture; each has its own fields.
-
-### `type = "dense"` (also accepted as `"sliding"`)
-
-Dense / GQA transformer, optionally with sliding-window layers.
+A model is described by its per-token weight streams and its token-mixing
+layer classes; there are no named architectures. Any transformer the
+simulator serves is a composition of the pieces below.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `name` | String | — | |
-| `num_parameters` | U64 | — | Resident parameters |
-| `num_active_parameters` | U64 | `num_parameters` | Parameters touched per token (sparse models) |
-| `num_layers` | U32 | — | |
-| `hidden_dim` | U32 | — | |
-| `num_heads` | U32 | — | |
-| `num_kv_heads` | U32 | `num_heads` | GQA / MQA |
-| `head_dim` | U32 | `hidden_dim / num_heads` | |
-| `max_seq_len` | U32 | — | |
-| `sliding_window` | U32 | 0 | Window of the windowed layers; 0 = none |
-| `num_sliding_layers` | U32 | 0 | Layers attending only the last `sliding_window` tokens |
-| `precision` | `"fp4"`,`"fp8"`,`"bf16"`,`"fp16"`,`"fp32"` | `"bf16"` | Weights, attention compute and KV |
+| `hidden_dim` | U32 | — | Residual width (sizes collectives; prices MLA attention when its head shape is not given) |
+| `max_seq_len` | U32 | — | Architecture context limit (`max_position_embeddings`) |
+| `attention_precision` | Precision | `"bf16"` | Rate the attention score / AV matmuls run at; KV reads charge this stream |
+| `activation_bytes` | U32 | 2 | Bytes per activation element on the wire |
+| `weights` | Array | — | One or more weight streams (below) |
+| `layers` | Array | — | One or more layer classes (below) |
 
-### `type = "deepseek_v4"`
-
-MoE + MLA with per-layer compressed-history attention (DeepSeek-V4, GLM-5.2).
-Expert GEMMs and everything else are separate precision streams.
+### `[[weights]]` — a per-token GEMM stream at one precision
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `name`, `num_layers`, `hidden_dim`, `num_heads`, `max_seq_len` | | — | |
-| `kv_latent_dim` | U32 | — | MLA latent width stored per token per layer |
-| `qk_rope_head_dim` | U32 | 0 | RoPE'd K width stored alongside the latent |
-| `kv_precision` | Precision | `"fp8"` | KV cache precision |
-| `num_active_expert_params` | U64 | — | Expert params per token (routed + shared) |
-| `num_active_non_expert_params` | U64 | — | Non-expert params per token (attention, indexer, dense FFN, head) |
-| `num_resident_expert_params` | U64 | — | All experts' resident params |
-| `num_resident_non_expert_params` | U64 | — | |
-| `expert_precision` | Precision | `"fp4"` | |
-| `non_expert_precision` | Precision | `"fp8"` | |
-| `window_size` | U32 | — | Recent-token window every layer attends |
-| `num_dense_layers` | U32 | — | Layers with window only |
-| `num_near_layers` | U32 | — | Layers with window + indexer-selected compressed history |
-| `num_far_layers` | U32 | — | Layers with window + full stride-compressed history |
-| `near_compress_ratio`, `far_compress_ratio` | U32 | — | Compression strides |
-| `index_topk` | U32 | — | Indexer top-k cap on near layers |
-| `index_n_heads`, `index_head_dim` | U32 | — | Indexer scoring shape |
-| `indexer_retained_layers` | U32 | all near layers | Near layers running their own indexer (others reuse a neighbour's scores) |
-| `index_kv_precision` | Precision | `kv_precision` | |
-| `num_experts_per_tok` | U32 | — | Routed experts per token |
-| `num_routed_experts` | U32 | 0 | Routed-expert pool; when set, per-step expert weight traffic follows coupon-collector growth with batch tokens |
-| `num_moe_layers` | U32 | — | Layers doing EP routing |
+| `precision` | `"fp4"`,`"fp8"`,`"bf16"`,`"fp16"`,`"fp32"` | — | |
+| `active_params` | U64 | — | Parameters touched per token (FLOPs = 2×) |
+| `resident_params` | U64 | — | Parameters resident in HBM |
+| `routing` | Table | unset | MoE routing: `{ routed_experts, experts_per_tok, moe_layers }`. The per-step read then follows coupon-collector growth with the step's tokens (per-expert and shared params are recovered from the active/resident split); EP all-to-alls = 2 × `moe_layers` |
 
-### `type = "qwen35"`
+A dense fp8 model is one stream; DeepSeek-V4 is an fp4 expert stream with
+routing plus an fp8 non-expert stream; gpt-oss is fp4 experts + bf16 rest.
 
-Hybrid MoE: a minority of full-attention (GQA) layers with a growing KV
-cache, the rest GatedDeltaNet linear layers with a fixed per-sequence state.
+### `[[layers]]` — a class of identical token-mixing layers
+
+`kind = "attention"` — GQA / MHA with a growing KV cache:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `name`, `num_layers`, `hidden_dim`, `max_seq_len` | | — | |
-| `num_attention_layers` | U32 | — | Full-attention layers |
-| `num_attention_heads`, `num_kv_heads`, `attn_head_dim` | U32 | — | |
-| `linear_num_value_heads`, `linear_num_key_heads`, `linear_key_head_dim`, `linear_value_head_dim`, `linear_conv_kernel` | U32 | — | GatedDeltaNet state shape |
-| `num_active_expert_params`, `num_active_non_expert_params`, `num_resident_expert_params`, `num_resident_non_expert_params` | U64 | — | As for `deepseek_v4` |
-| `num_experts_per_tok`, `num_routed_experts`, `num_moe_layers` | U32 | — / 0 / — | As for `deepseek_v4` |
-| `expert_precision`, `non_expert_precision`, `kv_precision` | Precision | `"bf16"` | |
+| `count` | U32 | — | Layers in the class |
+| `heads`, `head_dim` | U32 | — | Query heads and head width (attention FLOPs = 4 × heads × head_dim per query-key pair) |
+| `kv_heads` | U32 | — | KV heads (KV per token = 2 × kv_heads × head_dim × bytes) |
+| `kv_shared` | Bool | false | K and V share one tensor (Gemma-4): half the KV |
+| `window` | U32 | 0 | Sliding window: attend to and store only the last `window` tokens; 0 = full context |
+| `kv_precision` | Precision | — | |
+
+`kind = "mla"` — multi-head latent attention, optionally sparse:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `count` | U32 | — | |
+| `latent_dim`, `rope_dim` | U32 | — / 0 | KV per token = (latent + rope) × bytes |
+| `kv_precision` | Precision | — | |
+| `window` | U32 | 0 | Recent tokens attended directly. Without a `history` path, 0 means the whole context; with one, 0 means no local window |
+| `history` | Table | unset | Long-range path `{ compress_ratio, index_topk, indexer }`: the history at stride `compress_ratio` (1 = every position), all of it or the `index_topk` entries an `indexer = { heads, head_dim, kv_precision }` selects (the indexer scores every entry and keeps its own KV) |
+| `heads`, `qk_head_dim`, `v_head_dim` | U32 | unset | Head shape for the score/AV FLOP count (2 × heads × (qk + v) per pair). All three or none; absent = 4 × hidden_dim per pair |
+
+Kimi-K2 is one `mla` class (full context); DeepSeek-V4 is three (window 128
+only; window + top-k of the ÷4 history with an indexer; window + the whole
+÷128 history); GLM-5 is top-2048 over the uncompressed history.
+
+`kind = "linear"` — linear attention / SSM (GatedDeltaNet, Mamba, KDA):
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `count` | U32 | — | |
+| `state_bytes` | U64 | — | Fixed per-sequence state per layer (reserved for the sequence's lifetime and read once per step); no context-scaling work |
+
+Shipped model presets: `catalog/models/` (`inference_lab::catalog::model_names()`),
+each with the derivation of its numbers from the HF config in its header.
 
 ---
 
@@ -138,6 +134,9 @@ cache, the rest GatedDeltaNet linear layers with a fixed per-sequence state.
 | `long_prefill_token_threshold` | U32 | 0 | Prefill chunk cap; 0 = no cap. Defaults to 4% of `max_seq_len` when `max_num_partial_prefills > 1` |
 | `max_num_partial_prefills` | U32 | 1 | vLLM's knob; only its effect on the threshold default is modelled |
 | `block_size` | U32 | — | KV block size, tokens |
+| `gpu_memory_utilization` | Float | 0.9 | Fraction of GPU memory the engine may use (vLLM's `--gpu-memory-utilization`); the KV cache gets what is left after the weights |
+| `kv_cache_capacity` | U64 | 0 | Explicit KV cache bytes across the TP group; 0 derives it from `gpu_memory_utilization` |
+| `max_model_len` | U32 | model's `max_seq_len` | Serving-time context limit (only the chunked-prefill threshold default depends on it) |
 | `enable_preemption_free` | Bool | false | Admit only what can grow to `prompt + max_output` without preemption |
 | `enable_cascade_attention` | Bool | false | Load a batch's shared prompt prefix once per iteration |
 

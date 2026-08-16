@@ -489,7 +489,7 @@ impl Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, KVTier, ModelCosts};
+    use crate::config::{Config, KVTier};
 
     /// KV manager over the test model with `capacity` bytes.
     fn kv_manager(config: &Config, capacity: u64, prefix_caching: bool) -> KVCacheManager {
@@ -509,14 +509,14 @@ mod tests {
 
     fn create_test_scheduler() -> Scheduler {
         let config = Config::test_default();
-        let kv = kv_manager(&config, config.hardware.kv_cache_capacity, false);
+        let kv = kv_manager(&config, config.scheduler.kv_cache_capacity, false);
         scheduler_from(config, kv)
     }
 
     fn create_scheduler_with_policy(policy: &str) -> Scheduler {
         let mut config = Config::test_default();
         config.scheduler.policy = policy.parse().unwrap();
-        let kv = kv_manager(&config, config.hardware.kv_cache_capacity, false);
+        let kv = kv_manager(&config, config.scheduler.kv_cache_capacity, false);
         scheduler_from(config, kv)
     }
 
@@ -569,7 +569,7 @@ mod tests {
         let config = Config::test_default();
         let block_size = config.scheduler.block_size;
         let kv =
-            kv_manager(&config, config.hardware.kv_cache_capacity, true).with_tiers(&[KVTier {
+            kv_manager(&config, config.scheduler.kv_cache_capacity, true).with_tiers(&[KVTier {
                 name: "host_ram".into(),
                 // Plenty of host RAM.
                 capacity_bytes: 10 * 1024 * 1024 * 1024,
@@ -686,7 +686,7 @@ mod tests {
     fn test_hbm_prefix_hit_skips_cached_compute() {
         let config = Config::test_default();
         let bs = config.scheduler.block_size;
-        let kv = kv_manager(&config, config.hardware.kv_cache_capacity, true);
+        let kv = kv_manager(&config, config.scheduler.kv_cache_capacity, true);
         let mut scheduler = scheduler_from(config, kv);
 
         let mut a = create_test_request("a", 4 * bs, 10);
@@ -979,7 +979,7 @@ mod tests {
     fn create_scheduler_with_preemption_free() -> Scheduler {
         let mut config = Config::test_default();
         config.scheduler.enable_preemption_free = true;
-        let kv = kv_manager(&config, config.hardware.kv_cache_capacity, false);
+        let kv = kv_manager(&config, config.scheduler.kv_cache_capacity, false);
         scheduler_from(config, kv)
     }
 
@@ -987,8 +987,8 @@ mod tests {
     fn test_preemption_free_admission_control() {
         let mut config = Config::test_default();
         config.scheduler.enable_preemption_free = true;
-        config.hardware.kv_cache_capacity = 100_000_000; // Small cache
-        let kv = kv_manager(&config, config.hardware.kv_cache_capacity, false);
+        config.scheduler.kv_cache_capacity = 100_000_000; // Small cache
+        let kv = kv_manager(&config, config.scheduler.kv_cache_capacity, false);
         let mut scheduler = scheduler_from(config, kv);
 
         let total_blocks = scheduler.kv_cache_manager().total_blocks();

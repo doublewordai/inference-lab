@@ -8,10 +8,11 @@ built from the hardware spec and the model's architecture.
 ## Layers
 
 ```
+catalog       shipped hardware / model presets (embedded TOML)
 config        TOML/JSON -> Config, ClusterSpec, DisaggTopology
   |
-  |  ModelCosts trait: per-precision FLOPs and weight bytes, attention
-  |  FLOPs, KV read / storage bytes, per-sequence state, collective volumes
+  |  ModelSpec: weight streams (per-precision FLOPs and bytes, MoE routing)
+  |  + layer classes (attention FLOPs, KV read / storage, per-sequence state)
   v
 compute       ComputeEngine: roofline step cost for a batch on a cluster
 kv_cache      KVCacheManager (blocks, prefix cache, spillover tiers), Link
@@ -24,9 +25,11 @@ simulation    Engine: worker pools + hand-off links + event heap
 metrics       MetricsCollector over RequestTiming -> MetricsSummary
 ```
 
-Every consumer of a model goes through `ModelCosts`; architectures
-(`dense`, `deepseek_v4`, `qwen35`) implement it and nothing else in the
-simulator knows their knobs.
+Every consumer of a model goes through `ModelSpec`'s cost methods. There
+are no named architectures: a model is a composition of weight streams and
+layer classes (`attention` with optional window and shared KV, `mla` with
+optional window / history / indexer, `linear` state), so nothing else in the
+simulator knows an architecture's knobs.
 
 ## One worker
 

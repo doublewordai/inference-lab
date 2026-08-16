@@ -1,0 +1,49 @@
+# Source: configs/estate/gemma-4-31b-it-b200.toml
+# google/gemma-4-31B-it — dense hybrid: 50 sliding(1024) + 10 full-attention
+# layers, no MoE. Architecture from HF google/gemma-4-31B-it config.json
+# (gated repo, fetched with the local HF token):
+#   60 layers (layer_types: 50 sliding_attention + 10 full_attention), hidden 5376,
+#   32 q heads; sliding layers: head_dim 256, 16 KV heads; full layers:
+#   global_head_dim 512, 4 global KV heads; attention_k_eq_v=true (K and V share
+#   one tensor -> KV cache is half the usual 2x); sliding_window 1024;
+#   MLP gated GeGLU intermediate 21504; vocab 262144, tied embeddings.
+#
+# Param split (all non-expert; computed, bf16 deployment):
+#   sliding layer attn (q 32x256 + kv 16x256 k_eq_v + o) = 5376*24576 = 110_100_480
+#   full layer attn (q 32x512 + kv 4x512 k_eq_v + o)     = 5376*35840 = 187_170_816
+#   MLP (gated, inter 21504) = 3*5376*21504               = 346_816_512
+#   embedding (tied, = lm_head) = 262144*5376              = 1_409_286_144
+#   active = 50*(sl+mlp) + 10*(fl+mlp) + lm_head           = 29_595_009_024
+#   resident = checkpoint total_size 62_546_177_752 B / 2  = 31_273_088_876
+#     (safetensors index; includes vision tower + norms the sum above omits)
+#
+# Modelled directly: 50 sliding(1024) k_eq_v layers and 10 full k_eq_v layers as two attention classes (window KV, window attention FLOPs and prefix caching are exact; nothing is reserved from t=0).
+
+name = "gemma-4-31B-it"
+hidden_dim = 5376
+max_seq_len = 262144
+attention_precision = "bf16"
+
+[[weights]]
+precision = "bf16"
+active_params = 29595009024
+resident_params = 31273088876
+
+[[layers]]
+kind = "attention"
+count = 50
+heads = 32
+head_dim = 256
+kv_heads = 16
+kv_shared = true
+window = 1024
+kv_precision = "bf16"
+
+[[layers]]
+kind = "attention"
+count = 10
+heads = 32
+head_dim = 512
+kv_heads = 4
+kv_shared = true
+kv_precision = "bf16"

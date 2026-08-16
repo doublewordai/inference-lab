@@ -7,9 +7,8 @@
 //!
 //! Run with: `cargo run --example hierarchy_demo --no-default-features`
 
-use inference_lab::config::{
-    DenseModel, HardwareConfig, KVTier, ModelConfig, ModelCosts, Precision, SchedulerConfig,
-};
+use inference_lab::catalog;
+use inference_lab::config::{HardwareConfig, KVTier, SchedulerConfig};
 use inference_lab::kv_cache::KVCacheManager;
 use inference_lab::request::Request;
 use inference_lab::scheduler::Scheduler;
@@ -24,10 +23,6 @@ fn run_for_batch(num_concurrent: usize, share_prefix: bool) -> Vec<f64> {
         flops_fp16: Some(1e15),
         memory_bandwidth: 3e12,
         memory_capacity: 80_000_000_000,
-        // Modest HBM. With block-ref sharing, batches that all share the
-        // same prefix only need one physical copy regardless of N.
-        kv_cache_capacity: 2_000_000_000,
-        gpu_memory_utilization: 0.9,
         // Single host-RAM tier, plenty of capacity, 1 GB/s PCIe so wait
         // time is observable.
         kv_tiers: vec![KVTier {
@@ -36,20 +31,8 @@ fn run_for_batch(num_concurrent: usize, share_prefix: bool) -> Vec<f64> {
             bandwidth_to_hbm: 1e9,
         }],
     };
-    let model = ModelConfig::Dense(DenseModel {
-        name: "demo".into(),
-        num_parameters: 7_000_000_000,
-        num_active_parameters: None,
-        num_layers: 32,
-        hidden_dim: 4096,
-        num_heads: 32,
-        num_kv_heads: None,
-        head_dim: None,
-        max_seq_len: 8192,
-        sliding_window: 0,
-        num_sliding_layers: 0,
-        precision: Precision::Bf16,
-    });
+    // A dense 70B-class model from the catalog; only its KV footprint matters here.
+    let model = catalog::model("llama-3-70b").expect("catalog preset");
     let scheduler_cfg = SchedulerConfig {
         max_num_batched_tokens: 8192,
         max_num_seqs: 256,
@@ -58,6 +41,9 @@ fn run_for_batch(num_concurrent: usize, share_prefix: bool) -> Vec<f64> {
         long_prefill_token_threshold: 0,
         max_num_partial_prefills: 1,
         block_size: 16,
+        gpu_memory_utilization: 0.9,
+        kv_cache_capacity: 0,
+        max_model_len: None,
         enable_preemption_free: false,
         enable_cascade_attention: false,
     };
@@ -68,7 +54,7 @@ fn run_for_batch(num_concurrent: usize, share_prefix: bool) -> Vec<f64> {
 
     let kv_model = config_model.clone();
     let mut kv_cache_manager = KVCacheManager::new(
-        config_hardware.kv_cache_capacity,
+        2_000_000_000, // 2 GB of HBM for KV: modest on purpose
         block_size,
         move |t| kv_model.kv_storage_bytes(t),
         config_model.per_sequence_state_bytes(),

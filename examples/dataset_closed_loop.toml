@@ -1,23 +1,10 @@
 # Example configuration for dataset mode with closed-loop pattern
 # This simulates a fixed number of concurrent users replaying real requests
 
-[hardware]
-name = "H100"
-flops_bf16 = 1.513e15       # 1513 TFLOPS bf16
-memory_bandwidth = 3.35e12      # 3.35 TB/s
-memory_capacity = 85899345920   # 80 GB
-kv_cache_capacity = 68719476736 # 64 GB
-
-[model]
-type = "dense"
-precision = "bf16"
-name = "Llama-3-70B"
-num_parameters = 70000000000
-num_layers = 80
-hidden_dim = 8192
-num_heads = 64
-num_kv_heads = 8
-max_seq_len = 8192
+# Presets ship in the crate catalog (inference_lab::catalog); replace either with an
+# inline [hardware] / [model] table to override.
+hardware = "h100"
+model = "llama-3-70b"
 
 [scheduler]
 max_num_batched_tokens = 8192
@@ -25,6 +12,7 @@ max_num_seqs = 256
 policy = "fcfs"
 enable_chunked_prefill = true
 block_size = 16
+kv_cache_capacity = 68719476736
 
 [workload]
 # Dataset mode - specify path to JSONL file

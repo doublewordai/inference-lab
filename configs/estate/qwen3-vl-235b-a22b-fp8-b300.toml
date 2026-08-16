@@ -1,77 +1,17 @@
 # === Estate serving config: Qwen/Qwen3-VL-235B-A22B-Instruct-FP8 on 2x B300 (tp=2) ===
-# Hardware: B300 (dense datasheet: fp4 13.5e15 / fp8 4.5e15 / bf16 2.25e15 FLOP/s, 8.0e12 B/s, 288 GB).
 # Scheduler: deadline-priority admission as the estate dispatches.
 # The [workload] block is required by the config loader but unused by
 # estate-lab (arrivals come from the replayed trace).
-#
-# Qwen/Qwen3-VL-235B-A22B-Instruct-FP8 — GQA MoE vision-language model.
-# From HF Qwen/Qwen3-VL-235B-A22B-Instruct-FP8 config.json (text_config):
-#   94 layers, hidden 4096, 64 heads x head_dim 128, 4 KV heads, full
-#   attention; MoE every layer (decoder_sparse_step 1): 128 experts, 8 per
-#   token, moe_intermediate 1536, no shared expert; vocab 151936;
-#   max_pos 262144; FP8. Vision tower (27-layer SigLIP-style, ~0.45B) is
-#   counted in residency only — image encode compute is outside this model.
-# `qwen35` with num_attention_layers = num_layers (plain GQA MoE; coupon
-# knee at E/k = 16).
-#
-# Param split (computed):
-#   per expert = 3*4096*1536 = 18_874_368
-#   active expert  = 8 * per * 94   = 14_193_524_736
-#   resident expert= 128 * per * 94 = 227_096_395_776
-#   attn/layer (q+o 64x128, k+v 4x128) = 4096*17408 = 71_303_168; x94 = 6_702_497_792
-#   router = 49_283_072; lm_head = 151936*4096 = 622_329_856
-#   active non-exp = 7_374_110_720
-#   resident non-exp (+embed +vision ~0.45e9) = 8_446_440_576
-#   Sanity: ~235B total / ~21.6B active (advertised 235B-A22B).
 
-[hardware]
-name = "B300"
-flops_fp4 = 13.5e15
-flops_fp8 = 4.5e15
-flops_bf16 = 2.25e15
-flops_fp16 = 2.25e15
-memory_bandwidth = 8.0e12
-memory_capacity = 309237645312   # 288 GB
-kv_cache_capacity = 0            # auto: mem * util - weights
-gpu_memory_utilization = 0.9
+# Presets ship in the crate catalog (inference_lab::catalog); replace either with an
+# inline [hardware] / [model] table to override.
+hardware = "b300"
+model = "qwen3-vl-235b-a22b-fp8"
 
 [parallel]
 tp = 2
 ep = 1
 
-[model]
-type = "qwen35"
-name = "Qwen3-VL-235B-A22B-Instruct-FP8"
-num_layers = 94
-hidden_dim = 4096
-max_seq_len = 262144
-
-num_attention_layers = 94
-num_attention_heads = 64
-num_kv_heads = 4
-attn_head_dim = 128
-
-linear_num_value_heads = 0
-linear_num_key_heads = 0
-linear_key_head_dim = 0
-linear_value_head_dim = 0
-linear_conv_kernel = 0
-
-num_active_expert_params = 14193524736
-num_active_non_expert_params = 7374110720
-num_resident_expert_params = 227096395776
-num_resident_non_expert_params = 8446440576
-
-num_experts_per_tok = 8
-num_routed_experts = 128
-num_moe_layers = 94
-
-expert_precision = "fp8"
-non_expert_precision = "fp8"
-kv_precision = "bf16"
-
-# Engine args from internal/inference/node catalogs (b300; backend sglang; backend defaults for chunked_prefill, max_running):
-# mem-fraction/chunked-prefill/max-running -> 0.9/8192/4096
 [scheduler]
 max_num_batched_tokens = 8192
 max_num_seqs = 4096

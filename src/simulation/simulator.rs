@@ -333,12 +333,12 @@ impl Simulator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{LengthDistribution, ModelCosts};
+    use crate::config::LengthDistribution;
 
     #[test]
     fn kv_cache_smaller_than_a_block_is_a_config_error() {
         let mut config = create_minimal_test_config();
-        config.hardware.kv_cache_capacity = 1;
+        config.scheduler.kv_cache_capacity = 1;
         let err = Simulator::new(config, None).err().unwrap();
         assert!(err.contains("less than one"), "{err}");
     }
@@ -418,7 +418,7 @@ mod tests {
         let mut config = create_minimal_test_config();
         // A prompt longer than the whole KV cache (64 blocks of 16 tokens)
         // can never be admitted.
-        config.hardware.kv_cache_capacity = 64 * config.model.kv_storage_bytes(16);
+        config.scheduler.kv_cache_capacity = 64 * config.model.kv_storage_bytes(16);
         config.workload.input_len_dist = LengthDistribution::Fixed { value: 4096 };
         config.workload.num_requests = Some(1);
         let mut simulator = Simulator::new(config, None).unwrap();

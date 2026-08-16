@@ -2,7 +2,7 @@
 //! scheduler queueing, KV pressure, and topology composition. Useful as
 //! upper-bound references for the full event-driven [`super::Engine`].
 
-use crate::config::{ClusterSpec, ModelConfig};
+use crate::config::{ClusterSpec, ModelSpec};
 use crate::request::Request;
 
 /// Roofline TPOT (seconds per output token) for a decode-only cluster running
@@ -11,7 +11,7 @@ use crate::request::Request;
 /// request, so iteration time *is* TPOT.
 pub fn predict_decode_tpot(
     decode_cluster: &ClusterSpec,
-    model: &ModelConfig,
+    model: &ModelSpec,
     batch_size: u32,
     avg_seq_len: u32,
 ) -> f64 {
@@ -30,7 +30,7 @@ pub fn predict_decode_tpot(
 
 /// Roofline prefill latency (seconds) for a single ISL-length request running
 /// alone on a prefill-only cluster. One monolithic iteration, no chunking.
-pub fn predict_prefill_time(prefill_cluster: &ClusterSpec, model: &ModelConfig, isl: u32) -> f64 {
+pub fn predict_prefill_time(prefill_cluster: &ClusterSpec, model: &ModelSpec, isl: u32) -> f64 {
     let engine = prefill_cluster.compute_engine(model.clone());
     let req = Request::new("prefill".to_string(), 0, 0.0, isl, 1);
     let req_refs: Vec<&Request> = vec![&req];
