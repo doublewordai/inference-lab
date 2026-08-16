@@ -21,9 +21,10 @@
 //!     fantasy column priced from the optimistic roofline otherwise wins)
 //!   - GoodputBudget   (homogeneous width, bank-mean acceptance signal)
 //!   - GatedAggregate  (per-sequence signal, one batch-uniform width -- the
-//!                      engine-realizable aggregation)
+//!     engine-realizable aggregation)
 //!   - GatedBudget     (per-sequence signal, ragged per-sequence widths --
-//!                      the unconstrained upper reference)
+//!     the unconstrained upper reference)
+//!
 //! and reports GatedAggregate's headroom over the best fixed k.
 //!
 //! The scenario comes entirely from the config file: acceptance is the real
@@ -420,13 +421,13 @@ fn validate_against_llama_bench(cfg: &Config) {
     println!("{}", "-".repeat(14 + 9 * VAL_KS.len()));
     for (ci, &conc) in VAL_CONCS.iter().enumerate() {
         print!("{conc:>5} {:>6} |", "sim");
-        for ki in 0..VAL_KS.len() {
-            print!(" {:>8.0}", sim_tps[ci][ki]);
+        for v in sim_tps[ci].iter().take(VAL_KS.len()) {
+            print!(" {v:>8.0}");
         }
         println!();
         print!("{:>5} {:>6} |", "", "meas");
-        for ki in 0..VAL_KS.len() {
-            print!(" {:>8.0}", MEASURED_TPS[ci][ki]);
+        for v in MEASURED_TPS[ci].iter().take(VAL_KS.len()) {
+            print!(" {v:>8.0}");
         }
         println!();
         print!("{:>5} {:>6} |", "", "resid");

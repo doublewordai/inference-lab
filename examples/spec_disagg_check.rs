@@ -13,10 +13,12 @@
 //!
 //! Run: `cargo run --release --example spec_disagg_check --no-default-features`
 
+mod common;
+
 use inference_lab::config::DisaggTopology;
 use inference_lab::config::{
-    AcceptanceModel, ClusterSpec, CommsConfig, DeepseekV4Model, DrafterCost, GammaPolicy,
-    HardwareConfig, ModelConfig, ParallelConfig, Precision, SchedulerConfig, SpeculativeConfig,
+    AcceptanceModel, ClusterSpec, CommsConfig, DrafterCost, GammaPolicy, HardwareConfig,
+    ParallelConfig, SchedulerConfig, SpeculativeConfig,
 };
 use inference_lab::scheduler::SchedulingPolicy;
 use inference_lab::simulation::{simulate_closed_loop, ClosedLoop, Topology};
@@ -36,39 +38,6 @@ fn b200() -> HardwareConfig {
         gpu_memory_utilization: 0.9,
         kv_tiers: Vec::new(),
     }
-}
-
-fn deepseek_v4_flash() -> ModelConfig {
-    ModelConfig::DeepseekV4(DeepseekV4Model {
-        name: "DeepSeek-V4-Flash".into(),
-        num_layers: 43,
-        hidden_dim: 4096,
-        num_heads: 64,
-        max_seq_len: 1_048_576,
-        kv_latent_dim: 512,
-        qk_rope_head_dim: 64,
-        kv_precision: Precision::Fp8,
-        num_active_expert_params: 7_574_913_024,
-        num_active_non_expert_params: 5_660_947_776,
-        num_resident_expert_params: 278_107_521_024,
-        num_resident_non_expert_params: 6_225_000_000,
-        expert_precision: Precision::Fp4,
-        non_expert_precision: Precision::Fp8,
-        window_size: 128,
-        num_dense_layers: 2,
-        num_near_layers: 21,
-        num_far_layers: 20,
-        near_compress_ratio: 4,
-        far_compress_ratio: 128,
-        index_topk: 512,
-        index_n_heads: 64,
-        index_head_dim: 128,
-        indexer_retained_layers: None,
-        index_kv_precision: None,
-        num_experts_per_tok: 6,
-        num_routed_experts: 256,
-        num_moe_layers: 43,
-    })
 }
 
 fn scheduler() -> SchedulerConfig {
@@ -150,7 +119,8 @@ fn run(
         decode: cluster(1),
         kv_link_bw: 9.0e11,
     };
-    let topology = Topology::from_disagg(&topo, deepseek_v4_flash(), scheduler()).expect("topo");
+    let topology =
+        Topology::from_disagg(&topo, common::deepseek_v4_flash(), scheduler()).expect("topo");
     let total = (conc * 16).max(2000);
     let warmup = conc * 4;
     let res = simulate_closed_loop(

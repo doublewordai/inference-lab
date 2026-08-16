@@ -119,7 +119,7 @@ fn run_for_batch(num_concurrent: usize, share_prefix: bool) -> Vec<f64> {
 
     let mut scheduler = Scheduler::new(config_scheduler, kv_cache_manager);
 
-    for i in 0..num_concurrent {
+    for (i, prefix_hashes) in prefix_hashes_per_req.iter().enumerate() {
         let mut req = Request::new(
             format!("req-{i}"),
             0,
@@ -127,7 +127,7 @@ fn run_for_batch(num_concurrent: usize, share_prefix: bool) -> Vec<f64> {
             (prefix_blocks + 1) * block_size,
             1,
         );
-        let mut hashes = prefix_hashes_per_req[i].clone();
+        let mut hashes = prefix_hashes.clone();
         hashes.push(20_000_000_000 + i as u64);
         req.prompt_block_hashes = hashes;
         scheduler.add_request(req);
