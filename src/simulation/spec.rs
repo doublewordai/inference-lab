@@ -138,6 +138,17 @@ pub struct PlanCosts<'a> {
     pub bw: f64,
 }
 
+/// One second of draft-depth decisions.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DepthSample {
+    /// Simulated second (floor of the step end time).
+    pub second: u64,
+    /// Mean draft length per decode sequence over the second's steps.
+    pub mean_draft: f64,
+    /// Mean decode batch size over the second's steps.
+    pub mean_decode_batch: f64,
+}
+
 /// One decode sequence's plan for its next step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DraftPlan {
@@ -202,17 +213,14 @@ impl SpecPlanner {
         }
     }
 
-    /// Per-second draft-depth series:
-    /// (second, mean drafts per decode seq, mean decode batch).
-    pub fn depth_series(&self) -> Vec<(u64, f64, f64)> {
+    /// Per-second draft-depth series.
+    pub fn depth_series(&self) -> Vec<DepthSample> {
         self.depth_buckets
             .iter()
-            .map(|(&s, &(drafts, seqs, steps))| {
-                (
-                    s,
-                    drafts as f64 / seqs.max(1) as f64,
-                    seqs as f64 / steps.max(1) as f64,
-                )
+            .map(|(&second, &(drafts, seqs, steps))| DepthSample {
+                second,
+                mean_draft: drafts as f64 / seqs.max(1) as f64,
+                mean_decode_batch: seqs as f64 / steps.max(1) as f64,
             })
             .collect()
     }
@@ -727,7 +735,14 @@ mod tests {
         // A scheduler-trimmed verify realises min(commits, draft).
         assert_eq!(SpecPlanner::accepted(2, Some(plans[0].commits)), 2);
         assert_eq!(SpecPlanner::accepted(4, None), 0);
-        assert_eq!(p.depth_series(), vec![(0, 4.0, 3.0)]);
+        assert_eq!(
+            p.depth_series(),
+            vec![DepthSample {
+                second: 0,
+                mean_draft: 4.0,
+                mean_decode_batch: 3.0
+            }]
+        );
     }
 
     #[test]

@@ -7,7 +7,7 @@
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 
-use super::spec::{PlanCosts, SpecPlanner};
+use super::spec::{DepthSample, PlanCosts, SpecPlanner};
 use crate::compute::ComputeEngine;
 use crate::config::{
     ClusterSpec, DisaggTopology, ModelConfig, ModelCosts, SchedulerConfig, SpeculativeConfig,
@@ -479,10 +479,9 @@ impl Engine {
             .sum()
     }
 
-    /// Per-second speculative draft-depth series:
-    /// (second, mean drafts per decode seq, mean decode batch). Empty when
-    /// speculation is off.
-    pub fn spec_depth_series(&self) -> Vec<(u64, f64, f64)> {
+    /// Per-second speculative draft-depth series; empty when speculation is
+    /// off.
+    pub fn spec_depth_series(&self) -> Vec<DepthSample> {
         self.spec
             .as_ref()
             .map(|s| s.depth_series())

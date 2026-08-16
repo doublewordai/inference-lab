@@ -253,7 +253,7 @@ impl KVCacheManager {
             per_seq_state_bytes.div_ceil(bytes_per_block) as usize
         };
 
-        let blocks = (0..total_blocks).map(Block::new).collect();
+        let blocks = vec![Block::default(); total_blocks as usize];
         let free_blocks = (0..total_blocks).collect();
 
         Self {
@@ -499,10 +499,7 @@ impl KVCacheManager {
     /// Free blocks from a request (due to preemption or completion).
     pub fn free_blocks(&mut self, block_ids: &[BlockId]) {
         for &block_id in block_ids {
-            let block = &mut self.blocks[block_id as usize];
-            block.release();
-
-            if block.is_free {
+            if self.blocks[block_id as usize].release() {
                 self.free_blocks.push(block_id);
             }
         }

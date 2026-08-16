@@ -72,12 +72,12 @@ pub struct UnparsedEntry {
     pub max_output_tokens: Option<u32>,
 }
 
-/// Iterator over dataset entries, parsing JSON but NOT tokenizing
-/// Tokenization happens in batches in the background thread for performance
+/// Iterator over dataset entries: parses each JSONL line, skipping empty
+/// ones. Tokenisation happens later, in batches, on the generator's
+/// background thread.
 pub struct DatasetIterator<R: BufRead> {
     lines: Lines<R>,
     line_num: usize,
-    sent_end_signal: bool,
 }
 
 impl<R: BufRead> DatasetIterator<R> {
@@ -85,13 +85,12 @@ impl<R: BufRead> DatasetIterator<R> {
         Self {
             lines: reader.lines(),
             line_num: 0,
-            sent_end_signal: false,
         }
     }
 }
 
 impl<R: BufRead> Iterator for DatasetIterator<R> {
-    type Item = Result<Option<UnparsedEntry>, Box<dyn std::error::Error>>;
+    type Item = Result<UnparsedEntry, Box<dyn std::error::Error>>;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
@@ -99,15 +98,7 @@ impl<R: BufRead> Iterator for DatasetIterator<R> {
             let line = match self.lines.next() {
                 Some(Ok(line)) => line,
                 Some(Err(e)) => return Some(Err(Box::new(e))),
-                None => {
-                    // End of dataset - signal completion with Ok(None) once, then end iterator
-                    if !self.sent_end_signal {
-                        self.sent_end_signal = true;
-                        return Some(Ok(None));
-                    } else {
-                        return None;
-                    }
-                }
+                None => return None,
             };
 
             // Skip empty lines
@@ -127,14 +118,14 @@ impl<R: BufRead> Iterator for DatasetIterator<R> {
                 }
             };
 
-            return Some(Ok(Some(UnparsedEntry {
+            return Some(Ok(UnparsedEntry {
                 request_id: batch_request.custom_id,
                 prompt_input: match batch_request.body.input {
                     RequestInput::Chat { messages } => PromptInput::Messages(messages),
                     RequestInput::Completion { prompt } => PromptInput::Prompt(prompt),
                 },
                 max_output_tokens: batch_request.body.max_tokens,
-            })));
+            }));
         }
     }
 }
@@ -216,7 +207,7 @@ mod tests {
 
         let mut iter = DatasetLoader::from_string(test_data.to_string());
 
-        let entry1 = iter.next().unwrap().unwrap().unwrap();
+        let entry1 = iter.next().unwrap().unwrap();
         assert_eq!(entry1.request_id, "req-1");
         match entry1.prompt_input {
             PromptInput::Messages(messages) => {
@@ -228,15 +219,9 @@ mod tests {
         }
         assert_eq!(entry1.max_output_tokens, Some(10));
 
-        let entry2 = iter.next().unwrap().unwrap().unwrap();
+        let entry2 = iter.next().unwrap().unwrap();
         assert_eq!(entry2.request_id, "req-2");
         assert_eq!(entry2.max_output_tokens, Some(20));
-
-        // Should get Ok(None) signaling end of dataset
-        let end_signal = iter.next().unwrap().unwrap();
-        assert!(end_signal.is_none());
-
-        // After that, iterator itself should be exhausted
         assert!(iter.next().is_none());
     }
 

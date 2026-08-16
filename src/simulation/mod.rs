@@ -20,7 +20,7 @@ pub use engine::{
 };
 pub use roofline::{predict_decode_tpot, predict_prefill_time};
 pub use simulator::{ProgressInfo, Simulator, TimeSeriesPoint};
-pub use spec::{DraftPlan, PlanCosts, SpecPlanner};
+pub use spec::{DepthSample, DraftPlan, PlanCosts, SpecPlanner};
 
 use crate::config::SpeculativeConfig;
 use crate::request::Request;
@@ -344,7 +344,7 @@ mod tests {
         let series = engine.spec_depth_series();
         let (s, n) = series
             .iter()
-            .fold((0.0f64, 0.0f64), |(s, n), &(_, md, _)| (s + md, n + 1.0));
+            .fold((0.0f64, 0.0f64), |(s, n), d| (s + d.mean_draft, n + 1.0));
         s / n.max(1.0)
     }
 

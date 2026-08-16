@@ -488,8 +488,11 @@ fn run_sim(args: SimArgs) {
         let depth = simulator.spec_depth_series();
         if !depth.is_empty() {
             let mut d = String::from("second,mean_draft,mean_decode_batch\n");
-            for (s, md, mb) in &depth {
-                d.push_str(&format!("{s},{md:.4},{mb:.2}\n"));
+            for p in &depth {
+                d.push_str(&format!(
+                    "{},{:.4},{:.2}\n",
+                    p.second, p.mean_draft, p.mean_decode_batch
+                ));
             }
             let dp = csv_path.with_extension("depth.csv");
             if let Err(e) = std::fs::write(&dp, d) {

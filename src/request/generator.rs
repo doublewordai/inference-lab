@@ -60,11 +60,10 @@ impl RequestGenerator {
         tokenizer: BatchTokenizerFn,
     ) -> Self
     where
-        I: Iterator<Item = Result<Option<UnparsedEntry>, Box<dyn std::error::Error>>>
-            + Send
-            + 'static,
+        I: Iterator<Item = Result<UnparsedEntry, Box<dyn std::error::Error>>> + Send + 'static,
     {
         // Buffer size: 5000 entries (~10-50MB depending on token counts).
+        // `None` on the channel marks the end of the dataset.
         let (sender, receiver) = sync_channel::<Option<DatasetEntry>>(5000);
         thread::spawn(move || {
             let batch_size: usize = std::env::var("TOKENIZER_BATCH_SIZE")
@@ -74,7 +73,7 @@ impl RequestGenerator {
             let mut batch = Vec::with_capacity(batch_size);
             for result in dataset_iterator {
                 match result {
-                    Ok(Some(unparsed)) => {
+                    Ok(unparsed) => {
                         batch.push(unparsed);
                         if batch.len() >= batch_size
                             && Self::tokenize_and_send_batch(&mut batch, &tokenizer, &sender)
@@ -83,22 +82,14 @@ impl RequestGenerator {
                             return; // receiver dropped: simulation ended
                         }
                     }
-                    Ok(None) => {
-                        // End of dataset: flush the partial batch, then signal.
-                        if Self::tokenize_and_send_batch(&mut batch, &tokenizer, &sender).is_err() {
-                            return;
-                        }
-                        let _ = sender.send(None);
-                        return;
-                    }
                     Err(e) => {
                         log::error!("Error loading dataset entry: {e}");
-                        let _ = sender.send(None);
-                        return;
+                        break;
                     }
                 }
             }
-            // Iterator ended without an explicit end marker.
+            // End of dataset (or a read error): flush the partial batch, then
+            // signal the end.
             if Self::tokenize_and_send_batch(&mut batch, &tokenizer, &sender).is_ok() {
                 let _ = sender.send(None);
             }

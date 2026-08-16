@@ -6,6 +6,7 @@
 //! different driver.
 
 use super::engine::{Engine, IterationInfo, RequestTiming, StepKind, Topology};
+use super::spec::DepthSample;
 use crate::config::Config;
 use crate::dataset::{BatchTokenizerFn, DatasetLoader};
 use crate::metrics::{LatencySamples, MetricsCollector, MetricsSummary, RequestRow, SampleCursor};
@@ -295,7 +296,7 @@ impl Simulator {
     }
 
     /// Per-second speculative draft-depth series from the engine.
-    pub fn spec_depth_series(&self) -> Vec<(u64, f64, f64)> {
+    pub fn spec_depth_series(&self) -> Vec<DepthSample> {
         self.engine.spec_depth_series()
     }
 
