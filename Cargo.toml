@@ -1,6 +1,6 @@
 [package]
 name = "inference-lab"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2021"
 authors = ["Doubleword"]
 description = "High-performance LLM inference simulator for analyzing serving systems"
@@ -9,10 +9,15 @@ repository = "https://github.com/doublewordai/inference-lab"
 readme = "README.md"
 keywords = ["llm", "inference", "simulator", "performance"]
 categories = ["simulation", "wasm"]
-exclude = ["pkg/", ".npmrc", "node_modules/"]
+exclude = ["pkg/", ".npmrc", "node_modules/", "calibration/"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "inference-lab"
+path = "src/main.rs"
+required-features = ["cli"]
 
 [dependencies]
 toml = "0.8"

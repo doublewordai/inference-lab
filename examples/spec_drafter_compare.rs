@@ -8,7 +8,7 @@
 //! the only difference is how many times that read is paid.
 //!
 //! This sweep prices each drafter with its real roofline (`DrafterCost`) instead
-//! of the zeroed `draft_cost_frac`, runs both against their measured acceptance
+//! of a free drafter, runs both against their measured acceptance
 //! banks (MTP D=8 / DFlash D=16, SPEED-Bench), and asks at each operating point:
 //! how far does a priced adaptive policy beat the best-in-hindsight fixed γ?
 //!
@@ -20,59 +20,10 @@
 //!
 //! Run: `cargo run --release --no-default-features --example spec_drafter_compare`
 
-use inference_lab::config::model::Qwen35Model;
-use inference_lab::config::{
-    AcceptanceModel, Config, DrafterCost, GammaPolicy, HardwareConfig, LengthDistribution,
-    ModelConfig, ParallelConfig, Precision, SchedulerConfig, SimulationConfig, SpeculativeConfig,
-    WorkloadConfig,
-};
+mod common;
+
+use inference_lab::config::{AcceptanceModel, DrafterCost, GammaPolicy, SpeculativeConfig};
 use inference_lab::simulation::Simulator;
-
-fn b200_per_gpu() -> HardwareConfig {
-    HardwareConfig {
-        name: "B200".into(),
-        flops_fp4: Some(9.0e15),
-        flops_fp8: Some(4.5e15),
-        flops_bf16: Some(2.25e15),
-        flops_fp16: Some(2.25e15),
-        memory_bandwidth: 8.0e12,
-        memory_capacity: 206_158_430_208, // 192 GiB
-        kv_cache_capacity: 0,
-        gpu_memory_utilization: 0.9,
-        kv_tiers: Vec::new(),
-    }
-}
-
-fn qwen36() -> ModelConfig {
-    // Qwen3.6-35B-A3B, exactly the configs/qwen3.6-35b-a3b.toml shape: 40 layers
-    // (10 GQA full-attention + 30 GatedDeltaNet linear), every layer MoE (256
-    // routed + 1 shared, 8 per token). bf16 weights + KV.
-    ModelConfig::Qwen35(Qwen35Model {
-        name: "Qwen3.6-35B-A3B".into(),
-        num_layers: 40,
-        hidden_dim: 2048,
-        max_seq_len: 262_144,
-        num_attention_layers: 10,
-        num_attention_heads: 16,
-        num_kv_heads: 2,
-        attn_head_dim: 256,
-        linear_num_value_heads: 32,
-        linear_num_key_heads: 16,
-        linear_key_head_dim: 128,
-        linear_value_head_dim: 128,
-        linear_conv_kernel: 4,
-        num_active_expert_params: 1_132_462_080,
-        num_active_non_expert_params: 1_725_693_952,
-        num_resident_expert_params: 32_338_083_840,
-        num_resident_non_expert_params: 2_234_253_312,
-        num_experts_per_tok: 8,
-        num_routed_experts: 256,
-        num_moe_layers: 40,
-        expert_precision: Precision::Bf16,
-        non_expert_precision: Precision::Bf16,
-        kv_precision: Precision::Bf16,
-    })
-}
 
 #[derive(Clone, Copy)]
 enum Drafter {
@@ -128,7 +79,6 @@ enum Policy {
     NoSpec,
     Fixed(u32),
     Budget(u32),
-    Gated(u32),
 }
 
 impl Policy {
@@ -141,7 +91,6 @@ impl Policy {
                 gamma,
                 acceptance: acceptance.clone(),
                 policy,
-                draft_cost_frac: 0.0,
                 measured_cost: None,
                 switch: Default::default(),
                 drafter: Some(d.cost()),
@@ -151,62 +100,22 @@ impl Policy {
             Policy::NoSpec => None,
             Policy::Fixed(g) => mk(g, GammaPolicy::Fixed),
             Policy::Budget(g) => mk(g, GammaPolicy::GoodputBudget),
-            Policy::Gated(g) => mk(g, GammaPolicy::GatedAggregate),
         }
-    }
-}
-
-fn base_config(conc: usize, isl: u32, osl: u32) -> Config {
-    Config {
-        hardware: b200_per_gpu(),
-        parallel: ParallelConfig {
-            tp: 1,
-            ep: 1,
-            dp_attention: false,
-        },
-        model: qwen36(),
-        scheduler: SchedulerConfig {
-            max_num_batched_tokens: 16384,
-            max_num_seqs: 32768,
-            enable_chunked_prefill: true,
-            long_prefill_token_threshold: 0,
-            max_num_partial_prefills: 1,
-            block_size: 64,
-            policy: "fcfs".into(),
-            enable_preemption_free: true,
-            enable_cascade_attention: false,
-        },
-        workload: WorkloadConfig {
-            dataset_path: None,
-            arrival_pattern: "closed_loop".into(),
-            arrival_rate: 1.0,
-            rate_schedule: None,
-            num_concurrent_users: Some(conc),
-            closed_loop_jitter_secs: Some(0.5e-3),
-            input_len_dist: LengthDistribution::Fixed { value: isl },
-            output_len_dist: LengthDistribution::Fixed { value: osl },
-            num_requests: Some((conc * 20).max(2000)),
-            duration_secs: None,
-            seed: 7,
-        },
-        simulation: SimulationConfig::default(),
-        speculative: None,
-        fault: None,
     }
 }
 
 /// (goodput tok/s, tpot ms, bw util).
 fn run_point(conc: usize, isl: u32, osl: u32, d: Drafter, p: Policy) -> (f64, f64, f64) {
-    let mut config = base_config(conc, isl, osl);
+    let mut config = common::closed_loop_config(common::qwen36(), 16384, conc, isl, osl);
     config.speculative = p.spec(d);
     config.finalize();
-    let (mut sim, _cfg) = Simulator::new(config, None).expect("build sim");
+    let mut sim = Simulator::new(config, None).expect("build sim");
     sim.run_with_callback(|_| {}).expect("run");
-    let s = sim.get_metrics_summary();
+    let s = sim.summary();
     (
-        s.output_tokens_per_sec,
-        s.per_token_mean * 1000.0,
-        s.avg_bandwidth_util,
+        s.throughput_metrics.output_tokens_per_sec,
+        s.latency_metrics.per_token_ms.mean * 1000.0,
+        s.utilization.avg_bandwidth_util,
     )
 }
 

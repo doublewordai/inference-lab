@@ -1,0 +1,14 @@
+# Poisson 1 req/s, until the dataset ends; prompts from examples/sample_dataset.jsonl.
+
+dataset_path = "examples/sample_dataset.jsonl"
+arrival_pattern = "poisson"
+arrival_rate = 1.0
+seed = 42
+
+[input_len_dist]
+type = "fixed"
+value = 100
+
+[output_len_dist]
+type = "fixed"
+value = 50
