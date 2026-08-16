@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
 
-use crate::config::{ClusterSpec, Config};
+use crate::config::{Deployment, WorkloadConfig};
 use crate::request::Request;
 use crate::simulation::{Engine, StepKind, Topology};
 
@@ -28,7 +28,10 @@ struct LiveRequest {
 
 pub struct RealtimeEngine {
     engine: Engine,
-    config: Config,
+    /// Output lengths are sampled from this workload's `output_len_dist`
+    /// (capped at the request's `max_tokens`); without one every request
+    /// runs to `max_tokens`.
+    workload: Option<WorkloadConfig>,
     rx: mpsc::Receiver<EngineRequest>,
     live_requests: HashMap<String, LiveRequest>,
     /// Wall-clock-anchored offset from sim-time to real-time. Set on the
@@ -38,19 +41,19 @@ pub struct RealtimeEngine {
 }
 
 impl RealtimeEngine {
-    pub fn new(config: Config, rx: mpsc::Receiver<EngineRequest>) -> Result<Self, String> {
-        let cluster = ClusterSpec {
-            hardware: config.hardware.clone(),
-            parallel: config.parallel.clone(),
-            comms: None,
-            num_workers: 1,
-            node: 0,
-        };
-        let topology =
-            Topology::aggregated(cluster, config.model.clone(), config.scheduler.clone())?;
+    pub fn new(
+        deployment: &Deployment,
+        workload: Option<WorkloadConfig>,
+        rx: mpsc::Receiver<EngineRequest>,
+    ) -> Result<Self, String> {
+        let topology = Topology::aggregated(
+            deployment.cluster(),
+            deployment.model.clone(),
+            deployment.scheduler.clone(),
+        )?;
         Ok(Self {
             engine: Engine::new(topology),
-            config,
+            workload,
             rx,
             live_requests: HashMap::new(),
             epoch: None,
@@ -133,9 +136,11 @@ impl RealtimeEngine {
         if matches!(outcome.kind, StepKind::Iteration) {
             if let Some(iter) = outcome.iteration {
                 for prog in &iter.progress {
-                    // Prefill iterations advance num_computed_tokens but yield no
-                    // user-visible text.
-                    if prog.was_prefill || !self.live_requests.contains_key(&prog.request_id) {
+                    // `num_output` is what the client sees: 1 when this step
+                    // completed prefill (the first token comes out of the
+                    // prefill pass), `1 + accepted` per decode step, 0 for a
+                    // prefill chunk that did not finish the prompt.
+                    if prog.num_output == 0 || !self.live_requests.contains_key(&prog.request_id) {
                         continue;
                     }
 
@@ -151,7 +156,7 @@ impl RealtimeEngine {
                         }
                     }
 
-                    for _ in 0..prog.num_tokens {
+                    for _ in 0..prog.num_output {
                         let live = match self.live_requests.get_mut(&prog.request_id) {
                             Some(l) => l,
                             None => break,
@@ -196,13 +201,13 @@ impl RealtimeEngine {
     }
 
     fn admit_request(&mut self, engine_req: EngineRequest) {
-        let mut rng = rand::thread_rng();
-        let target_output_tokens = self
-            .config
-            .workload
-            .output_len_dist
-            .sample(&mut rng)
-            .min(engine_req.max_output_tokens);
+        let target_output_tokens = match &self.workload {
+            Some(w) => w
+                .output_len_dist
+                .sample(&mut rand::thread_rng())
+                .min(engine_req.max_output_tokens),
+            None => engine_req.max_output_tokens,
+        };
 
         let now = self.engine.current_time();
         let request = Request::new_with_target(

@@ -1,0 +1,12 @@
+model = "qwen3-30b-a3b"
+
+[scheduler]
+max_num_batched_tokens = 16384
+max_num_seqs = 650
+policy = "fcfs"
+enable_chunked_prefill = true
+block_size = 16
+kv_cache_capacity = 68719476736
+
+[hardware.h100]
+tp = 1

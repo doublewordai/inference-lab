@@ -104,7 +104,7 @@ Notes:
 
 ## Examples
 
-All against a local sim (`inference-lab serve --config configs/ --port 8080`); `$BODY` is
+All against a local sim (`inference-lab serve --config configs/ --hardware b200 --port 8080`); `$BODY` is
 any streaming chat request:
 
 ```bash

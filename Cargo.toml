@@ -9,10 +9,15 @@ repository = "https://github.com/doublewordai/inference-lab"
 readme = "README.md"
 keywords = ["llm", "inference", "simulator", "performance"]
 categories = ["simulation", "wasm"]
-exclude = ["pkg/", ".npmrc", "node_modules/"]
+exclude = ["pkg/", ".npmrc", "node_modules/", "calibration/"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "inference-lab"
+path = "src/main.rs"
+required-features = ["cli"]
 
 [dependencies]
 toml = "0.8"

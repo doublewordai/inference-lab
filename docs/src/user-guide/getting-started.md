@@ -18,9 +18,15 @@ cargo build --release
 
 ## Running Your First Simulation
 
+From a checkout of the repository:
+
 ```bash
-inference-lab -c config.toml
+inference-lab --config configs/llama-3-70b.toml --workload workloads/quick.toml
 ```
+
+`configs/` holds one file per model (each with its hardware entries) and
+`workloads/` the arrival patterns and request shapes; pass `--hardware
+<name>` when a model config has more than one entry.
 
 ## Next Steps
 

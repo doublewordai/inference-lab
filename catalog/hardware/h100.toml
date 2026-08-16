@@ -1,0 +1,7 @@
+# NVIDIA H100 SXM, dense datasheet peaks; 80 GB HBM3.
+
+name = "H100"
+flops_fp8 = 1.979e15
+flops_bf16 = 9.895e14
+memory_bandwidth = 3.35e12
+memory_capacity = 85899345920
