@@ -1,4 +1,3 @@
-# Source: configs/estate/qwen3.5-35b-a3b-fp8-b200.toml
 # Qwen/Qwen3.5-35B-A3B-FP8 — hybrid MoE (GatedDeltaNet linear + GQA full
 # attention). The HF Qwen/Qwen3.5-35B-A3B-FP8 config.json is architecturally
 # IDENTICAL to Qwen/Qwen3.6-35B-A3B: 40 layers = 10 GQA full-attn + 30
@@ -6,7 +5,7 @@
 # moe_intermediate 512, hidden 2048; full attn 16 q / 2 kv heads x 256;
 # linear 16 key / 32 value heads x 128, conv 4; vocab 248320. The param
 # split below is therefore copied verbatim from
-# configs/qwen3.6-35b-a3b-gh200.toml (arithmetic documented there):
+# catalog/models/qwen3.6-35b-a3b.toml (arithmetic documented there):
 #   per-expert 3*2048*512 = 3_145_728
 #   active expert (8+1)*per*40 = 1_132_462_080
 #   resident expert (256+1)*per*40 = 32_338_083_840

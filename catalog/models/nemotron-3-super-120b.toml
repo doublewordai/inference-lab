@@ -1,4 +1,3 @@
-# Source: configs/estate/nemotron-3-super-120b-b200.toml
 # nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 — NemotronH hybrid: Mamba2 + attention +
 # latent-MoE FFN layers. From HF config.json (model_type nemotron_h):
 #   88 layers total: 40 mamba (M) + 8 attention (*) + 40 MoE-FFN (E);

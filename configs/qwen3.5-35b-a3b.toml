@@ -1,11 +1,4 @@
-# Presets ship in the crate catalog (inference_lab::catalog); replace either with an
-# inline [hardware] / [model] table to override.
-hardware = "b200-datasheet"
 model = "qwen3.5-35b-a3b"
-
-[parallel]
-tp = 1
-ep = 1
 
 [scheduler]
 max_num_batched_tokens = 16384
@@ -14,23 +7,6 @@ policy = "fcfs"
 enable_chunked_prefill = true
 block_size = 64
 
-[workload]
-arrival_pattern = "closed_loop"
-num_concurrent_users = 256
-closed_loop_jitter_secs = 0.05
-num_requests = 2000
-seed = 7
-
-[workload.input_len_dist]
-type = "lognormal"
-mean = 7.0
-std_dev = 0.5
-
-[workload.output_len_dist]
-type = "lognormal"
-mean = 6.5
-std_dev = 0.8
-
 [speculative]
 gamma = 4
 policy = "goodput_budget"
@@ -38,3 +14,6 @@ policy = "goodput_budget"
 [speculative.acceptance]
 kind = "constant"
 alpha = 0.75
+
+[hardware.b200-datasheet]
+tp = 1

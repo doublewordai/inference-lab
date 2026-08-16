@@ -1,4 +1,3 @@
-# Source: configs/estate/hy3-fp8-b200.toml
 # tencent/Hy3-FP8 — plain GQA MoE (model_type hy_v3). From HF
 # tencent/Hy3-FP8 config.json:
 #   80 layers, hidden 4096, 64 heads x head_dim 128, 8 KV heads, full

@@ -1,6 +1,5 @@
-# Source: configs/estate/qwen3.5-397b-a17b-fp8-b200.toml
 # Qwen/Qwen3.5-397B-A17B-FP8 — hybrid MoE (GatedDeltaNet linear + GQA full attention),
-# same family as the Qwen3.6-35B template (configs/qwen3.6-35b-a3b-gh200.toml).
+# same family as the Qwen3.6-35B template (catalog/models/qwen3.6-35b-a3b.toml).
 # From HF Qwen/Qwen3.5-397B-A17B-FP8 config.json (text_config):
 #   60 layers, full_attention_interval 4 -> 15 full-attn + 45 GatedDeltaNet
 #   linear; hidden 4096; full attn: 32 q / 2 kv heads, head_dim 256; linear:

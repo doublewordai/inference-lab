@@ -1,4 +1,3 @@
-# Source: configs/estate/glm-5.1-fp8-b200.toml
 # zai-org/GLM-5.1-FP8 — MLA + DeepSeek-style sparse attention (DSA) + MoE.
 # From HF zai-org/GLM-5.1-FP8 config.json (model_type glm_moe_dsa):
 #   78 layers, hidden 6144, 64 heads; MLA kv_lora_rank 512 + qk_rope 64

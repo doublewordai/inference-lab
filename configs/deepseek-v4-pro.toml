@@ -1,43 +1,19 @@
-# DeepSeek-V4-Pro
-# 1.6T-param MoE with 49B active, MLA, hybrid sparse + sliding-window attention,
-# mixed FP4/FP8 weights. Param split: ~28.2B FP4 expert / ~20.8B FP8 non-expert
-# active, ~1.547T FP4 / ~53B FP8 resident. Deployed on 8x B200 (TP=8).
-
-# Presets ship in the crate catalog (inference_lab::catalog); replace either with an
-# inline [hardware] / [model] table to override.
 model = "deepseek-v4-pro"
 
-[hardware]
-name = "B200"
-flops_fp4 = 20.0e15           # FP4 dense Tensor Core peak
-flops_fp8 = 10.0e15           # FP8 dense Tensor Core peak (half of FP4)
-flops_bf16 = 5.0e15
-memory_bandwidth = 8.0e12     # 8 TB/s per B200
-memory_capacity = 206158430208 # 192 GB per B200
-
-[parallel]
-tp = 8
-ep = 1
-
 [scheduler]
-max_num_batched_tokens = 16384
-max_num_seqs = 256
-policy = "fcfs"
+max_num_batched_tokens = 32768
+max_num_seqs = 4096
+policy = "priority"
 enable_chunked_prefill = true
 block_size = 64
+gpu_memory_utilization = 0.8
 
-[workload]
-arrival_pattern = "poisson"
-arrival_rate = 2.0
-num_requests = 200
-seed = 42
+[hardware.b200]
+tp = 8
 
-[workload.input_len_dist]
-type = "lognormal"
-mean = 8.0
-std_dev = 1.0
+[hardware.b300]
+tp = 8
 
-[workload.output_len_dist]
-type = "lognormal"
-mean = 6.5
-std_dev = 0.9
+[hardware.b200-datasheet]
+tp = 8
+scheduler = { max_num_batched_tokens = 16384, max_num_seqs = 256, policy = "fcfs", gpu_memory_utilization = 0.9 }

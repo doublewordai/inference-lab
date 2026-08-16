@@ -1,4 +1,3 @@
-# Source: configs/estate/gpt-oss-20b-b200.toml
 # openai/gpt-oss-20b — MoE with alternating sliding(128)/full attention.
 # From HF openai/gpt-oss-20b config.json:
 #   24 layers (12 sliding_attention + 12 full_attention, strictly

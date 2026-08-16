@@ -69,21 +69,25 @@ cargo install inference-lab
 **Note:** The CLI tool is only available if you install it using `cargo install inference-lab` (see above).
 
 ```bash
-# Run a configuration
-inference-lab --config examples/config.toml
+# A model config (× one of its hardware entries) plus a workload
+inference-lab --config configs/qwen3.6-35b-a3b-fp8.toml --hardware b200 \
+              --workload workloads/chat-closed-256.toml
 
-# Example output shows TTFT, E2E latency, throughput, and utilization metrics
+# Output shows TTFT, E2E latency, throughput, and utilization metrics
 ```
 
 ### Rust Library
 
 ```rust
-use inference_lab::config::Config;
+use inference_lab::config::{ModelConfig, WorkloadConfig};
 use inference_lab::simulation::Simulator;
 
-// Presets: inference_lab::catalog::hardware("b200"), catalog::model("gemma-4-31b-it")
-let config = Config::from_file("config.toml")?;
-let mut simulator = Simulator::new(config, None)?;
+// A model config resolves to a Deployment per hardware entry; add a workload
+// to get a runnable Config.
+let deployment = ModelConfig::from_file("configs/gemma-4-31b-it.toml")?
+    .deployment(Some("b200"))?;
+let workload = WorkloadConfig::from_file("workloads/chat-closed-256.toml")?;
+let mut simulator = Simulator::new(deployment.with_workload(workload), None)?;
 simulator.run_with_callback(|_| {})?;
 let summary = simulator.summary();
 
@@ -134,19 +138,21 @@ console.log('Throughput:', results.metrics.output_tokens_per_sec);
 
 ## Configuration
 
-Configuration files use TOML format and specify:
+A simulation is a **model config** × one of its **hardware entries** × a
+**workload**:
 
-- **Hardware**: a catalog preset name or GPU specs (FLOP rates, bandwidth, VRAM)
-- **Model**: a catalog preset name or the architecture as weight streams + layer classes
-- **Scheduler**: engine args (batching, KV blocks, memory utilisation, policy)
-- **Workload**: Request arrival patterns and distributions
+- `configs/<model>.toml` — one file per model deployment: the model (a
+  catalog preset name or an inline architecture), its engine args
+  (`[scheduler]`), optional `[speculative]`, and a `[hardware.<name>]` entry
+  per hardware it runs on (`tp`/`ep`, per-entry scheduler overrides). Every
+  model the production fleet serves has a file here with its B200 / B300 /
+  GH200 entries.
+- `workloads/<name>.toml` — arrival pattern, request-length distributions or
+  a dataset, request count, seed.
 
-The catalog lives in `catalog/{hardware,models}/*.toml` and is compiled into
-the crate (`inference_lab::catalog`).
-
-Example configurations are in `examples/*.toml` (small H100 / Llama and
-Qwen setups) and `configs/` (production-shaped DeepSeek-V4, Qwen3.5/3.6,
-GLM-5.2 and estate catalogs).
+The hardware and model presets live in `catalog/{hardware,models}/*.toml`
+and are compiled into the crate (`inference_lab::catalog`); a config refers
+to them by name (`model = "gemma-4-31b-it"`, `[hardware.b200]`).
 
 ## Building
 
@@ -154,7 +160,7 @@ GLM-5.2 and estate catalogs).
 
 ```bash
 cargo build --release
-./target/release/inference-lab --config examples/config.toml
+./target/release/inference-lab --config configs/llama-3-70b.toml --workload workloads/quick.toml
 ```
 
 ### WASM Package
@@ -194,8 +200,9 @@ inference-lab/
 │   ├── main.rs         # CLI entry point
 │   └── wasm.rs         # WebAssembly bindings
 ├── catalog/            # hardware/*.toml and models/*.toml presets
-├── configs/            # Production-shaped configurations
-├── examples/           # Small example configs and Rust examples
+├── configs/            # One model config per deployment (model × hardware entries)
+├── workloads/          # Workload files
+├── examples/           # Rust examples and a sample dataset
 ├── build.rs            # Embeds catalog/ into the crate
 ├── Cargo.toml          # Rust package manifest
 └── package.json        # npm package manifest

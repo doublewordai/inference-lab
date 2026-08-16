@@ -1,14 +1,10 @@
-# Source: configs/estate/qwen3.6-35b-a3b-fp8-b200.toml
-# Qwen3.6-35B-A3B-FP8 on one B200 (tp=1) — estate serving config.
+# Qwen/Qwen3.6-35B-A3B-FP8 — the production FP8 quantization of Qwen3.6-35B-A3B.
 #
-# Model arithmetic is identical to configs/qwen3.6-35b-a3b-gh200.toml (HF
+# Model arithmetic is identical to catalog/models/qwen3.6-35b-a3b.toml (HF
 # Qwen/Qwen3.6-35B-A3B config.json: 40 layers = 10 GQA full-attn + 30
 # GatedDeltaNet linear, 256-expert MoE with 8 routed + 1 shared, hidden 2048;
-# param split computed there). Differences here: the production deployment is
-# the FP8 quantization (expert + non-expert weights fp8, KV bf16), the
-# hardware is B200, and the scheduler runs deadline-priority admission the way
-# the estate dispatches (production injects deadline priorities into the
-# engines via inject_deadline_priority).
+# param split computed there). Difference here: expert + non-expert weights
+# fp8, KV bf16.
 #
 # B200 hardware (dense, not sparse, per-GPU; first-principles datasheet
 # numbers, deviations from achieved rates are findings):

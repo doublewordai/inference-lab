@@ -32,4 +32,4 @@ COPY configs/ /etc/inference-lab/configs/
 EXPOSE 8080
 
 ENTRYPOINT ["inference-lab", "serve"]
-CMD ["--config", "/etc/inference-lab/configs/", "--port", "8080", "--host", "0.0.0.0"]
+CMD ["--config", "/etc/inference-lab/configs/", "--hardware", "b200", "--port", "8080", "--host", "0.0.0.0"]

@@ -1,13 +1,11 @@
-# Source: configs/estate/deepseek-v4-flash-b200.toml
 # deepseek-ai/DeepSeek-V4-Flash — MLA MoE with hybrid sparse attention.
-# Model arithmetic identical to configs/deepseek-v4-flash.toml (HF
-# deepseek-ai/DeepSeek-V4-Flash config.json): 43 layers, hidden 4096, 64 heads,
+# From HF deepseek-ai/DeepSeek-V4-Flash config.json: 43 layers, hidden 4096, 64 heads,
 # MLA latent 512 + qk_rope 64; compress_ratios -> 2 dense + 21 near(4) +
 # 20 far(128) (+1 trailing 0 = the MTP head, not in the backbone); sliding
 # window 128 in every layer; indexer 64 heads x 128, top-k 512; MoE 256 routed
 # + 1 shared, 6 per token, moe_intermediate 2048. expert_dtype fp4 (native),
 # attention/dense fp8, KV cache fp8 (deployed inference stack).
-# Param split (as in configs/deepseek-v4-flash.toml):
+# Param split:
 #   per expert = 3*4096*2048 = 25_165_824
 #   active expert  = (6 routed + 1 shared) * per * 43 = 7_574_913_024
 #   resident expert= (256 + 1 shared)      * per * 43 = 278_107_521_024
