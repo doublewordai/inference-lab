@@ -241,10 +241,12 @@ enum EventKind {
         pool: PoolId,
         worker: usize,
     },
-    LinkComplete {
+    /// The next hand-off on `link` is due to complete (under the contention
+    /// in force when it was scheduled). `generation` invalidates events made
+    /// stale by a later change to the link's in-flight set.
+    LinkDrain {
         link: LinkId,
-        request_id: String,
-        then_pool: PoolId,
+        generation: u64,
     },
 }
 
@@ -329,6 +331,9 @@ pub struct Engine {
     /// Requests that finished prefill on the P pool and are mid-handoff over
     /// the link.
     parked: HashMap<String, Request>,
+    /// Per-link generation of the scheduled `LinkDrain` event; only the
+    /// event carrying the current generation is acted on.
+    link_generation: Vec<u64>,
     /// `worker_busy[pool][worker]` is true iff a `WorkerReady` for that
     /// worker is currently scheduled in the queue.
     worker_busy: Vec<Vec<bool>>,
@@ -349,10 +354,12 @@ impl Engine {
             worker_busy.push(vec![false; pool.workers.len()]);
         }
         let pool_batch_acc = vec![(0.0_f64, 0.0_f64); topology.pools.len()];
+        let link_generation = vec![0u64; topology.links.len()];
         Self {
             topology,
             events: BinaryHeap::new(),
             parked: HashMap::new(),
+            link_generation,
             worker_busy,
             pool_batch_acc,
             current_time: 0.0,
@@ -567,12 +574,8 @@ impl Engine {
                     completions,
                 })
             }
-            EventKind::LinkComplete {
-                link,
-                request_id,
-                then_pool,
-            } => {
-                self.handle_link_complete(link, request_id, then_pool)?;
+            EventKind::LinkDrain { link, generation } => {
+                self.handle_link_drain(link, generation)?;
                 Ok(StepOutcome {
                     time: self.current_time,
                     kind: StepKind::LinkComplete,
@@ -922,40 +925,52 @@ impl Engine {
             .model
             .kv_storage_bytes(req.num_computed_tokens);
         let id = req.request_id.clone();
-        let (link, then_pool) = match self.topology.roles {
-            Roles::Disagg {
-                handoff, decode, ..
-            } => (handoff, decode),
+        let link = match self.topology.roles {
+            Roles::Disagg { handoff, .. } => handoff,
             _ => return,
         };
+        // Bring the link up to date under the old contention, then add the
+        // new transfer and re-plan the next completion under the new one.
+        // (`advance` returns nothing here: any completion due before now was
+        // handled by its own drain event.)
+        let _ = self.topology.links[link].advance(prefill_done_at);
         self.topology.links[link].submit(id.clone(), kv_bytes, prefill_done_at);
-        let eta = self.topology.links[link].estimate_remaining(&id);
-        let drain_time = prefill_done_at + eta;
-        self.push(
-            drain_time,
-            EventKind::LinkComplete {
-                link,
-                request_id: id.clone(),
-                then_pool,
-            },
-        );
         self.parked.insert(id, req);
+        self.schedule_link_drain(link, prefill_done_at);
     }
 
-    fn handle_link_complete(
-        &mut self,
-        link: LinkId,
-        request_id: String,
-        then_pool: PoolId,
-    ) -> Result<(), String> {
+    /// Schedule the next completion on `link` under its current contention,
+    /// invalidating any previously scheduled drain event.
+    fn schedule_link_drain(&mut self, link: LinkId, now: f64) {
+        self.link_generation[link] += 1;
+        let generation = self.link_generation[link];
+        if let Some(delay) = self.topology.links[link].next_completion_delay() {
+            self.push(now + delay, EventKind::LinkDrain { link, generation });
+        }
+    }
+
+    fn handle_link_drain(&mut self, link: LinkId, generation: u64) -> Result<(), String> {
+        if generation != self.link_generation[link] {
+            return Ok(()); // superseded by a later submit / completion
+        }
         let now = self.current_time;
-        let _ = self.topology.links[link].advance(now);
-        let mut req = self
-            .parked
-            .remove(&request_id)
-            .ok_or_else(|| format!("link complete for unknown request {request_id}"))?;
-        req.handoff_done_time = Some(now);
-        self.route_into_pool(then_pool, req);
+        let done = self.topology.links[link].advance(now);
+        let decode_pool = match self.topology.roles {
+            Roles::Disagg { decode, .. } => decode,
+            _ => return Err("link drain on an aggregated topology".to_string()),
+        };
+        // Route completed hand-offs in a deterministic order.
+        let mut done: Vec<String> = done.into_iter().collect();
+        done.sort();
+        for request_id in done {
+            let mut req = self
+                .parked
+                .remove(&request_id)
+                .ok_or_else(|| format!("link complete for unknown request {request_id}"))?;
+            req.handoff_done_time = Some(now);
+            self.route_into_pool(decode_pool, req);
+        }
+        self.schedule_link_drain(link, now);
         Ok(())
     }
 

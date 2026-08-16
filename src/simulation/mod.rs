@@ -161,11 +161,12 @@ fn mean<I: Iterator<Item = f64>>(iter: I) -> f64 {
 mod tests {
     use super::*;
     use crate::config::{
-        AcceptanceModel, ClusterSpec, DenseModel, GammaPolicy, HardwareConfig, MeasuredCostConfig,
-        ModelConfig, ParallelConfig, Precision, SchedulerConfig, SpeculativeConfig,
+        AcceptanceModel, ClusterSpec, DenseModel, DisaggTopology, GammaPolicy, HardwareConfig,
+        MeasuredCostConfig, ModelConfig, ModelCosts, ParallelConfig, Precision, SchedulerConfig,
+        SpeculativeConfig,
     };
 
-    fn small_dense_topology() -> Topology {
+    fn small_dense_parts() -> (ClusterSpec, ModelConfig, SchedulerConfig) {
         let hardware = HardwareConfig {
             name: "test".into(),
             flops_fp4: None,
@@ -211,7 +212,100 @@ mod tests {
             comms: None,
             num_workers: 1,
         };
+        (cluster, model, sched)
+    }
+
+    fn small_dense_topology() -> Topology {
+        let (cluster, model, sched) = small_dense_parts();
         Topology::aggregated(cluster, model, sched).expect("topo")
+    }
+
+    /// Run `engine` until `n` requests complete; returns their timings.
+    fn run_until(engine: &mut Engine, n: usize) -> Vec<RequestTiming> {
+        let mut done = Vec::new();
+        while done.len() < n {
+            assert!(engine.next_event_time().is_some(), "queue drained");
+            done.extend(engine.step().unwrap().completions);
+        }
+        done
+    }
+
+    #[test]
+    fn disagg_handoffs_share_the_link_bandwidth() {
+        let (cluster, model, sched) = small_dense_parts();
+        // KV of a 64-token prompt takes exactly 1.0 s alone on the link.
+        let kv_bytes = model.kv_storage_bytes(64) as f64;
+        let topo = DisaggTopology {
+            prefill: cluster.clone(),
+            decode: cluster,
+            kv_link_bw: kv_bytes,
+        };
+        let topology = Topology::from_disagg(&topo, model, sched).unwrap();
+        let mut engine = Engine::new(topology);
+        // Two prompts prefill in the same step, so both hand-offs start
+        // together and share the link: each takes 2.0 s, not 1.0 s.
+        engine.submit(Request::new("a".into(), 0, 0.0, 64, 2));
+        engine.submit(Request::new("b".into(), 0, 0.0, 64, 2));
+        let timings = run_until(&mut engine, 2);
+        for t in &timings {
+            let handoff = t.handoff_done_time - t.prefill_done_time;
+            assert!(
+                (handoff - 2.0).abs() < 1e-6,
+                "{}: handoff {handoff}",
+                t.request_id
+            );
+        }
+        // A third request whose prefill lands mid-way through the pair's
+        // transfer slows them (three-way share) and is itself slowed.
+        let mut engine =
+            Engine::new(Topology::from_disagg(&topo_of(64), model_of(), sched_of()).unwrap());
+        engine.submit(Request::new("a".into(), 0, 0.0, 64, 2));
+        engine.submit(Request::new("b".into(), 0, 0.0, 64, 2));
+        // The prefill step of a+b takes t_p; c arrives at t_p + 1.0 (both
+        // half done, 1.0 s of link work each left) and prefills alone in
+        // roughly t_p / 2, joining at ~t_p + 1 + t_p/2.
+        let outcome_time = {
+            let mut probe =
+                Engine::new(Topology::from_disagg(&topo_of(64), model_of(), sched_of()).unwrap());
+            probe.submit(Request::new("a".into(), 0, 0.0, 64, 2));
+            probe.submit(Request::new("b".into(), 0, 0.0, 64, 2));
+            let t = run_until(&mut probe, 2);
+            t[0].prefill_done_time
+        };
+        engine.submit(Request::new("c".into(), 0, outcome_time + 1.0, 64, 2));
+        let timings = run_until(&mut engine, 3);
+        let get = |id: &str| timings.iter().find(|t| t.request_id == id).unwrap();
+        let (a, c) = (get("a"), get("c"));
+        // a and b were half done when c joined; the rest ran three-way.
+        assert!(a.handoff_done_time - a.prefill_done_time > 2.0 + 1e-6);
+        // c never had the link to itself.
+        assert!(c.handoff_done_time - c.prefill_done_time > 1.0 + 1e-6);
+        // Conservation: the link moved 3 transfers' bytes in the span from
+        // the first submit to the last completion at full rate throughout.
+        let first_start = timings
+            .iter()
+            .map(|t| t.prefill_done_time)
+            .fold(f64::MAX, f64::min);
+        let last_end = timings
+            .iter()
+            .map(|t| t.handoff_done_time)
+            .fold(0.0, f64::max);
+        assert!((last_end - first_start - 3.0).abs() < 1e-6);
+    }
+
+    fn topo_of(prompt: u32) -> DisaggTopology {
+        let (cluster, model, _) = small_dense_parts();
+        DisaggTopology {
+            prefill: cluster.clone(),
+            decode: cluster,
+            kv_link_bw: model.kv_storage_bytes(prompt) as f64,
+        }
+    }
+    fn model_of() -> ModelConfig {
+        small_dense_parts().1
+    }
+    fn sched_of() -> SchedulerConfig {
+        small_dense_parts().2
     }
 
     /// Drive a tiny prefilled closed loop with a measured cost table and
