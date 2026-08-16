@@ -1532,7 +1532,10 @@ mod tests {
 
         // No include_usage means no usage frame at all — the stream ends finish -> [DONE].
         assert_eq!(events.last().map(String::as_str), Some("[DONE]"));
-        assert_eq!(frames.last().unwrap()["choices"][0]["finish_reason"], "stop");
+        assert_eq!(
+            frames.last().unwrap()["choices"][0]["finish_reason"],
+            "stop"
+        );
         assert!(!frames.iter().any(|f| f.get("usage").is_some()));
     }
 
@@ -1573,7 +1576,10 @@ mod tests {
         let frames = json_frames(&events);
 
         assert_eq!(events.last().map(String::as_str), Some("[DONE]"));
-        assert_eq!(frames.last().unwrap()["choices"][0]["finish_reason"], "stop");
+        assert_eq!(
+            frames.last().unwrap()["choices"][0]["finish_reason"],
+            "stop"
+        );
         assert!(!frames.iter().any(|f| f.get("usage").is_some()));
     }
 
@@ -2462,7 +2468,10 @@ mod tests {
 
         answered.await.unwrap();
         let frames = json_frames(&response_sse_events(response).await);
-        assert_eq!(frames.last().unwrap()["choices"][0]["finish_reason"], "stop");
+        assert_eq!(
+            frames.last().unwrap()["choices"][0]["finish_reason"],
+            "stop"
+        );
     }
 
     #[tokio::test]

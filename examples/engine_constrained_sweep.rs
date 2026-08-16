@@ -24,7 +24,7 @@ use inference_lab::compute::MeasuredCostTable;
 use inference_lab::config::{
     ClusterSpec, Config, GammaPolicy, SpeculativeConfig, SwitchConstraints,
 };
-use inference_lab::simulation::{simulate_closed_loop, Topology};
+use inference_lab::simulation::{simulate_closed_loop, ClosedLoop, Topology};
 use rayon::prelude::*;
 use std::collections::BTreeMap;
 
@@ -44,7 +44,6 @@ fn topology(cfg: &Config) -> Topology {
         parallel: cfg.parallel.clone(),
         comms: None,
         num_workers: 1,
-        node: 0,
     };
     Topology::aggregated(cluster, cfg.model.clone(), cfg.scheduler.clone()).expect("topo")
 }
@@ -56,14 +55,16 @@ fn run(cfg: &Config, conc: u32, spec: SpeculativeConfig) -> f64 {
     let warmup = conc / 2;
     let res = simulate_closed_loop(
         topology(cfg),
-        conc,
-        ISL,
-        OSL,
-        total,
-        warmup,
-        Some(spec),
-        7,
-        true, // skip_prefill: pure-decode target
+        &ClosedLoop {
+            concurrency: conc,
+            isl: ISL,
+            osl: OSL,
+            num_completions: total,
+            warmup_completions: warmup,
+            spec: Some(spec),
+            seed: 7,
+            skip_prefill: true, // pure-decode target
+        },
     )
     .expect("run");
     res.throughput() * OSL as f64
@@ -233,7 +234,6 @@ trait ModelName {
 }
 impl ModelName for Config {
     fn model_name(&self) -> &str {
-        use inference_lab::config::ModelCosts;
-        self.model.name()
+        self.model.name.as_str()
     }
 }

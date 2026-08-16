@@ -1,36 +1,42 @@
-//! Batch-sim driver. Wraps the unified [`Engine`] with a synthetic
-//! [`RequestGenerator`] and a [`MetricsCollector`], pumping events to
-//! completion. This is what `Commands::Sim` (CLI) and the WASM entry points
-//! drive.
+//! Batch-sim driver. Wraps the unified [`Engine`] with a [`RequestGenerator`]
+//! and a [`MetricsCollector`], pumping events to completion. This is what
+//! `Commands::Sim` (CLI) and the WASM entry points drive.
 //!
-//! For real-time HTTP serving, see [`crate::serve::engine`] — same `Engine`,
+//! For real-time HTTP serving, see `crate::serve::engine` — same `Engine`,
 //! different driver.
 
-use std::collections::HashSet;
-
 use super::engine::{Engine, IterationInfo, RequestTiming, StepKind, Topology};
+use super::spec::DepthSample;
 use crate::config::Config;
 use crate::dataset::{BatchTokenizerFn, DatasetLoader};
-use crate::metrics::{LatencySampleTriplet, MetricsCollector};
-use crate::request::{Request, RequestGenerator};
+use crate::metrics::{LatencySamples, MetricsCollector, MetricsSummary, RequestRow, SampleCursor};
+use crate::request::RequestGenerator;
 
+/// One sample of the fixed-interval time series.
 #[derive(Debug, Clone)]
 pub struct TimeSeriesPoint {
     pub time: f64,
+    /// Requests submitted so far.
     pub arrivals: u64,
     pub running: usize,
     pub waiting: usize,
     pub kv_cache_util: f64,
     pub num_prefilling: usize,
     pub num_decoding: usize,
+    /// Prompt positions computed in the interval.
     pub prefill_tokens: u32,
+    /// Output tokens generated in the interval.
     pub decode_tokens: u32,
     pub input_throughput: f64,
     pub output_throughput: f64,
-    pub ttft_p50: f64,
-    pub tpot_p50: f64,
+    /// Mean TTFT (ms) over requests completed in the interval; NaN if none.
+    pub ttft_interval_mean_ms: f64,
+    /// Mean per-request TPOT (ms) over requests completed in the interval;
+    /// NaN if none.
+    pub tpot_interval_mean_ms: f64,
 }
 
+/// Snapshot handed to the progress callback.
 pub struct ProgressInfo<'a> {
     pub current_time: f64,
     pub completed_requests: u64,
@@ -38,16 +44,21 @@ pub struct ProgressInfo<'a> {
     pub running: usize,
     pub waiting: usize,
     pub kv_cache_util: f64,
-    pub time_series: Option<&'a [TimeSeriesPoint]>,
-    pub metrics: Option<crate::metrics::MetricsSummary>,
-    pub latency_samples: Option<LatencySampleTriplet<'a>>,
-    pub distribution_samples: Option<(&'a [u32], &'a [u32])>,
+    pub time_series: &'a [TimeSeriesPoint],
+    pub metrics: MetricsSummary,
+    /// Latency samples added since the previous callback.
+    pub latency_samples: LatencySamples<'a>,
+    /// Prompt / output lengths of requests completed since the previous
+    /// callback.
+    pub input_lengths: &'a [u32],
+    pub output_lengths: &'a [u32],
 }
 
 pub struct Simulator {
     engine: Engine,
     request_generator: RequestGenerator,
     metrics: MetricsCollector,
+    config: Config,
     time_series: Vec<TimeSeriesPoint>,
 
     sample_interval: f64,
@@ -57,56 +68,43 @@ pub struct Simulator {
     window_prefill_tokens: u32,
     window_decode_tokens: u32,
 
-    last_sent_ttft_count: usize,
-    last_sent_e2e_count: usize,
-    last_sent_tpot_count: usize,
-    last_sent_input_count: usize,
-    last_sent_output_count: usize,
+    /// Samples already delivered to the progress callback.
+    sent: SampleCursor,
 }
 
 impl Simulator {
     /// Build a `Simulator` from a `Config`, with an optional batch tokenizer
-    /// for dataset-mode workloads. Returns the simulator and the (possibly
-    /// updated) config — `num_requests` is filled in from a streamed dataset
-    /// count when the source path was provided but the count wasn't.
-    pub fn new(
-        mut config: Config,
-        tokenizer: Option<BatchTokenizerFn>,
-    ) -> Result<(Self, Config), String> {
+    /// for dataset-mode workloads. When the workload names a dataset but no
+    /// `num_requests`, the dataset is counted and the config's `num_requests`
+    /// filled in (see [`Simulator::config`]).
+    pub fn new(mut config: Config, tokenizer: Option<BatchTokenizerFn>) -> Result<Self, String> {
         // The single-cluster `Config` describes one pool of workers. For
         // disagg topologies, callers build a [`Topology`] directly via
         // `Topology::from_disagg` and drive an `Engine` themselves.
-        let cluster = crate::config::ClusterSpec {
-            hardware: config.hardware.clone(),
-            parallel: config.parallel.clone(),
-            comms: None,
-            num_workers: 1,
-            node: 0,
-        };
-        let topology =
-            Topology::aggregated(cluster, config.model.clone(), config.scheduler.clone())?;
+        let topology = Topology::aggregated(
+            config.cluster(),
+            config.model.clone(),
+            config.scheduler.clone(),
+        )?;
 
         let request_generator = if let Some(dataset_path) = &config.workload.dataset_path {
             let tokenizer = tokenizer.ok_or_else(|| {
-                format!(
-                    "Dataset path '{}' provided but no tokenizer function supplied",
-                    dataset_path
-                )
+                format!("Dataset path '{dataset_path}' provided but no tokenizer function supplied")
             })?;
 
             if config.workload.num_requests.is_none() {
                 let total_entries = DatasetLoader::count_entries(dataset_path)
-                    .map_err(|e| format!("Failed to count entries in '{}': {}", dataset_path, e))?;
+                    .map_err(|e| format!("Failed to count entries in '{dataset_path}': {e}"))?;
                 config.workload.num_requests = Some(total_entries);
             }
 
             let dataset_iterator = DatasetLoader::from_file(dataset_path)
-                .map_err(|e| format!("Failed to load dataset from '{}': {}", dataset_path, e))?;
+                .map_err(|e| format!("Failed to load dataset from '{dataset_path}': {e}"))?;
 
             RequestGenerator::from_dataset(
                 config.workload.clone(),
+                config.scheduler.block_size,
                 dataset_iterator,
-                None,
                 tokenizer,
             )
         } else {
@@ -115,36 +113,36 @@ impl Simulator {
 
         let mut engine = Engine::new(topology);
         if let Some(spec) = &config.speculative {
-            engine.enable_speculative(spec.clone(), config.workload.seed);
+            engine.enable_speculative(spec.clone(), config.workload.seed)?;
         }
 
-        let simulator = Self {
+        Ok(Self {
             engine,
             request_generator,
             metrics: MetricsCollector::new(0.0),
+            config,
             time_series: Vec::new(),
             sample_interval: 0.1,
             next_sample_time: 0.0,
             window_prefill_tokens: 0,
             window_decode_tokens: 0,
-            last_sent_ttft_count: 0,
-            last_sent_e2e_count: 0,
-            last_sent_tpot_count: 0,
-            last_sent_input_count: 0,
-            last_sent_output_count: 0,
-        };
+            sent: SampleCursor::default(),
+        })
+    }
 
-        Ok((simulator, config))
+    /// The configuration in force, including any fields filled in at
+    /// construction (`workload.num_requests` from a counted dataset).
+    pub fn config(&self) -> &Config {
+        &self.config
     }
 
     /// Pull all currently-available arrivals from the generator into the
     /// engine. Returns the number of requests submitted.
     fn drain_arrivals(&mut self) -> usize {
         let mut n = 0;
-        // For closed-loop, peek_next_arrival_time returns a stale construction
-        // value (always 0.0) and is never updated as completions queue
-        // replenishment. Use current_time as a floor so closed-loop entries
-        // are visible once we reach their arrival time.
+        // Closed-loop replenishment is keyed on completions, not on the
+        // generator's own clock; use current_time as a floor so those
+        // entries are visible once we reach their arrival time.
         let now = self.engine.current_time();
         let bound = self.request_generator.peek_next_arrival_time().max(now) + 1e-9;
         while let Some(req) = self.request_generator.next_if_before(bound) {
@@ -155,8 +153,8 @@ impl Simulator {
         n
     }
 
-    /// Fast-forward sim time to the next arrival or pending event when the
-    /// engine has nothing to do (Poisson idle gaps, dataset stragglers).
+    /// Fast-forward sim time to the next arrival when the engine has nothing
+    /// to do (Poisson idle gaps, dataset stragglers).
     fn maybe_skip_idle(&mut self) {
         if !self.engine.is_idle() {
             return;
@@ -180,15 +178,19 @@ impl Simulator {
 
             if self.engine.next_event_time().is_none() {
                 if self.should_terminate() {
-                    self.emit_progress(&mut callback, true);
+                    self.emit_progress(&mut callback);
                     break;
                 }
-                // Nothing to do but no termination yet — bump sim a bit and
-                // re-poll the generator. This guards against weird states
-                // where a closed-loop generator has nothing pending and the
-                // engine is empty but `is_finished` is false.
-                self.engine.advance_to(self.engine.current_time() + 1e-3);
-                continue;
+                // No pending event, no arrival to jump to, and work still in
+                // the system: nothing can ever make progress (a request that
+                // can never be scheduled, e.g. a prompt longer than the KV
+                // cache, or a closed loop with no users).
+                return Err(format!(
+                    "simulation stalled at t={:.3}: {} running, {} waiting, no pending events",
+                    self.engine.current_time(),
+                    self.engine.aggregate_running(),
+                    self.engine.aggregate_waiting()
+                ));
             }
 
             let outcome = self.engine.step()?;
@@ -206,9 +208,7 @@ impl Simulator {
 
                 let prefill_tokens = self.window_prefill_tokens;
                 let decode_tokens = self.window_decode_tokens;
-                let input_throughput = prefill_tokens as f64 / self.sample_interval;
-                let output_throughput = decode_tokens as f64 / self.sample_interval;
-                let (ttft_mean, tpot_mean) = self.metrics.get_interval_latencies();
+                let (ttft_mean, tpot_mean) = self.metrics.take_interval_latencies();
 
                 self.time_series.push(TimeSeriesPoint {
                     time: self.engine.current_time(),
@@ -220,10 +220,10 @@ impl Simulator {
                     num_decoding: decoding,
                     prefill_tokens,
                     decode_tokens,
-                    input_throughput,
-                    output_throughput,
-                    ttft_p50: ttft_mean,
-                    tpot_p50: tpot_mean,
+                    input_throughput: prefill_tokens as f64 / self.sample_interval,
+                    output_throughput: decode_tokens as f64 / self.sample_interval,
+                    ttft_interval_mean_ms: ttft_mean,
+                    tpot_interval_mean_ms: tpot_mean,
                 });
                 self.window_prefill_tokens = 0;
                 self.window_decode_tokens = 0;
@@ -234,12 +234,12 @@ impl Simulator {
             if matches!(outcome.kind, StepKind::Iteration)
                 && self.engine.current_time() - last_callback_time >= callback_interval
             {
-                self.emit_progress(&mut callback, false);
+                self.emit_progress(&mut callback);
                 last_callback_time = self.engine.current_time();
             }
 
             if self.should_terminate() {
-                self.emit_progress(&mut callback, true);
+                self.emit_progress(&mut callback);
                 break;
             }
         }
@@ -248,15 +248,11 @@ impl Simulator {
     }
 
     fn handle_iteration(&mut self, iter: &IterationInfo) {
-        // Token-by-phase counters and bandwidth/flops trackers.
-        let mut prefill_ids: HashSet<&str> = HashSet::new();
         for prog in &iter.progress {
             if prog.was_prefill {
-                prefill_ids.insert(&prog.request_id);
                 self.window_prefill_tokens += prog.num_tokens;
-            } else {
-                self.window_decode_tokens += prog.num_tokens;
             }
+            self.window_decode_tokens += prog.num_output;
         }
         self.metrics.record_iteration_metrics(
             self.engine.kv_cache_util(),
@@ -266,128 +262,67 @@ impl Simulator {
     }
 
     fn handle_completion(&mut self, timing: &RequestTiming) {
-        // Build a Request stand-in from the timing for the metrics collector.
-        // MetricsCollector wants the canonical Request (it pulls TTFT,
-        // token_generation_times, num_preemptions, etc.). The engine doesn't
-        // hand the original Request back, so we synthesise the fields the
-        // collector reads.
-        let mut req = Request::new(
-            timing.request_id.clone(),
-            0,
-            timing.arrival_time,
-            timing.num_prompt_tokens,
-            timing.num_output_tokens,
-        );
-        req.first_token_time = Some(timing.first_token_time);
-        req.completion_time = Some(timing.completion_time);
-        req.num_output_tokens = timing.num_output_tokens;
-        // Per-token timestamps: we lost individual times, so synthesise an
-        // even decode cadence between first_token and completion. This
-        // preserves the per-token-latency mean and percentiles to within
-        // sample_interval but loses jitter detail. Under speculative decoding
-        // the real emission is bursty (a clump of accepted tokens per verify
-        // step, then a gap), so the even cadence is a coarser approximation
-        // there: the mean/median per-token latency stay correct (span /
-        // num_output_tokens), but inter-token jitter and ITL tails are not
-        // represented. Acceptable while nothing consumes spec ITL tails.
-        if timing.num_output_tokens > 0 {
-            let n = timing.num_output_tokens as usize;
-            let span = (timing.completion_time - timing.first_token_time).max(0.0);
-            let dt = if n > 1 { span / (n - 1) as f64 } else { 0.0 };
-            req.token_generation_times = (0..n)
-                .map(|i| timing.first_token_time + i as f64 * dt)
-                .collect();
-        }
-
-        self.metrics.record_request_completion(&req);
+        self.metrics.record_request_completion(timing);
         self.request_generator
             .on_request_complete(timing.completion_time);
     }
 
-    fn emit_progress<F: FnMut(ProgressInfo)>(&mut self, callback: &mut F, _final_step: bool) {
-        let summary = self.compute_summary_inner();
-        let latency_samples = self.metrics.get_latency_samples();
-        let input_lengths = self.metrics.get_input_lengths();
-        let output_lengths = self.metrics.get_output_lengths();
-
-        let ttft_delta = &latency_samples.0 .0[self.last_sent_ttft_count..];
-        let ttft_ts_delta = &latency_samples.0 .1[self.last_sent_ttft_count..];
-        let e2e_delta = &latency_samples.1 .0[self.last_sent_e2e_count..];
-        let e2e_ts_delta = &latency_samples.1 .1[self.last_sent_e2e_count..];
-        let tpot_delta = &latency_samples.2 .0[self.last_sent_tpot_count..];
-        let tpot_ts_delta = &latency_samples.2 .1[self.last_sent_tpot_count..];
-        let input_delta = &input_lengths[self.last_sent_input_count..];
-        let output_delta = &output_lengths[self.last_sent_output_count..];
-
-        let progress = ProgressInfo {
+    fn emit_progress<F: FnMut(ProgressInfo)>(&mut self, callback: &mut F) {
+        let metrics = self.summary();
+        let (latency_samples, (input_lengths, output_lengths)) =
+            self.metrics.samples_since(&mut self.sent);
+        callback(ProgressInfo {
             current_time: self.engine.current_time(),
             completed_requests: self.metrics.completed_requests,
             total_requests: self.metrics.total_requests,
             running: self.engine.aggregate_running(),
             waiting: self.engine.aggregate_waiting(),
             kv_cache_util: self.engine.kv_cache_util(),
-            time_series: Some(&self.time_series),
-            metrics: Some(summary),
-            latency_samples: Some((
-                (ttft_delta, ttft_ts_delta),
-                (e2e_delta, e2e_ts_delta),
-                (tpot_delta, tpot_ts_delta),
-            )),
-            distribution_samples: Some((input_delta, output_delta)),
-        };
-        callback(progress);
-
-        self.last_sent_ttft_count = latency_samples.0 .0.len();
-        self.last_sent_e2e_count = latency_samples.1 .0.len();
-        self.last_sent_tpot_count = latency_samples.2 .0.len();
-        self.last_sent_input_count = input_lengths.len();
-        self.last_sent_output_count = output_lengths.len();
+            time_series: &self.time_series,
+            metrics,
+            latency_samples,
+            input_lengths,
+            output_lengths,
+        });
     }
 
-    fn compute_summary_inner(&mut self) -> crate::metrics::MetricsSummary {
-        let (hits, misses, hit_size_sum, hit_size_count) = self.engine.aggregate_prefix_cache();
+    /// Metrics summary as of the current simulated time.
+    pub fn summary(&mut self) -> MetricsSummary {
         self.metrics.compute_summary(
             self.engine.current_time(),
-            hits,
-            misses,
-            hit_size_sum,
-            hit_size_count,
+            self.engine.aggregate_prefix_cache(),
         )
     }
 
-    pub fn get_metrics_summary(&mut self) -> crate::metrics::MetricsSummary {
-        self.compute_summary_inner()
-    }
-
-    /// Per-request rows for the `--request-csv` dump:
-    /// (arrival, completion, ttft, e2e, mean_tpot, prompt_toks, output_toks).
-    pub fn get_request_rows(&self) -> &[(f64, f64, f64, f64, f64, u32, u32)] {
+    /// Per-request rows for the `--request-csv` dump.
+    pub fn request_rows(&self) -> &[RequestRow] {
         &self.metrics.request_rows
     }
 
     /// Per-second speculative draft-depth series from the engine.
-    pub fn get_spec_depth_series(&self) -> Vec<(u64, f64, f64)> {
+    pub fn spec_depth_series(&self) -> Vec<DepthSample> {
         self.engine.spec_depth_series()
     }
 
-    pub fn get_time_series_data(&self) -> &[TimeSeriesPoint] {
+    pub fn time_series(&self) -> &[TimeSeriesPoint] {
         &self.time_series
     }
 
-    pub fn get_input_lengths(&self) -> &[u32] {
-        self.metrics.get_input_lengths()
+    pub fn input_lengths(&self) -> &[u32] {
+        self.metrics.input_lengths()
     }
 
-    pub fn get_output_lengths(&self) -> &[u32] {
-        self.metrics.get_output_lengths()
+    pub fn output_lengths(&self) -> &[u32] {
+        self.metrics.output_lengths()
     }
 
-    pub fn get_current_time(&self) -> f64 {
+    pub fn current_time(&self) -> f64 {
         self.engine.current_time()
     }
 
-    pub fn get_latency_samples(&self) -> LatencySampleTriplet<'_> {
-        self.metrics.get_latency_samples()
+    /// All latency samples so far.
+    pub fn latency_samples(&self) -> LatencySamples<'_> {
+        self.metrics.latency_samples()
     }
 
     fn should_terminate(&self) -> bool {
@@ -398,6 +333,15 @@ impl Simulator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::LengthDistribution;
+
+    #[test]
+    fn kv_cache_smaller_than_a_block_is_a_config_error() {
+        let mut config = create_minimal_test_config();
+        config.scheduler.kv_cache_capacity = 1;
+        let err = Simulator::new(config, None).err().unwrap();
+        assert!(err.contains("less than one"), "{err}");
+    }
 
     fn create_minimal_test_config() -> Config {
         let mut config = Config::test_default();
@@ -409,46 +353,38 @@ mod tests {
     #[test]
     fn test_simulation_completes_all_requests() {
         let config = create_minimal_test_config();
-        let mut simulator = Simulator::new(config, None).unwrap().0;
+        let mut simulator = Simulator::new(config, None).unwrap();
         simulator.run_with_callback(|_| {}).unwrap();
-        let summary = simulator.get_metrics_summary();
-        assert_eq!(summary.completed_requests, summary.total_requests);
-        assert_eq!(summary.completed_requests, 10);
+        let summary = simulator.summary();
+        assert_eq!(summary.requests.completed, summary.requests.total);
+        assert_eq!(summary.requests.completed, 10);
     }
 
     #[test]
     fn test_simulation_time_progresses() {
         let config = create_minimal_test_config();
-        let mut simulator = Simulator::new(config, None).unwrap().0;
-        let start = simulator.get_current_time();
+        let mut simulator = Simulator::new(config, None).unwrap();
+        let start = simulator.current_time();
         simulator.run_with_callback(|_| {}).unwrap();
-        assert!(simulator.get_current_time() > start);
+        assert!(simulator.current_time() > start);
     }
 
     #[test]
     fn test_simulation_metrics_reasonable() {
         let config = create_minimal_test_config();
-        let mut simulator = Simulator::new(config, None).unwrap().0;
+        let mut simulator = Simulator::new(config, None).unwrap();
         simulator.run_with_callback(|_| {}).unwrap();
-        let s = simulator.get_metrics_summary();
-        assert!(s.ttft_mean > 0.0 && s.ttft_mean.is_finite());
-        assert!(s.e2e_mean > 0.0 && s.e2e_mean.is_finite());
-        assert!(s.per_token_mean > 0.0 && s.per_token_mean.is_finite());
-        assert!(s.ttft_min <= s.ttft_p50);
-        assert!(s.ttft_p50 <= s.ttft_p90);
-        assert!(s.ttft_p90 <= s.ttft_p99);
-        assert!(s.input_tokens_per_sec > 0.0);
-        assert!(s.output_tokens_per_sec > 0.0);
-        assert!(s.requests_per_sec > 0.0);
-    }
-
-    #[test]
-    fn test_simulation_with_fcfs_policy() {
-        let mut config = create_minimal_test_config();
-        config.scheduler.policy = "fcfs".to_string();
-        let mut simulator = Simulator::new(config, None).unwrap().0;
-        simulator.run_with_callback(|_| {}).unwrap();
-        assert_eq!(simulator.get_metrics_summary().completed_requests, 10);
+        let s = simulator.summary();
+        let l = &s.latency_metrics;
+        assert!(l.ttft_ms.mean > 0.0 && l.ttft_ms.mean.is_finite());
+        assert!(l.e2e_ms.mean > 0.0 && l.e2e_ms.mean.is_finite());
+        assert!(l.per_token_ms.mean > 0.0 && l.per_token_ms.mean.is_finite());
+        assert!(l.ttft_ms.min <= l.ttft_ms.p50);
+        assert!(l.ttft_ms.p50 <= l.ttft_ms.p90);
+        assert!(l.ttft_ms.p90 <= l.ttft_ms.p99);
+        assert!(s.throughput_metrics.input_tokens_per_sec > 0.0);
+        assert!(s.throughput_metrics.output_tokens_per_sec > 0.0);
+        assert!(s.throughput_metrics.requests_per_sec > 0.0);
     }
 
     #[test]
@@ -456,33 +392,49 @@ mod tests {
         let mut config = create_minimal_test_config();
         config.scheduler.enable_chunked_prefill = true;
         config.scheduler.long_prefill_token_threshold = 512;
-        let mut simulator = Simulator::new(config, None).unwrap().0;
+        let mut simulator = Simulator::new(config, None).unwrap();
         simulator.run_with_callback(|_| {}).unwrap();
-        assert_eq!(simulator.get_metrics_summary().completed_requests, 10);
+        assert_eq!(simulator.summary().requests.completed, 10);
     }
 
     #[test]
     fn test_simulation_time_series_collected() {
         let config = create_minimal_test_config();
-        let mut simulator = Simulator::new(config, None).unwrap().0;
+        let mut simulator = Simulator::new(config, None).unwrap();
         simulator.run_with_callback(|_| {}).unwrap();
-        let ts = simulator.get_time_series_data();
+        let ts = simulator.time_series();
         assert!(!ts.is_empty());
         for i in 1..ts.len() {
             assert!(ts[i].time >= ts[i - 1].time);
         }
+        // Every output token is counted exactly once across the windows.
+        let decode_total: u64 = ts.iter().map(|p| p.decode_tokens as u64).sum();
+        let output_total: u64 = simulator.output_lengths().iter().map(|&x| x as u64).sum();
+        assert_eq!(decode_total, output_total);
     }
 
     #[test]
-    fn test_simulation_latency_samples_collected() {
+    fn unschedulable_request_is_an_error_not_a_hang() {
+        let mut config = create_minimal_test_config();
+        // A prompt longer than the whole KV cache (64 blocks of 16 tokens)
+        // can never be admitted.
+        config.scheduler.kv_cache_capacity = 64 * config.model.kv_storage_bytes(16);
+        config.workload.input_len_dist = LengthDistribution::Fixed { value: 4096 };
+        config.workload.num_requests = Some(1);
+        let mut simulator = Simulator::new(config, None).unwrap();
+        let err = simulator.run_with_callback(|_| {}).unwrap_err();
+        assert!(err.contains("stalled"), "{err}");
+    }
+
+    #[test]
+    fn test_progress_callback_streams_each_sample_once() {
         let config = create_minimal_test_config();
-        let mut simulator = Simulator::new(config, None).unwrap().0;
-        simulator.run_with_callback(|_| {}).unwrap();
-        let ((ttft, ttft_ts), (e2e, e2e_ts), (tpot, tpot_ts)) = simulator.get_latency_samples();
-        assert!(!ttft.is_empty());
-        assert!(!e2e.is_empty());
-        assert_eq!(ttft.len(), ttft_ts.len());
-        assert_eq!(e2e.len(), e2e_ts.len());
-        assert_eq!(tpot.len(), tpot_ts.len());
+        let mut simulator = Simulator::new(config, None).unwrap();
+        let mut streamed = 0usize;
+        simulator
+            .run_with_callback(|p| streamed += p.latency_samples.ttft.values.len())
+            .unwrap();
+        assert_eq!(streamed, simulator.latency_samples().ttft.values.len());
+        assert_eq!(streamed, 10);
     }
 }

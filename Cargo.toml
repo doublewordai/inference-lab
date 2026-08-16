@@ -14,6 +14,11 @@ exclude = ["pkg/", ".npmrc", "node_modules/"]
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[[bin]]
+name = "inference-lab"
+path = "src/main.rs"
+required-features = ["cli"]
+
 [dependencies]
 toml = "0.8"
 serde = { version = "1.0", features = ["derive"] }

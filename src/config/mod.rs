@@ -2,38 +2,70 @@ pub mod hardware;
 pub mod model;
 pub mod parallel;
 pub mod scheduler;
-pub mod simulation;
 pub mod speculative;
 pub mod topology;
 pub mod workload;
 
 pub use hardware::{HardwareConfig, KVTier, Precision};
-pub use model::{DeepseekV4Model, DenseModel, ModelConfig, ModelCosts, SlidingWindowModel};
+pub use model::{
+    expected_distinct_experts, History, Indexer, LayerClass, ModelSpec, Routing, WeightStream,
+};
 pub use parallel::{CommsConfig, ParallelConfig};
 pub use scheduler::SchedulerConfig;
-pub use simulation::SimulationConfig;
 pub use speculative::{
     AcceptanceModel, DrafterCost, GammaPolicy, MeasuredCostConfig, SpeculativeConfig,
     SwitchConstraints, TraceBank, TraceRound,
 };
-pub use topology::{ClusterSpec, DisaggTopology, Node};
-pub use workload::{LengthDistribution, RateSchedule, WorkloadConfig};
+pub use topology::{ClusterSpec, DisaggTopology};
+pub use workload::{ArrivalPattern, LengthDistribution, RateSchedule, WorkloadConfig};
 
+#[cfg(test)]
+use crate::scheduler::SchedulingPolicy;
+use serde::de::{self, Deserializer};
 use serde::Deserialize;
 use std::fs;
 use std::path::Path;
 
+/// A config field that is either a catalog name or an inline table.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum NameOrInline<T> {
+    Name(String),
+    Inline(T),
+}
+
+/// Deserialise a hardware spec given as a catalog name or an inline table.
+pub(crate) fn hardware_ref<'de, D: Deserializer<'de>>(d: D) -> Result<HardwareConfig, D::Error> {
+    match NameOrInline::<HardwareConfig>::deserialize(d)? {
+        NameOrInline::Name(n) => crate::catalog::hardware(&n).map_err(de::Error::custom),
+        NameOrInline::Inline(h) => Ok(h),
+    }
+}
+
+/// Deserialise a model spec given as a catalog name or an inline table.
+pub(crate) fn model_ref<'de, D: Deserializer<'de>>(d: D) -> Result<ModelSpec, D::Error> {
+    let spec = match NameOrInline::<ModelSpec>::deserialize(d)? {
+        NameOrInline::Name(n) => crate::catalog::model(&n).map_err(de::Error::custom)?,
+        NameOrInline::Inline(m) => m,
+    };
+    spec.validate().map_err(de::Error::custom)?;
+    Ok(spec)
+}
+
 /// Top-level configuration that aggregates all sub-configs
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
+    /// Catalog name (`hardware = "b200"`) or inline `[hardware]` table.
+    #[serde(deserialize_with = "hardware_ref")]
     pub hardware: HardwareConfig,
     #[serde(default)]
     pub parallel: ParallelConfig,
-    pub model: ModelConfig,
+    /// Catalog name (`model = "deepseek-v4-flash"`) or inline `[model]` table.
+    #[serde(deserialize_with = "model_ref")]
+    pub model: ModelSpec,
     pub scheduler: SchedulerConfig,
     pub workload: WorkloadConfig,
-    #[serde(default)]
-    pub simulation: SimulationConfig,
     /// Optional speculative decoding. When set, decode steps verify `gamma + 1`
     /// tokens and advance by `accepted + 1` per the acceptance model.
     #[serde(default)]
@@ -76,24 +108,28 @@ impl Config {
     /// Fill in derived fields after deserialization. Public so wasm.rs can
     /// call it after `serde_json::from_str`.
     pub fn finalize(&mut self) {
-        self.model.finalize(&self.hardware);
-        let model_size_bytes = self.model.weight_residency_bytes();
-        // Re-use ClusterSpec's helper for KV-cache capacity sizing so the
-        // single-cluster path agrees with the disagg path.
-        let mut cluster = ClusterSpec {
+        let max_model_len = self
+            .scheduler
+            .max_model_len
+            .unwrap_or(self.model.max_seq_len);
+        self.scheduler.set_default_prefill_threshold(max_model_len);
+    }
+
+    /// The single worker pool this config describes: its hardware and
+    /// parallel layout as one `ClusterSpec` (no collective-comms model, one
+    /// worker).
+    pub fn cluster(&self) -> ClusterSpec {
+        ClusterSpec {
             hardware: self.hardware.clone(),
             parallel: self.parallel.clone(),
             comms: None,
             num_workers: 1,
-            node: 0,
-        };
-        cluster.compute_kv_cache_capacity(model_size_bytes);
-        self.hardware.kv_cache_capacity = cluster.hardware.kv_cache_capacity;
-        self.scheduler
-            .set_default_prefill_threshold(self.model.max_seq_len());
+        }
     }
 
-    /// Get a default configuration for testing
+    /// Get a default configuration for testing: a 7B-class bf16 dense model
+    /// (32 layers, hidden 4096, 32 heads / 8 KV heads) on a 1 PFLOP/s,
+    /// 1 TB/s test GPU with a 60 GB KV cache.
     #[cfg(test)]
     pub fn test_default() -> Self {
         let hardware = HardwareConfig {
@@ -104,41 +140,52 @@ impl Config {
             flops_fp16: Some(1e15),
             memory_bandwidth: 1e12,
             memory_capacity: 80_000_000_000,
-            kv_cache_capacity: 60_000_000_000,
-            gpu_memory_utilization: 0.9,
             kv_tiers: Vec::new(),
         };
         let parallel = ParallelConfig::default();
 
-        let model = ModelConfig::Dense(DenseModel {
+        let model = ModelSpec {
             name: "Test Model".to_string(),
-            num_parameters: 7_000_000_000,
-            num_active_parameters: None,
-            num_layers: 32,
             hidden_dim: 4096,
-            num_heads: 32,
-            num_kv_heads: None,
-            head_dim: None,
             max_seq_len: 2048,
-            precision: crate::config::Precision::Bf16,
-        });
+            attention_precision: Precision::Bf16,
+            activation_bytes: 2,
+            weights: vec![WeightStream {
+                precision: Precision::Bf16,
+                active_params: 7_000_000_000,
+                resident_params: 7_000_000_000,
+                routing: None,
+            }],
+            layers: vec![LayerClass::Attention {
+                count: 32,
+                heads: 32,
+                head_dim: 128,
+                kv_heads: 8,
+                kv_shared: false,
+                window: 0,
+                kv_precision: Precision::Bf16,
+            }],
+        };
 
         let mut scheduler = SchedulerConfig {
             max_num_batched_tokens: 2048,
             max_num_seqs: 128,
-            policy: "fcfs".to_string(),
+            policy: SchedulingPolicy::FCFS,
             enable_chunked_prefill: true,
             long_prefill_token_threshold: 0,
             max_num_partial_prefills: 1,
             block_size: 16,
+            gpu_memory_utilization: 0.9,
+            kv_cache_capacity: 60_000_000_000,
+            max_model_len: None,
             enable_preemption_free: false,
             enable_cascade_attention: false,
         };
-        scheduler.set_default_prefill_threshold(model.max_seq_len());
+        scheduler.set_default_prefill_threshold(model.max_seq_len);
 
         let workload = WorkloadConfig {
             dataset_path: None,
-            arrival_pattern: "poisson".to_string(),
+            arrival_pattern: ArrivalPattern::Poisson,
             arrival_rate: 1.0,
             rate_schedule: None,
             num_concurrent_users: None,
@@ -150,15 +197,12 @@ impl Config {
             closed_loop_jitter_secs: None,
         };
 
-        let simulation = SimulationConfig::default();
-
         Config {
             hardware,
             parallel,
             model,
             scheduler,
             workload,
-            simulation,
             speculative: None,
             fault: None,
         }
@@ -169,53 +213,69 @@ impl Config {
 mod tests {
     use super::*;
 
+    /// Every TOML shipped under configs/ and examples/ must parse under the
+    /// current schema (unknown fields are rejected, so this catches drift).
     #[test]
-    fn test_dense_kv_storage_matches_formula() {
-        let model = ModelConfig::Dense(DenseModel {
-            name: "Test".to_string(),
-            num_parameters: 7_000_000_000,
-            num_active_parameters: None,
-            num_layers: 32,
-            hidden_dim: 4096,
-            num_heads: 32,
-            num_kv_heads: None,
-            head_dim: None,
-            max_seq_len: 2048,
-            precision: crate::config::Precision::Bf16,
-        });
-
-        // 2 (K+V) * 4096 (hidden) * 2 (bytes) * 32 (layers) = 524,288 per token.
-        // For seq_len=100: 52,428,800.
-        assert_eq!(model.kv_storage_bytes(100), 52_428_800);
-        assert_eq!(model.kv_bytes_read_per_decode_step(100), 52_428_800);
+    fn shipped_configs_parse() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut paths = Vec::new();
+        for dir in ["configs", "configs/estate", "examples"] {
+            let Ok(entries) = fs::read_dir(root.join(dir)) else {
+                continue;
+            };
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.extension().and_then(|x| x.to_str()) == Some("toml") {
+                    paths.push(p);
+                }
+            }
+        }
+        assert!(!paths.is_empty(), "no configs found");
+        let mut failures = Vec::new();
+        for p in &paths {
+            if let Err(e) = Config::from_file(p) {
+                failures.push(format!("{}: {e}", p.display()));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "configs failed to parse:\n{}",
+            failures.join("\n")
+        );
     }
 
     #[test]
     fn test_config_creation() {
         let config = Config::test_default();
         assert!(config.model.kv_storage_bytes(1) > 0);
+        assert!(config.model.validate().is_ok());
     }
 
     #[test]
-    fn test_sliding_window_kv_cache_caps_at_window() {
-        let model = ModelConfig::Sliding(SlidingWindowModel {
-            name: "Sliding".to_string(),
-            num_parameters: 7_000_000_000,
-            num_active_parameters: None,
-            num_layers: 4,
-            hidden_dim: 16,
-            num_heads: 4,
-            num_kv_heads: Some(2),
-            max_seq_len: 2048,
-            sliding_window: 8,
-            num_sliding_layers: 2,
-            precision: crate::config::Precision::Bf16,
-        });
+    fn hardware_and_model_resolve_from_the_catalog_by_name() {
+        let toml_src = r#"
+hardware = "b200"
+model = "deepseek-v4-flash"
 
-        // per layer: 2 * 2 * 4 * 2 = 32 bytes/token.
-        // 2 full layers @ seq_len=10: 32 * 2 * 10 = 640
-        // 2 sliding layers @ min(10,8)=8: 32 * 2 * 8 = 512
-        // total 1,152
-        assert_eq!(model.kv_storage_bytes(10), 1_152);
+[scheduler]
+max_num_batched_tokens = 8192
+max_num_seqs = 256
+policy = "fcfs"
+enable_chunked_prefill = true
+block_size = 64
+
+[workload]
+arrival_pattern = "poisson"
+num_requests = 1
+seed = 1
+input_len_dist = { type = "fixed", value = 10 }
+output_len_dist = { type = "fixed", value = 10 }
+"#;
+        let cfg: Config = toml::from_str(toml_src).unwrap();
+        assert_eq!(cfg.hardware.name, "B200");
+        assert_eq!(cfg.model.name, "DeepSeek-V4-Flash");
+        let bad = toml_src.replace("\"b200\"", "\"b2000\"");
+        let err = toml::from_str::<Config>(&bad).unwrap_err().to_string();
+        assert!(err.contains("unknown hardware preset"), "{err}");
     }
 }

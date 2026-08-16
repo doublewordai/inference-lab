@@ -4,18 +4,43 @@ fn default_arrival_rate() -> f64 {
     1.0
 }
 
+/// How requests arrive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArrivalPattern {
+    /// Poisson process at `arrival_rate` (or `rate_schedule`).
+    Poisson,
+    /// Constant inter-arrival time `1 / arrival_rate`.
+    #[serde(alias = "fixed_rate")]
+    Uniform,
+    /// Alternating bursts (1–10 ms gaps, 20% of the time) and lulls
+    /// (0.5–2 s gaps). Ignores `arrival_rate`.
+    Burst,
+    /// `num_concurrent_users` users, each issuing its next request when its
+    /// previous one completes.
+    ClosedLoop,
+    /// Every request arrives at t = 0.
+    Batched,
+}
+
+impl ArrivalPattern {
+    /// Whether arrivals are driven by completions rather than a clock.
+    pub fn is_closed_loop(self) -> bool {
+        matches!(self, ArrivalPattern::ClosedLoop)
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkloadConfig {
     /// Path to dataset file (JSONL in OpenAI batch API format)
     /// If provided, dataset mode is used instead of synthetic workload
     #[serde(default)]
     pub dataset_path: Option<String>,
 
-    /// Arrival pattern: "poisson", "uniform", "burst", "fixed_rate", "closed_loop", "batched"
-    pub arrival_pattern: String,
+    pub arrival_pattern: ArrivalPattern,
 
-    /// Mean arrival rate (requests per second)
-    /// Not used for "closed_loop" or "batched" patterns
+    /// Mean arrival rate (requests per second) for the open-loop patterns.
     #[serde(default = "default_arrival_rate")]
     pub arrival_rate: f64,
 
@@ -56,7 +81,7 @@ pub struct WorkloadConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type")]
+#[serde(tag = "type", deny_unknown_fields)]
 pub enum LengthDistribution {
     #[serde(rename = "fixed")]
     Fixed { value: u32 },
@@ -74,7 +99,7 @@ pub enum LengthDistribution {
 /// Time-varying arrival rate λ(t), requests/sec. Set on the workload to drive
 /// the open-loop arrival process through changing load within a single run.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type")]
+#[serde(tag = "type", deny_unknown_fields)]
 pub enum RateSchedule {
     /// Sinusoid between `min` and `max`, starting in the trough at t=0 and
     /// peaking at half-period.

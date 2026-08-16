@@ -5,32 +5,50 @@
 //! traffic flows through one HBM, so weight bytes for each precision plus KV
 //! bytes (charged to the attention stream) all share the same bandwidth.
 
-use std::collections::HashMap;
-
-use super::arithmetic;
-use crate::config::{
-    CommsConfig, HardwareConfig, ModelConfig, ModelCosts, ParallelConfig, Precision,
-};
+use crate::config::{CommsConfig, HardwareConfig, ModelSpec, ParallelConfig, Precision};
 use crate::request::Request;
 
 pub struct ComputeEngine {
     hardware: HardwareConfig,
     parallel: ParallelConfig,
-    model: ModelConfig,
+    model: ModelSpec,
     comms: Option<CommsConfig>,
     block_size: u32,
     enable_cascade_attention: bool,
 }
 
-#[derive(Default, Clone)]
+/// Work accumulated on one precision stream.
+#[derive(Default, Clone, Copy)]
 struct StreamAcc {
     flops: f64,
-    weight_bytes: f64,
-    other_bytes: f64,
+    bytes: f64,
+}
+
+impl StreamAcc {
+    fn is_empty(&self) -> bool {
+        self.flops == 0.0 && self.bytes == 0.0
+    }
+}
+
+/// Per-precision work for one step, indexed by [`Precision::index`].
+type Streams = [StreamAcc; Precision::COUNT];
+
+/// Roofline cost of one step.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StepCost {
+    /// Wall time: per-precision `max(compute, memory)` summed, plus
+    /// collectives.
+    pub time: f64,
+    /// Bytes moved HBM -> SM (weights of every stream plus KV reads).
+    pub bytes: f64,
+    /// FLOPs across all streams.
+    pub flops: f64,
+    /// Time the FLOPs alone would take at each stream's peak rate, summed.
+    pub compute_time: f64,
 }
 
 impl ComputeEngine {
-    pub fn new(hardware: HardwareConfig, parallel: ParallelConfig, model: ModelConfig) -> Self {
+    pub fn new(hardware: HardwareConfig, parallel: ParallelConfig, model: ModelSpec) -> Self {
         Self {
             hardware,
             parallel,
@@ -124,78 +142,79 @@ impl ComputeEngine {
         self
     }
 
-    /// Build per-precision (flops, weight_bytes, other_bytes) accumulators
-    /// for the batch. Matmul FLOPs and weight bytes come from the model's
-    /// per-precision splits; attention FLOPs and KV reads are attached to
+    /// Accumulate the batch's work per precision stream. Matmul FLOPs and
+    /// weight bytes come from the model's per-precision splits; attention
+    /// FLOPs, KV reads and per-sequence state reads attach to
     /// `attention_precision`.
-    fn assemble_streams(
-        &self,
-        batch_requests: &[&Request],
-        tokens_per_request: &[u32],
-    ) -> HashMap<Precision, StreamAcc> {
-        let mut streams: HashMap<Precision, StreamAcc> = HashMap::new();
+    fn assemble_streams(&self, batch_requests: &[&Request], tokens_per_request: &[u32]) -> Streams {
+        let mut streams: Streams = [StreamAcc::default(); Precision::COUNT];
         let total_tokens: u32 = tokens_per_request.iter().sum();
 
-        // Matmul FLOPs per token, distributed across precision streams.
         for (prec, fpt) in self.model.matmul_flops_per_token_by_prec() {
-            streams.entry(prec).or_default().flops += total_tokens as f64 * fpt as f64;
+            streams[prec.index()].flops += total_tokens as f64 * fpt as f64;
         }
-
         // Weight bytes per forward pass, also per precision. For MoE this grows
         // with the step's token count (coupon-collector expert loading).
         for (prec, b) in self.model.weight_bytes_per_step_by_prec(total_tokens) {
-            streams.entry(prec).or_default().weight_bytes += b as f64;
+            streams[prec.index()].bytes += b as f64;
         }
 
-        // Attention compute and KV reads — both belong to attention_precision.
-        let attn_prec = self.model.attention_precision();
-        let attn_entry = streams.entry(attn_prec).or_default();
+        let attn = &mut streams[self.model.attention_precision.index()];
 
         // With cascade attention, the KV bytes for the shared prompt prefix
         // are loaded once per iteration instead of once per request.
         let shared_prefix_tokens = if self.enable_cascade_attention && self.block_size > 0 {
-            arithmetic::shared_prefix_blocks(batch_requests) * self.block_size
+            Request::shared_prefix_blocks(batch_requests) * self.block_size
         } else {
             0
         };
-        let shared_kv_bytes =
-            self.model
-                .kv_bytes_read_per_decode_step(shared_prefix_tokens) as f64;
-        attn_entry.other_bytes += shared_kv_bytes;
+        attn.bytes += self
+            .model
+            .kv_bytes_read_per_decode_step(shared_prefix_tokens) as f64;
 
+        // Fixed per-sequence state (Mamba / GatedDeltaNet) is read once per
+        // sequence per step, independent of context length.
+        let state_bytes = self.model.per_sequence_state_bytes() as f64;
         for (req, &num_new) in batch_requests.iter().zip(tokens_per_request) {
             let attended = req.num_computed_tokens + num_new;
-            attn_entry.flops += self.model.attention_flops(num_new, attended) as f64;
+            attn.flops += self.model.attention_flops(num_new, attended) as f64;
 
             let avg_seq_len = req.num_computed_tokens + num_new / 2;
             let unshared = avg_seq_len.saturating_sub(shared_prefix_tokens);
-            attn_entry.other_bytes += self.model.kv_bytes_read_per_decode_step(unshared) as f64;
+            attn.bytes += self.model.kv_bytes_read_per_decode_step(unshared) as f64 + state_bytes;
         }
 
         streams
     }
 
-    /// Calculate time to process an iteration (in seconds). Per-precision
-    /// stream times are summed (kernels of different precisions are serial),
-    /// then collectives are added on top.
-    pub fn calculate_iteration_time(
-        &self,
-        batch_requests: &[&Request],
-        tokens_per_request: &[u32],
-    ) -> f64 {
+    /// Roofline cost of processing `tokens_per_request[i]` positions for
+    /// each `batch_requests[i]` in one step. Per-precision stream times are
+    /// summed (kernels of different precisions are serial), then collectives
+    /// are added on top.
+    pub fn step_cost(&self, batch_requests: &[&Request], tokens_per_request: &[u32]) -> StepCost {
         if batch_requests.is_empty() {
-            return 0.0;
+            return StepCost {
+                time: 0.0,
+                bytes: 0.0,
+                flops: 0.0,
+                compute_time: 0.0,
+            };
         }
-
         let total_tokens: u32 = tokens_per_request.iter().sum();
         let streams = self.assemble_streams(batch_requests, tokens_per_request);
         let bw = self.aggregate_memory_bandwidth();
 
-        let mut sum_time = 0.0;
-        for (prec, acc) in streams {
-            if acc.flops == 0.0 && acc.weight_bytes == 0.0 && acc.other_bytes == 0.0 {
+        let mut cost = StepCost {
+            time: 0.0,
+            bytes: 0.0,
+            flops: 0.0,
+            compute_time: 0.0,
+        };
+        for (i, acc) in streams.iter().enumerate() {
+            if acc.is_empty() {
                 continue;
             }
+            let prec = Precision::ALL[i];
             let rate = self.aggregate_flop_rate(prec).unwrap_or_else(|| {
                 panic!(
                     "model declares a {prec:?} stream but hardware {} has no FLOP rate for {prec:?}",
@@ -203,11 +222,41 @@ impl ComputeEngine {
                 )
             });
             let compute_time = acc.flops / rate;
-            let memory_time = (acc.weight_bytes + acc.other_bytes) / bw;
-            sum_time += compute_time.max(memory_time);
+            let memory_time = acc.bytes / bw;
+            cost.time += compute_time.max(memory_time);
+            cost.compute_time += compute_time;
+            cost.bytes += acc.bytes;
+            cost.flops += acc.flops;
         }
+        cost.time += self.collective_time(total_tokens);
+        cost
+    }
 
-        sum_time + self.collective_time(total_tokens)
+    /// Wall time of a step (see [`ComputeEngine::step_cost`]).
+    pub fn calculate_iteration_time(
+        &self,
+        batch_requests: &[&Request],
+        tokens_per_request: &[u32],
+    ) -> f64 {
+        self.step_cost(batch_requests, tokens_per_request).time
+    }
+
+    /// Fraction of `actual_time` the step's FLOPs would fill at peak rate,
+    /// per-precision-weighted (FP4-heavy work is compared against FP4 peak).
+    pub fn flops_utilization(&self, cost: &StepCost, actual_time: f64) -> f64 {
+        if actual_time <= 0.0 {
+            return 0.0;
+        }
+        (cost.compute_time / actual_time).min(1.0)
+    }
+
+    /// Fraction of `actual_time` the step's bytes would fill at peak
+    /// bandwidth.
+    pub fn bandwidth_utilization(&self, cost: &StepCost, actual_time: f64) -> f64 {
+        if actual_time <= 0.0 {
+            return 0.0;
+        }
+        (cost.bytes / self.aggregate_memory_bandwidth() / actual_time).min(1.0)
     }
 
     /// Bandwidth-roofline KV-read time delta between the batch's actual KV
@@ -231,67 +280,6 @@ impl ComputeEngine {
             })
             .sum::<f64>()
             / bw
-    }
-
-    /// Calculate total bytes transferred for a batch of requests (weights of
-    /// every stream + KV reads). Used for memory-bandwidth utilisation
-    /// reporting in the metrics layer.
-    pub fn calculate_bytes_transferred(
-        &self,
-        batch_requests: &[&Request],
-        tokens_per_request: &[u32],
-    ) -> f64 {
-        let streams = self.assemble_streams(batch_requests, tokens_per_request);
-        streams
-            .values()
-            .map(|s| s.weight_bytes + s.other_bytes)
-            .sum()
-    }
-
-    /// Total FLOPs for the batch (sum across precision streams). Used for
-    /// FLOPS-utilisation reporting.
-    pub fn calculate_total_flops(
-        &self,
-        batch_requests: &[&Request],
-        tokens_per_request: &[u32],
-    ) -> f64 {
-        let streams = self.assemble_streams(batch_requests, tokens_per_request);
-        streams.values().map(|s| s.flops).sum()
-    }
-
-    /// Calculate FLOPS utilization for this iteration (0.0 to 1.0). Uses the
-    /// per-precision-weighted theoretical time so that FP4-heavy work is
-    /// compared against FP4 peak, etc.
-    pub fn calculate_flops_utilization(
-        &self,
-        batch_requests: &[&Request],
-        tokens_per_request: &[u32],
-        actual_time: f64,
-    ) -> f64 {
-        if actual_time == 0.0 {
-            return 0.0;
-        }
-        let streams = self.assemble_streams(batch_requests, tokens_per_request);
-        let mut theoretical_time = 0.0;
-        for (prec, acc) in streams {
-            if acc.flops == 0.0 {
-                continue;
-            }
-            if let Some(rate) = self.aggregate_flop_rate(prec) {
-                theoretical_time += acc.flops / rate;
-            }
-        }
-        (theoretical_time / actual_time).min(1.0)
-    }
-
-    /// Calculate memory bandwidth utilization for this iteration (0.0 to 1.0)
-    pub fn calculate_bandwidth_utilization(&self, bytes_transferred: f64, actual_time: f64) -> f64 {
-        if actual_time == 0.0 {
-            return 0.0;
-        }
-
-        let theoretical_time = bytes_transferred / self.aggregate_memory_bandwidth();
-        (theoretical_time / actual_time).min(1.0)
     }
 }
 
@@ -348,16 +336,17 @@ mod tests {
         let req = create_test_request("req-1", 0, 1000);
         let requests = vec![&req];
         let tokens = vec![1000];
-        let total_flops = engine.calculate_total_flops(&requests, &tokens);
+        let cost = engine.step_cost(&requests, &tokens);
         // Single-precision test model: theoretical time = total_flops / aggregate_rate.
         let prec = engine.model.matmul_flops_per_token_by_prec()[0].0;
         let rate = engine.aggregate_flop_rate(prec).unwrap();
-        let theoretical_time = total_flops / rate;
-        let util = engine.calculate_flops_utilization(&requests, &tokens, theoretical_time);
+        let theoretical_time = cost.flops / rate;
+        assert!((cost.compute_time - theoretical_time).abs() < 1e-12);
+        let util = engine.flops_utilization(&cost, theoretical_time);
         assert!((util - 1.0).abs() < 1e-10);
-        let util = engine.calculate_flops_utilization(&requests, &tokens, theoretical_time * 2.0);
+        let util = engine.flops_utilization(&cost, theoretical_time * 2.0);
         assert!((util - 0.5).abs() < 1e-10);
-        let util = engine.calculate_flops_utilization(&requests, &tokens, 0.0);
+        let util = engine.flops_utilization(&cost, 0.0);
         assert_eq!(util, 0.0);
     }
 
@@ -395,8 +384,8 @@ mod tests {
         let requests = vec![&req_a, &req_b];
         let tokens = vec![1, 1];
 
-        let bytes_plain = plain.calculate_bytes_transferred(&requests, &tokens);
-        let bytes_cascade = cascade.calculate_bytes_transferred(&requests, &tokens);
+        let bytes_plain = plain.step_cost(&requests, &tokens).bytes;
+        let bytes_cascade = cascade.step_cost(&requests, &tokens).bytes;
 
         // Cascade should load the shared 8*block_size tokens of KV once
         // instead of twice; expected saving is exactly that.
@@ -433,21 +422,26 @@ mod tests {
         let requests = vec![&req_a, &req_b];
         let tokens = vec![1, 1];
 
-        let bytes_plain = plain.calculate_bytes_transferred(&requests, &tokens);
-        let bytes_cascade = cascade.calculate_bytes_transferred(&requests, &tokens);
+        let bytes_plain = plain.step_cost(&requests, &tokens).bytes;
+        let bytes_cascade = cascade.step_cost(&requests, &tokens).bytes;
         assert!((bytes_plain - bytes_cascade).abs() < 1e-6);
     }
 
     #[test]
     fn test_bandwidth_utilization() {
         let engine = create_test_engine();
-        let bytes = 1e12;
-        let theoretical_time = bytes / engine.aggregate_memory_bandwidth();
-        let util = engine.calculate_bandwidth_utilization(bytes, theoretical_time);
+        let cost = StepCost {
+            time: 0.0,
+            bytes: 1e12,
+            flops: 0.0,
+            compute_time: 0.0,
+        };
+        let theoretical_time = cost.bytes / engine.aggregate_memory_bandwidth();
+        let util = engine.bandwidth_utilization(&cost, theoretical_time);
         assert!((util - 1.0).abs() < 1e-10);
-        let util = engine.calculate_bandwidth_utilization(bytes, theoretical_time * 2.0);
+        let util = engine.bandwidth_utilization(&cost, theoretical_time * 2.0);
         assert!((util - 0.5).abs() < 1e-10);
-        let util = engine.calculate_bandwidth_utilization(bytes, 0.0);
+        let util = engine.bandwidth_utilization(&cost, 0.0);
         assert_eq!(util, 0.0);
     }
 }

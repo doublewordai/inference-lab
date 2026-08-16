@@ -21,9 +21,10 @@
 //!     fantasy column priced from the optimistic roofline otherwise wins)
 //!   - GoodputBudget   (homogeneous width, bank-mean acceptance signal)
 //!   - GatedAggregate  (per-sequence signal, one batch-uniform width -- the
-//!                      engine-realizable aggregation)
+//!     engine-realizable aggregation)
 //!   - GatedBudget     (per-sequence signal, ragged per-sequence widths --
-//!                      the unconstrained upper reference)
+//!     the unconstrained upper reference)
+//!
 //! and reports GatedAggregate's headroom over the best fixed k.
 //!
 //! The scenario comes entirely from the config file: acceptance is the real
@@ -49,7 +50,7 @@ use inference_lab::config::{
     AcceptanceModel, ClusterSpec, Config, GammaPolicy, SpeculativeConfig, TraceBank,
 };
 use inference_lab::request::Request;
-use inference_lab::simulation::{simulate_closed_loop, Engine, Topology};
+use inference_lab::simulation::{simulate_closed_loop, ClosedLoop, Engine, Topology};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use rand_distr::{Distribution, LogNormal};
@@ -113,7 +114,6 @@ fn topology(cfg: &Config) -> Topology {
         parallel: cfg.parallel.clone(),
         comms: None,
         num_workers: 1,
-        node: 0,
     };
     Topology::aggregated(cluster, cfg.model.clone(), cfg.scheduler.clone()).expect("topo")
 }
@@ -156,14 +156,16 @@ fn run(cfg: &Config, conc: u32, isl: u32, osl: u32, p: Policy) -> (f64, f64) {
     let warmup = conc / 2;
     let res = simulate_closed_loop(
         topology(cfg),
-        conc,
-        isl,
-        osl,
-        total,
-        warmup,
-        spec_for(p, base),
-        7,
-        true, // skip_prefill: pure-decode target, prefill not competing
+        &ClosedLoop {
+            concurrency: conc,
+            isl,
+            osl,
+            num_completions: total,
+            warmup_completions: warmup,
+            spec: spec_for(p, base),
+            seed: 7,
+            skip_prefill: true, // pure-decode target, prefill not competing
+        },
     )
     .expect("run");
     let dbatch = res
@@ -200,7 +202,9 @@ fn run_validation(
         Policy::Fixed(k)
     };
     let mut engine = Engine::new(topology(cfg));
-    engine.enable_speculative(spec_for(p, base).expect("spec"), seed);
+    engine
+        .enable_speculative(spec_for(p, base).expect("spec"), seed)
+        .expect("enable speculative decoding");
 
     let isl_dist =
         LogNormal::new(mean_isl.ln() - SIGMA_LOG * SIGMA_LOG / 2.0, SIGMA_LOG).expect("isl dist");
@@ -289,8 +293,8 @@ fn main() {
     println!("Engine-target sweep + validation: {}", cfg.model_name());
     println!("config:        {config_path}");
     println!(
-        "{} TP{}, gamma_max={gamma_max} c_draft={}",
-        cfg.hardware.name, cfg.parallel.tp, base.draft_cost_frac
+        "{} TP{}, gamma_max={gamma_max} drafter={:?}",
+        cfg.hardware.name, cfg.parallel.tp, base.drafter
     );
     println!("acceptance:    trace_rounds ({bank_path})");
     println!(
@@ -417,13 +421,13 @@ fn validate_against_llama_bench(cfg: &Config) {
     println!("{}", "-".repeat(14 + 9 * VAL_KS.len()));
     for (ci, &conc) in VAL_CONCS.iter().enumerate() {
         print!("{conc:>5} {:>6} |", "sim");
-        for ki in 0..VAL_KS.len() {
-            print!(" {:>8.0}", sim_tps[ci][ki]);
+        for v in sim_tps[ci].iter().take(VAL_KS.len()) {
+            print!(" {v:>8.0}");
         }
         println!();
         print!("{:>5} {:>6} |", "", "meas");
-        for ki in 0..VAL_KS.len() {
-            print!(" {:>8.0}", MEASURED_TPS[ci][ki]);
+        for v in MEASURED_TPS[ci].iter().take(VAL_KS.len()) {
+            print!(" {v:>8.0}");
         }
         println!();
         print!("{:>5} {:>6} |", "", "resid");
@@ -582,7 +586,6 @@ trait ModelName {
 }
 impl ModelName for Config {
     fn model_name(&self) -> &str {
-        use inference_lab::config::ModelCosts;
-        self.model.name()
+        self.model.name.as_str()
     }
 }

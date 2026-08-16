@@ -81,7 +81,9 @@ impl CompletionPrompt {
         match self {
             CompletionPrompt::Ids(ids) => Some(ids),
             // Batch-of-one is the only batch shape that reaches the engine.
-            CompletionPrompt::IdBatch(batch) => Some(batch.first().map(Vec::as_slice).unwrap_or(&[])),
+            CompletionPrompt::IdBatch(batch) => {
+                Some(batch.first().map(Vec::as_slice).unwrap_or(&[]))
+            }
             _ => None,
         }
     }

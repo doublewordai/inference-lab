@@ -1,0 +1,60 @@
+# Source: configs/estate/kimi-k3-b200.toml
+# moonshotai/kimi-k3 — KimiLinear hybrid: 69 KDA (Kimi Delta Attention,
+# linear) + 24 full MLA layers, latent MoE. From HF moonshotai/kimi-k3
+# config.json (text_config, model_type kimi_linear):
+#   93 layers (linear_attn_config: 69 kda_layers + 24 full_attn_layers),
+#   hidden 7168, 96 heads; MLA kv_lora 512 + rope 64 (qk_nope 128, v 128);
+#   KDA: 96 heads x head_dim 128, short_conv 4; MoE: 896 routed experts,
+#   16 per token, 2 shared, latent experts (routed_expert_hidden_size 3584,
+#   moe_intermediate 3072), first layer dense (inter 33792); vocab 163840;
+#   max_pos 1048576. Routed experts mxfp4 (compressed-tensors); attention,
+#   shared experts, dense MLP bf16.
+#
+# WARNING (documented non-fit): resident weights are ~1_449_351_120_896 B
+# (checkpoint is 1_560_860_324_864 B with mxfp4 scales) — this does NOT fit
+# an 8x B200 node (0.9 * 8 * 180 GB = 1391 GB usable). The model never
+# appears with a footprint in the scouter archive; the config exists so the
+# alias is representable, per the archive fallback of 8 GPUs on b200.
+#
+# Param split (computed; latent-expert internals are the main uncertainty —
+# per-expert = 3 * routed_expert_hidden 3584 * moe_inter 3072):
+#   per expert = 33_030_144
+#   active routed = 16 * per * 92  = 48_620_371_968
+#   resident routed = 896 * per * 92 = 2_722_740_830_208
+#   per-MLA-layer = 144_113_664; per-KDA-layer (q,k,v,gate + out) = 440_401_920
+#   shared experts (2 * per * 92) = 6_077_546_496  [bf16 -> non-expert bucket]
+#   dense FFN = 726_663_168; router = 590_872_576; lm_head = 1_174_405_120
+#   active non-exp = 42_415_947_776; resident non-exp = 43_990_352_896
+#
+# Modelled directly: 24 MLA layers (latent 512 + rope 64, bf16; attention priced with the true head shape 96 x (192+128)) and 69 KDA linear layers (state 96x128x128 + conv 4, bf16 = 3_440_640 B/layer/seq); no effective-head encoding.
+
+name = "kimi-k3"
+hidden_dim = 7168
+max_seq_len = 1048576
+attention_precision = "bf16"
+
+[[weights]]
+precision = "fp4"
+active_params = 48620371968
+resident_params = 2722740830208
+routing = { routed_experts = 896, experts_per_tok = 16, moe_layers = 92 }
+
+[[weights]]
+precision = "bf16"
+active_params = 42415947776
+resident_params = 43990352896
+
+[[layers]]
+kind = "mla"
+count = 24
+latent_dim = 512
+rope_dim = 64
+kv_precision = "bf16"
+heads = 96
+qk_head_dim = 192
+v_head_dim = 128
+
+[[layers]]
+kind = "linear"
+count = 69
+state_bytes = 3440640

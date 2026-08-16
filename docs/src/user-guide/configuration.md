@@ -1,35 +1,26 @@
 # Configuration
 
-Inference Lab uses TOML configuration files to define your simulation parameters. A configuration file has five main sections: hardware, model, scheduler, workload, and simulation.
+Inference Lab uses TOML configuration files to define your simulation parameters. A configuration names (or inlines) a hardware spec and a model, then sets the engine arguments (`[scheduler]`) and the workload; `[parallel]` and `[speculative]` are optional. Unknown fields are rejected.
 
 ## Configuration Sections Overview
 
-- **[hardware]** - GPU specifications (compute, memory, bandwidth)
-- **[model]** - LLM architecture (layers, parameters, dimensions)
-- **[scheduler]** - Scheduling policy and batching behavior
+- **hardware** - a catalog preset name (`hardware = "b200"`) or an inline `[hardware]` table: per-GPU FLOP rates per precision, memory, bandwidth, optional KV tiers
+- **model** - a catalog preset name (`model = "deepseek-v4-flash"`) or an inline `[model]` table: weight streams and token-mixing layer classes
+- **[scheduler]** - engine arguments: batching, KV blocks, memory utilisation, scheduling policy
 - **[workload]** - Request arrival patterns and distributions
-- **[simulation]** - Logging and output options
+- **[speculative]** - Speculative decoding (optional)
+
+The crate ships a catalog of hardware (`b200`, `b300`, `gh200-120`, `h100`, ...)
+and model presets (`inference_lab::catalog::model_names()`), each model
+with the derivation of its numbers from the HF config in its file.
 
 ## Quick Start Example
 
 Here's a minimal configuration to get started:
 
 ```toml
-[hardware]
-name = "H100"
-compute_flops = 1.513e15        # 1513 TFLOPS bf16
-memory_bandwidth = 3.35e12      # 3.35 TB/s
-memory_capacity = 85899345920   # 80 GB
-bytes_per_param = 2             # bf16
-
-[model]
-name = "Llama-3-70B"
-num_parameters = 70000000000
-num_layers = 80
-hidden_dim = 8192
-num_heads = 64
-num_kv_heads = 8                # GQA with 8 KV heads
-max_seq_len = 8192
+hardware = "h100"               # catalog preset
+model = "llama-3-70b-fp8"       # catalog preset
 
 [scheduler]
 max_num_batched_tokens = 8192
@@ -53,70 +44,68 @@ std_dev = 0.7
 type = "lognormal"
 mean = 5.3                      # ~200 tokens median
 std_dev = 0.8
-
-[simulation]
-log_interval = 5
 ```
 
 ## Hardware Configuration
 
-The hardware section defines your GPU specifications:
+Name a shipped preset:
+
+```toml
+hardware = "b200"     # b200, b200-datasheet, b300, gh200-120, gh200-96, h100
+```
+
+or give the per-GPU spec inline (a FLOP rate for every precision the model
+uses, bandwidth, capacity, optional spillover `kv_tiers`):
 
 ```toml
 [hardware]
 name = "H100"
-compute_flops = 1.513e15        # bf16 TFLOPS
+flops_fp8 = 1.979e15            # dense FLOP/s at fp8
+flops_bf16 = 9.895e14           # dense FLOP/s at bf16
 memory_bandwidth = 3.35e12      # bytes/sec
 memory_capacity = 85899345920   # 80 GB
-bytes_per_param = 2             # 2 for bf16, 1 for fp8
 ```
 
-Optional fields:
-- `kv_cache_capacity` - Explicit KV cache size (otherwise computed automatically)
-- `gpu_memory_utilization` - Fraction of memory to use (default: 0.9)
+How much of that memory the engine may use, and how much goes to KV, are
+deployment settings and live in `[scheduler]` (`gpu_memory_utilization`,
+`kv_cache_capacity`).
 
 ## Model Configuration
 
-Define your LLM architecture:
+Name a shipped preset:
+
+```toml
+model = "gemma-4-31b-it"
+```
+
+or describe the architecture inline as weight streams plus layer classes:
 
 ```toml
 [model]
 name = "Llama-3-70B"
-num_parameters = 70000000000
-num_layers = 80
 hidden_dim = 8192
-num_heads = 64
-num_kv_heads = 8                # For GQA (omit for MHA)
 max_seq_len = 8192
+attention_precision = "fp8"
+
+[[model.weights]]               # one per-token GEMM stream per precision
+precision = "fp8"
+active_params = 70000000000
+resident_params = 70000000000
+
+[[model.layers]]                # token-mixing layer classes
+kind = "attention"              # or "mla", "linear"
+count = 80
+heads = 64
+head_dim = 128
+kv_heads = 8                    # GQA
+kv_precision = "fp8"
 ```
 
-### Grouped Query Attention (GQA)
-
-For models using GQA, set `num_kv_heads` to the number of KV heads:
-
-```toml
-num_kv_heads = 8  # Llama 3 uses 8 KV heads
-```
-
-Omit `num_kv_heads` for standard multi-head attention (MHA) models.
-
-### Mixture of Experts (MoE)
-
-For MoE models, specify active parameters separately:
-
-```toml
-num_parameters = 140000000000      # Total params
-num_active_parameters = 12000000000 # Active per forward pass
-```
-
-### Sliding Window Attention
-
-For models like GPT-OSS with sliding window attention:
-
-```toml
-sliding_window = 4096
-num_sliding_layers = 28  # Number of layers using sliding window
-```
+MoE adds `routing = { routed_experts, experts_per_tok, moe_layers }` to the
+expert stream; sliding-window layers are an `attention` class with
+`window`; MLA / DeepSeek sparse attention is the `mla` kind; GatedDeltaNet or
+Mamba layers are `linear` with their per-sequence `state_bytes`. See the
+[Configuration Reference](../reference/config.md) for every field.
 
 ## Scheduler Configuration
 
@@ -280,15 +269,6 @@ Simulate a fixed number of concurrent users:
 arrival_pattern = "closed_loop"
 num_concurrent_users = 10
 # ... length distributions ...
-```
-
-## Simulation Configuration
-
-Control logging and output:
-
-```toml
-[simulation]
-log_interval = 5  # Log every 5 iterations
 ```
 
 ## Common Configuration Patterns

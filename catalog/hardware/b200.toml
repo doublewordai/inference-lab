@@ -1,0 +1,9 @@
+# NVIDIA B200 (HGX), dense datasheet peaks; memory as reported by nvidia-smi (180 GiB, 7.7 TB/s achievable).
+
+name = "B200"
+flops_fp4 = 9.0e15
+flops_fp8 = 4.5e15
+flops_bf16 = 2.25e15
+flops_fp16 = 2.25e15
+memory_bandwidth = 7.7e12
+memory_capacity = 193273528320

@@ -2,24 +2,10 @@
 # MoE Vision-Language model: 128 experts, 8 active per token
 # Total: ~30.5B params, Active: ~3.3B params per token, FP8 quantized
 
-[hardware]
-name = "H100"
-flops_fp8 = 1.979e15        # H100 SXM5 FP8 dense tensor core TFLOPS
-flops_bf16 = 9.895e+14    # half FP8 rate
-memory_bandwidth = 3.35e12      # 3.35 TB/s
-memory_capacity = 85899345920   # 80 GB HBM3
-
-[model]
-precision = "fp8"
-type = "dense"
-name = "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8"
-num_parameters = 30500000000
-num_active_parameters = 3340000000
-num_layers = 48
-hidden_dim = 2048
-num_heads = 32
-num_kv_heads = 4
-max_seq_len = 32768
+# Presets ship in the crate catalog (inference_lab::catalog); replace either with an
+# inline [hardware] / [model] table to override.
+hardware = "h100"
+model = "qwen3-vl-30b-a3b-fp8"
 
 [scheduler]
 max_num_batched_tokens = 16384

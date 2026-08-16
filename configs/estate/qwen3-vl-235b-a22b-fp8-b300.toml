@@ -1,0 +1,34 @@
+# === Estate serving config: Qwen/Qwen3-VL-235B-A22B-Instruct-FP8 on 2x B300 (tp=2) ===
+# Scheduler: deadline-priority admission as the estate dispatches.
+# The [workload] block is required by the config loader but unused by
+# estate-lab (arrivals come from the replayed trace).
+
+# Presets ship in the crate catalog (inference_lab::catalog); replace either with an
+# inline [hardware] / [model] table to override.
+hardware = "b300"
+model = "qwen3-vl-235b-a22b-fp8"
+
+[parallel]
+tp = 2
+ep = 1
+
+[scheduler]
+max_num_batched_tokens = 8192
+max_num_seqs = 4096
+policy = "priority"
+enable_chunked_prefill = true
+block_size = 64
+
+[workload]
+arrival_pattern = "closed_loop"
+num_concurrent_users = 1
+num_requests = 1
+seed = 1
+
+[workload.input_len_dist]
+type = "fixed"
+value = 1024
+
+[workload.output_len_dist]
+type = "fixed"
+value = 256

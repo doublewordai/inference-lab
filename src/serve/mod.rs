@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use tower::ServiceExt;
 use tower_http::cors::CorsLayer;
 
-use crate::config::{Config, ModelCosts};
+use crate::config::Config;
 use engine::RealtimeEngine;
 use handlers::AppState;
 
@@ -40,7 +40,7 @@ pub async fn start_server(
     let mut model_faults: HashMap<String, fault::FaultSpec> = HashMap::new();
 
     for config in configs {
-        let model_name = config.model.name().to_string();
+        let model_name = config.model.name.clone();
 
         // Validate static fault config at boot: a typo'd mode must fail the server, not
         // silently serve healthy streams under an e2e test that expects deaths.

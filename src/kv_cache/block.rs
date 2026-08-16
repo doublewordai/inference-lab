@@ -1,58 +1,36 @@
-use crate::request::BlockId;
-
-/// Represents a single KV cache block
-#[derive(Debug, Clone)]
+/// One KV cache block: a reference count (requests sharing it) and, for
+/// prefix caching, the content hash of the prompt prefix it holds. A block
+/// is free when nothing references it; a freed block keeps its hash so it
+/// can be re-hit until it is recycled.
+#[derive(Debug, Clone, Default)]
 pub struct Block {
-    /// Unique block ID
-    pub block_id: BlockId,
-
-    /// Reference count (number of requests using this block)
     pub ref_count: u32,
-
-    /// Whether this block is free
-    pub is_free: bool,
-
-    /// For prefix caching: hash of the token sequence in this block
     pub content_hash: Option<u64>,
 }
 
 impl Block {
-    /// Create a new free block
-    pub fn new(block_id: BlockId) -> Self {
-        Self {
-            block_id,
-            ref_count: 0,
-            is_free: true,
-            content_hash: None,
-        }
+    pub fn is_free(&self) -> bool {
+        self.ref_count == 0
     }
 
-    /// Allocate this block (increment ref count, mark as not free)
+    /// Take a fresh block for new content, returning the hash it held before
+    /// (which the caller evicts from the prefix cache).
     pub fn allocate(&mut self, content_hash: Option<u64>) -> Option<u64> {
         self.ref_count += 1;
-        self.is_free = false;
         std::mem::replace(&mut self.content_hash, content_hash)
     }
 
     /// Take an additional reference on a block that already holds the
-    /// content the caller wants. Used when a request's prompt prefix
-    /// matches a cached or in-flight block and we want to share the
-    /// physical copy instead of allocating a fresh one.
+    /// content the caller wants (a prefix-cache hit or an in-flight
+    /// promotion), sharing the physical copy.
     pub fn reference(&mut self) {
         self.ref_count += 1;
-        self.is_free = false;
     }
 
-    /// Release this block (decrement ref count, mark as free if ref count reaches 0)
-    pub fn release(&mut self) {
-        if self.ref_count > 0 {
-            self.ref_count -= 1;
-        }
-
-        if self.ref_count == 0 {
-            // Leave the content hash in there. When we overwrite the block, we will update it.
-            self.is_free = true;
-        }
+    /// Drop one reference. Returns true if the block became free.
+    pub fn release(&mut self) -> bool {
+        self.ref_count = self.ref_count.saturating_sub(1);
+        self.ref_count == 0
     }
 }
 
@@ -61,44 +39,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_block_creation() {
-        let block = Block::new(0);
-        assert_eq!(block.block_id, 0);
-        assert_eq!(block.ref_count, 0);
-        assert!(block.is_free);
+    fn allocate_reference_release() {
+        let mut block = Block::default();
+        assert!(block.is_free());
         assert!(block.content_hash.is_none());
-    }
 
-    #[test]
-    fn test_block_allocate() {
-        let mut block = Block::new(0);
-
-        block.allocate(None);
+        assert_eq!(block.allocate(Some(7)), None);
         assert_eq!(block.ref_count, 1);
-        assert!(!block.is_free);
-
-        block.allocate(None);
+        block.reference();
         assert_eq!(block.ref_count, 2);
-        assert!(!block.is_free);
-    }
+        assert!(!block.is_free());
 
-    #[test]
-    fn test_block_release() {
-        let mut block = Block::new(0);
-        block.allocate(None);
-        block.allocate(None);
-
+        assert!(!block.release());
+        assert!(block.release());
+        assert!(block.is_free());
+        // The hash survives until the block is recycled...
+        assert_eq!(block.content_hash, Some(7));
+        // ...and recycling returns it for eviction.
+        assert_eq!(block.allocate(Some(9)), Some(7));
+        // Releasing past zero is safe.
         block.release();
-        assert_eq!(block.ref_count, 1);
-        assert!(!block.is_free);
-
         block.release();
-        assert_eq!(block.ref_count, 0);
-        assert!(block.is_free);
-
-        // Releasing when already at 0 should be safe
-        block.release();
-        assert_eq!(block.ref_count, 0);
-        assert!(block.is_free);
+        assert!(block.is_free());
     }
 }
