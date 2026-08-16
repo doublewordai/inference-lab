@@ -1,0 +1,17 @@
+# 64 closed-loop users, 2000 requests; median ISL 1097 / OSL 245 tokens.
+
+arrival_pattern = "closed_loop"
+num_concurrent_users = 64
+closed_loop_jitter_secs = 0.05
+num_requests = 2000
+seed = 7
+
+[input_len_dist]
+type = "lognormal"
+mean = 7.0
+std_dev = 0.5
+
+[output_len_dist]
+type = "lognormal"
+mean = 5.5
+std_dev = 0.8

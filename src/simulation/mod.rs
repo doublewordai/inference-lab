@@ -2,7 +2,7 @@
 //! over a [`Topology`] of worker pools and inter-pool links; drivers above it
 //! pump events through `next_event_time` / `submit` / `step`. Three drivers
 //! exist:
-//!   * [`Simulator`] — synchronous batch sim driving a [`RequestGenerator`]
+//!   * [`Simulator`] — synchronous batch sim driving a `RequestGenerator`
 //!     against the engine. CLI and WASM use this.
 //!   * `crate::serve::engine::RealtimeEngine` — async driver that turns
 //!     external HTTP requests into engine submissions and paces wall-clock
@@ -13,45 +13,65 @@
 pub mod engine;
 pub mod roofline;
 pub mod simulator;
+pub mod spec;
 
 pub use engine::{
     Engine, IterationInfo, RequestProgress, RequestTiming, StepKind, StepOutcome, Topology,
 };
 pub use roofline::{predict_decode_tpot, predict_prefill_time};
 pub use simulator::{ProgressInfo, Simulator, TimeSeriesPoint};
+pub use spec::{DepthSample, DraftPlan, PlanCosts, SpecPlanner};
 
 use crate::config::SpeculativeConfig;
 use crate::request::Request;
 
-/// Run a closed-loop workload of `conc` users issuing fixed-shape requests
-/// (`isl` prompt tokens, `osl` output tokens) through `topology`. Stops once
-/// `num_completions` requests have finished. The first `warmup_completions`
-/// are dropped from the returned set (so the steady state is what's reported).
-/// `spec` optionally enables speculative decoding (applies only to decode
-/// steps, so on a disagg topology it affects only the decode pool).
+/// A closed-loop workload of fixed-shape requests for [`simulate_closed_loop`].
+#[derive(Debug, Clone)]
+pub struct ClosedLoop {
+    /// Concurrent users; each issues its next request when its previous one
+    /// completes.
+    pub concurrency: u32,
+    /// Prompt tokens per request.
+    pub isl: u32,
+    /// Output tokens per request.
+    pub osl: u32,
+    /// Stop once this many requests have completed.
+    pub num_completions: u32,
+    /// Drop the earliest completions from the result (steady state only).
+    pub warmup_completions: u32,
+    /// Optional speculative decoding (decode steps only, so on a disagg
+    /// topology it affects only the decode pool).
+    pub spec: Option<SpeculativeConfig>,
+    pub seed: u64,
+    /// Requests arrive already prefilled (pure decode work): the
+    /// disaggregated decode pool in isolation, no prefill compute sharing
+    /// the GPU. Pair with lifted KV caps to sweep the compute roofline.
+    pub skip_prefill: bool,
+}
+
+/// Run `workload` through `topology`.
 pub fn simulate_closed_loop(
     topology: Topology,
-    conc: u32,
-    isl: u32,
-    osl: u32,
-    num_completions: u32,
-    warmup_completions: u32,
-    spec: Option<SpeculativeConfig>,
-    seed: u64,
-    skip_prefill: bool,
+    workload: &ClosedLoop,
 ) -> Result<ClosedLoopResult, String> {
+    let ClosedLoop {
+        concurrency: conc,
+        isl,
+        osl,
+        num_completions,
+        warmup_completions,
+        seed,
+        skip_prefill,
+        ..
+    } = *workload;
     let mut engine = Engine::new(topology);
-    if let Some(s) = spec {
-        engine.enable_speculative(s, seed);
+    if let Some(s) = &workload.spec {
+        engine.enable_speculative(s.clone(), seed)?;
     }
-    // `skip_prefill` makes requests arrive already prefilled (num_computed = isl),
-    // i.e. as pure-decode work -- the disaggregated decode pool in isolation, no
-    // prefill compute sharing the GPU. Pair with lifted KV caps to sweep the
-    // compute roofline.
     let mk = |id: u32, arrival: f64| {
         let mut req = Request::new(format!("req-{id}"), 0, arrival, isl, osl);
         if skip_prefill {
-            req.num_computed_tokens = isl;
+            req.mark_prefilled(arrival);
         }
         req
     };
@@ -90,10 +110,7 @@ pub fn simulate_closed_loop(
         });
     }
     let mean_batch_per_pool = engine.pool_batch_means();
-    let kept: Vec<_> = all
-        .into_iter()
-        .skip(warmup_completions as usize)
-        .collect();
+    let kept: Vec<_> = all.into_iter().skip(warmup_completions as usize).collect();
     let total_time = if let (Some(first), Some(last)) = (kept.first(), kept.last()) {
         (last.completion_time - first.completion_time).max(1e-9)
     } else {
@@ -144,11 +161,13 @@ fn mean<I: Iterator<Item = f64>>(iter: I) -> f64 {
 mod tests {
     use super::*;
     use crate::config::{
-        AcceptanceModel, ClusterSpec, DenseModel, GammaPolicy, HardwareConfig, MeasuredCostConfig,
-        ModelConfig, ParallelConfig, Precision, SchedulerConfig, SpeculativeConfig,
+        AcceptanceModel, ClusterSpec, DisaggTopology, GammaPolicy, HardwareConfig, LayerClass,
+        MeasuredCostConfig, ModelSpec, ParallelConfig, Precision, SchedulerConfig,
+        SpeculativeConfig, WeightStream,
     };
+    use crate::scheduler::SchedulingPolicy;
 
-    fn small_dense_topology() -> Topology {
+    fn small_dense_parts() -> (ClusterSpec, ModelSpec, SchedulerConfig) {
         let hardware = HardwareConfig {
             name: "test".into(),
             flops_fp4: None,
@@ -157,22 +176,30 @@ mod tests {
             flops_fp16: Some(1e15),
             memory_bandwidth: 1e12,
             memory_capacity: 80_000_000_000,
-            kv_cache_capacity: 0,
-            gpu_memory_utilization: 0.9,
             kv_tiers: Vec::new(),
         };
-        let model = ModelConfig::Dense(DenseModel {
+        let model = ModelSpec {
             name: "test-dense".into(),
-            num_parameters: 1_000_000_000,
-            num_active_parameters: None,
-            num_layers: 8,
             hidden_dim: 1024,
-            num_heads: 8,
-            num_kv_heads: None,
-            head_dim: None,
             max_seq_len: 4096,
-            precision: Precision::Bf16,
-        });
+            attention_precision: Precision::Bf16,
+            activation_bytes: 2,
+            weights: vec![WeightStream {
+                precision: Precision::Bf16,
+                active_params: 1_000_000_000,
+                resident_params: 1_000_000_000,
+                routing: None,
+            }],
+            layers: vec![LayerClass::Attention {
+                count: 8,
+                heads: 8,
+                head_dim: 128,
+                kv_heads: 8,
+                kv_shared: false,
+                window: 0,
+                kv_precision: Precision::Bf16,
+            }],
+        };
         let sched = SchedulerConfig {
             max_num_batched_tokens: 8192,
             max_num_seqs: 256,
@@ -180,18 +207,117 @@ mod tests {
             long_prefill_token_threshold: 0,
             max_num_partial_prefills: 1,
             block_size: 16,
-            policy: "fcfs".into(),
+            gpu_memory_utilization: 0.9,
+            kv_cache_capacity: 0,
+            max_model_len: None,
+            policy: SchedulingPolicy::FCFS,
             enable_preemption_free: false,
             enable_cascade_attention: false,
         };
         let cluster = ClusterSpec {
             hardware,
-            parallel: ParallelConfig { tp: 1, ep: 1, dp_attention: false },
+            parallel: ParallelConfig {
+                tp: 1,
+                ep: 1,
+                dp_attention: false,
+            },
             comms: None,
             num_workers: 1,
-            node: 0,
         };
+        (cluster, model, sched)
+    }
+
+    fn small_dense_topology() -> Topology {
+        let (cluster, model, sched) = small_dense_parts();
         Topology::aggregated(cluster, model, sched).expect("topo")
+    }
+
+    /// Run `engine` until `n` requests complete; returns their timings.
+    fn run_until(engine: &mut Engine, n: usize) -> Vec<RequestTiming> {
+        let mut done = Vec::new();
+        while done.len() < n {
+            assert!(engine.next_event_time().is_some(), "queue drained");
+            done.extend(engine.step().unwrap().completions);
+        }
+        done
+    }
+
+    #[test]
+    fn disagg_handoffs_share_the_link_bandwidth() {
+        let (cluster, model, sched) = small_dense_parts();
+        // KV of a 64-token prompt takes exactly 1.0 s alone on the link.
+        let kv_bytes = model.kv_storage_bytes(64) as f64;
+        let topo = DisaggTopology {
+            prefill: cluster.clone(),
+            decode: cluster,
+            kv_link_bw: kv_bytes,
+        };
+        let topology = Topology::from_disagg(&topo, model, sched).unwrap();
+        let mut engine = Engine::new(topology);
+        // Two prompts prefill in the same step, so both hand-offs start
+        // together and share the link: each takes 2.0 s, not 1.0 s.
+        engine.submit(Request::new("a".into(), 0, 0.0, 64, 2));
+        engine.submit(Request::new("b".into(), 0, 0.0, 64, 2));
+        let timings = run_until(&mut engine, 2);
+        for t in &timings {
+            let handoff = t.handoff_done_time - t.prefill_done_time;
+            assert!(
+                (handoff - 2.0).abs() < 1e-6,
+                "{}: handoff {handoff}",
+                t.request_id
+            );
+        }
+        // A third request whose prefill lands mid-way through the pair's
+        // transfer slows them (three-way share) and is itself slowed.
+        let mut engine =
+            Engine::new(Topology::from_disagg(&topo_of(64), model_of(), sched_of()).unwrap());
+        engine.submit(Request::new("a".into(), 0, 0.0, 64, 2));
+        engine.submit(Request::new("b".into(), 0, 0.0, 64, 2));
+        // The prefill step of a+b takes t_p; c arrives at t_p + 1.0 (both
+        // half done, 1.0 s of link work each left) and prefills alone in
+        // roughly t_p / 2, joining at ~t_p + 1 + t_p/2.
+        let outcome_time = {
+            let mut probe =
+                Engine::new(Topology::from_disagg(&topo_of(64), model_of(), sched_of()).unwrap());
+            probe.submit(Request::new("a".into(), 0, 0.0, 64, 2));
+            probe.submit(Request::new("b".into(), 0, 0.0, 64, 2));
+            let t = run_until(&mut probe, 2);
+            t[0].prefill_done_time
+        };
+        engine.submit(Request::new("c".into(), 0, outcome_time + 1.0, 64, 2));
+        let timings = run_until(&mut engine, 3);
+        let get = |id: &str| timings.iter().find(|t| t.request_id == id).unwrap();
+        let (a, c) = (get("a"), get("c"));
+        // a and b were half done when c joined; the rest ran three-way.
+        assert!(a.handoff_done_time - a.prefill_done_time > 2.0 + 1e-6);
+        // c never had the link to itself.
+        assert!(c.handoff_done_time - c.prefill_done_time > 1.0 + 1e-6);
+        // Conservation: the link moved 3 transfers' bytes in the span from
+        // the first submit to the last completion at full rate throughout.
+        let first_start = timings
+            .iter()
+            .map(|t| t.prefill_done_time)
+            .fold(f64::MAX, f64::min);
+        let last_end = timings
+            .iter()
+            .map(|t| t.handoff_done_time)
+            .fold(0.0, f64::max);
+        assert!((last_end - first_start - 3.0).abs() < 1e-6);
+    }
+
+    fn topo_of(prompt: u32) -> DisaggTopology {
+        let (cluster, model, _) = small_dense_parts();
+        DisaggTopology {
+            prefill: cluster.clone(),
+            decode: cluster,
+            kv_link_bw: model.kv_storage_bytes(prompt) as f64,
+        }
+    }
+    fn model_of() -> ModelSpec {
+        small_dense_parts().1
+    }
+    fn sched_of() -> SchedulerConfig {
+        small_dense_parts().2
     }
 
     /// Drive a tiny prefilled closed loop with a measured cost table and
@@ -205,7 +331,6 @@ mod tests {
             gamma: 4,
             acceptance: AcceptanceModel::Constant { alpha: 0.9 },
             policy: GammaPolicy::GoodputBudget,
-            draft_cost_frac: 0.0,
             measured_cost: Some(MeasuredCostConfig {
                 path: path.to_str().unwrap().into(),
                 ref_seq_len: None,
@@ -214,10 +339,10 @@ mod tests {
             drafter: None,
         };
         let mut engine = Engine::new(small_dense_topology());
-        engine.enable_speculative(spec, 7);
+        engine.enable_speculative(spec, 7).unwrap();
         for i in 0..4u32 {
             let mut req = Request::new(format!("r{i}"), 0, 0.0, 64, 32);
-            req.num_computed_tokens = 64; // arrive prefilled: pure decode
+            req.mark_prefilled(0.0); // pure decode
             engine.submit(req);
         }
         let mut done = 0usize;
@@ -228,7 +353,7 @@ mod tests {
         let series = engine.spec_depth_series();
         let (s, n) = series
             .iter()
-            .fold((0.0f64, 0.0f64), |(s, n), &(_, md, _)| (s + md, n + 1.0));
+            .fold((0.0f64, 0.0f64), |(s, n), d| (s + d.mean_draft, n + 1.0));
         s / n.max(1.0)
     }
 
