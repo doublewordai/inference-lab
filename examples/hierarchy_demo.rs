@@ -46,6 +46,8 @@ fn run_for_batch(num_concurrent: usize, share_prefix: bool) -> Vec<f64> {
         num_kv_heads: None,
         head_dim: None,
         max_seq_len: 8192,
+        sliding_window: 0,
+        num_sliding_layers: 0,
         precision: Precision::Bf16,
     });
     let scheduler_cfg = SchedulerConfig {

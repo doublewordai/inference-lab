@@ -190,6 +190,8 @@ mod tests {
             num_kv_heads: None,
             head_dim: None,
             max_seq_len: 4096,
+            sliding_window: 0,
+            num_sliding_layers: 0,
             precision: Precision::Bf16,
         });
         let sched = SchedulerConfig {

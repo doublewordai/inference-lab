@@ -7,7 +7,7 @@ pub mod topology;
 pub mod workload;
 
 pub use hardware::{HardwareConfig, KVTier, Precision};
-pub use model::{DeepseekV4Model, DenseModel, ModelConfig, ModelCosts, SlidingWindowModel};
+pub use model::{DeepseekV4Model, DenseModel, ModelConfig, ModelCosts, Qwen35Model};
 pub use parallel::{CommsConfig, ParallelConfig};
 pub use scheduler::SchedulerConfig;
 pub use speculative::{
@@ -94,6 +94,8 @@ impl Config {
             num_kv_heads: None,
             head_dim: None,
             max_seq_len: 2048,
+            sliding_window: 0,
+            num_sliding_layers: 0,
             precision: crate::config::Precision::Bf16,
         });
 
@@ -151,6 +153,8 @@ mod tests {
             num_kv_heads: None,
             head_dim: None,
             max_seq_len: 2048,
+            sliding_window: 0,
+            num_sliding_layers: 0,
             precision: crate::config::Precision::Bf16,
         });
 
@@ -199,7 +203,7 @@ mod tests {
 
     #[test]
     fn test_sliding_window_kv_cache_caps_at_window() {
-        let model = ModelConfig::Sliding(SlidingWindowModel {
+        let model = ModelConfig::Dense(DenseModel {
             name: "Sliding".to_string(),
             num_parameters: 7_000_000_000,
             num_active_parameters: None,
@@ -207,6 +211,7 @@ mod tests {
             hidden_dim: 16,
             num_heads: 4,
             num_kv_heads: Some(2),
+            head_dim: None,
             max_seq_len: 2048,
             sliding_window: 8,
             num_sliding_layers: 2,
@@ -218,5 +223,22 @@ mod tests {
         // 2 sliding layers @ min(10,8)=8: 32 * 2 * 8 = 512
         // total 1,152
         assert_eq!(model.kv_storage_bytes(10), 1_152);
+        // `type = "sliding"` is an alias of the dense model.
+        let parsed: ModelConfig = toml::from_str(
+            r#"
+            type = "sliding"
+            name = "s"
+            num_parameters = 1000
+            num_layers = 4
+            hidden_dim = 16
+            num_heads = 4
+            num_kv_heads = 2
+            max_seq_len = 2048
+            sliding_window = 8
+            num_sliding_layers = 2
+            "#,
+        )
+        .unwrap();
+        assert_eq!(parsed.kv_storage_bytes(10), 1_152);
     }
 }

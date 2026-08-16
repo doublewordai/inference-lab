@@ -35,6 +35,8 @@ fn main() {
         num_kv_heads: Some(8),
         head_dim: None,
         max_seq_len: 8192,
+        sliding_window: 0,
+        num_sliding_layers: 0,
         precision: Precision::Fp8,
     });
 
@@ -84,8 +86,8 @@ fn main() {
 
         let t_plain = plain.calculate_iteration_time(&req_refs, &tokens);
         let t_cascade = cascade.calculate_iteration_time(&req_refs, &tokens);
-        let b_plain = plain.calculate_bytes_transferred(&req_refs, &tokens);
-        let b_cascade = cascade.calculate_bytes_transferred(&req_refs, &tokens);
+        let b_plain = plain.step_cost(&req_refs, &tokens).bytes;
+        let b_cascade = cascade.step_cost(&req_refs, &tokens).bytes;
 
         println!(
             "{:>6}  {:>14.3}  {:>14.3}  {:>14.3}  {:>14.3}  {:>9.2}x",

@@ -287,15 +287,10 @@ impl DrafterCost {
                 experts_per_tok,
                 shared_experts,
             } => {
-                let e = num_experts as f64;
                 let k = experts_per_tok as f64;
                 let shared = shared_experts as f64;
                 // Coupon-collector: distinct routed experts touched by b·k draws.
-                let loaded = if e > 0.0 {
-                    e * (1.0 - (1.0 - 1.0 / e).powf(b * k))
-                } else {
-                    0.0
-                };
+                let loaded = super::model::expected_distinct_experts(num_experts, b * k);
                 let resident = dense_params + (shared + loaded) * expert_params; // bytes
                 let active = dense_params + (k + shared) * expert_params; // FLOPs/token
                 let per_pass = ((2.0 * active * b) / peak).max((2.0 * resident) / bw);

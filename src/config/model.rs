@@ -53,9 +53,11 @@ pub trait ModelCosts {
     /// engine sums them.
     fn weight_bytes_per_step_by_prec(&self, num_tokens: u32) -> Vec<(Precision, u64)>;
 
-    /// Bytes of KV read per decode step for a sequence of `seq_len` tokens.
-    /// Captures sliding window, sparse top-k, etc. KV is always charged
-    /// against `attention_precision()`'s memory budget.
+    /// Bytes of attention KV read per decode step for a sequence of `seq_len`
+    /// tokens. Captures sliding window, sparse top-k, etc. KV is always
+    /// charged against `attention_precision()`'s memory budget. Fixed
+    /// per-sequence state (`per_sequence_state_bytes`) is charged separately
+    /// by the engine, once per sequence per step.
     fn kv_bytes_read_per_decode_step(&self, seq_len: u32) -> u64;
 
     /// Bytes of resident model weights in HBM (capacity accounting). Sum
@@ -64,7 +66,10 @@ pub trait ModelCosts {
     /// subset are activated each step.
     fn weight_residency_bytes(&self) -> u64;
 
-    /// Bytes of resident KV cache for a sequence of `seq_len` tokens.
+    /// Bytes of resident attention KV cache for a sequence of `seq_len`
+    /// tokens. Monotone non-decreasing in `seq_len`; the KV cache manager
+    /// quantises it into blocks. Fixed per-sequence state is
+    /// `per_sequence_state_bytes`, held alongside.
     fn kv_storage_bytes(&self, seq_len: u32) -> u64;
 
     /// Fixed per-sequence state bytes that occupy KV memory independent of
@@ -72,9 +77,9 @@ pub trait ModelCosts {
     /// GatedDeltaNet layers in a hybrid model. The scheduler reserves
     /// `ceil(this / block_bytes)` blocks per running sequence for its whole
     /// lifetime (vLLM's unified-hybrid-allocator model: the state is padded to
-    /// the attention page size and held alongside the growing attention KV).
-    /// Zero for pure-attention models, which keeps their allocation path
-    /// byte-identical.
+    /// the attention page size and held alongside the growing attention KV),
+    /// and the engine charges it as read bandwidth once per sequence per
+    /// decode step. Zero for pure-attention models.
     fn per_sequence_state_bytes(&self) -> u64 {
         0
     }
@@ -107,136 +112,78 @@ pub trait ModelCosts {
 }
 
 /// Tagged-enum dispatch over architectures. The `type` field in TOML/JSON
-/// chooses the variant: `dense`, `sliding`, or `deepseek_v4`.
+/// chooses the variant: `dense` (also accepted as `sliding`), `deepseek_v4`,
+/// or `qwen35`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ModelConfig {
+    #[serde(alias = "sliding")]
     Dense(DenseModel),
-    Sliding(SlidingWindowModel),
     DeepseekV4(DeepseekV4Model),
     Qwen35(Qwen35Model),
 }
 
+macro_rules! dispatch {
+    ($self:expr, $m:ident => $e:expr) => {
+        match $self {
+            ModelConfig::Dense($m) => $e,
+            ModelConfig::DeepseekV4($m) => $e,
+            ModelConfig::Qwen35($m) => $e,
+        }
+    };
+}
+
 impl ModelCosts for ModelConfig {
     fn name(&self) -> &str {
-        match self {
-            Self::Dense(m) => m.name(),
-            Self::Sliding(m) => m.name(),
-            Self::DeepseekV4(m) => m.name(),
-            Self::Qwen35(m) => m.name(),
-        }
+        dispatch!(self, m => m.name())
     }
     fn max_seq_len(&self) -> u32 {
-        match self {
-            Self::Dense(m) => m.max_seq_len(),
-            Self::Sliding(m) => m.max_seq_len(),
-            Self::DeepseekV4(m) => m.max_seq_len(),
-            Self::Qwen35(m) => m.max_seq_len(),
-        }
-    }
-    fn matmul_flops_per_token_by_prec(&self) -> Vec<(Precision, u64)> {
-        match self {
-            Self::Dense(m) => m.matmul_flops_per_token_by_prec(),
-            Self::Sliding(m) => m.matmul_flops_per_token_by_prec(),
-            Self::DeepseekV4(m) => m.matmul_flops_per_token_by_prec(),
-            Self::Qwen35(m) => m.matmul_flops_per_token_by_prec(),
-        }
-    }
-    fn attention_flops(&self, s: u32, t: u32) -> u64 {
-        match self {
-            Self::Dense(m) => m.attention_flops(s, t),
-            Self::Sliding(m) => m.attention_flops(s, t),
-            Self::DeepseekV4(m) => m.attention_flops(s, t),
-            Self::Qwen35(m) => m.attention_flops(s, t),
-        }
-    }
-    fn attention_precision(&self) -> Precision {
-        match self {
-            Self::Dense(m) => m.attention_precision(),
-            Self::Sliding(m) => m.attention_precision(),
-            Self::DeepseekV4(m) => m.attention_precision(),
-            Self::Qwen35(m) => m.attention_precision(),
-        }
-    }
-    fn weight_bytes_per_step_by_prec(&self, num_tokens: u32) -> Vec<(Precision, u64)> {
-        match self {
-            Self::Dense(m) => m.weight_bytes_per_step_by_prec(num_tokens),
-            Self::Sliding(m) => m.weight_bytes_per_step_by_prec(num_tokens),
-            Self::DeepseekV4(m) => m.weight_bytes_per_step_by_prec(num_tokens),
-            Self::Qwen35(m) => m.weight_bytes_per_step_by_prec(num_tokens),
-        }
-    }
-    fn kv_bytes_read_per_decode_step(&self, seq_len: u32) -> u64 {
-        match self {
-            Self::Dense(m) => m.kv_bytes_read_per_decode_step(seq_len),
-            Self::Sliding(m) => m.kv_bytes_read_per_decode_step(seq_len),
-            Self::DeepseekV4(m) => m.kv_bytes_read_per_decode_step(seq_len),
-            Self::Qwen35(m) => m.kv_bytes_read_per_decode_step(seq_len),
-        }
-    }
-    fn weight_residency_bytes(&self) -> u64 {
-        match self {
-            Self::Dense(m) => m.weight_residency_bytes(),
-            Self::Sliding(m) => m.weight_residency_bytes(),
-            Self::DeepseekV4(m) => m.weight_residency_bytes(),
-            Self::Qwen35(m) => m.weight_residency_bytes(),
-        }
-    }
-    fn kv_storage_bytes(&self, seq_len: u32) -> u64 {
-        match self {
-            Self::Dense(m) => m.kv_storage_bytes(seq_len),
-            Self::Sliding(m) => m.kv_storage_bytes(seq_len),
-            Self::DeepseekV4(m) => m.kv_storage_bytes(seq_len),
-            Self::Qwen35(m) => m.kv_storage_bytes(seq_len),
-        }
-    }
-    fn per_sequence_state_bytes(&self) -> u64 {
-        match self {
-            Self::Dense(m) => m.per_sequence_state_bytes(),
-            Self::Sliding(m) => m.per_sequence_state_bytes(),
-            Self::DeepseekV4(m) => m.per_sequence_state_bytes(),
-            Self::Qwen35(m) => m.per_sequence_state_bytes(),
-        }
+        dispatch!(self, m => m.max_seq_len())
     }
     fn hidden_dim(&self) -> u32 {
-        match self {
-            Self::Dense(m) => m.hidden_dim(),
-            Self::Sliding(m) => m.hidden_dim(),
-            Self::DeepseekV4(m) => m.hidden_dim(),
-            Self::Qwen35(m) => m.hidden_dim(),
-        }
+        dispatch!(self, m => m.hidden_dim())
     }
     fn num_layers(&self) -> u32 {
-        match self {
-            Self::Dense(m) => m.num_layers(),
-            Self::Sliding(m) => m.num_layers(),
-            Self::DeepseekV4(m) => m.num_layers(),
-            Self::Qwen35(m) => m.num_layers(),
-        }
+        dispatch!(self, m => m.num_layers())
     }
     fn activation_bytes(&self) -> u32 {
-        match self {
-            Self::Dense(m) => m.activation_bytes(),
-            Self::Sliding(m) => m.activation_bytes(),
-            Self::DeepseekV4(m) => m.activation_bytes(),
-            Self::Qwen35(m) => m.activation_bytes(),
-        }
+        dispatch!(self, m => m.activation_bytes())
+    }
+    fn matmul_flops_per_token_by_prec(&self) -> Vec<(Precision, u64)> {
+        dispatch!(self, m => m.matmul_flops_per_token_by_prec())
+    }
+    fn attention_flops(&self, s: u32, t: u32) -> u64 {
+        dispatch!(self, m => m.attention_flops(s, t))
+    }
+    fn attention_precision(&self) -> Precision {
+        dispatch!(self, m => m.attention_precision())
+    }
+    fn weight_bytes_per_step_by_prec(&self, num_tokens: u32) -> Vec<(Precision, u64)> {
+        dispatch!(self, m => m.weight_bytes_per_step_by_prec(num_tokens))
+    }
+    fn kv_bytes_read_per_decode_step(&self, seq_len: u32) -> u64 {
+        dispatch!(self, m => m.kv_bytes_read_per_decode_step(seq_len))
+    }
+    fn weight_residency_bytes(&self) -> u64 {
+        dispatch!(self, m => m.weight_residency_bytes())
+    }
+    fn kv_storage_bytes(&self, seq_len: u32) -> u64 {
+        dispatch!(self, m => m.kv_storage_bytes(seq_len))
+    }
+    fn per_sequence_state_bytes(&self) -> u64 {
+        dispatch!(self, m => m.per_sequence_state_bytes())
+    }
+    fn allreduce_bytes_per_token(&self) -> u64 {
+        dispatch!(self, m => m.allreduce_bytes_per_token())
+    }
+    fn num_tp_allreduces_per_pass(&self) -> u32 {
+        dispatch!(self, m => m.num_tp_allreduces_per_pass())
     }
     fn alltoall_bytes_per_token(&self) -> u64 {
-        match self {
-            Self::Dense(m) => m.alltoall_bytes_per_token(),
-            Self::Sliding(m) => m.alltoall_bytes_per_token(),
-            Self::DeepseekV4(m) => m.alltoall_bytes_per_token(),
-            Self::Qwen35(m) => m.alltoall_bytes_per_token(),
-        }
+        dispatch!(self, m => m.alltoall_bytes_per_token())
     }
     fn num_ep_alltoalls_per_pass(&self) -> u32 {
-        match self {
-            Self::Dense(m) => m.num_ep_alltoalls_per_pass(),
-            Self::Sliding(m) => m.num_ep_alltoalls_per_pass(),
-            Self::DeepseekV4(m) => m.num_ep_alltoalls_per_pass(),
-            Self::Qwen35(m) => m.num_ep_alltoalls_per_pass(),
-        }
+        dispatch!(self, m => m.num_ep_alltoalls_per_pass())
     }
 }
 
@@ -245,7 +192,109 @@ fn default_precision() -> Precision {
 }
 
 // ---------------------------------------------------------------------------
-// Dense / GQA transformer (Llama-3, Qwen, etc.)
+// Shared building blocks
+// ---------------------------------------------------------------------------
+
+/// KV bytes per token for one GQA/MHA attention layer: K and V, `kv_heads`
+/// heads of `head_dim`, at `precision`.
+fn gqa_kv_bytes_per_token_per_layer(kv_heads: u32, head_dim: u32, precision: Precision) -> f64 {
+    2.0 * kv_heads as f64 * head_dim as f64 * precision.bytes_per_value()
+}
+
+/// Expected number of distinct experts touched when `draws` independent
+/// uniform routing draws are made over a pool of `num_experts`
+/// (coupon-collector growth). This is what gives MoE its shallow
+/// intensity-vs-batch slope, distant knee, and low-batch "expert tax".
+pub fn expected_distinct_experts(num_experts: u32, draws: f64) -> f64 {
+    let e = num_experts as f64;
+    if e <= 0.0 || draws <= 0.0 {
+        return 0.0;
+    }
+    e * (1.0 - (1.0 - 1.0 / e).powf(draws))
+}
+
+/// Weight-cost model shared by MoE architectures: active vs resident params
+/// split into expert and non-expert kernels, each with its own precision.
+/// Implementors supply the accessors; the provided methods are the
+/// `ModelCosts` weight terms.
+trait MoeWeights {
+    fn active_expert_params(&self) -> u64;
+    fn active_non_expert_params(&self) -> u64;
+    fn resident_expert_params(&self) -> u64;
+    fn resident_non_expert_params(&self) -> u64;
+    fn experts_per_tok(&self) -> u32;
+    /// Total routed experts; 0 disables the coupon-collector model.
+    fn routed_experts(&self) -> u32;
+    fn moe_layers(&self) -> u32;
+    fn expert_precision(&self) -> Precision;
+    fn non_expert_precision(&self) -> Precision;
+
+    /// Distinct routed-expert weights that must be read for a step over
+    /// `num_tokens` tokens, in params. Uniform routing over
+    /// `num_tokens × experts_per_tok` draws: the expected distinct routed
+    /// experts grows from the active (single-token) footprint toward
+    /// all-experts-resident as the batch grows. Falls back to the constant
+    /// active footprint when `routed_experts` is unset (0) or not above
+    /// `experts_per_tok`.
+    fn expert_params_resident_per_step(&self, num_tokens: u32) -> u64 {
+        let e = self.routed_experts();
+        let k = self.experts_per_tok();
+        let active = self.active_expert_params();
+        if e <= k || num_tokens == 0 {
+            return active;
+        }
+        let (ef, kf) = (e as f64, k as f64);
+        // Per-routed-expert params `w` and always-resident shared params,
+        // recovered from the active (k routed + shared) and resident (all
+        // routed + shared) footprints: active = k·w + shared, resident = E·w + shared.
+        let w = self.resident_expert_params().saturating_sub(active) as f64 / (ef - kf);
+        let shared = (active as f64 - kf * w).max(0.0);
+        let loaded = expected_distinct_experts(e, num_tokens as f64 * kf);
+        (shared + loaded * w).round() as u64
+    }
+
+    fn moe_matmul_flops_per_token_by_prec(&self) -> Vec<(Precision, u64)> {
+        vec![
+            (self.expert_precision(), 2 * self.active_expert_params()),
+            (
+                self.non_expert_precision(),
+                2 * self.active_non_expert_params(),
+            ),
+        ]
+    }
+
+    fn moe_weight_bytes_per_step_by_prec(&self, num_tokens: u32) -> Vec<(Precision, u64)> {
+        let exp_bytes = (self.expert_params_resident_per_step(num_tokens) as f64
+            * self.expert_precision().bytes_per_value()) as u64;
+        let non_exp_bytes = (self.active_non_expert_params() as f64
+            * self.non_expert_precision().bytes_per_value()) as u64;
+        vec![
+            (self.expert_precision(), exp_bytes),
+            (self.non_expert_precision(), non_exp_bytes),
+        ]
+    }
+
+    fn moe_weight_residency_bytes(&self) -> u64 {
+        let exp = self.resident_expert_params() as f64 * self.expert_precision().bytes_per_value();
+        let non_exp = self.resident_non_expert_params() as f64
+            * self.non_expert_precision().bytes_per_value();
+        (exp + non_exp) as u64
+    }
+
+    /// Each token is dispatched to `experts_per_tok` experts; each dispatch
+    /// sends one full hidden_dim-wide activation.
+    fn moe_alltoall_bytes_per_token(&self, hidden_dim: u32, activation_bytes: u32) -> u64 {
+        self.experts_per_tok() as u64 * hidden_dim as u64 * activation_bytes as u64
+    }
+
+    /// Dispatch + combine per MoE layer.
+    fn moe_num_ep_alltoalls_per_pass(&self) -> u32 {
+        2 * self.moe_layers()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dense / GQA transformer (Llama-3, Qwen, Mistral-style sliding window)
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize)]
@@ -266,6 +315,14 @@ pub struct DenseModel {
     #[serde(default)]
     pub head_dim: Option<u32>,
     pub max_seq_len: u32,
+    /// Sliding-window size for the `num_sliding_layers` windowed layers;
+    /// 0 (default) means no windowed layers.
+    #[serde(default)]
+    pub sliding_window: u32,
+    /// Layers attending only the last `sliding_window` tokens; the rest use
+    /// full attention. Default 0.
+    #[serde(default)]
+    pub num_sliding_layers: u32,
     /// Precision of weights, attention compute, and KV cache. Single-precision
     /// model — all compute and memory traffic shares one bucket.
     #[serde(default = "default_precision")]
@@ -282,9 +339,25 @@ impl DenseModel {
     fn head_dim(&self) -> u32 {
         self.head_dim.unwrap_or(self.hidden_dim / self.num_heads)
     }
-    /// KV bytes per token for a single layer (K and V combined).
     fn kv_bytes_per_token_per_layer(&self) -> f64 {
-        2.0 * self.kv_heads() as f64 * self.head_dim() as f64 * self.precision.bytes_per_value()
+        gqa_kv_bytes_per_token_per_layer(self.kv_heads(), self.head_dim(), self.precision)
+    }
+    fn num_sliding_layers(&self) -> u32 {
+        if self.sliding_window == 0 {
+            0
+        } else {
+            self.num_sliding_layers.min(self.num_layers)
+        }
+    }
+    fn num_full_layers(&self) -> u32 {
+        self.num_layers - self.num_sliding_layers()
+    }
+    /// Layer-weighted attended positions for a `seq_len`-token context: full
+    /// layers see everything, windowed layers see the last `sliding_window`.
+    fn attended_layer_positions(&self, seq_len: u32) -> f64 {
+        let full = self.num_full_layers() as f64 * seq_len as f64;
+        let windowed = self.num_sliding_layers() as f64 * seq_len.min(self.sliding_window) as f64;
+        full + windowed
     }
 }
 
@@ -305,8 +378,8 @@ impl ModelCosts for DenseModel {
         vec![(self.precision, 2 * self.active_params())]
     }
     fn attention_flops(&self, s: u32, t: u32) -> u64 {
-        // 4 * L * S * T * D — both QK^T and softmax-V kernels.
-        4u64 * self.num_layers as u64 * s as u64 * t as u64 * self.hidden_dim as u64
+        // 4 * D * S * (layer-weighted attended positions): QK^T and softmax-V.
+        (4.0 * self.hidden_dim as f64 * s as f64 * self.attended_layer_positions(t)) as u64
     }
     fn attention_precision(&self) -> Precision {
         self.precision
@@ -316,108 +389,14 @@ impl ModelCosts for DenseModel {
         vec![(self.precision, bytes)]
     }
     fn kv_bytes_read_per_decode_step(&self, seq_len: u32) -> u64 {
-        (self.kv_bytes_per_token_per_layer() * seq_len as f64 * self.num_layers as f64) as u64
+        (self.kv_bytes_per_token_per_layer() * self.attended_layer_positions(seq_len)) as u64
     }
     fn weight_residency_bytes(&self) -> u64 {
         (self.num_parameters as f64 * self.precision.bytes_per_value()) as u64
     }
     fn kv_storage_bytes(&self, seq_len: u32) -> u64 {
-        (self.kv_bytes_per_token_per_layer() * seq_len as f64 * self.num_layers as f64) as u64
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Sliding-window transformer (Mistral-style)
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SlidingWindowModel {
-    pub name: String,
-    pub num_parameters: u64,
-    #[serde(default)]
-    pub num_active_parameters: Option<u64>,
-    pub num_layers: u32,
-    pub hidden_dim: u32,
-    pub num_heads: u32,
-    #[serde(default)]
-    pub num_kv_heads: Option<u32>,
-    pub max_seq_len: u32,
-    pub sliding_window: u32,
-    /// Layers using sliding window; the rest use full attention.
-    pub num_sliding_layers: u32,
-    #[serde(default = "default_precision")]
-    pub precision: Precision,
-}
-
-impl SlidingWindowModel {
-    fn active_params(&self) -> u64 {
-        self.num_active_parameters.unwrap_or(self.num_parameters)
-    }
-    fn kv_heads(&self) -> u32 {
-        self.num_kv_heads.unwrap_or(self.num_heads)
-    }
-    fn head_dim(&self) -> u32 {
-        self.hidden_dim / self.num_heads
-    }
-    fn kv_bytes_per_token_per_layer(&self) -> f64 {
-        2.0 * self.kv_heads() as f64 * self.head_dim() as f64 * self.precision.bytes_per_value()
-    }
-    fn num_full_layers(&self) -> u32 {
-        self.num_layers.saturating_sub(self.num_sliding_layers)
-    }
-}
-
-impl ModelCosts for SlidingWindowModel {
-    fn name(&self) -> &str {
-        &self.name
-    }
-    fn max_seq_len(&self) -> u32 {
-        self.max_seq_len
-    }
-    fn hidden_dim(&self) -> u32 {
-        self.hidden_dim
-    }
-    fn num_layers(&self) -> u32 {
-        self.num_layers
-    }
-    fn matmul_flops_per_token_by_prec(&self) -> Vec<(Precision, u64)> {
-        vec![(self.precision, 2 * self.active_params())]
-    }
-    fn attention_flops(&self, s: u32, t: u32) -> u64 {
-        let d = self.hidden_dim as u64;
-        let full = self.num_full_layers() as u64;
-        let sliding = self.num_sliding_layers as u64;
-        let t_sliding = t.min(self.sliding_window) as u64;
-        let s = s as u64;
-        let t = t as u64;
-        4 * d * s * (full * t + sliding * t_sliding)
-    }
-    fn attention_precision(&self) -> Precision {
-        self.precision
-    }
-    fn weight_bytes_per_step_by_prec(&self, _num_tokens: u32) -> Vec<(Precision, u64)> {
-        let bytes = (self.active_params() as f64 * self.precision.bytes_per_value()) as u64;
-        vec![(self.precision, bytes)]
-    }
-    fn kv_bytes_read_per_decode_step(&self, seq_len: u32) -> u64 {
-        let per = self.kv_bytes_per_token_per_layer();
-        let full = self.num_full_layers() as f64;
-        let sliding = self.num_sliding_layers as f64;
-        let s_full = seq_len as f64;
-        let s_slid = seq_len.min(self.sliding_window) as f64;
-        (per * (full * s_full + sliding * s_slid)) as u64
-    }
-    fn weight_residency_bytes(&self) -> u64 {
-        (self.num_parameters as f64 * self.precision.bytes_per_value()) as u64
-    }
-    fn kv_storage_bytes(&self, seq_len: u32) -> u64 {
-        let per = self.kv_bytes_per_token_per_layer();
-        let full = self.num_full_layers() as f64;
-        let sliding = self.num_sliding_layers as f64;
-        let s_full = seq_len as f64;
-        let s_slid = seq_len.min(self.sliding_window) as f64;
-        (per * (full * s_full + sliding * s_slid)) as u64
+        // Windowed layers store only the window.
+        (self.kv_bytes_per_token_per_layer() * self.attended_layer_positions(seq_len)) as u64
     }
 }
 
@@ -535,35 +514,6 @@ pub struct DeepseekV4Model {
 }
 
 impl DeepseekV4Model {
-    /// Distinct routed-expert weights that must be resident for a step over
-    /// `num_tokens` tokens, in params. Models expert loading as a uniform-
-    /// routing coupon-collector over `num_tokens × num_experts_per_tok` draws:
-    /// the expected number of distinct routed experts grows from the active
-    /// (single-token) footprint toward all-experts-resident as the batch grows.
-    /// This is what gives MoE its shallow intensity-vs-batch slope, distant
-    /// knee, and low-batch "expert tax". Falls back to the constant active
-    /// footprint when `num_routed_experts` is unset (0) or not above per-tok.
-    fn expert_params_resident_per_step(&self, num_tokens: u32) -> u64 {
-        let e = self.num_routed_experts;
-        let k = self.num_experts_per_tok;
-        if e <= k || num_tokens == 0 {
-            return self.num_active_expert_params;
-        }
-        let ef = e as f64;
-        let kf = k as f64;
-        // Per-routed-expert params `w` and always-resident shared params,
-        // recovered from the active (k routed + shared) and resident (all
-        // routed + shared) footprints: active = k·w + shared, resident = E·w + shared.
-        let w = (self
-            .num_resident_expert_params
-            .saturating_sub(self.num_active_expert_params) as f64)
-            / (ef - kf);
-        let shared = (self.num_active_expert_params as f64 - kf * w).max(0.0);
-        // Expected distinct routed experts hit by N tokens each routing to k.
-        let loaded = ef * (1.0 - (1.0 - 1.0 / ef).powf(num_tokens as f64 * kf));
-        (shared + loaded * w).round() as u64
-    }
-
     /// Per-token-per-layer KV bytes: latent + RoPE head, both at kv_precision.
     fn kv_bytes_per_token_per_layer(&self) -> f64 {
         (self.kv_latent_dim as f64 + self.qk_rope_head_dim as f64)
@@ -600,6 +550,44 @@ impl DeepseekV4Model {
             .unwrap_or(self.num_near_layers)
             .min(self.num_near_layers)
     }
+    /// Indexer KV bytes for a `seq_len`-token sequence: one entry per
+    /// compressed position per retained near layer, `index_head_dim` wide.
+    fn indexer_kv_bytes(&self, seq_len: u32) -> f64 {
+        self.indexer_layers() as f64
+            * self.near_compressed_positions(seq_len) as f64
+            * self.index_head_dim as f64
+            * self.index_kv_bytes_per_value()
+    }
+}
+
+impl MoeWeights for DeepseekV4Model {
+    fn active_expert_params(&self) -> u64 {
+        self.num_active_expert_params
+    }
+    fn active_non_expert_params(&self) -> u64 {
+        self.num_active_non_expert_params
+    }
+    fn resident_expert_params(&self) -> u64 {
+        self.num_resident_expert_params
+    }
+    fn resident_non_expert_params(&self) -> u64 {
+        self.num_resident_non_expert_params
+    }
+    fn experts_per_tok(&self) -> u32 {
+        self.num_experts_per_tok
+    }
+    fn routed_experts(&self) -> u32 {
+        self.num_routed_experts
+    }
+    fn moe_layers(&self) -> u32 {
+        self.num_moe_layers
+    }
+    fn expert_precision(&self) -> Precision {
+        self.expert_precision
+    }
+    fn non_expert_precision(&self) -> Precision {
+        self.non_expert_precision
+    }
 }
 
 impl ModelCosts for DeepseekV4Model {
@@ -616,22 +604,13 @@ impl ModelCosts for DeepseekV4Model {
         self.num_layers
     }
     fn alltoall_bytes_per_token(&self) -> u64 {
-        // Each token is dispatched to `num_experts_per_tok` experts; each
-        // dispatch sends one full hidden_dim-wide activation.
-        self.num_experts_per_tok as u64 * self.hidden_dim as u64 * self.activation_bytes() as u64
+        self.moe_alltoall_bytes_per_token(self.hidden_dim, self.activation_bytes())
     }
     fn num_ep_alltoalls_per_pass(&self) -> u32 {
-        // Dispatch + combine per MoE layer.
-        2 * self.num_moe_layers
+        self.moe_num_ep_alltoalls_per_pass()
     }
     fn matmul_flops_per_token_by_prec(&self) -> Vec<(Precision, u64)> {
-        vec![
-            (self.expert_precision, 2 * self.num_active_expert_params),
-            (
-                self.non_expert_precision,
-                2 * self.num_active_non_expert_params,
-            ),
-        ]
+        self.moe_matmul_flops_per_token_by_prec()
     }
     fn attention_flops(&self, s: u32, t: u32) -> u64 {
         let d = self.hidden_dim as u64;
@@ -647,9 +626,10 @@ impl ModelCosts for DeepseekV4Model {
         // Far layers attend the entire stride-compressed history.
         let far_flops = 4 * d * s * (self.num_far_layers as u64) * far_t;
 
-        // Indexer scoring on each near layer: scores every compressed candidate
-        // (t / near_ratio of them) with `index_n_heads` heads of `index_head_dim`.
-        // Per (query, candidate, head): 2 × index_head_dim FLOPs.
+        // Indexer scoring on each retained near layer: scores every
+        // compressed candidate (t / near_ratio of them) with `index_n_heads`
+        // heads of `index_head_dim`. Per (query, candidate, head):
+        // 2 × index_head_dim FLOPs.
         let indexer_candidates = self.near_compressed_positions(t) as u64;
         let indexer_flops = 2
             * (self.index_n_heads as u64)
@@ -669,62 +649,33 @@ impl ModelCosts for DeepseekV4Model {
         Precision::Bf16
     }
     fn weight_bytes_per_step_by_prec(&self, num_tokens: u32) -> Vec<(Precision, u64)> {
-        let exp_bytes = (self.expert_params_resident_per_step(num_tokens) as f64
-            * self.expert_precision.bytes_per_value()) as u64;
-        let non_exp_bytes = (self.num_active_non_expert_params as f64
-            * self.non_expert_precision.bytes_per_value()) as u64;
-        vec![
-            (self.expert_precision, exp_bytes),
-            (self.non_expert_precision, non_exp_bytes),
-        ]
+        self.moe_weight_bytes_per_step_by_prec(num_tokens)
     }
     fn kv_bytes_read_per_decode_step(&self, seq_len: u32) -> u64 {
         let per = self.kv_bytes_per_token_per_layer();
-        let win = self.window_attended(seq_len) as f64;
-        let near_compressed = self.near_compressed_attended(seq_len) as f64;
-        let far_compressed = self.far_compressed_attended(seq_len) as f64;
-
-        // Sliding window in every layer.
-        let window_total = self.num_layers as f64 * win;
-        // Near and far compressed history reads.
-        let near_total = self.num_near_layers as f64 * near_compressed;
-        let far_total = self.num_far_layers as f64 * far_compressed;
-
-        // Indexer reads its full compressed-position KV cache on every near
-        // layer to score candidates (head_dim_idx × bytes per position).
-        let indexer_per_position = self.index_head_dim as f64 * self.index_kv_bytes_per_value();
-        let indexer_total = self.indexer_layers() as f64
-            * self.near_compressed_positions(seq_len) as f64
-            * indexer_per_position;
-
-        (per * (window_total + near_total + far_total) + indexer_total) as u64
+        // Sliding window in every layer, plus near / far compressed reads.
+        let window_total = self.num_layers as f64 * self.window_attended(seq_len) as f64;
+        let near_total =
+            self.num_near_layers as f64 * self.near_compressed_attended(seq_len) as f64;
+        let far_total = self.num_far_layers as f64 * self.far_compressed_attended(seq_len) as f64;
+        // The indexer reads its full compressed-position KV on every retained
+        // near layer to score candidates.
+        (per * (window_total + near_total + far_total) + self.indexer_kv_bytes(seq_len)) as u64
     }
     fn weight_residency_bytes(&self) -> u64 {
-        let exp = self.num_resident_expert_params as f64 * self.expert_precision.bytes_per_value();
-        let non_exp = self.num_resident_non_expert_params as f64
-            * self.non_expert_precision.bytes_per_value();
-        (exp + non_exp) as u64
+        self.moe_weight_residency_bytes()
     }
     fn kv_storage_bytes(&self, seq_len: u32) -> u64 {
         let per = self.kv_bytes_per_token_per_layer();
         let win = self.window_attended(seq_len) as f64;
-
-        // Dense layers store only the rolling window.
+        // Dense layers store only the rolling window; near / far layers store
+        // the window plus every compressed position.
         let dense_total = self.num_dense_layers as f64 * win;
-        // Near layers store window + every compressed position.
         let near_total =
             self.num_near_layers as f64 * (win + self.near_compressed_positions(seq_len) as f64);
-        // Far layers store window + every (more aggressively) compressed position.
         let far_total =
             self.num_far_layers as f64 * (win + self.far_compressed_positions(seq_len) as f64);
-
-        // Indexer's auxiliary KV: one entry per compressed position, head_dim_idx wide.
-        let indexer_per_position = self.index_head_dim as f64 * self.index_kv_bytes_per_value();
-        let indexer_total = self.indexer_layers() as f64
-            * self.near_compressed_positions(seq_len) as f64
-            * indexer_per_position;
-
-        (per * (dense_total + near_total + far_total) + indexer_total) as u64
+        (per * (dense_total + near_total + far_total) + self.indexer_kv_bytes(seq_len)) as u64
     }
 }
 
@@ -811,27 +762,6 @@ pub struct Qwen35Model {
 }
 
 impl Qwen35Model {
-    /// Coupon-collector routed-expert loading, identical to the DeepSeek model:
-    /// distinct routed experts touched by `num_tokens × k` draws over a pool of
-    /// `E`, plus the always-resident shared expert. Falls back to the constant
-    /// active footprint when `num_routed_experts` is unset/≤ per-tok.
-    fn expert_params_resident_per_step(&self, num_tokens: u32) -> u64 {
-        let e = self.num_routed_experts;
-        let k = self.num_experts_per_tok;
-        if e <= k || num_tokens == 0 {
-            return self.num_active_expert_params;
-        }
-        let ef = e as f64;
-        let kf = k as f64;
-        let w = (self
-            .num_resident_expert_params
-            .saturating_sub(self.num_active_expert_params) as f64)
-            / (ef - kf);
-        let shared = (self.num_active_expert_params as f64 - kf * w).max(0.0);
-        let loaded = ef * (1.0 - (1.0 - 1.0 / ef).powf(num_tokens as f64 * kf));
-        (shared + loaded * w).round() as u64
-    }
-
     fn num_linear_layers(&self) -> u32 {
         self.num_layers.saturating_sub(self.num_attention_layers)
     }
@@ -839,9 +769,7 @@ impl Qwen35Model {
     /// KV bytes per token per *full-attention* layer (K and V, GQA), at
     /// `kv_precision`.
     fn attn_kv_bytes_per_token_per_layer(&self) -> f64 {
-        2.0 * self.num_kv_heads as f64
-            * self.attn_head_dim as f64
-            * self.kv_precision.bytes_per_value()
+        gqa_kv_bytes_per_token_per_layer(self.num_kv_heads, self.attn_head_dim, self.kv_precision)
     }
 
     /// Per-sequence bytes of GatedDeltaNet state across all linear layers,
@@ -857,6 +785,44 @@ impl Qwen35Model {
             + self.linear_num_value_heads as f64 * self.linear_value_head_dim as f64;
         let conv = self.linear_conv_kernel as f64 * conv_channels;
         self.num_linear_layers() as f64 * (recurrent + conv) * gdn_state_bytes_per_value()
+    }
+
+    /// Attention KV bytes of a `seq_len`-token sequence (full-attention
+    /// layers only; the linear layers hold `per_sequence_state_bytes`).
+    fn attn_kv_bytes(&self, seq_len: u32) -> u64 {
+        (self.attn_kv_bytes_per_token_per_layer()
+            * seq_len as f64
+            * self.num_attention_layers as f64) as u64
+    }
+}
+
+impl MoeWeights for Qwen35Model {
+    fn active_expert_params(&self) -> u64 {
+        self.num_active_expert_params
+    }
+    fn active_non_expert_params(&self) -> u64 {
+        self.num_active_non_expert_params
+    }
+    fn resident_expert_params(&self) -> u64 {
+        self.num_resident_expert_params
+    }
+    fn resident_non_expert_params(&self) -> u64 {
+        self.num_resident_non_expert_params
+    }
+    fn experts_per_tok(&self) -> u32 {
+        self.num_experts_per_tok
+    }
+    fn routed_experts(&self) -> u32 {
+        self.num_routed_experts
+    }
+    fn moe_layers(&self) -> u32 {
+        self.num_moe_layers
+    }
+    fn expert_precision(&self) -> Precision {
+        self.expert_precision
+    }
+    fn non_expert_precision(&self) -> Precision {
+        self.non_expert_precision
     }
 }
 
@@ -874,19 +840,13 @@ impl ModelCosts for Qwen35Model {
         self.num_layers
     }
     fn alltoall_bytes_per_token(&self) -> u64 {
-        self.num_experts_per_tok as u64 * self.hidden_dim as u64 * self.activation_bytes() as u64
+        self.moe_alltoall_bytes_per_token(self.hidden_dim, self.activation_bytes())
     }
     fn num_ep_alltoalls_per_pass(&self) -> u32 {
-        2 * self.num_moe_layers
+        self.moe_num_ep_alltoalls_per_pass()
     }
     fn matmul_flops_per_token_by_prec(&self) -> Vec<(Precision, u64)> {
-        vec![
-            (self.expert_precision, 2 * self.num_active_expert_params),
-            (
-                self.non_expert_precision,
-                2 * self.num_active_non_expert_params,
-            ),
-        ]
+        self.moe_matmul_flops_per_token_by_prec()
     }
     fn attention_flops(&self, s: u32, t: u32) -> u64 {
         // Only full-attention layers scale with context. 4·L_attn·(H·d)·S·T
@@ -899,31 +859,15 @@ impl ModelCosts for Qwen35Model {
         Precision::Bf16
     }
     fn weight_bytes_per_step_by_prec(&self, num_tokens: u32) -> Vec<(Precision, u64)> {
-        let exp_bytes = (self.expert_params_resident_per_step(num_tokens) as f64
-            * self.expert_precision.bytes_per_value()) as u64;
-        let non_exp_bytes = (self.num_active_non_expert_params as f64
-            * self.non_expert_precision.bytes_per_value()) as u64;
-        vec![
-            (self.expert_precision, exp_bytes),
-            (self.non_expert_precision, non_exp_bytes),
-        ]
+        self.moe_weight_bytes_per_step_by_prec(num_tokens)
     }
     fn kv_bytes_read_per_decode_step(&self, seq_len: u32) -> u64 {
-        // seq_len==0 is the cascade shared-prefix probe: return 0 so the constant
-        // linear-state term isn't added spuriously (cascade for GDN unmodeled).
-        if seq_len == 0 {
-            return 0;
-        }
-        let attn = self.attn_kv_bytes_per_token_per_layer()
-            * seq_len as f64
-            * self.num_attention_layers as f64;
-        (attn + self.linear_state_bytes_per_seq()) as u64
+        // Attention KV only; the GatedDeltaNet state read is the
+        // per-sequence term the engine charges once per sequence.
+        self.attn_kv_bytes(seq_len)
     }
     fn weight_residency_bytes(&self) -> u64 {
-        let exp = self.num_resident_expert_params as f64 * self.expert_precision.bytes_per_value();
-        let non_exp = self.num_resident_non_expert_params as f64
-            * self.non_expert_precision.bytes_per_value();
-        (exp + non_exp) as u64
+        self.moe_weight_residency_bytes()
     }
     fn per_sequence_state_bytes(&self) -> u64 {
         // The GatedDeltaNet recurrent + conv state across all linear layers,
@@ -931,16 +875,9 @@ impl ModelCosts for Qwen35Model {
         self.linear_state_bytes_per_seq() as u64
     }
     fn kv_storage_bytes(&self, seq_len: u32) -> u64 {
-        // CAPACITY/admission only. The scheduler's block allocator reads this as a
-        // per-token rate (`kv_storage_bytes(1) × seq_len`), so it MUST be linear in
-        // seq_len. Only the full-attention layers' growing KV is block-allocated;
-        // the GatedDeltaNet recurrent state is a fixed per-sequence allocation the
-        // per-token block model can't express, so it's omitted here (a small,
-        // bounded under-count of occupancy). It IS charged in the decode *bandwidth*
-        // via kv_bytes_read_per_decode_step, which is where it affects step time.
-        (self.attn_kv_bytes_per_token_per_layer()
-            * seq_len as f64
-            * self.num_attention_layers as f64) as u64
+        // Only the full-attention layers' growing KV; the fixed GDN state is
+        // `per_sequence_state_bytes`.
+        self.attn_kv_bytes(seq_len)
     }
 }
 

@@ -901,15 +901,14 @@ impl Engine {
             };
             Some(t_dec + t_pre)
         });
-        let iter_time =
-            measured_time.unwrap_or_else(|| ce.calculate_iteration_time(batch_refs, cost_tokens));
+        let cost = ce.step_cost(batch_refs, cost_tokens);
+        let iter_time = measured_time.unwrap_or(cost.time);
         let iter_time = match correction {
             Some((alpha, beta)) => alpha * iter_time + beta,
             None => iter_time,
         };
-        let bytes = ce.calculate_bytes_transferred(batch_refs, cost_tokens);
-        let bw = ce.calculate_bandwidth_utilization(bytes, iter_time);
-        let flops = ce.calculate_flops_utilization(batch_refs, cost_tokens, iter_time);
+        let bw = ce.bandwidth_utilization(&cost, iter_time);
+        let flops = ce.flops_utilization(&cost, iter_time);
         (iter_time, measured_time.is_some(), bw, flops)
     }
 

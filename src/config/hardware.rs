@@ -32,6 +32,27 @@ pub enum Precision {
 }
 
 impl Precision {
+    /// Every precision, in `index()` order.
+    pub const ALL: [Precision; 5] = [
+        Precision::Fp4,
+        Precision::Fp8,
+        Precision::Bf16,
+        Precision::Fp16,
+        Precision::Fp32,
+    ];
+    pub const COUNT: usize = Self::ALL.len();
+
+    /// Dense index for per-precision tables.
+    pub fn index(self) -> usize {
+        match self {
+            Precision::Fp4 => 0,
+            Precision::Fp8 => 1,
+            Precision::Bf16 => 2,
+            Precision::Fp16 => 3,
+            Precision::Fp32 => 4,
+        }
+    }
+
     /// Bytes-per-value at this precision. FP4 is sub-byte; we model it as 0.5
     /// because fractional bytes only ever appear weighted by parameter counts
     /// of order 1e9+ — the rounding loss is negligible.
