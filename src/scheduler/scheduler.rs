@@ -33,18 +33,16 @@ pub struct Scheduler {
 }
 
 impl Scheduler {
-    pub fn new(config: SchedulerConfig, kv_cache_manager: KVCacheManager) -> Result<Self, String> {
-        let policy = config.policy.parse::<SchedulingPolicy>()?;
-
-        Ok(Self {
+    pub fn new(config: SchedulerConfig, kv_cache_manager: KVCacheManager) -> Self {
+        Self {
+            policy: config.policy,
             config,
             waiting: VecDeque::new(),
             running: Vec::new(),
             pending_transfers: Vec::new(),
-            policy,
             kv_cache_manager,
             num_preemptions: 0,
-        })
+        }
     }
 
     /// Promote any pending KV-transfer requests whose transfer has finished
@@ -506,7 +504,7 @@ mod tests {
     }
 
     fn scheduler_from(config: Config, kv: KVCacheManager) -> Scheduler {
-        Scheduler::new(config.scheduler, kv).unwrap()
+        Scheduler::new(config.scheduler, kv)
     }
 
     fn create_test_scheduler() -> Scheduler {
@@ -517,7 +515,7 @@ mod tests {
 
     fn create_scheduler_with_policy(policy: &str) -> Scheduler {
         let mut config = Config::test_default();
-        config.scheduler.policy = policy.to_string();
+        config.scheduler.policy = policy.parse().unwrap();
         let kv = kv_manager(&config, config.hardware.kv_cache_capacity, false);
         scheduler_from(config, kv)
     }
@@ -526,7 +524,7 @@ mod tests {
     /// prefix caching).
     fn scheduler_with_blocks(policy: &str, blocks: u64) -> Scheduler {
         let mut config = Config::test_default();
-        config.scheduler.policy = policy.to_string();
+        config.scheduler.policy = policy.parse().unwrap();
         let per_block = config.model.kv_storage_bytes(config.scheduler.block_size);
         let kv = kv_manager(&config, blocks * per_block, false);
         scheduler_from(config, kv)

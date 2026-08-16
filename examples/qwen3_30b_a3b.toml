@@ -44,6 +44,3 @@ std_dev = 0.5      # Less variation for consistent sizing
 type = "lognormal"
 mean = 8.60        # ln(5431) tokens
 std_dev = 0.4      # Low variation for consistent sizing
-
-[simulation]
-log_interval = 5 # Log every 5 iterations

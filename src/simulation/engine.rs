@@ -88,16 +88,11 @@ impl Worker {
         )
         .with_tiers(&cluster.hardware.kv_tiers);
 
-        let scheduler = Scheduler::new(scheduler_config.clone(), kv_cache_manager)?;
-        let mut compute_engine =
-            ComputeEngine::new(cluster.hardware.clone(), cluster.parallel.clone(), model)
-                .with_cascade_attention(
-                    scheduler_config.enable_cascade_attention,
-                    scheduler_config.block_size,
-                );
-        if let Some(comms) = cluster.comms {
-            compute_engine = compute_engine.with_comms(comms);
-        }
+        let scheduler = Scheduler::new(scheduler_config.clone(), kv_cache_manager);
+        let compute_engine = cluster.compute_engine(model).with_cascade_attention(
+            scheduler_config.enable_cascade_attention,
+            scheduler_config.block_size,
+        );
         Ok(Self {
             scheduler,
             compute_engine,

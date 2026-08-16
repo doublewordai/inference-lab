@@ -31,6 +31,7 @@ impl ArrivalPattern {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkloadConfig {
     /// Path to dataset file (JSONL in OpenAI batch API format)
     /// If provided, dataset mode is used instead of synthetic workload
@@ -80,7 +81,7 @@ pub struct WorkloadConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type")]
+#[serde(tag = "type", deny_unknown_fields)]
 pub enum LengthDistribution {
     #[serde(rename = "fixed")]
     Fixed { value: u32 },
@@ -98,7 +99,7 @@ pub enum LengthDistribution {
 /// Time-varying arrival rate λ(t), requests/sec. Set on the workload to drive
 /// the open-loop arrival process through changing load within a single run.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type")]
+#[serde(tag = "type", deny_unknown_fields)]
 pub enum RateSchedule {
     /// Sinusoid between `min` and `max`, starting in the trough at t=0 and
     /// peaking at half-period.

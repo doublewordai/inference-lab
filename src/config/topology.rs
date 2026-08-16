@@ -6,7 +6,8 @@
 
 use serde::Deserialize;
 
-use super::{CommsConfig, HardwareConfig, ParallelConfig};
+use super::{CommsConfig, HardwareConfig, ModelConfig, ParallelConfig};
+use crate::compute::ComputeEngine;
 
 /// A worker pool: one or more identically-shaped workers running the same
 /// hardware spec and parallelism layout.
@@ -42,6 +43,16 @@ impl ClusterSpec {
         self.hardware
             .memory_capacity
             .saturating_mul(self.parallel.tp as u64)
+    }
+
+    /// The roofline cost model for `model` on this cluster (its hardware,
+    /// parallel layout and, when configured, collective comms).
+    pub fn compute_engine(&self, model: ModelConfig) -> ComputeEngine {
+        let mut engine = ComputeEngine::new(self.hardware.clone(), self.parallel.clone(), model);
+        if let Some(comms) = self.comms.clone() {
+            engine = engine.with_comms(comms);
+        }
+        engine
     }
 
     /// Fill in `hardware.kv_cache_capacity` from `aggregate_memory_capacity *

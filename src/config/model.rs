@@ -1,4 +1,4 @@
-use crate::config::{HardwareConfig, Precision};
+use crate::config::Precision;
 use serde::Deserialize;
 
 /// Architecture-agnostic cost model. Every consumer in the simulator goes
@@ -115,12 +115,6 @@ pub enum ModelConfig {
     Sliding(SlidingWindowModel),
     DeepseekV4(DeepseekV4Model),
     Qwen35(Qwen35Model),
-}
-
-impl ModelConfig {
-    /// Fill in any fields defaulted from hardware. Currently a no-op for all
-    /// variants — kept as a hook for future architecture additions.
-    pub fn finalize(&mut self, _hardware: &HardwareConfig) {}
 }
 
 impl ModelCosts for ModelConfig {
@@ -255,6 +249,7 @@ fn default_precision() -> Precision {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DenseModel {
     pub name: String,
     pub num_parameters: u64,
@@ -336,6 +331,7 @@ impl ModelCosts for DenseModel {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SlidingWindowModel {
     pub name: String,
     pub num_parameters: u64,
@@ -460,6 +456,7 @@ fn default_non_expert_precision() -> Precision {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeepseekV4Model {
     pub name: String,
     pub num_layers: u32,
@@ -511,6 +508,13 @@ pub struct DeepseekV4Model {
     pub index_n_heads: u32,
     /// Indexer scoring head dim (per near layer).
     pub index_head_dim: u32,
+    /// Number of near layers whose indexer computes and stores its own
+    /// top-k scores; the remaining near layers reuse a neighbour's (GLM-5.2's
+    /// "shared" indexers). Defaults to all near layers (standard DSA). Only
+    /// the indexer scoring FLOPs and indexer KV scale with this; the sparse
+    /// attention reads themselves are unchanged.
+    #[serde(default)]
+    pub indexer_retained_layers: Option<u32>,
     /// Precision of indexer KV. Defaults to `kv_precision` if unset.
     #[serde(default)]
     pub index_kv_precision: Option<Precision>,
@@ -590,6 +594,12 @@ impl DeepseekV4Model {
     fn far_compressed_positions(&self, seq_len: u32) -> u32 {
         seq_len / self.far_compress_ratio
     }
+    /// Near layers that run their own indexer.
+    fn indexer_layers(&self) -> u32 {
+        self.indexer_retained_layers
+            .unwrap_or(self.num_near_layers)
+            .min(self.num_near_layers)
+    }
 }
 
 impl ModelCosts for DeepseekV4Model {
@@ -645,7 +655,7 @@ impl ModelCosts for DeepseekV4Model {
             * (self.index_n_heads as u64)
             * (self.index_head_dim as u64)
             * s
-            * (self.num_near_layers as u64)
+            * (self.indexer_layers() as u64)
             * indexer_candidates;
 
         window_flops + near_flops + far_flops + indexer_flops
@@ -683,7 +693,7 @@ impl ModelCosts for DeepseekV4Model {
         // Indexer reads its full compressed-position KV cache on every near
         // layer to score candidates (head_dim_idx × bytes per position).
         let indexer_per_position = self.index_head_dim as f64 * self.index_kv_bytes_per_value();
-        let indexer_total = self.num_near_layers as f64
+        let indexer_total = self.indexer_layers() as f64
             * self.near_compressed_positions(seq_len) as f64
             * indexer_per_position;
 
@@ -710,7 +720,7 @@ impl ModelCosts for DeepseekV4Model {
 
         // Indexer's auxiliary KV: one entry per compressed position, head_dim_idx wide.
         let indexer_per_position = self.index_head_dim as f64 * self.index_kv_bytes_per_value();
-        let indexer_total = self.num_near_layers as f64
+        let indexer_total = self.indexer_layers() as f64
             * self.near_compressed_positions(seq_len) as f64
             * indexer_per_position;
 
@@ -753,6 +763,7 @@ fn gdn_state_bytes_per_value() -> f64 {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Qwen35Model {
     pub name: String,
     pub num_layers: u32,

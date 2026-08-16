@@ -42,6 +42,3 @@ std_dev = 0.5
 type = "lognormal"
 mean = 5
 std_dev = 0.5
-
-[simulation]
-log_interval = 5

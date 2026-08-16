@@ -13,6 +13,7 @@ use inference_lab::config::{
 use inference_lab::kv_cache::KVCacheManager;
 use inference_lab::request::Request;
 use inference_lab::scheduler::Scheduler;
+use inference_lab::scheduler::SchedulingPolicy;
 
 fn run_for_batch(num_concurrent: usize, share_prefix: bool) -> Vec<f64> {
     let hardware = HardwareConfig {
@@ -50,7 +51,7 @@ fn run_for_batch(num_concurrent: usize, share_prefix: bool) -> Vec<f64> {
     let scheduler_cfg = SchedulerConfig {
         max_num_batched_tokens: 8192,
         max_num_seqs: 256,
-        policy: "fcfs".into(),
+        policy: SchedulingPolicy::FCFS,
         enable_chunked_prefill: true,
         long_prefill_token_threshold: 0,
         max_num_partial_prefills: 1,
@@ -114,7 +115,7 @@ fn run_for_batch(num_concurrent: usize, share_prefix: bool) -> Vec<f64> {
         mgr.free_blocks(&churn_blocks_alloc);
     }
 
-    let mut scheduler = Scheduler::new(config_scheduler, kv_cache_manager).unwrap();
+    let mut scheduler = Scheduler::new(config_scheduler, kv_cache_manager);
 
     for i in 0..num_concurrent {
         let mut req = Request::new(

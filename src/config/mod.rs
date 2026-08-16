@@ -2,7 +2,6 @@ pub mod hardware;
 pub mod model;
 pub mod parallel;
 pub mod scheduler;
-pub mod simulation;
 pub mod speculative;
 pub mod topology;
 pub mod workload;
@@ -11,7 +10,6 @@ pub use hardware::{HardwareConfig, KVTier, Precision};
 pub use model::{DeepseekV4Model, DenseModel, ModelConfig, ModelCosts, SlidingWindowModel};
 pub use parallel::{CommsConfig, ParallelConfig};
 pub use scheduler::SchedulerConfig;
-pub use simulation::SimulationConfig;
 pub use speculative::{
     AcceptanceModel, DrafterCost, GammaPolicy, MeasuredCostConfig, SpeculativeConfig,
     SwitchConstraints, TraceBank, TraceRound,
@@ -19,12 +17,15 @@ pub use speculative::{
 pub use topology::{ClusterSpec, DisaggTopology};
 pub use workload::{ArrivalPattern, LengthDistribution, RateSchedule, WorkloadConfig};
 
+#[cfg(test)]
+use crate::scheduler::SchedulingPolicy;
 use serde::Deserialize;
 use std::fs;
 use std::path::Path;
 
 /// Top-level configuration that aggregates all sub-configs
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     pub hardware: HardwareConfig,
     #[serde(default)]
@@ -32,8 +33,6 @@ pub struct Config {
     pub model: ModelConfig,
     pub scheduler: SchedulerConfig,
     pub workload: WorkloadConfig,
-    #[serde(default)]
-    pub simulation: SimulationConfig,
     /// Optional speculative decoding. When set, decode steps verify `gamma + 1`
     /// tokens and advance by `accepted + 1` per the acceptance model.
     #[serde(default)]
@@ -101,7 +100,7 @@ impl Config {
         let mut scheduler = SchedulerConfig {
             max_num_batched_tokens: 2048,
             max_num_seqs: 128,
-            policy: "fcfs".to_string(),
+            policy: SchedulingPolicy::FCFS,
             enable_chunked_prefill: true,
             long_prefill_token_threshold: 0,
             max_num_partial_prefills: 1,
@@ -125,15 +124,12 @@ impl Config {
             closed_loop_jitter_secs: None,
         };
 
-        let simulation = SimulationConfig::default();
-
         Config {
             hardware,
             parallel,
             model,
             scheduler,
             workload,
-            simulation,
             speculative: None,
         }
     }
@@ -162,6 +158,37 @@ mod tests {
         // For seq_len=100: 52,428,800.
         assert_eq!(model.kv_storage_bytes(100), 52_428_800);
         assert_eq!(model.kv_bytes_read_per_decode_step(100), 52_428_800);
+    }
+
+    /// Every TOML shipped under configs/ and examples/ must parse under the
+    /// current schema (unknown fields are rejected, so this catches drift).
+    #[test]
+    fn shipped_configs_parse() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut paths = Vec::new();
+        for dir in ["configs", "configs/estate", "examples"] {
+            let Ok(entries) = fs::read_dir(root.join(dir)) else {
+                continue;
+            };
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.extension().and_then(|x| x.to_str()) == Some("toml") {
+                    paths.push(p);
+                }
+            }
+        }
+        assert!(!paths.is_empty(), "no configs found");
+        let mut failures = Vec::new();
+        for p in &paths {
+            if let Err(e) = Config::from_file(p) {
+                failures.push(format!("{}: {e}", p.display()));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "configs failed to parse:\n{}",
+            failures.join("\n")
+        );
     }
 
     #[test]

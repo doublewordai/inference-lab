@@ -25,8 +25,9 @@
 use inference_lab::config::{
     AcceptanceModel, ArrivalPattern, Config, DeepseekV4Model, DrafterCost, GammaPolicy,
     HardwareConfig, LengthDistribution, ModelConfig, ParallelConfig, Precision, SchedulerConfig,
-    SimulationConfig, SpeculativeConfig, WorkloadConfig,
+    SpeculativeConfig, WorkloadConfig,
 };
+use inference_lab::scheduler::SchedulingPolicy;
 use inference_lab::simulation::Simulator;
 
 fn b200_per_gpu() -> HardwareConfig {
@@ -77,6 +78,7 @@ fn deepseek_v4_flash() -> ModelConfig {
         index_topk: 512,
         index_n_heads: 64,
         index_head_dim: 128,
+        indexer_retained_layers: None,
         index_kv_precision: None,
         num_experts_per_tok: 6,
         num_routed_experts: 256,
@@ -102,7 +104,7 @@ fn base_config(conc: usize, isl: u32, osl: u32) -> Config {
             long_prefill_token_threshold: 0,
             max_num_partial_prefills: 1,
             block_size: 64,
-            policy: "fcfs".into(),
+            policy: SchedulingPolicy::FCFS,
             enable_preemption_free: true,
             enable_cascade_attention: false,
         },
@@ -122,7 +124,6 @@ fn base_config(conc: usize, isl: u32, osl: u32) -> Config {
             duration_secs: None,
             seed: 7,
         },
-        simulation: SimulationConfig::default(),
         speculative: None,
     }
 }

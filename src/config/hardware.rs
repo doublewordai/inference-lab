@@ -9,6 +9,7 @@ fn default_gpu_memory_utilization() -> f64 {
 /// HBM. HBM itself is implicit (driven by `kv_cache_capacity`); tiers in
 /// this list represent host RAM, NVMe, remote storage, and so on.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct KVTier {
     /// Human-readable tier name (e.g. "host_ram", "nvme").
     pub name: String,
@@ -48,6 +49,7 @@ impl Precision {
 /// `ParallelConfig`; aggregate cluster figures are computed by
 /// `ClusterSpec`'s helpers.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HardwareConfig {
     /// Accelerator name (e.g., "H100", "A100").
     pub name: String,

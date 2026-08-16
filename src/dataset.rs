@@ -3,14 +3,10 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Lines};
 use std::path::Path;
 
-/// A tokenizer function that takes either chat messages or a raw prompt and returns tokenized output.
-/// This allows different implementations (tiktoken, transformers.js, etc.)
-/// to be passed in from the CLI or WASM interface.
-/// The tokenizer should apply the appropriate chat template for chat-style requests.
-pub type TokenizerFn = Box<dyn Fn(&PromptInput) -> Result<Vec<u32>, String> + Send + Sync>;
-
-/// A batch tokenizer function that takes multiple prompt inputs and returns multiple token vectors.
-/// This is much faster than tokenizing one at a time.
+/// A batch tokenizer: takes prompt inputs (chat messages or raw prompts)
+/// and returns one token vector each. Supplied by the CLI (HF tokenizers +
+/// chat template); the tokenizer should apply the chat template itself for
+/// chat-style requests.
 pub type BatchTokenizerFn = Box<dyn Fn(&[PromptInput]) -> Result<Vec<Vec<u32>>, String> + Send>;
 
 /// OpenAI Batch API format - JSONL entries

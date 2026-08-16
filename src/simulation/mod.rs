@@ -165,6 +165,7 @@ mod tests {
         MeasuredCostConfig, ModelConfig, ModelCosts, ParallelConfig, Precision, SchedulerConfig,
         SpeculativeConfig,
     };
+    use crate::scheduler::SchedulingPolicy;
 
     fn small_dense_parts() -> (ClusterSpec, ModelConfig, SchedulerConfig) {
         let hardware = HardwareConfig {
@@ -198,7 +199,7 @@ mod tests {
             long_prefill_token_threshold: 0,
             max_num_partial_prefills: 1,
             block_size: 16,
-            policy: "fcfs".into(),
+            policy: SchedulingPolicy::FCFS,
             enable_preemption_free: false,
             enable_cascade_attention: false,
         };

@@ -4,7 +4,7 @@ use serde::Deserialize;
 /// How the target accepts a draft. The acceptance model is the knob you vary to
 /// study the simulated benefit of speculation under different draft qualities.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AcceptanceModel {
     /// i.i.d. per-position acceptance probability `alpha`. The classic Leviathan
     /// model: E[accepted] = (1 - alpha^(gamma+1)) / (1 - alpha) - 1 over the
@@ -184,6 +184,7 @@ pub enum GammaPolicy {
 /// `batch_size,num_draft_tokens,step_seconds`, one row per measured grid
 /// point. See [`crate::compute::MeasuredCostTable`].
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeasuredCostConfig {
     pub path: String,
     /// Mean KV length (tokens of context per sequence) at which the table's
@@ -204,6 +205,7 @@ pub struct MeasuredCostConfig {
 /// Defaults are fully unconstrained (the raw aggregated gate, bit-identical
 /// to the policy without this struct).
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SwitchConstraints {
     /// Re-evaluate the batch width only every this-many decode rounds
     /// (0 or 1 = every round). Between re-evaluations the previous width
@@ -233,7 +235,7 @@ impl SwitchConstraints {
 /// only difference is how many times that sweep is paid for a draft of `gamma`.
 /// See the drafter-roofline section of the post.
 #[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum DrafterCost {
     /// Legacy scalar: overhead = `frac · gamma · verify_cost`. Reproduces the old
     /// multiplicative `(1 + frac·gamma)` exactly when added to the verify cost.

@@ -1,6 +1,8 @@
+use crate::scheduler::SchedulingPolicy;
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SchedulerConfig {
     /// Maximum number of tokens processed in a single iteration
     pub max_num_batched_tokens: u32,
@@ -8,8 +10,8 @@ pub struct SchedulerConfig {
     /// Maximum number of sequences that can run concurrently
     pub max_num_seqs: u32,
 
-    /// Scheduling policy: "fcfs" or "priority"
-    pub policy: String,
+    /// Scheduling policy: "fcfs", "priority", or a length-based variant.
+    pub policy: SchedulingPolicy,
 
     /// Enable chunked prefilling
     pub enable_chunked_prefill: bool,
@@ -19,8 +21,10 @@ pub struct SchedulerConfig {
     #[serde(default)]
     pub long_prefill_token_threshold: u32,
 
-    /// Maximum number of sequences that can be partially prefilled concurrently (vLLM default: 1)
-    /// This limits how many NEW waiting requests can start prefilling per iteration
+    /// vLLM's `max_num_partial_prefills`. Only its effect on the default
+    /// `long_prefill_token_threshold` is modelled: as in vLLM's config
+    /// post-init, a value above 1 with no explicit threshold sets the
+    /// threshold to 4% of the model's max sequence length.
     #[serde(default = "default_max_num_partial_prefills")]
     pub max_num_partial_prefills: u32,
 

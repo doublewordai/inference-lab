@@ -46,6 +46,3 @@ output_len_dist = { type = "lognormal", mean = 5.3, std_dev = 0.8 }
 
 # Random seed for reproducibility
 seed = 42
-
-[simulation]
-log_interval = 10

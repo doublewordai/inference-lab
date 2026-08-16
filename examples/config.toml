@@ -40,6 +40,3 @@ std_dev = 0.7     # ~2x variation
 type = "lognormal"
 mean = 5.3        # ln(200) ≈ 5.3, median ~200 tokens
 std_dev = 0.8     # Heavier tail for outputs
-
-[simulation]
-log_interval = 5 # Log every 5 iterations
