@@ -32,7 +32,7 @@ enum Drafter {
 impl Drafter {
     fn label(&self) -> &'static str {
         match self {
-            Drafter::Mtp => "MTP (autoregressive, D=8)",
+            Drafter::Mtp => "MTP (autoregressive, D=16)",
             Drafter::Dflash => "DFlash (block-parallel, D=16)",
         }
     }
@@ -65,7 +65,7 @@ impl Drafter {
     }
     fn gamma_max(&self) -> u32 {
         match self {
-            Drafter::Mtp => 8,
+            Drafter::Mtp => 16,
             Drafter::Dflash => 16,
         }
     }

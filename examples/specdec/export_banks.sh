@@ -13,7 +13,7 @@ out="$repo_root/data/banks"
 
 if [[ ! -d "$src/mtp/acceptance" ]]; then
   echo "base data not found under $src" >&2
-  echo "pull it first:  hf download Doubleword/qwen3.6-specdec-calibration --repo-type dataset --local-dir data/" >&2
+  echo "pull it first:  hf download Doubleword/specdec-calibration --repo-type dataset --local-dir data/" >&2
   exit 1
 fi
 
