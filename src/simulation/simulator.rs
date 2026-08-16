@@ -2,7 +2,7 @@
 //! and a [`MetricsCollector`], pumping events to completion. This is what
 //! `Commands::Sim` (CLI) and the WASM entry points drive.
 //!
-//! For real-time HTTP serving, see [`crate::serve::engine`] — same `Engine`,
+//! For real-time HTTP serving, see `crate::serve::engine` — same `Engine`,
 //! different driver.
 
 use super::engine::{Engine, IterationInfo, RequestTiming, StepKind, Topology};

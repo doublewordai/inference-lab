@@ -351,8 +351,8 @@ impl KVCacheManager {
         }
     }
 
-    /// Try to allocate blocks for a request.
-    /// Returns Some(Vec<BlockId>) if successful, None if insufficient blocks.
+    /// Allocate the blocks `request` needs to grow by `num_tokens` positions.
+    /// `None` if there are not enough free blocks.
     pub fn allocate_blocks(&mut self, request: &Request, num_tokens: u32) -> Option<Vec<BlockId>> {
         self.allocate_blocks_inner(request, num_tokens, /*publish_to_hbm=*/ true)
     }

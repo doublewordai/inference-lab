@@ -47,7 +47,7 @@ pub struct LatencySamples<'a> {
 }
 
 /// Position up to which a consumer has already seen each series; use with
-/// [`MetricsCollector::latency_samples_since`] to stream only new samples.
+/// [`MetricsCollector::samples_since`] to stream only new samples.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SampleCursor {
     ttft: usize,

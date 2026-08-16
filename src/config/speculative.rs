@@ -7,7 +7,7 @@ use serde::Deserialize;
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AcceptanceModel {
     /// i.i.d. per-position acceptance probability `alpha`. The classic Leviathan
-    /// model: E[accepted] = (1 - alpha^(gamma+1)) / (1 - alpha) - 1 over the
+    /// model: `E[accepted] = (1 - alpha^(gamma+1)) / (1 - alpha) - 1` over the
     /// draft, geometric in depth.
     Constant { alpha: f64 },
     /// Empirical per-position conditional acceptance `a[d]` = P(accept the draft

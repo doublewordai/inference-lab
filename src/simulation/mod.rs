@@ -2,7 +2,7 @@
 //! over a [`Topology`] of worker pools and inter-pool links; drivers above it
 //! pump events through `next_event_time` / `submit` / `step`. Three drivers
 //! exist:
-//!   * [`Simulator`] — synchronous batch sim driving a [`RequestGenerator`]
+//!   * [`Simulator`] — synchronous batch sim driving a `RequestGenerator`
 //!     against the engine. CLI and WASM use this.
 //!   * `crate::serve::engine::RealtimeEngine` — async driver that turns
 //!     external HTTP requests into engine submissions and paces wall-clock
