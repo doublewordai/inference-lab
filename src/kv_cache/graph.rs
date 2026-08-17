@@ -1762,6 +1762,49 @@ bandwidth = 900
     }
 
     #[test]
+    fn a_pinned_peer_fetch_preserves_session_free_runs_during_sibling_eviction() {
+        let (_graph, mut managers) = peer_managers(2, 2, 3, true);
+
+        // A closed-loop session first frees a three-block step, then re-enters
+        // and frees its shorter two-block prefix. The source HBM consequently
+        // has adjacent free runs with different recency stamps.
+        let mut long_step = request("long", &[1, 2, 3]);
+        managers[0].allocate_blocks(&mut long_step, 3).unwrap();
+        managers[0].free_request(&mut long_step);
+        let mut short_step = request("short", &[1, 2]);
+        managers[0].allocate_blocks(&mut short_step, 2).unwrap();
+        managers[0].free_request(&mut short_step);
+
+        // A sibling promotes the first block. The source may still recycle
+        // the unpinned suffix while that fetch is in flight.
+        let mut fetch = request("fetch", &[1]);
+        let lookup = managers[1].peek_prefix_cache(&fetch);
+        assert_eq!(lookup.total_cached_tokens, 1);
+        assert_eq!(lookup.tier_spans[0].source, TierSource::PeerHbm(0));
+        fetch.num_cached_tokens = 1;
+        managers[1]
+            .reserve_blocks_for_transfer(&mut fetch, 1)
+            .unwrap();
+        managers[1].start_transfer("fetch".into(), &lookup, &[1], 0.0);
+
+        let mut first_replacement = request("replace-1", &[9]);
+        managers[0]
+            .allocate_blocks(&mut first_replacement, 1)
+            .expect("the unpinned session suffix remains evictable");
+
+        let done = managers[1].advance_transfers(1.0).unwrap();
+        assert_eq!(done.get("fetch"), Some(&1));
+
+        // Once the pin drains, the two remaining session blocks are both
+        // ordinary eviction candidates. Their order must not retain an
+        // overlapping/stale run after the first sibling eviction.
+        let mut second_replacement = request("replace-2", &[10, 11]);
+        managers[0]
+            .allocate_blocks(&mut second_replacement, 2)
+            .expect("source eviction order remains consistent after unpin");
+    }
+
+    #[test]
     fn an_unpinned_evicted_source_partially_lands_and_recomputes() {
         let (graph, mut managers) = peer_managers(2, 2, 2, false);
         let mut source = request("source", &[1, 2]);
