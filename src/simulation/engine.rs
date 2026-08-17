@@ -1143,22 +1143,9 @@ impl Engine {
             if has_work {
                 self.maybe_wake_worker(pool, worker, now);
             }
-        } else if let Some(ready) = {
-            let p = &self.topology.pools[pool];
-            p.members_of(worker)
-                .iter()
-                .filter_map(|&m| p.workers[m].scheduler.earliest_pending_ready(now))
-                .min_by(f64::total_cmp)
-        } {
-            // Nothing ran, but a request is parked on a KV tier promotion.
-            // Its `ready_at` is the estimate made when it parked; the
-            // memory graph's `FlowDrain` wakes this worker when the
-            // promotion actually completes, so a stale estimate that has
-            // already passed is left to that (re-arming at `now` would spin).
-            if ready > now {
-                self.maybe_wake_worker(pool, worker, ready);
-            }
         }
+        // Requests parked on a KV promotion need no timer: the memory
+        // graph's `FlowDrain` wakes this group when the transfer completes.
         // Arm each member's next prefetch plan as its own event, so it
         // fires whether or not the group is busy then.
         let members: Vec<usize> = self.topology.pools[pool].members_of(worker).to_vec();
