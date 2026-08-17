@@ -134,7 +134,8 @@ impl Worker {
             }
         };
         let scheduler = Scheduler::new(scheduler_config.clone(), kv_cache_manager)
-            .with_source(policies.source, recompute);
+            .with_source(policies.source, recompute)
+            .with_prefetch(policies.prefetch);
         Ok(Self {
             scheduler,
             compute_engine,
@@ -988,10 +989,13 @@ impl Engine {
             if w.scheduler.num_running() > 0 || w.scheduler.num_waiting() > 0 {
                 self.maybe_wake_worker(pool, worker, now);
             }
-        } else if let Some(ready) = self.topology.pools[pool].workers[worker]
-            .scheduler
-            .earliest_pending_ready()
-        {
+        } else if let Some(ready) = {
+            let s = &self.topology.pools[pool].workers[worker].scheduler;
+            match (s.earliest_pending_ready(), s.next_prefetch_at()) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            }
+        } {
             // Nothing ran, but a request is parked on a KV tier promotion.
             // Its `ready_at` is the estimate made when it parked; the
             // memory graph's `FlowDrain` wakes this worker when the

@@ -316,6 +316,8 @@ impl MetricsCollector {
                 mean_hit_size: prefix_cache.mean_hit_size(),
                 recomputed: prefix_cache.recomputed,
                 recomputed_tokens: prefix_cache.recomputed_tokens,
+                prefetches: prefix_cache.prefetches,
+                prefetch_tokens: prefix_cache.prefetch_tokens,
             },
             router,
             decode_router,

@@ -267,8 +267,12 @@ can promote. A worker wider than a node pools the node stores it spans.
 ```toml
 [memory]
 tiers = ["host_dram", "nvme"]
-write = { policy = "write_back" }              # write_back | write_through | selective
-eviction = { policy = "fifo" }                 # fifo | lru | ttl
+preset = "reactive"                            # reactive | oracle (optional bundle)
+source = { policy = "promote" }                # promote | min_time
+hbm_eviction = { policy = "lru" }              # lru | outlook
+write = { policy = "write_back" }              # write_back | write_through | selective | live
+eviction = { policy = "fifo" }                 # fifo | lru | ttl | outlook
+prefetch = { policy = "none" }                 # none | outlook
 hbm_evict_backed_first = false
 [memory.capacity]
 host_dram = 1.0e12          # bytes per instance given to KV
@@ -278,9 +282,22 @@ host_dram = 1.0e12          # bytes per instance given to KV
 |-------|------|---------|-------------|
 | `tiers` | Array | `[]` | Store names from the hardware's `[memory]`, closest first. Each must be reachable from a GPU over the hardware's links |
 | `capacity` | Table | full | Per-store cap on bytes per instance |
-| `write` | Table | `write_back` | When a block's KV is written to the first tier: `write_back` — when its HBM block is recycled, if no tier holds it; `write_through` — as soon as it is produced; `selective` (`min_hits`, default 1) — on its `min_hits`-th HBM hit, and dropped on eviction otherwise (SGLang HiCache's three positions) |
-| `eviction` | Table | `fifo` | How every tier picks what to recycle: `fifo` (least recently inserted), `lru` (least recently inserted or promoted from), `ttl` (`seconds`: LRU, and any block untouched that long is dropped whether or not the store is full) |
-| `hbm_evict_backed_first` | Bool | false | When HBM must recycle a block, take one whose KV a tier already holds (a free drop) over the least recently freed, looking 16 blocks up the free queue |
+| `preset` | String | unset | A named bundle of the five policies below plus `hbm_evict_backed_first`; any field set explicitly overrides the preset's choice. `reactive`: `promote` / `lru` / `selective` (`min_hits` 1) / `lru` / `none` / backed-first — decides only from what has already happened, as shipped stacks do. `oracle`: `min_time` / `outlook` / `live` / `outlook` / `outlook` / backed-first — reads every session's announced re-entry |
+| `source` | Table | `promote` | Where a re-entry's tier-held prefix comes from: `promote` — fetch it (a hit is a hit); `min_time` — fetch it only if the transfer, at the fetch path's current fair share, beats recomputing those tokens at the worker's roofline; otherwise recompute (the tier keeps its copy) |
+| `hbm_eviction` | Table | `lru` | Which free HBM block is recycled first: `lru` — least recently freed; `outlook` — blocks with no announced re-entry first (LRU among them), then the farthest re-entry first, each sequence tail first |
+| `write` | Table | `write_back` | When a block's KV is written to the first tier: `write_back` — when its HBM block is recycled, if no tier holds it; `write_through` — as soon as it is produced; `selective` (`min_hits`, default 1) — on its `min_hits`-th HBM hit, and dropped on eviction otherwise (SGLang HiCache's three positions); `live` — when recycled, only if its session has announced a re-entry (a finished trajectory is dropped) |
+| `eviction` | Table | `fifo` | How every tier picks what to recycle: `fifo` (least recently inserted), `lru` (least recently inserted or promoted from), `ttl` (`seconds`: LRU, and any block untouched that long is dropped whether or not the store is full), `outlook` (no announced re-entry first, then farthest re-entry first) |
+| `prefetch` | Table | `none` | Whether a demoted prefix is pulled back ahead of its re-entry: `none`; `outlook` (`lead`, default 0 s) — when a session step completes, plan a promotion of the prefix its next step re-enters with, starting so it lands `lead` seconds before that arrival at the fetch path's fair share at planning time; whatever is still in HBM when the plan fires needs nothing, and a re-entry that arrives mid-transfer joins it |
+| `hbm_evict_backed_first` | Bool | false | When HBM must recycle a block, take one whose KV a tier already holds (a free drop) over the policy's first choice, looking 16 blocks up the free queue |
+
+The `outlook`, `live` and `min_time`/`prefetch` policies act on a session
+step's **outlook**: on a session workload, when a step completes the
+simulator knows its successor's arrival (completion plus the recorded gap)
+and how much of the context it re-enters with, and marks those blocks —
+in HBM and in the tiers — with that time. Other workloads announce
+nothing, so under `live` nothing is written and `outlook` eviction reduces
+to LRU. The gap between the `reactive` and `oracle` presets on the same
+replay is the value of knowing the re-entry.
 
 Tiers are inclusive: a promoted block keeps its tier copy (KV is
 immutable), so its next eviction from HBM is a free drop and only blocks no
@@ -298,7 +315,9 @@ flight — while the request waits with its landing blocks reserved.
 The summary's `memory` section reports, per store name, blocks held, bytes
 written / read / dead, evictions and expiries; per link name, bytes moved
 and utilisation; and totals of bytes written, bytes promoted, and
-promotions that waited on a write.
+promotions that waited on a write. The `prefix_cache` section counts
+lookups recomputed instead of fetched (`min_time`) and prefetches started
+(`prefetch = outlook`), with their tokens.
 
 ## [router] and [decode_router]
 

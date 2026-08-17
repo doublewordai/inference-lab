@@ -780,6 +780,12 @@ fn print_final_metrics(
                 pc.recomputed, pc.recomputed_tokens
             );
         }
+        if pc.prefetches > 0 {
+            println!(
+                "  • Prefetched: {} prefixes, {} tokens",
+                pc.prefetches, pc.prefetch_tokens
+            );
+        }
     }
 
     // Router Section (only interesting with more than one replica)

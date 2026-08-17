@@ -167,4 +167,8 @@ pub struct PrefixCacheMetrics {
     /// (`[memory] source = min_time`), and the tokens recomputed.
     pub recomputed: u64,
     pub recomputed_tokens: u64,
+    /// Prefetches started ahead of announced re-entries (`[memory]
+    /// prefetch = outlook`), and the tokens they pulled up.
+    pub prefetches: u64,
+    pub prefetch_tokens: u64,
 }

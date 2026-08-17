@@ -1,9 +1,20 @@
 use super::{decision::ScheduleDecision, decision::ScheduledSeq, policy::SchedulingPolicy};
-use crate::config::{SchedulerConfig, SourcePolicy};
+use crate::config::{PrefetchPolicy, SchedulerConfig, SourcePolicy};
 use crate::kv_cache::{KVCacheManager, PrefixCacheLookup};
 use crate::request::Request;
 use ordered_float::OrderedFloat;
 use std::collections::VecDeque;
+
+/// A prefix to pull back into HBM ahead of its announced re-entry.
+#[derive(Debug, Clone)]
+struct PrefetchPlan {
+    /// When to start it.
+    fire_at: f64,
+    /// The re-entry's block hashes (a prefix of the completed step's).
+    hashes: Vec<u64>,
+    tokens: u32,
+    id: String,
+}
 
 /// vLLM-v1-style iteration scheduler for one worker: a waiting queue, a
 /// running set, and the worker's KV cache manager. Each `schedule` call
@@ -38,6 +49,16 @@ pub struct Scheduler {
     /// starting at position `from`, alone on the worker; set by the worker
     /// from its compute engine. Needed by `source = min_time`.
     recompute_seconds: Option<RecomputeFn>,
+
+    /// Whether demoted prefixes are pulled back ahead of their re-entry.
+    prefetch: PrefetchPolicy,
+    /// Prefetches planned, soonest first.
+    prefetch_plans: Vec<PrefetchPlan>,
+    /// Prefetches in flight: synthetic requests holding the landing
+    /// blocks; on completion their blocks are published and freed
+    /// (hittable) instead of scheduled.
+    prefetches: Vec<Request>,
+    next_prefetch_seq: u64,
 }
 
 /// `(request, from, tokens) -> seconds`.
@@ -55,7 +76,106 @@ impl Scheduler {
             num_preemptions: 0,
             source: SourcePolicy::Promote {},
             recompute_seconds: None,
+            prefetch: PrefetchPolicy::None {},
+            prefetch_plans: Vec::new(),
+            prefetches: Vec::new(),
+            next_prefetch_seq: 0,
         }
+    }
+
+    /// Set the prefetch policy.
+    pub fn with_prefetch(mut self, prefetch: PrefetchPolicy) -> Self {
+        self.prefetch = prefetch;
+        self
+    }
+
+    /// A session step completed with an outlook: under `prefetch =
+    /// outlook`, plan to pull its shared prefix back into HBM so it lands
+    /// `lead` seconds before the re-entry, assuming the fetch path's
+    /// current fair share. A plan whose start is already past is dropped
+    /// (the prefix is either still in HBM or promotes on arrival).
+    fn plan_prefetch(&mut self, req: &Request, now: f64) {
+        let PrefetchPolicy::Outlook { lead } = self.prefetch else {
+            return;
+        };
+        let Some(outlook) = req.outlook_at(now) else {
+            return;
+        };
+        let block_size = self.config.block_size.max(1);
+        let blocks = (outlook.shared_tokens / block_size) as usize;
+        if blocks == 0 || blocks > req.prompt_block_hashes.len() {
+            return;
+        }
+        let tokens = blocks as u32 * block_size;
+        let transfer = self.kv_cache_manager.estimate_promotion_of(tokens);
+        if !transfer.is_finite() {
+            return;
+        }
+        let fire_at = outlook.next_arrival - lead - transfer;
+        if fire_at <= now {
+            return;
+        }
+        let id = format!("pf:{}:{}", req.request_id, self.next_prefetch_seq);
+        self.next_prefetch_seq += 1;
+        let plan = PrefetchPlan {
+            fire_at,
+            hashes: req.prompt_block_hashes[..blocks].to_vec(),
+            tokens,
+            id,
+        };
+        let at = self
+            .prefetch_plans
+            .partition_point(|p| p.fire_at <= plan.fire_at);
+        self.prefetch_plans.insert(at, plan);
+    }
+
+    /// Start every prefetch plan that is due: whatever of its prefix a
+    /// tier holds is promoted under a synthetic leader; a prefix still in
+    /// HBM, already in flight, or gone from every tier needs nothing. A
+    /// plan that can't reserve its landing blocks is dropped.
+    fn fire_due_prefetches(&mut self, now: f64) {
+        while self
+            .prefetch_plans
+            .first()
+            .is_some_and(|p| p.fire_at <= now)
+        {
+            let plan = self.prefetch_plans.remove(0);
+            let mut probe = Request::new(plan.id.clone(), 0, now, plan.tokens, 1);
+            probe.prompt_block_hashes = plan.hashes.clone();
+            let lookup = self.kv_cache_manager.peek_prefix_cache(&probe);
+            if !lookup.needs_promotion() {
+                continue;
+            }
+            let cached = lookup.total_cached_tokens.min(plan.tokens);
+            let blocks_needed = self.kv_cache_manager.blocks_for_context(cached);
+            if self.kv_cache_manager.num_free_blocks() < blocks_needed {
+                continue;
+            }
+            let Some(allocated) = self
+                .kv_cache_manager
+                .reserve_blocks_for_transfer(&probe, cached)
+            else {
+                continue;
+            };
+            probe.kv_blocks.extend(allocated);
+            probe.num_cached_tokens = cached;
+            self.kv_cache_manager.start_transfer(
+                plan.id.clone(),
+                &lookup,
+                &probe.prompt_block_hashes,
+                now,
+            );
+            let promoted: u32 = lookup.promote_tokens_per_tier.iter().sum();
+            self.kv_cache_manager.record_prefetch(promoted);
+            let remaining = self.kv_cache_manager.estimate_remaining_time(&plan.id);
+            probe.ready_at = Some(now + remaining);
+            self.prefetches.push(probe);
+        }
+    }
+
+    /// When the next prefetch plan is due, if any.
+    pub fn next_prefetch_at(&self) -> Option<f64> {
+        self.prefetch_plans.first().map(|p| p.fire_at)
     }
 
     /// Set where a tier-held prefix comes from at admission. `min_time`
@@ -136,6 +256,30 @@ impl Scheduler {
             }
         }
         self.pending_transfers = still_pending;
+
+        // Landed prefetches: publish and free (hittable, keeping their
+        // outlook order); the rest wait on.
+        let mut still_flying = Vec::with_capacity(self.prefetches.len());
+        for req in self.prefetches.drain(..) {
+            if completed.contains(&req.request_id) {
+                let cached_blocks = self
+                    .kv_cache_manager
+                    .content_blocks_for_tokens(req.num_cached_tokens);
+                let hashes: Vec<u64> = req
+                    .prompt_block_hashes
+                    .iter()
+                    .copied()
+                    .take(cached_blocks)
+                    .collect();
+                let blocks: Vec<u32> = req.kv_blocks.iter().copied().take(cached_blocks).collect();
+                self.kv_cache_manager
+                    .publish_transferred_blocks(&hashes, &blocks);
+                self.kv_cache_manager.free_blocks(&req.kv_blocks);
+            } else {
+                still_flying.push(req);
+            }
+        }
+        self.prefetches = still_flying;
     }
 
     /// Main scheduling function, called once per iteration.
@@ -160,6 +304,7 @@ impl Scheduler {
                 // outlook policies see the marks as the blocks are freed.
                 self.kv_cache_manager
                     .set_outlook(&req.prompt_block_hashes, req.outlook_at(current_time));
+                self.plan_prefetch(&req, current_time);
                 self.kv_cache_manager.free_blocks(&req.kv_blocks);
                 req.kv_blocks.clear();
                 decision.completed.push(req);
@@ -167,6 +312,10 @@ impl Scheduler {
                 idx += 1;
             }
         }
+
+        // Prefetches due now start before admission competes for the
+        // free blocks they land in.
+        self.fire_due_prefetches(current_time);
 
         // Phase 1: schedule RUNNING requests, preempting under KV pressure.
         let mut idx = 0;
@@ -726,6 +875,116 @@ mod tests {
         mgr.free_blocks(&cb);
         assert!(mgr.num_tiers() == 1 && mgr.peek_prefix_cache(&seed).needs_promotion());
         (scheduler, prefix_hash)
+    }
+
+    #[test]
+    fn outlook_prefetch_lands_a_demoted_prefix_before_its_re_entry() {
+        use crate::config::PrefetchPolicy;
+        use crate::request::SessionStep;
+        let config = Config::test_default();
+        let block_size = config.scheduler.block_size;
+        let per_block = config.model.kv_storage_bytes(block_size);
+        // 4 HBM blocks; a tier at 1 block/s so a 2-block prefix takes 2 s
+        // to promote (private tier: write is free, blocks land instantly).
+        let bw = per_block as f64;
+        let build = |prefetch: PrefetchPolicy| {
+            let kv = kv_manager(&config, 4 * per_block, true).with_private_tiers(&[(
+                "host_ram",
+                10 * 1024 * 1024 * 1024,
+                bw,
+            )]);
+            scheduler_from(config.clone(), kv).with_prefetch(prefetch)
+        };
+        // A two-block session step whose successor arrives 10 s after it
+        // completes and reuses both blocks.
+        let step = |id: &str| {
+            let mut r = create_test_request(id, block_size * 2, 1);
+            r.prompt_block_hashes = vec![0xA1, 0xA2];
+            r.session = Some(Box::new(SessionStep {
+                session: 0,
+                step: 0,
+                gap: 0.0,
+                shared_tokens: 0,
+                kind: None,
+                parent_bytes_written: None,
+                reuse_distance_bytes: None,
+                parent_bytes_touched: None,
+                reuse_touched_bytes: None,
+                next_gap: Some(10.0),
+                next_shared_tokens: block_size * 2,
+            }));
+            r
+        };
+        // Run the step to completion at t=0..1: prefill both blocks, one
+        // decode token, finished.
+        let mut s = build(PrefetchPolicy::Outlook { lead: 0.0 });
+        s.add_request(step("a0"));
+        let d = s.schedule(0.0);
+        assert_eq!(d.batch.len(), 1);
+        apply(&mut s, &d, 0.5);
+        let d = s.schedule(1.0);
+        assert_eq!(d.completed.len(), 1, "a0 done at t=1");
+        // Plan: re-entry at 11, transfer 2 s → fire at 9.
+        assert_eq!(s.next_prefetch_at(), Some(9.0));
+        // Churn pushes both blocks out to the tier (write_back).
+        let mut churn = create_test_request("churn", block_size * 4, 1);
+        churn.prompt_block_hashes = vec![0xC1, 0xC2, 0xC3, 0xC4];
+        s.add_request(churn);
+        let d = s.schedule(2.0);
+        apply(&mut s, &d, 2.5);
+        let d = s.schedule(3.0);
+        assert_eq!(d.completed.len(), 1);
+        let g = s.kv_cache_manager.memory().unwrap().0.clone();
+        assert!(g.lock().unwrap().holds(0, 0xA1) && g.lock().unwrap().holds(0, 0xA2));
+        assert!(!s.kv_cache_manager.hbm_contains(0xA1));
+        // Before 9 nothing starts; at 9 the prefetch goes out.
+        s.schedule(8.0);
+        assert_eq!(s.kv_cache_manager.prefix_cache_stats().prefetches, 0);
+        s.schedule(9.0);
+        assert_eq!(s.kv_cache_manager.prefix_cache_stats().prefetches, 1);
+        assert_eq!(
+            s.kv_cache_manager.prefix_cache_stats().prefetch_tokens,
+            u64::from(block_size) * 2
+        );
+        assert_eq!(s.prefetches.len(), 1);
+        assert_eq!(s.next_prefetch_at(), None);
+        // It lands at 11: both blocks back in HBM, free and hittable.
+        s.schedule(11.0 + 1e-9);
+        assert!(s.prefetches.is_empty());
+        assert!(s.kv_cache_manager.hbm_contains(0xA1) && s.kv_cache_manager.hbm_contains(0xA2));
+        assert_eq!(s.kv_cache_manager.num_free_blocks(), 4);
+        // The re-entry hits HBM: admitted straight in with the prefix cached.
+        let mut a1 = create_test_request("a1", block_size * 3, 1);
+        a1.prompt_block_hashes = vec![0xA1, 0xA2, 0xA3];
+        s.add_request(a1);
+        let d = s.schedule(11.5);
+        assert_eq!(d.batch.len(), 1);
+        assert_eq!(
+            d.batch[0].num_tokens, block_size,
+            "only the novel block computes"
+        );
+        assert!(s.pending_transfers.is_empty());
+
+        // Without prefetch the same re-entry parks on a promotion.
+        let mut s = build(PrefetchPolicy::None {});
+        s.add_request(step("a0"));
+        let d = s.schedule(0.0);
+        apply(&mut s, &d, 0.5);
+        s.schedule(1.0);
+        assert_eq!(s.next_prefetch_at(), None);
+        let mut churn = create_test_request("churn", block_size * 4, 1);
+        churn.prompt_block_hashes = vec![0xC1, 0xC2, 0xC3, 0xC4];
+        s.add_request(churn);
+        let d = s.schedule(2.0);
+        apply(&mut s, &d, 2.5);
+        s.schedule(3.0);
+        s.schedule(9.0);
+        let mut a1 = create_test_request("a1", block_size * 3, 1);
+        a1.prompt_block_hashes = vec![0xA1, 0xA2, 0xA3];
+        s.add_request(a1);
+        let d = s.schedule(11.5);
+        assert!(d.batch.is_empty());
+        assert_eq!(s.pending_transfers.len(), 1);
     }
 
     #[test]

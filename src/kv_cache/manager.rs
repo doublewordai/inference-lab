@@ -162,6 +162,10 @@ pub struct PrefixCacheStats {
     /// (`source = min_time`), and the tokens that recomputed.
     pub recomputed: u64,
     pub recomputed_tokens: u64,
+    /// Prefetches started ahead of an announced re-entry, and the tokens
+    /// they pulled up.
+    pub prefetches: u64,
+    pub prefetch_tokens: u64,
 }
 
 impl PrefixCacheStats {
@@ -188,6 +192,8 @@ impl std::ops::AddAssign for PrefixCacheStats {
     fn add_assign(&mut self, o: Self) {
         self.recomputed += o.recomputed;
         self.recomputed_tokens += o.recomputed_tokens;
+        self.prefetches += o.prefetches;
+        self.prefetch_tokens += o.prefetch_tokens;
         self.hits += o.hits;
         self.misses += o.misses;
         self.hit_size_sum += o.hit_size_sum;
@@ -301,6 +307,26 @@ impl KVCacheManager {
             .filter(|(_, &b)| b > 0)
             .map(|(tier, &b)| g.estimate_promotion(*w, tier, b))
             .fold(0.0, f64::max)
+    }
+
+    /// Time promoting a `tokens`-token prefix from the first tier would
+    /// take if started now (the prefix need not be there yet: what a
+    /// prefetch plan assumes when it is made). Infinite without tiers.
+    pub fn estimate_promotion_of(&self, tokens: u32) -> f64 {
+        let Some((g, w)) = &self.memory else {
+            return f64::INFINITY;
+        };
+        let g = g.lock().unwrap();
+        if g.num_tiers(*w) == 0 {
+            return f64::INFINITY;
+        }
+        g.estimate_promotion(*w, 0, self.kv_bytes_for_tokens(tokens))
+    }
+
+    /// A prefetch of `tokens` started: count it.
+    pub fn record_prefetch(&mut self, tokens: u32) {
+        self.stats.prefetches += 1;
+        self.stats.prefetch_tokens += tokens as u64;
     }
 
     /// The tier-held part of a lookup is being recomputed rather than
@@ -915,7 +941,7 @@ impl KVCacheManager {
     }
 
     #[cfg(test)]
-    fn hbm_contains(&self, hash: u64) -> bool {
+    pub(crate) fn hbm_contains(&self, hash: u64) -> bool {
         self.prefix_cache.contains_key(&hash)
     }
 
