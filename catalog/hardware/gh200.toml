@@ -15,3 +15,32 @@ memory_capacity = 96000000000
 gpus_per_node = 4
 scale_up = { bandwidth = 4.5e11, latency = 5e-6 }
 scale_out = { bandwidth = 2.5e10, latency = 2e-5 }
+
+# KV memory beyond HBM (see docs: [memory]). Each superchip's Grace holds
+# 120 GB of LPDDR5X (the Isambard-AI part; the 480 GB variant exists)
+# behind its own NVLink-C2C at 450 GB/s per direction — a per-GPU store,
+# not a node pool: a peer reaches it over NVLink through the owning GPU
+# (multi-hop, not yet modelled). `nvlink` and `nic` restate the fabric.
+[memory]
+[[memory.stores]]
+name = "grace_dram"
+per = "gpu"
+capacity = 1.2e11
+
+[[memory.links]]
+name = "c2c"
+from = "gpu"
+to = "grace_dram"
+bandwidth = 4.5e11
+
+[[memory.links]]
+name = "nvlink"
+from = "gpu"
+to = "switch"
+bandwidth = 4.5e11
+
+[[memory.links]]
+name = "nic"
+from = "gpu"
+to = "network"
+bandwidth = 2.5e10

@@ -44,7 +44,13 @@ pub fn hardware(name: &str) -> Result<HardwareConfig, String> {
             hardware_names().join(", ")
         )
     })?;
-    toml::from_str(src).map_err(|e| format!("catalog hardware {name:?}: {e}"))
+    let hw: HardwareConfig =
+        toml::from_str(src).map_err(|e| format!("catalog hardware {name:?}: {e}"))?;
+    if let Some(m) = &hw.memory {
+        m.validate()
+            .map_err(|e| format!("catalog hardware {name:?}: {e}"))?;
+    }
+    Ok(hw)
 }
 
 /// A model preset by name, validated.
@@ -70,7 +76,17 @@ mod tests {
         assert!(!hardware_names().is_empty());
         assert!(!model_names().is_empty());
         for n in hardware_names() {
-            hardware(n).unwrap_or_else(|e| panic!("{e}"));
+            let hw = hardware(n).unwrap_or_else(|e| panic!("{e}"));
+            // Every shipped preset offers at least one store reachable
+            // from a GPU by a direct link.
+            let m = hw
+                .memory
+                .as_ref()
+                .unwrap_or_else(|| panic!("{n}: no [memory]"));
+            assert!(
+                m.stores.iter().any(|s| m.gpu_link_to(&s.name).is_some()),
+                "{n}: no store with a gpu link"
+            );
         }
         for n in model_names() {
             model(n).unwrap_or_else(|e| panic!("{e}"));

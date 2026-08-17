@@ -13,6 +13,7 @@ model = "deepseek-v4-flash"    # catalog preset, or an inline [model] table
 [speculative]                  # optional: speculative decoding, shared default
 [router]                       # optional: how requests spread over replicas
 [decode_router]                # optional: disagg decode pool (defaults to [router])
+[memory]                       # optional: KV tiers beyond HBM, from the hardware's stores
 [fault]                        # optional: serve-mode static fault injection
 
 [hardware.b200]                # one entry per hardware the model runs on
@@ -39,7 +40,7 @@ runs one; `--hardware` may be omitted when the file has one entry. In Rust,
 (model on hardware) and `.with_workload(WorkloadConfig::from_file(..))` a
 `Config`. The WASM API takes that resolved `Config` as JSON: `hardware`,
 `parallel`, `model`, `scheduler`, `workload`, optional `replicas`, `router`,
-`decode_router`, `speculative`.
+`decode_router`, `memory`, `speculative`.
 
 ## Catalog presets
 
@@ -67,6 +68,7 @@ hardware preset unless `spec` says otherwise.
 | `speculative` | Table | shared `[speculative]` | Replaces the shared block for this entry |
 | `router` | Table | shared `[router]` | Replaces the shared block for this entry |
 | `decode_router` | Table | shared `[decode_router]` | Replaces the shared block for this entry |
+| `memory` | Table | shared `[memory]` | Replaces the shared block for this entry |
 
 Collectives are priced on the hardware's `[fabric]` (below) and added
 serially to the step; an entry with `tp > 1` or `ep > 1` on hardware without
@@ -92,8 +94,8 @@ an inline `spec` table.
 | `flops_fp16` | Float | unset | Dense FLOP/s at FP16 (FP32 is taken as half of it) |
 | `memory_bandwidth` | Float | — | HBM bandwidth, bytes/s |
 | `memory_capacity` | U64 | — | HBM capacity, bytes |
-| `kv_tiers` | Array | `[]` | Spillover tiers below HBM, closest first: `{ name, capacity_bytes, bandwidth_to_hbm }`. Evicted KV blocks fall through the tiers and can be promoted back over the tier's bandwidth instead of being recomputed |
 | `fabric` | Table | unset | Collective fabric, see below |
+| `memory` | Table | unset | KV memory beyond HBM this node class offers (stores and links), see below. A deployment picks tiers from it with its own `[memory]` |
 
 #### `[fabric]`
 
@@ -111,6 +113,23 @@ all-reduce of the `V/k` shard across the `n` nodes on the NIC. An EP
 all-to-all moves each rank's `(g−1)/g` share at the scale-up rate, or, across
 nodes, its in-node and cross-node shares concurrently on their own links.
 `dp_attention` skips the per-layer all-reduce.
+
+#### `[memory]` on the hardware
+
+The stores a node offers for KV beyond HBM and the links that reach them,
+templated per GPU or per node. Presets ship one (host DRAM over PCIe and a
+node NVMe pool on the HGX parts; Grace LPDDR5X behind NVLink-C2C on
+`gh200`); an inline hardware table can declare its own.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `gpus_per_node` | U32 | fabric's, else 1 | GPUs sharing a node's `per = "node"` stores |
+| `stores` | Array | `[]` | `{ name, per = "gpu" \| "node", capacity, eviction = "fifo" }` — bytes per instance; a `gpu` store is private to its GPU, a `node` store is one pool for the node's GPUs |
+| `links` | Array | `[]` | `{ name, from, to, bandwidth, latency = 0 }` — `from` is `"gpu"` (one port per GPU) or `"node"`; `to` is a store name, `"switch"` (scale-up fabric) or `"network"` (NIC); bytes/s per direction per instance |
+
+Only direct `gpu → store` links carry transfers today; `switch` and
+`network` links are declared for the multi-hop paths (peer HBM, cross-node
+fetch) that are next.
 
 Shipped presets, at datasheet figures: `b200` (192 GB / 8 TB/s), `b300`
 (288 GB / 8 TB/s), `gh200` (96 GB / 4 TB/s), `h100` (80 GB / 3.35 TB/s);
@@ -227,6 +246,34 @@ The `[workload]` table, at top level of `workloads/<name>.toml`.
 | `seed` | U64 | — | |
 
 ---
+
+## [memory]
+
+Optional; no tiering when absent. Which of the hardware's stores hold KV
+evicted from HBM, closest first, and how much of each. A worker (a
+`tp`-GPU replica) reaches each tier over its own link — its GPUs' ports
+pooled, so a `tp = 2` worker on `gh200` promotes at 2 × 450 GB/s from 2 ×
+120 GB of Grace memory. A `per = "node"` store is shared by the workers on
+that node (`gpus_per_node / tp` of them): what one demotes, its neighbours
+can promote. A worker wider than a node pools the node stores it spans.
+
+```toml
+[memory]
+tiers = ["host_dram", "nvme"]
+[memory.capacity]
+host_dram = 1.0e12          # bytes per instance given to KV
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `tiers` | Array | `[]` | Store names from the hardware's `[memory]`, closest first. Each needs a direct `gpu → store` link |
+| `capacity` | Table | full | Per-store cap on bytes per instance |
+
+Blocks recycled out of HBM fall into the first tier; a full tier evicts its
+oldest into the next; hashes falling off the last are gone. A prompt whose
+blocks sit in a tier is promoted back over the worker's link (bandwidth
+shared with that worker's other promotions on the same tier) while the
+request waits with its landing blocks reserved.
 
 ## [router] and [decode_router]
 

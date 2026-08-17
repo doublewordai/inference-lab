@@ -15,3 +15,45 @@ memory_capacity = 192000000000
 gpus_per_node = 8
 scale_up = { bandwidth = 9.0e11, latency = 5e-6, in_network_reduction = true }
 scale_out = { bandwidth = 5.0e10, latency = 2e-5 }
+
+# KV memory beyond HBM (see docs: [memory]). Host DRAM is one pool per
+# node over each GPU's PCIe Gen5 x16 port (64 GB/s per direction; the host
+# CPUs are Gen5). Local NVMe is a node pool of eight U.2 drives; the link
+# bandwidth is the drives' aggregate read rate divided across the eight
+# GPUs — it rides the same PCIe port as host DRAM, which is not yet charged
+# jointly. `nvlink` and `nic` restate the fabric for the memory graph
+# (peer-HBM and cross-node paths land with multi-hop transfers).
+[memory]
+[[memory.stores]]
+name = "host_dram"
+per = "node"
+capacity = 2.0e12
+
+[[memory.stores]]
+name = "nvme"
+per = "node"
+capacity = 3.0e13
+
+[[memory.links]]
+name = "pcie"
+from = "gpu"
+to = "host_dram"
+bandwidth = 6.4e10
+
+[[memory.links]]
+name = "nvme"
+from = "gpu"
+to = "nvme"
+bandwidth = 7.0e9
+
+[[memory.links]]
+name = "nvlink"
+from = "gpu"
+to = "switch"
+bandwidth = 9.0e11
+
+[[memory.links]]
+name = "nic"
+from = "gpu"
+to = "network"
+bandwidth = 5.0e10

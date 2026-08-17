@@ -12,7 +12,7 @@ use crate::compute::ComputeEngine;
 use crate::config::{
     ClusterSpec, DisaggTopology, ModelSpec, RouterConfig, SchedulerConfig, SpeculativeConfig,
 };
-use crate::kv_cache::{KVCacheManager, Link, PrefixCacheStats};
+use crate::kv_cache::{KVCacheManager, Link, MemoryGraph, PrefixCacheStats, SharedMemoryGraph};
 use crate::request::{Request, SessionStep};
 use crate::router::{build_router, PrefixSignal, Router, RouterStats, WorkerSignal};
 use crate::scheduler::Scheduler;
@@ -70,10 +70,13 @@ pub(crate) struct Worker {
 }
 
 impl Worker {
+    /// `memory` is the pool's KV memory graph (shared by its workers) and
+    /// this worker's index in it; `None` = HBM only.
     pub fn new(
         cluster: &ClusterSpec,
         model: ModelSpec,
         scheduler_config: SchedulerConfig,
+        memory: Option<(SharedMemoryGraph, usize)>,
     ) -> Result<Self, String> {
         let kv_capacity =
             cluster.kv_cache_capacity(&scheduler_config, cluster.resident_weight_bytes(&model));
@@ -83,14 +86,16 @@ impl Worker {
         // nonlinear in position (sliding window, DeepSeek-V4's window +
         // compressed history) get their real bytes.
         let kv_model = model.clone();
-        let kv_cache_manager = KVCacheManager::new(
+        let mut kv_cache_manager = KVCacheManager::new(
             kv_capacity,
             scheduler_config.block_size,
             move |t| kv_model.kv_storage_bytes(t),
             model.per_sequence_state_bytes(),
             true,
-        )
-        .with_tiers(&cluster.hardware.kv_tiers);
+        );
+        if let Some((graph, worker)) = memory {
+            kv_cache_manager = kv_cache_manager.with_memory(graph, worker);
+        }
         if kv_cache_manager.total_blocks() == 0 {
             return Err(format!(
                 "KV cache capacity ({} bytes) holds less than one {}-token block ({} bytes) of {}",
@@ -198,15 +203,7 @@ impl Topology {
         model: ModelSpec,
         scheduler_config: SchedulerConfig,
     ) -> Result<Self, String> {
-        let n = cluster.num_workers.max(1) as usize;
-        let mut workers = Vec::with_capacity(n);
-        for _ in 0..n {
-            workers.push(Worker::new(
-                &cluster,
-                model.clone(),
-                scheduler_config.clone(),
-            )?);
-        }
+        let workers = Self::build_pool(&cluster, &model, &scheduler_config)?;
         Ok(Self {
             pools: vec![WorkerPool::new(workers)],
             links: vec![],
@@ -215,29 +212,36 @@ impl Topology {
         })
     }
 
+    /// The workers of one pool, sharing one KV memory graph built from the
+    /// cluster's hardware `[memory]` template and `[memory]` selection.
+    fn build_pool(
+        cluster: &ClusterSpec,
+        model: &ModelSpec,
+        scheduler_config: &SchedulerConfig,
+    ) -> Result<Vec<Worker>, String> {
+        let n = cluster.num_workers.max(1) as usize;
+        let bytes_per_block = model.kv_storage_bytes(scheduler_config.block_size);
+        let graph: Option<SharedMemoryGraph> =
+            MemoryGraph::build(cluster, bytes_per_block)?.map(MemoryGraph::shared_handle);
+        let mut workers = Vec::with_capacity(n);
+        for w in 0..n {
+            workers.push(Worker::new(
+                cluster,
+                model.clone(),
+                scheduler_config.clone(),
+                graph.as_ref().map(|g| (g.clone(), w)),
+            )?);
+        }
+        Ok(workers)
+    }
+
     pub fn from_disagg(
         topology: &DisaggTopology,
         model: ModelSpec,
         scheduler_config: SchedulerConfig,
     ) -> Result<Self, String> {
-        let p_count = topology.prefill.num_workers.max(1) as usize;
-        let d_count = topology.decode.num_workers.max(1) as usize;
-        let mut p_workers = Vec::with_capacity(p_count);
-        for _ in 0..p_count {
-            p_workers.push(Worker::new(
-                &topology.prefill,
-                model.clone(),
-                scheduler_config.clone(),
-            )?);
-        }
-        let mut d_workers = Vec::with_capacity(d_count);
-        for _ in 0..d_count {
-            d_workers.push(Worker::new(
-                &topology.decode,
-                model.clone(),
-                scheduler_config.clone(),
-            )?);
-        }
+        let p_workers = Self::build_pool(&topology.prefill, &model, &scheduler_config)?;
+        let d_workers = Self::build_pool(&topology.decode, &model, &scheduler_config)?;
         Ok(Self {
             pools: vec![WorkerPool::new(p_workers), WorkerPool::new(d_workers)],
             links: vec![Link::new(topology.kv_link_bw)],

@@ -1,20 +1,6 @@
 use serde::Deserialize;
 
-/// A spillover tier of the KV cache hierarchy. Tier ordering is implicit in
-/// the enclosing `Vec<KVTier>` — earlier tiers are conceptually closer to
-/// HBM. HBM itself is implicit (its KV share is a serving setting, see
-/// `SchedulerConfig`); tiers in this list represent host RAM, NVMe, remote
-/// storage, and so on.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct KVTier {
-    /// Human-readable tier name (e.g. "host_ram", "nvme").
-    pub name: String,
-    /// Capacity of this tier in bytes.
-    pub capacity_bytes: u64,
-    /// Promotion bandwidth from this tier to HBM, in bytes/sec.
-    pub bandwidth_to_hbm: f64,
-}
+use super::MemoryTemplate;
 
 /// Numeric precision a kernel runs at. Hardware tracks one FLOP rate per
 /// precision; models declare which precision each compute stream uses.
@@ -217,10 +203,11 @@ pub struct HardwareConfig {
     /// Per-GPU memory capacity in bytes.
     pub memory_capacity: u64,
 
-    /// Spillover KV cache tiers below HBM, ordered by distance from HBM.
-    /// Empty means single-tier (HBM only).
+    /// KV memory beyond HBM this node class offers — stores (host memory,
+    /// NVMe, …) and the links that reach them (see [`MemoryTemplate`]).
+    /// Which of them a deployment uses is the deployment's `[memory]`.
     #[serde(default)]
-    pub kv_tiers: Vec<KVTier>,
+    pub memory: Option<MemoryTemplate>,
 
     /// Collective fabric (see [`FabricConfig`]). Required to price TP / EP
     /// collectives: a deployment with `tp > 1` or `ep > 1` on hardware
@@ -230,6 +217,17 @@ pub struct HardwareConfig {
 }
 
 impl HardwareConfig {
+    /// GPUs sharing a node's `per = "node"` memory: the memory template's
+    /// `gpus_per_node`, else the fabric's, else 1.
+    pub fn gpus_per_node(&self) -> u32 {
+        self.memory
+            .as_ref()
+            .and_then(|m| m.gpus_per_node)
+            .or_else(|| self.fabric.as_ref().map(|f| f.gpus_per_node))
+            .unwrap_or(1)
+            .max(1)
+    }
+
     /// Per-GPU FLOP rate at the given precision, or `None` if the hardware
     /// does not declare a rate for it.
     pub fn flop_rate(&self, prec: Precision) -> Option<f64> {

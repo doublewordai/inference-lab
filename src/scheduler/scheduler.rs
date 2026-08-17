@@ -300,7 +300,11 @@ impl Scheduler {
                 }
 
                 let mut request = self.waiting.remove(selected_idx).unwrap();
-                self.kv_cache_manager.record_prefix_lookup(&lookup);
+                // A request re-admitted after a tier promotion already holds
+                // its landing blocks and recorded its lookup when it parked.
+                if request.kv_blocks.is_empty() {
+                    self.kv_cache_manager.record_prefix_lookup(&lookup);
+                }
                 request.num_cached_tokens = cached_tokens;
                 request.num_computed_tokens = cached_tokens;
                 let blocks = self
@@ -541,7 +545,7 @@ impl Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, KVTier};
+    use crate::config::Config;
 
     /// KV manager over the test model with `capacity` bytes.
     fn kv_manager(config: &Config, capacity: u64, prefix_caching: bool) -> KVCacheManager {
@@ -623,13 +627,11 @@ mod tests {
         let per_block = config.model.kv_storage_bytes(block_size);
         // Four HBM blocks, so a churn allocation can push the seeded prefix
         // out to host RAM (recycling is LRU: only a full HBM evicts).
-        let kv = kv_manager(&config, 4 * per_block, true).with_tiers(&[KVTier {
-            name: "host_ram".into(),
-            // Plenty of host RAM.
-            capacity_bytes: 10 * 1024 * 1024 * 1024,
-            // 1 GB/s, very slow on purpose so the transfer time is observable.
-            bandwidth_to_hbm: 1e9,
-        }]);
+        let kv = kv_manager(&config, 4 * per_block, true).with_private_tiers(&[(
+            "host_ram",
+            10 * 1024 * 1024 * 1024,
+            1e9,
+        )]);
         let mut scheduler = scheduler_from(config, kv);
 
         // Seed the host-RAM tier: allocate then free a block carrying our
@@ -682,11 +684,11 @@ mod tests {
         let per_block = config.model.kv_storage_bytes(block_size);
         // Constrained HBM so a model that didn't share the prefix block would
         // fail: one shared prefix block plus one private block per request.
-        let kv = kv_manager(&config, 4 * per_block, true).with_tiers(&[KVTier {
-            name: "host_ram".into(),
-            capacity_bytes: 16 * per_block,
-            bandwidth_to_hbm: 1e9,
-        }]);
+        let kv = kv_manager(&config, 4 * per_block, true).with_private_tiers(&[(
+            "host_ram",
+            16 * per_block,
+            1e9,
+        )]);
         let mut scheduler = scheduler_from(config, kv);
 
         // Pre-warm the prefix into host RAM.

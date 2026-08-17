@@ -6,7 +6,7 @@
 
 use serde::Deserialize;
 
-use super::{HardwareConfig, ModelSpec, ParallelConfig, SchedulerConfig};
+use super::{HardwareConfig, MemoryConfig, ModelSpec, ParallelConfig, SchedulerConfig};
 use crate::compute::ComputeEngine;
 
 /// A worker pool: one or more identically-shaped workers running the same
@@ -24,6 +24,9 @@ pub struct ClusterSpec {
     /// Number of identical workers in this pool. Defaults to 1.
     #[serde(default = "default_num_workers")]
     pub num_workers: u32,
+    /// KV tiers beyond HBM, chosen from the hardware's `[memory]` stores.
+    #[serde(default)]
+    pub memory: MemoryConfig,
 }
 
 fn default_num_workers() -> u32 {
@@ -87,6 +90,7 @@ impl ClusterSpec {
                 Some(_) => {}
             }
         }
+        self.memory.validate(self.hardware.memory.as_ref())?;
         Ok(())
     }
 

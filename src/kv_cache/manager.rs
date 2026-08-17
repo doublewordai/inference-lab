@@ -1,9 +1,8 @@
 use super::block::Block;
 use super::free_queue::FreeQueue;
-use super::link::Link;
-use crate::config::KVTier;
+use super::graph::{MemoryGraph, SharedMemoryGraph, WorkerId};
 use crate::request::{BlockId, Request};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 
 /// Bytes of KV a sequence of `t` tokens occupies. Supplied by the model
 /// (`ModelSpec::kv_storage_bytes`); the manager quantises it into blocks.
@@ -13,67 +12,6 @@ pub type KvBytesFn = Box<dyn Fn(u32) -> u64 + Send + Sync>;
 struct InFlightEntry {
     leader_id: String,
     block_id: BlockId,
-}
-
-/// A spillover tier in the KV cache hierarchy. Tracks block content hashes
-/// that have been evicted from a closer tier; a hash present here can be
-/// "promoted" back to HBM by paying the tier's transfer bandwidth, instead
-/// of being recomputed via prefill. The actual byte-pumping (bandwidth
-/// sharing across concurrent transfers, time advance) lives on the embedded
-/// `Link`.
-#[derive(Debug)]
-struct SpilloverTier {
-    capacity_blocks: u32,
-    members: HashSet<u64>,
-    /// Insertion order; front is oldest.
-    order: VecDeque<u64>,
-    num_evictions: u64,
-    link: Link,
-}
-
-impl SpilloverTier {
-    fn new(capacity_blocks: u32, bandwidth_to_hbm: f64) -> Self {
-        Self {
-            capacity_blocks,
-            members: HashSet::new(),
-            order: VecDeque::new(),
-            num_evictions: 0,
-            link: Link::new(bandwidth_to_hbm),
-        }
-    }
-
-    fn contains(&self, hash: u64) -> bool {
-        self.members.contains(&hash)
-    }
-
-    /// Insert a hash. Returns `Some(evicted)` if at capacity.
-    fn insert(&mut self, hash: u64) -> Option<u64> {
-        if self.members.contains(&hash) {
-            return None;
-        }
-        self.members.insert(hash);
-        self.order.push_back(hash);
-        if self.members.len() > self.capacity_blocks as usize {
-            let oldest = self.order.pop_front().unwrap();
-            self.members.remove(&oldest);
-            self.num_evictions += 1;
-            Some(oldest)
-        } else {
-            None
-        }
-    }
-
-    /// Remove a specific hash (e.g. on promotion back to HBM).
-    fn remove(&mut self, hash: u64) -> bool {
-        if self.members.remove(&hash) {
-            if let Some(pos) = self.order.iter().position(|&h| h == hash) {
-                self.order.remove(pos);
-            }
-            true
-        } else {
-            false
-        }
-    }
 }
 
 /// Result of looking up a request's prompt against the cache hierarchy.
@@ -155,10 +93,10 @@ pub struct KVCacheManager {
     /// blocks (1, 2, 3) reconstructs as cat(cache[1], cache[2], cache[3]).
     prefix_cache: HashMap<u64, BlockId>,
 
-    /// Spillover tiers, ordered closest-to-HBM first (tier 0 = host RAM).
-    /// Each tier owns the bandwidth-sharing state for its own promotion
-    /// transfers via an embedded `Link`.
-    tiers: Vec<SpilloverTier>,
+    /// The pool's KV memory beyond HBM and this worker's id in it, when the
+    /// deployment has tiers. Lookups, demotion and promotion transfers go
+    /// through it; `None` = HBM only.
+    memory: Option<(SharedMemoryGraph, WorkerId)>,
 
     /// For each leader currently being promoted, the count of tiers that
     /// still have bytes in flight for it. A leader is fully done when this
@@ -272,7 +210,7 @@ impl KVCacheManager {
             free_blocks,
             enable_prefix_caching,
             prefix_cache: HashMap::new(),
-            tiers: Vec::new(),
+            memory: None,
             leader_active_tiers: HashMap::new(),
             leader_joiners: HashMap::new(),
             in_flight_cache: HashMap::new(),
@@ -284,19 +222,36 @@ impl KVCacheManager {
         }
     }
 
-    /// Attach a spillover hierarchy. Tier ordering is closest-to-HBM first.
-    pub fn with_tiers(mut self, tiers: &[KVTier]) -> Self {
-        self.tiers = tiers
-            .iter()
-            .map(|t| {
-                let capacity_blocks = t
-                    .capacity_bytes
-                    .checked_div(self.bytes_per_block)
-                    .unwrap_or(0) as u32;
-                SpilloverTier::new(capacity_blocks, t.bandwidth_to_hbm)
-            })
-            .collect();
+    /// Attach the pool's KV memory graph; this manager is `worker` in it.
+    pub fn with_memory(mut self, graph: SharedMemoryGraph, worker: WorkerId) -> Self {
+        self.memory = Some((graph, worker));
         self
+    }
+
+    /// Attach a private hierarchy for this worker alone: one tier per
+    /// `(name, capacity_bytes, bandwidth_to_hbm)`, closest first. What a
+    /// hardware `[memory]` of `per = "gpu"` stores gives a single worker.
+    pub fn with_private_tiers(self, tiers: &[(&str, u64, f64)]) -> Self {
+        let bpb = self.bytes_per_block.max(1);
+        let spec: Vec<(&str, u64, f64)> = tiers
+            .iter()
+            .map(|&(name, bytes, bw)| (name, bytes / bpb, bw))
+            .collect();
+        let graph = MemoryGraph::private(1, &spec).shared_handle();
+        self.with_memory(graph, 0)
+    }
+
+    /// The pool's memory graph and this worker's id in it, if tiered.
+    pub fn memory(&self) -> Option<(&SharedMemoryGraph, WorkerId)> {
+        self.memory.as_ref().map(|(g, w)| (g, *w))
+    }
+
+    /// Number of tiers below this worker's HBM.
+    pub fn num_tiers(&self) -> usize {
+        match &self.memory {
+            Some((g, w)) => g.lock().unwrap().num_tiers(*w),
+            None => 0,
+        }
     }
 
     /// Fixed blocks reserved per running sequence for length-independent state.
@@ -341,25 +296,19 @@ impl KVCacheManager {
             .saturating_sub(request.kv_blocks.len())
     }
 
-    /// Push a hash down through the spillover hierarchy starting at tier 0.
-    /// If a tier evicts to make room, the eviction cascades to the next tier.
-    /// Hashes that fall off the bottom are silently dropped.
-    fn cascade_demote(&mut self, mut hash: u64) {
-        for tier in &mut self.tiers {
-            match tier.insert(hash) {
-                None => return,
-                Some(evicted) => hash = evicted,
-            }
+    /// Push a hash evicted from HBM down this worker's tiers (see
+    /// `MemoryGraph::demote`). No-op without tiers.
+    fn cascade_demote(&mut self, hash: u64) {
+        if let Some((g, w)) = &self.memory {
+            g.lock().unwrap().demote(*w, hash);
         }
     }
 
-    /// Remove a hash from any spillover tier it lives in. Used when a block
-    /// is promoted back to HBM so the spillover index stays consistent.
+    /// Remove a hash from whichever tier holds it (it was promoted back to
+    /// HBM) so the tier index stays consistent.
     fn remove_from_spillover(&mut self, hash: u64) {
-        for tier in &mut self.tiers {
-            if tier.remove(hash) {
-                return;
-            }
+        if let Some((g, w)) = &self.memory {
+            g.lock().unwrap().remove(*w, hash);
         }
     }
 
@@ -565,7 +514,8 @@ impl KVCacheManager {
     /// first block that's nowhere. Does not touch the lookup statistics; call
     /// `record_prefix_lookup` when the lookup is acted on.
     pub fn peek_prefix_cache(&self, request: &Request) -> PrefixCacheLookup {
-        let n_tiers = self.tiers.len();
+        let graph = self.memory.as_ref().map(|(g, w)| (g.lock().unwrap(), *w));
+        let n_tiers = graph.as_ref().map_or(0, |(g, w)| g.num_tiers(*w));
         let mut lookup = PrefixCacheLookup {
             total_cached_tokens: 0,
             hbm_tokens: 0,
@@ -591,7 +541,8 @@ impl KVCacheManager {
                 lookup.join_leader = Some(entry.leader_id.clone());
                 continue;
             }
-            match self.tiers.iter().position(|tier| tier.contains(hash)) {
+            let held = graph.as_ref().and_then(|(g, w)| g.tier_holding(*w, hash));
+            match held {
                 Some(idx) => {
                     let start = k as u32 * self.block_size;
                     let end = start + self.block_size;
@@ -612,7 +563,10 @@ impl KVCacheManager {
     fn holds_block(&self, hash: u64) -> bool {
         self.prefix_cache.contains_key(&hash)
             || self.in_flight_cache.contains_key(&hash)
-            || self.tiers.iter().any(|tier| tier.contains(hash))
+            || self
+                .memory
+                .as_ref()
+                .is_some_and(|(g, w)| g.lock().unwrap().holds(*w, hash))
     }
 
     /// Estimated cached prefix length in tokens, for routing. Finds the
@@ -693,14 +647,15 @@ impl KVCacheManager {
         current_time: f64,
     ) {
         let mut active_tiers = 0u32;
-        for (i, &bytes) in lookup.promote_bytes_per_tier.iter().enumerate() {
-            if bytes == 0 {
-                continue;
+        if let Some((g, w)) = &self.memory {
+            let mut g = g.lock().unwrap();
+            for (i, &bytes) in lookup.promote_bytes_per_tier.iter().enumerate() {
+                if bytes == 0 {
+                    continue;
+                }
+                g.submit(*w, i, request_id.clone(), bytes, current_time);
+                active_tiers += 1;
             }
-            self.tiers[i]
-                .link
-                .submit(request_id.clone(), bytes, current_time);
-            active_tiers += 1;
         }
         if active_tiers > 0 {
             self.leader_active_tiers
@@ -728,8 +683,11 @@ impl KVCacheManager {
     /// plus their joiners).
     pub fn advance_transfers(&mut self, current_time: f64) -> HashSet<String> {
         let mut completed: HashSet<String> = HashSet::new();
-        for tier in &mut self.tiers {
-            let done_on_tier = tier.link.advance(current_time);
+        let per_tier: Vec<HashSet<String>> = match &self.memory {
+            Some((g, w)) => g.lock().unwrap().advance(*w, current_time),
+            None => Vec::new(),
+        };
+        for done_on_tier in per_tier {
             for leader in done_on_tier {
                 if let Some(active) = self.leader_active_tiers.get_mut(&leader) {
                     *active = active.saturating_sub(1);
@@ -763,10 +721,17 @@ impl KVCacheManager {
         }
         // Tiers are modelled as serial in the cost projection: the request
         // must drain on each tier it has bytes on, and we sum those times.
-        self.tiers
-            .iter()
-            .map(|tier| tier.link.estimate_remaining(leader))
-            .sum()
+        match &self.memory {
+            Some((g, w)) => g.lock().unwrap().estimate_remaining(*w, leader),
+            None => 0.0,
+        }
+    }
+
+    /// Put `hash` straight into this worker's tier `tier` (pre-warming).
+    pub fn plant_in_tier(&self, tier: usize, hash: u64) {
+        if let Some((g, w)) = &self.memory {
+            g.lock().unwrap().plant(*w, tier, hash);
+        }
     }
 
     #[cfg(test)]
@@ -1048,11 +1013,7 @@ mod tests {
     fn test_spillover_demotion_on_eviction() {
         // 2 HBM blocks, 1 host-RAM tier of 2 blocks.
         let mut manager = KVCacheManager::new(2 * 16 * 100, 16, |t| 100 * t as u64, 0, true)
-            .with_tiers(&[KVTier {
-                name: "host_ram".into(),
-                capacity_bytes: 2 * 16 * 100,
-                bandwidth_to_hbm: 64e9,
-            }]);
+            .with_private_tiers(&[("host_ram", 2 * 16 * 100, 64e9)]);
 
         // Fill HBM with two requests' hashes.
         let mut req_a = create_test_request("a", 16);
@@ -1090,21 +1051,11 @@ mod tests {
         // block k costs more than block k-1) checks that promotion bytes are
         // charged from the curve, not from a per-token constant.
         let curve = |t: u32| (100.0 * (t as f64).powi(2) / 16.0) as u64;
-        let mut manager = KVCacheManager::new(curve(1024), 16, curve, 0, true).with_tiers(&[
-            KVTier {
-                name: "host_ram".into(),
-                capacity_bytes: 1_000_000,
-                bandwidth_to_hbm: 1e10,
-            },
-            KVTier {
-                name: "nvme".into(),
-                capacity_bytes: 10_000_000,
-                bandwidth_to_hbm: 1e9,
-            },
-        ]);
+        let manager = KVCacheManager::new(curve(1024), 16, curve, 0, true)
+            .with_private_tiers(&[("host_ram", 1_000_000, 1e10), ("nvme", 10_000_000, 1e9)]);
         // Hash 1 (tokens 0..16) in tier 0, hash 2 (tokens 16..32) in tier 1.
-        manager.tiers[0].insert(1);
-        manager.tiers[1].insert(2);
+        manager.plant_in_tier(0, 1);
+        manager.plant_in_tier(1, 2);
         let mut req = create_test_request("a", 32);
         req.prompt_block_hashes = vec![1, 2];
         let lookup = manager.peek_prefix_cache(&req);
@@ -1120,12 +1071,8 @@ mod tests {
     fn test_concurrent_transfers_share_bandwidth() {
         // 1 GB/s tier; one transfer of 1 GB should take 1.0s alone, but two
         // concurrent equal-size transfers should each take ~2.0s.
-        let mut manager =
-            KVCacheManager::new(16_000, 16, |t| 100 * t as u64, 0, true).with_tiers(&[KVTier {
-                name: "host_ram".into(),
-                capacity_bytes: 10_000_000_000,
-                bandwidth_to_hbm: 1e9,
-            }]);
+        let mut manager = KVCacheManager::new(16_000, 16, |t| 100 * t as u64, 0, true)
+            .with_private_tiers(&[("host_ram", 10_000_000_000, 1e9)]);
         let one_gb_in_tokens = 1_000_000_000 / 100; // 10 million tokens at 100 bytes/token
         let lookup = PrefixCacheLookup {
             total_cached_tokens: one_gb_in_tokens,
@@ -1221,11 +1168,7 @@ mod tests {
     fn test_in_flight_join_refs_leader_block() {
         // Set up a host-RAM tier and seed a prefix into it.
         let mut manager = KVCacheManager::new(2 * 16 * 100, 16, |t| 100 * t as u64, 0, true)
-            .with_tiers(&[KVTier {
-                name: "host_ram".into(),
-                capacity_bytes: 8 * 16 * 100,
-                bandwidth_to_hbm: 1e9,
-            }]);
+            .with_private_tiers(&[("host_ram", 8 * 16 * 100, 1e9)]);
         let prefix_hash = 0x1234u64;
         // Get prefix_hash into host_ram by allocating then evicting.
         let mut seed = create_test_request("seed", 16);
@@ -1269,16 +1212,12 @@ mod tests {
 
     #[test]
     fn test_publish_after_transfer_makes_prefix_hbm_resident() {
-        let mut manager =
-            KVCacheManager::new(16_000, 16, |t| 100 * t as u64, 0, true).with_tiers(&[KVTier {
-                name: "host_ram".into(),
-                capacity_bytes: 16_000,
-                bandwidth_to_hbm: 1e9,
-            }]);
+        let mut manager = KVCacheManager::new(16_000, 16, |t| 100 * t as u64, 0, true)
+            .with_private_tiers(&[("host_ram", 16_000, 1e9)]);
         let mut req = create_test_request("a", 16);
         req.prompt_block_hashes = vec![0xC0FFE];
         // Manually plant the hash in spillover to simulate a prior eviction.
-        manager.tiers[0].insert(0xC0FFE);
+        manager.plant_in_tier(0, 0xC0FFE);
 
         let lookup = manager.peek_prefix_cache(&req);
         assert!(lookup.needs_promotion());

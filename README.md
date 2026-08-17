@@ -14,7 +14,8 @@ performance modeling.
 - **vLLM-style scheduling**: chunked prefill, preemption with recompute,
   FCFS / priority / length-based policies, preemption-free admission
 - **KV cache**: block allocation from each model's exact KV footprint,
-  prefix caching with block sharing, spillover tiers, cascade attention
+  prefix caching with block sharing, memory tiers beyond HBM (per-GPU or
+  node-shared stores over C2C / PCIe), cascade attention
 - **Replicas and routing**: N identical workers behind a pluggable router —
   round-robin, least-loaded, prefix-affinity, KV-aware
 - **Disaggregated serving**: prefill and decode pools with a shared hand-off link

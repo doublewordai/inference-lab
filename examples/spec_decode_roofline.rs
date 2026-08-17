@@ -32,7 +32,7 @@ fn b200_unlimited_kv() -> HardwareConfig {
         flops_fp16: Some(2.25e15),
         memory_bandwidth: 8.0e12,
         memory_capacity: 1_000_000_000_000_000, // 1 PB -> KV cap never binds
-        kv_tiers: Vec::new(),
+        memory: None,
         fabric: None,
     }
 }
@@ -46,6 +46,7 @@ fn topology() -> Topology {
             dp_attention: false,
         },
         num_workers: 1,
+        memory: Default::default(),
     };
     let sched = SchedulerConfig {
         max_num_batched_tokens: 100_000_000, // lift token budget too

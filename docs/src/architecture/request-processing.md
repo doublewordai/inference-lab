@@ -19,9 +19,10 @@ Dataset prompts carry incremental content hashes, one per KV block of
 `block_size` tokens. At admission the scheduler looks the prompt up against
 the KV cache: blocks resident in HBM are shared by reference and their
 compute is skipped (block-aligned, and never the whole prompt — the last
-block is always computed, as in vLLM); blocks in a spillover tier or already
-in flight for another request are promoted / joined asynchronously while the
-request waits with its landing blocks reserved. Synthetic workloads carry no
+block is always computed, as in vLLM); blocks in a memory tier (a store of
+the pool's memory graph the worker can reach) or already in flight for
+another request are promoted / joined asynchronously while the request waits
+with its landing blocks reserved. Synthetic workloads carry no
 prompt content and never hit.
 
 ## KV blocks
@@ -32,8 +33,11 @@ from the model's own KV curve — linear models get `ceil(t / block_size)`,
 sliding-window and compressed-history models their real footprint — plus a
 fixed reservation for length-independent per-sequence state (GatedDeltaNet).
 Blocks are reference-counted; freed blocks keep their content hash and can
-be re-hit until they are recycled, at which point the hash falls into the
-first spillover tier.
+be re-hit until they are recycled (least recently freed first, sequences
+tail first), at which point the hash falls into the worker's first memory
+tier. Tiers are stores of the pool's `MemoryGraph`, instantiated from the
+hardware's `[memory]` template per GPU (private) or per node (shared by the
+node's workers); each worker reaches a store over its own link.
 
 ## Preemption
 

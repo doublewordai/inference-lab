@@ -34,7 +34,7 @@ fn b200() -> HardwareConfig {
         flops_fp16: Some(2.25e15),
         memory_bandwidth: 8.0e12,
         memory_capacity: 206_158_430_208,
-        kv_tiers: Vec::new(),
+        memory: None,
         fabric: Some(FabricConfig {
             gpus_per_node: 8,
             scale_up: FabricLink {
@@ -73,6 +73,7 @@ fn cluster(num_workers: u32) -> ClusterSpec {
             dp_attention: false,
         },
         num_workers,
+        memory: Default::default(),
     }
 }
 
