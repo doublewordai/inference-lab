@@ -4,6 +4,7 @@ use super::free_queue::{FreeQueue, FreeSet, OutlookFree};
 use super::graph::{promotion_request, MemoryGraph, SharedMemoryGraph, WorkerId};
 use crate::config::HbmEviction;
 use crate::request::{BlockId, Outlook, Request};
+use rustc_hash::FxHashMap;
 use std::collections::{HashMap, HashSet};
 
 /// Bytes of KV a sequence of `t` tokens occupies. Supplied by the model
@@ -72,6 +73,11 @@ pub struct KVCacheManager {
     /// KV bytes of a `t`-token sequence, from the model.
     kv_bytes_at: KvBytesFn,
 
+    /// `kv_bytes_at(k × block_size)` for `k = 0..`, grown on demand: the
+    /// model's curve is a sum over layers, and per-block byte counts are
+    /// asked for on every allocation and lookup.
+    boundary_bytes: std::cell::RefCell<Vec<u64>>,
+
     /// `kv_bytes_at(block_size)`: the unit of allocation.
     bytes_per_block: u64,
 
@@ -92,7 +98,7 @@ pub struct KVCacheManager {
     /// its sequence)`, set when the session step holding it completes.
     /// Only the shared prefix of the next step is marked; everything else
     /// is unmarked (no re-entry). Read by the outlook policies.
-    outlook: HashMap<u64, (f64, u32)>,
+    outlook: FxHashMap<u64, (f64, u32)>,
 
     /// Enable prefix caching.
     enable_prefix_caching: bool,
@@ -100,7 +106,7 @@ pub struct KVCacheManager {
     /// HBM tier: maps block hash -> block_id. The hashes are incremental
     /// hashes of all the tokens up to a certain point, so a sequence with
     /// blocks (1, 2, 3) reconstructs as cat(cache[1], cache[2], cache[3]).
-    prefix_cache: HashMap<u64, BlockId>,
+    prefix_cache: FxHashMap<u64, BlockId>,
 
     /// The pool's KV memory beyond HBM and this worker's id in it, when the
     /// deployment has tiers. Lookups, demotion and promotion transfers go
@@ -122,7 +128,7 @@ pub struct KVCacheManager {
     /// to land it. Subsequent requests with the same prefix join the
     /// existing transfer and ref-bump the same block, matching vLLM's
     /// block-ref-count sharing.
-    in_flight_cache: HashMap<u64, InFlightEntry>,
+    in_flight_cache: FxHashMap<u64, InFlightEntry>,
 
     /// Reverse index for joiners: maps a joiner request id to the leader
     /// it's piggybacking on. Used by `estimate_remaining_time` so a joiner's
@@ -138,7 +144,7 @@ pub struct KVCacheManager {
 
     /// HBM hits per resident hash (for the `selective` write policy);
     /// cleared when the hash is recycled.
-    hit_counts: HashMap<u64, u32>,
+    hit_counts: FxHashMap<u64, u32>,
 
     /// Fresh block allocations so far, in bytes: KV written into HBM.
     bytes_written: u64,
@@ -229,21 +235,22 @@ impl KVCacheManager {
         Self {
             block_size,
             kv_bytes_at: Box::new(kv_bytes_at),
+            boundary_bytes: std::cell::RefCell::new(vec![0]),
             bytes_per_block,
             total_blocks,
             blocks,
             free_blocks,
-            outlook: HashMap::new(),
+            outlook: FxHashMap::default(),
             enable_prefix_caching,
-            prefix_cache: HashMap::new(),
+            prefix_cache: FxHashMap::default(),
             memory: None,
             leader_active_tiers: HashMap::new(),
             leader_joiners: HashMap::new(),
-            in_flight_cache: HashMap::new(),
+            in_flight_cache: FxHashMap::default(),
             joiner_to_leader: HashMap::new(),
             state_blocks,
             stats: PrefixCacheStats::default(),
-            hit_counts: HashMap::new(),
+            hit_counts: FxHashMap::default(),
             bytes_written: 0,
             bytes_touched: 0,
         }
@@ -281,8 +288,16 @@ impl KVCacheManager {
             if let Some(&id) = self.prefix_cache.get(&hash) {
                 self.free_blocks.rekey(id, mark);
             }
-            if let Some((g, w)) = &self.memory {
-                g.lock().unwrap().set_outlook(*w, hash, mark.map(|m| m.0));
+        }
+        if let Some((g, w)) = &self.memory {
+            let mut g = g.lock().unwrap();
+            if g.outlook_ordered(*w) {
+                for (pos, &hash) in hashes.iter().enumerate() {
+                    let t = outlook
+                        .filter(|_| pos < shared_blocks)
+                        .map(|o| o.next_arrival);
+                    g.set_outlook(*w, hash, t);
+                }
             }
         }
     }
@@ -395,6 +410,18 @@ impl KVCacheManager {
         self.bytes_per_block
     }
 
+    /// KV bytes held by content block `idx` (positions `idx × block_size ..
+    /// (idx + 1) × block_size`), from the memoised block boundaries.
+    fn content_bytes_of_block(&self, idx: usize) -> u64 {
+        let mut b = self.boundary_bytes.borrow_mut();
+        while b.len() <= idx + 1 {
+            let k = b.len() as u32;
+            let at = (self.kv_bytes_at)(k * self.block_size);
+            b.push(at);
+        }
+        b[idx + 1].saturating_sub(b[idx])
+    }
+
     /// KV bytes of a `tokens`-token sequence, per the model's curve.
     pub fn kv_bytes_for_tokens(&self, tokens: u32) -> u64 {
         (self.kv_bytes_at)(tokens)
@@ -421,13 +448,6 @@ impl KVCacheManager {
         let total_tokens = request.num_computed_tokens + num_new_tokens;
         self.blocks_for_context(total_tokens)
             .saturating_sub(request.kv_blocks.len())
-    }
-
-    /// `hash` was promoted from a tier into HBM: the tier keeps its copy.
-    fn on_promoted(&mut self, hash: u64) {
-        if let Some((g, w)) = &self.memory {
-            g.lock().unwrap().promoted(*w, hash);
-        }
     }
 
     /// The next block to recycle: the least recently freed, unless the
@@ -483,12 +503,13 @@ impl KVCacheManager {
         if !self.enable_prefix_caching {
             return;
         }
-        for (i, &hash) in hashes.iter().enumerate() {
-            if let Some(&block_id) = blocks.get(i) {
-                self.prefix_cache.insert(hash, block_id);
-                self.on_promoted(hash);
-                self.in_flight_cache.remove(&hash);
-            }
+        let n = hashes.len().min(blocks.len());
+        for (&hash, &block_id) in hashes.iter().zip(blocks).take(n) {
+            self.prefix_cache.insert(hash, block_id);
+            self.in_flight_cache.remove(&hash);
+        }
+        if let Some((g, w)) = &self.memory {
+            g.lock().unwrap().promoted_batch(*w, &hashes[..n]);
         }
     }
 
@@ -558,12 +579,10 @@ impl KVCacheManager {
 
         // KV bytes the i-th allocated block holds, from the model's curve
         // at its position (content blocks after the state blocks).
-        let block_size = self.block_size;
         let content_bytes_of: Vec<u64> = (0..blocks_needed)
             .map(|i| {
-                let idx = (already_allocated + i).saturating_sub(state_blocks) as u32;
-                let (start, end) = (idx * block_size, (idx + 1) * block_size);
-                (self.kv_bytes_at)(end).saturating_sub((self.kv_bytes_at)(start))
+                let idx = (already_allocated + i).saturating_sub(state_blocks);
+                self.content_bytes_of_block(idx)
             })
             .collect();
 
@@ -731,11 +750,8 @@ impl KVCacheManager {
             let held = graph.as_ref().and_then(|(g, w)| g.tier_holding(*w, hash));
             match held {
                 Some(idx) => {
-                    let start = k as u32 * self.block_size;
-                    let end = start + self.block_size;
                     lookup.promote_tokens_per_tier[idx] += self.block_size;
-                    lookup.promote_bytes_per_tier[idx] +=
-                        (self.kv_bytes_at)(end).saturating_sub((self.kv_bytes_at)(start));
+                    lookup.promote_bytes_per_tier[idx] += self.content_bytes_of_block(k);
                     lookup.total_cached_tokens += self.block_size;
                 }
                 None => break,

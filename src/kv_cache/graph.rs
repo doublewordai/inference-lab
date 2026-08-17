@@ -21,6 +21,7 @@
 //! The graph is shared by the topology's workers behind a mutex; the
 //! engine is single-threaded, so the lock only serialises.
 
+use rustc_hash::FxHashMap;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
@@ -86,8 +87,13 @@ pub struct Store {
     pub eviction: EvictionPolicy,
     /// The store a full instance evicts into (the next tier), if any.
     pub next: Option<StoreId>,
-    entries: HashMap<u64, EntryInfo>,
-    /// Recycling order: smallest `(key, seq)` first.
+    entries: FxHashMap<u64, EntryInfo>,
+    /// Recycling order: smallest `(key, seq)` first. Lazily maintained: a
+    /// touch or re-key inserts the entry's new position and leaves the old
+    /// one behind as a stale pair (an entry's live position is the one
+    /// matching its `key`/`seq`); stale pairs are skipped and dropped when
+    /// they reach the front, and the map is compacted when stale pairs
+    /// outnumber entries.
     order: BTreeMap<(u64, u64), u64>,
     next_seq: u64,
     pub num_evictions: u64,
@@ -129,14 +135,40 @@ impl Store {
         self.entries.values().map(|e| e.bytes).sum()
     }
 
-    fn bump(&mut self, hash: u64, now: f64) {
-        if let Some(e) = self.entries.get_mut(&hash) {
-            self.order.remove(&(e.key, e.seq));
-            e.seq = self.next_seq;
-            e.touched = now;
-            self.next_seq += 1;
-            self.order.insert((e.key, e.seq), hash);
+    /// Rebuild `order` from the live positions when stale pairs outnumber
+    /// entries.
+    fn maybe_compact(&mut self) {
+        if self.order.len() > 2 * self.entries.len() + 1024 {
+            self.order = self
+                .entries
+                .iter()
+                .map(|(&h, e)| ((e.key, e.seq), h))
+                .collect();
         }
+    }
+
+    /// The front of the recycling order, skipping (and dropping) stale
+    /// pairs. `None` when empty.
+    fn peek_front(&mut self) -> Option<u64> {
+        while let Some((&(k, s), &hash)) = self.order.first_key_value() {
+            let live = self
+                .entries
+                .get(&hash)
+                .is_some_and(|e| e.key == k && e.seq == s);
+            if live {
+                return Some(hash);
+            }
+            self.order.remove(&(k, s));
+        }
+        None
+    }
+
+    /// Remove and return the entry at the front of the recycling order.
+    fn pop_front(&mut self) -> Option<(u64, EntryInfo)> {
+        let hash = self.peek_front()?;
+        let e = self.entries.remove(&hash)?;
+        self.order.remove(&(e.key, e.seq));
+        Some((hash, e))
     }
 
     /// The primary recycling key of an entry with `outlook` under this
@@ -157,10 +189,10 @@ impl Store {
             if e.key == key {
                 return;
             }
-            self.order.remove(&(e.key, e.seq));
             e.key = key;
             self.order.insert((e.key, e.seq), hash);
         }
+        self.maybe_compact();
     }
 
     /// Insert `hash`. Returns the evicted entry `(hash, bytes, write id if
@@ -203,9 +235,7 @@ impl Store {
         );
         self.order.insert((key, seq), hash);
         if self.entries.len() as u64 > self.capacity_blocks {
-            let (&oldest_key, &oldest) = self.order.iter().next().unwrap();
-            self.order.remove(&oldest_key);
-            let e = self.entries.remove(&oldest).unwrap();
+            let (oldest, e) = self.pop_front().expect("store over capacity has an entry");
             self.num_evictions += 1;
             if !e.read {
                 self.dead_bytes += e.bytes;
@@ -230,24 +260,30 @@ impl Store {
         }
     }
 
-    /// `hash` was promoted from here: mark read; refresh recency under
-    /// LRU / TTL.
-    fn promoted(&mut self, hash: u64, now: f64) {
-        let refresh = !matches!(self.eviction, EvictionPolicy::Fifo {});
-        if let Some(e) = self.entries.get_mut(&hash) {
-            e.read = true;
-            self.bytes_read += e.bytes;
-        }
-        if refresh {
-            self.bump(hash, now);
-        }
-    }
-
     /// Remove a specific hash. Returns its info if present.
     fn remove(&mut self, hash: u64) -> Option<EntryInfo> {
         let e = self.entries.remove(&hash)?;
         self.order.remove(&(e.key, e.seq));
         Some(e)
+    }
+
+    /// `hashes` were promoted from here: mark read; refresh recency under
+    /// LRU / TTL.
+    fn promoted_many(&mut self, hashes: &[u64], now: f64) {
+        let refresh = !matches!(self.eviction, EvictionPolicy::Fifo {});
+        for &hash in hashes {
+            if let Some(e) = self.entries.get_mut(&hash) {
+                e.read = true;
+                self.bytes_read += e.bytes;
+                if refresh {
+                    e.seq = self.next_seq;
+                    e.touched = now;
+                    self.next_seq += 1;
+                    self.order.insert((e.key, e.seq), hash);
+                }
+            }
+        }
+        self.maybe_compact();
     }
 
     /// Drop entries untouched for longer than the TTL. Returns `(hash,
@@ -257,13 +293,11 @@ impl Store {
             return Vec::new();
         };
         let mut cancelled = Vec::new();
-        while let Some((&key, &hash)) = self.order.first_key_value() {
-            let e = &self.entries[&hash];
-            if now - e.touched <= seconds {
+        while let Some(hash) = self.peek_front() {
+            if now - self.entries[&hash].touched <= seconds {
                 break;
             }
-            self.order.remove(&key);
-            let e = self.entries.remove(&hash).unwrap();
+            let (_, e) = self.pop_front().unwrap();
             self.num_expired += 1;
             if !e.read {
                 self.dead_bytes += e.bytes;
@@ -429,7 +463,7 @@ impl MemoryGraph {
             throughput_edge,
             eviction,
             next: None,
-            entries: HashMap::new(),
+            entries: FxHashMap::default(),
             order: BTreeMap::new(),
             next_seq: 0,
             num_evictions: 0,
@@ -990,11 +1024,36 @@ impl MemoryGraph {
     /// tier keeps its copy (KV is immutable); mark it read and, under LRU /
     /// TTL, recently used.
     pub fn promoted(&mut self, worker: WorkerId, hash: u64) {
+        self.promoted_batch(worker, &[hash]);
+    }
+
+    /// `hashes` were promoted from `worker`'s tiers back into its HBM in
+    /// one transfer: each tier keeps its copies, marked read (and recently
+    /// used under LRU / TTL).
+    pub fn promoted_batch(&mut self, worker: WorkerId, hashes: &[u64]) {
         let now = self.flows.now();
-        if let Some(i) = self.tier_holding(worker, hash) {
-            let store = self.tiers[worker][i].store;
-            self.stores[store].promoted(hash, now);
+        let mut per_store: Vec<(StoreId, Vec<u64>)> = self.tiers[worker]
+            .iter()
+            .map(|t| (t.store, Vec::new()))
+            .collect();
+        for &h in hashes {
+            if let Some(i) = self.tier_holding(worker, h) {
+                per_store[i].1.push(h);
+            }
         }
+        for (store, hs) in per_store {
+            if !hs.is_empty() {
+                self.stores[store].promoted_many(&hs, now);
+            }
+        }
+    }
+
+    /// Whether any of `worker`'s tiers orders its blocks by outlook (so
+    /// outlook changes need forwarding).
+    pub fn outlook_ordered(&self, worker: WorkerId) -> bool {
+        self.tiers[worker]
+            .iter()
+            .any(|t| matches!(self.stores[t.store].eviction, EvictionPolicy::Outlook {}))
     }
 
     /// Remove `hash` from whichever of `worker`'s tiers holds it.
