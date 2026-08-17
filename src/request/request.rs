@@ -1,5 +1,6 @@
 use super::session::{Outlook, SessionStep};
 use crate::kv_cache::radix::Path;
+use crate::kv_cache::PrefixCacheLookup;
 
 pub type BlockId = u32;
 
@@ -10,6 +11,37 @@ pub type BlockId = u32;
 pub(crate) struct KvLeaf {
     pub(crate) node: u32,
     pub(crate) blocks: u32,
+}
+
+/// Admission-time prefix lookup memo. The radix identity and worker keep a
+/// request moved between pools from reusing another worker's view; `version`
+/// covers that worker's HBM, reachable stores, and global tree structure.
+#[derive(Debug, Clone)]
+pub(crate) struct AdmissionLookupCache {
+    pub radix: usize,
+    pub worker: usize,
+    pub version: u64,
+    pub lookup: PrefixCacheLookup,
+}
+
+/// An owned admission lookup. A hit retains its existing box while it is
+/// checked; a fresh lookup stays inline and is boxed only if admission fails
+/// and the request actually needs to remember it for another pass.
+#[derive(Debug)]
+pub(crate) enum AdmissionLookup {
+    Cached(Box<AdmissionLookupCache>),
+    Fresh(AdmissionLookupCache),
+}
+
+impl std::ops::Deref for AdmissionLookup {
+    type Target = AdmissionLookupCache;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Cached(cached) => cached,
+            Self::Fresh(cached) => cached,
+        }
+    }
 }
 
 /// One inference request as the scheduler and engine see it.
@@ -119,6 +151,11 @@ pub struct Request {
     /// accepted tokens, so a scheduler-trimmed draft stays consistent. `None`
     /// when no round is pending (non-trace acceptance, or prefill).
     pub pending_round_commits: Option<u32>,
+
+    /// Last scheduler-admission lookup. A request can wait through thousands
+    /// of unchanged scheduling passes, so keep the resolved tier spans until
+    /// the radix says this worker's prefix view changed.
+    pub(crate) admission_lookup_cache: Option<Box<AdmissionLookupCache>>,
 }
 
 /// What a request holds of its worker's KV: a block count. Blocks are
@@ -191,6 +228,7 @@ impl Request {
             ready_at: None,
             pending_draft_len: 0,
             pending_round_commits: None,
+            admission_lookup_cache: None,
         }
     }
 

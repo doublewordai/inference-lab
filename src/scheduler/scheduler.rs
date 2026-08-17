@@ -438,24 +438,36 @@ impl Scheduler {
                     continue;
                 }
 
-                let mut lookup = self.kv_cache_manager.peek_prefix_cache(request);
+                let admission_lookup = self
+                    .kv_cache_manager
+                    .take_prefix_cache_for_admission(&mut self.waiting[selected_idx]);
+                let request = &self.waiting[selected_idx];
                 // Fetch or recompute the tier-held part: recomputing
                 // shrinks the lookup to the HBM + in-flight prefix (the
                 // tier keeps its copy).
-                let resident = lookup.hbm_tokens + lookup.in_flight_tokens;
-                if self.recompute_instead(request, &lookup, resident) {
-                    let recomputed: u32 = lookup.promote_tokens_per_tier.iter().sum();
-                    self.kv_cache_manager.record_recompute(recomputed);
-                    lookup.total_cached_tokens = resident;
-                    lookup
-                        .promote_tokens_per_tier
-                        .iter_mut()
-                        .for_each(|t| *t = 0);
-                    lookup
-                        .promote_bytes_per_tier
-                        .iter_mut()
-                        .for_each(|b| *b = 0);
-                }
+                let resident =
+                    admission_lookup.lookup.hbm_tokens + admission_lookup.lookup.in_flight_tokens;
+                let recomputed_lookup =
+                    if self.recompute_instead(request, &admission_lookup.lookup, resident) {
+                        let mut lookup = admission_lookup.lookup.clone();
+                        let recomputed: u32 = lookup.promote_tokens_per_tier.iter().sum();
+                        self.kv_cache_manager.record_recompute(recomputed);
+                        lookup.total_cached_tokens = resident;
+                        lookup
+                            .promote_tokens_per_tier
+                            .iter_mut()
+                            .for_each(|t| *t = 0);
+                        lookup
+                            .promote_bytes_per_tier
+                            .iter_mut()
+                            .for_each(|b| *b = 0);
+                        Some(lookup)
+                    } else {
+                        None
+                    };
+                let lookup = recomputed_lookup
+                    .as_ref()
+                    .unwrap_or(&admission_lookup.lookup);
                 let cached_tokens = self.usable_cached_tokens(request, lookup.total_cached_tokens);
 
                 // If part of the prefix lives in a slower tier (or is in
@@ -470,10 +482,14 @@ impl Scheduler {
                     // reference. Bytes/PCIe cost is only paid for the
                     // spillover portion; the in-flight portion is joined.
                     if !self.kv_cache_manager.can_grow_to(request, cached_tokens) {
+                        self.kv_cache_manager.restore_prefix_cache_for_admission(
+                            &mut self.waiting[selected_idx],
+                            admission_lookup,
+                        );
                         break;
                     }
                     let mut request = self.waiting.remove(selected_idx).unwrap();
-                    self.kv_cache_manager.record_prefix_lookup(&lookup);
+                    self.kv_cache_manager.record_prefix_lookup(lookup);
                     request.num_cached_tokens = cached_tokens;
                     // A request back from an earlier promotion already holds
                     // (and has computed) that prefix; reserve only the
@@ -490,13 +506,13 @@ impl Scheduler {
                     if lookup.needs_promotion() {
                         self.kv_cache_manager.start_transfer(
                             request.request_id.clone(),
-                            &lookup,
+                            lookup,
                             &request.prompt_block_hashes,
                             current_time,
                         );
                     } else {
                         self.kv_cache_manager
-                            .join_transfer(request.request_id.clone(), &lookup);
+                            .join_transfer(request.request_id.clone(), lookup);
                     }
                     // Its ready time is projected on demand (see
                     // `earliest_pending_ready`): the memory graph's drain
@@ -512,6 +528,10 @@ impl Scheduler {
                 let tokens_to_schedule =
                     self.tokens_to_schedule_from(request, cached_tokens, token_budget);
                 if tokens_to_schedule == 0 {
+                    self.kv_cache_manager.restore_prefix_cache_for_admission(
+                        &mut self.waiting[selected_idx],
+                        admission_lookup,
+                    );
                     break;
                 }
                 // Cached-prefix blocks held by running requests are shared by
@@ -529,10 +549,14 @@ impl Scheduler {
                         .kv_cache_manager
                         .blocks_for_context(cached_tokens + tokens_to_schedule)
                         .saturating_sub(request.kv_blocks.len() + request.aux_blocks.len());
-                    if self.running.is_empty()
+                    let released = self.running.is_empty()
                         && self.pending_transfers.is_empty()
-                        && self.release_waiting_kv(selected_idx, need)
-                    {
+                        && self.release_waiting_kv(selected_idx, need);
+                    self.kv_cache_manager.restore_prefix_cache_for_admission(
+                        &mut self.waiting[selected_idx],
+                        admission_lookup,
+                    );
+                    if released {
                         continue;
                     }
                     break; // Can't fit, stop scheduling new requests
@@ -542,7 +566,7 @@ impl Scheduler {
                 // A request re-admitted after a tier promotion already holds
                 // its landing blocks and recorded its lookup when it parked.
                 if request.kv_blocks.is_empty() {
-                    self.kv_cache_manager.record_prefix_lookup(&lookup);
+                    self.kv_cache_manager.record_prefix_lookup(lookup);
                 }
                 request.num_cached_tokens = cached_tokens;
                 request.num_computed_tokens = cached_tokens;

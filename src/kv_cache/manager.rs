@@ -2,6 +2,7 @@ use super::flows::Owner;
 use super::graph::{promotion_request, MemoryGraph, SharedMemoryGraph, WorkerId};
 use super::radix::{HbmLookup, KvBytesFn, Path, Radix, SharedRadix, Span};
 use crate::config::{HbmEviction, ModelSpec};
+use crate::request::request::{AdmissionLookup, AdmissionLookupCache};
 use crate::request::{KvLeaf, Outlook, Request};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -63,6 +64,10 @@ pub struct PrefixCacheStats {
     /// they pulled up.
     pub prefetches: u64,
     pub prefetch_tokens: u64,
+    /// Scheduler admission probes served from the request-local memo, and
+    /// probes that had to walk the radix tree.
+    pub admission_memo_hits: u64,
+    pub admission_memo_misses: u64,
 }
 
 impl PrefixCacheStats {
@@ -95,6 +100,8 @@ impl std::ops::AddAssign for PrefixCacheStats {
         self.misses += o.misses;
         self.hit_size_sum += o.hit_size_sum;
         self.lookups += o.lookups;
+        self.admission_memo_hits += o.admission_memo_hits;
+        self.admission_memo_misses += o.admission_memo_misses;
     }
 }
 
@@ -676,6 +683,63 @@ impl KVCacheManager {
         self.lookup_from(lk)
     }
 
+    /// Admission lookup with a request-local memo. Repeated scheduler passes
+    /// usually see the same waiting request while nothing relevant to its
+    /// worker's prefix view changed; checking the scoped radix version avoids
+    /// resolving and walking its full session path again.
+    pub(crate) fn take_prefix_cache_for_admission(
+        &mut self,
+        request: &mut Request,
+    ) -> AdmissionLookup {
+        let radix_id = Arc::as_ptr(&self.radix) as usize;
+        let radix = self.radix.lock().unwrap();
+        let version = radix.lookup_version(self.worker);
+        if let Some(cached) = request.admission_lookup_cache.take() {
+            if cached.radix == radix_id && cached.worker == self.worker && cached.version == version
+            {
+                drop(radix);
+                self.stats.admission_memo_hits += 1;
+                return AdmissionLookup::Cached(cached);
+            }
+        }
+
+        let lookup = if self.enable_prefix_caching {
+            // Only the prompt (short of its last token, which is always
+            // computed) can be served from the cache at admission.
+            let usable = ((request.num_prompt_tokens.saturating_sub(1) / self.block_size.max(1))
+                as usize)
+                .min(request.prompt_block_hashes.len());
+            self.lookup_from(radix.lookup(self.worker, &request.prompt_block_hashes[..usable]))
+        } else {
+            let tiers = radix.worker_tiers(self.worker).len();
+            PrefixCacheLookup {
+                promote_tokens_per_tier: vec![0; tiers],
+                promote_bytes_per_tier: vec![0; tiers],
+                ..Default::default()
+            }
+        };
+        drop(radix);
+        self.stats.admission_memo_misses += 1;
+        AdmissionLookup::Fresh(AdmissionLookupCache {
+            radix: radix_id,
+            worker: self.worker,
+            version,
+            lookup,
+        })
+    }
+
+    /// Put a lookup back only when the scheduler leaves the request waiting.
+    pub(crate) fn restore_prefix_cache_for_admission(
+        &self,
+        request: &mut Request,
+        cached: AdmissionLookup,
+    ) {
+        request.admission_lookup_cache = Some(match cached {
+            AdmissionLookup::Cached(cached) => cached,
+            AdmissionLookup::Fresh(cached) => Box::new(cached),
+        });
+    }
+
     fn lookup_from(&self, lk: HbmLookup) -> PrefixCacheLookup {
         let bs = self.block_size;
         PrefixCacheLookup {
@@ -1111,6 +1175,39 @@ mod tests {
         assert_eq!(m.cached_prefix_tokens_estimate(&[1, 2, 3, 4]), 48);
         assert_eq!(m.hbm_prefix_tokens(&[1, 2, 3, 4]), 48);
         assert_eq!(m.hbm_prefix_tokens(&[7]), 0);
+    }
+
+    #[test]
+    fn admission_lookup_memo_reuses_and_invalidates_the_prefix_view() {
+        let mut m = KVCacheManager::new(10 * 1600, 16, |t| 100 * t as u64, 0, true);
+        let mut probe = create_test_request("probe", 64);
+        probe.prompt_block_hashes = vec![1, 2, 3, 4];
+
+        let cold = m.take_prefix_cache_for_admission(&mut probe);
+        assert_eq!(cold.lookup.total_cached_tokens, 0);
+        m.restore_prefix_cache_for_admission(&mut probe, cold);
+        let cached_cold = m.take_prefix_cache_for_admission(&mut probe);
+        assert_eq!(cached_cold.lookup.total_cached_tokens, 0);
+        m.restore_prefix_cache_for_admission(&mut probe, cached_cold);
+
+        let mut producer = create_test_request("producer", 64);
+        producer.prompt_block_hashes = vec![1, 2, 3, 4];
+        alloc(&mut m, &mut producer, 64);
+        let hot = m.take_prefix_cache_for_admission(&mut probe);
+        assert_eq!(hot.lookup.hbm_tokens, 48);
+        m.restore_prefix_cache_for_admission(&mut probe, hot);
+        let cached_hot = m.take_prefix_cache_for_admission(&mut probe);
+        assert_eq!(cached_hot.lookup.hbm_tokens, 48);
+        m.restore_prefix_cache_for_admission(&mut probe, cached_hot);
+
+        // Freeing only unpins the resident prefix: its lookup remains exact,
+        // so the memo should survive this common completion path.
+        free(&mut m, &mut producer);
+        let cached_after_free = m.take_prefix_cache_for_admission(&mut probe);
+        assert_eq!(cached_after_free.lookup.hbm_tokens, 48);
+        let stats = m.prefix_cache_stats();
+        assert_eq!(stats.admission_memo_misses, 2);
+        assert_eq!(stats.admission_memo_hits, 3);
     }
 
     #[test]

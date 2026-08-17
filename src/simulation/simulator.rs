@@ -279,6 +279,18 @@ impl Simulator {
             }
         }
 
+        let stats = self.engine.aggregate_prefix_cache();
+        let memo_lookups = stats.admission_memo_hits + stats.admission_memo_misses;
+        if memo_lookups > 0 {
+            log::debug!(
+                target: "lookup_cache",
+                "admission prefix memo: {} hits, {} misses ({:.1}% hit rate)",
+                stats.admission_memo_hits,
+                stats.admission_memo_misses,
+                100.0 * stats.admission_memo_hits as f64 / memo_lookups as f64,
+            );
+        }
+
         Ok(())
     }
 

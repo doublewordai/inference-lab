@@ -214,6 +214,8 @@ struct WorkerMeta {
     backed_first: bool,
     /// The worker's stores, closest first (set by the memory graph).
     tiers: Vec<StoreId>,
+    /// Last HBM or landing mutation visible to prefix lookup on this worker.
+    lookup_version: u64,
 }
 
 /// Order entry: `(key, seq, range id)`. The range's current tree position is
@@ -229,6 +231,8 @@ struct StoreMeta {
     locations: FxHashMap<TierRangeId, (NodeId, u32)>,
     seq: u64,
     eviction: EvictionPolicy,
+    /// Last range mutation visible to workers that can reach this store.
+    lookup_version: u64,
 }
 
 /// What a worker sees of a request's prefix.
@@ -322,6 +326,11 @@ pub struct Radix {
     workers: Vec<Option<WorkerMeta>>,
     stores: Vec<StoreMeta>,
     next_tier_range_id: TierRangeId,
+    /// Monotone source for lookup invalidation stamps.
+    next_lookup_version: u64,
+    /// Last node split/merge, which can invalidate cached [`Span`] ids for
+    /// every worker even when the represented KV contents stay unchanged.
+    structure_lookup_version: u64,
     block_size: u32,
     kv_bytes_at: KvBytesFn,
     /// `kv_bytes_at(k × block_size)`, grown on demand.
@@ -357,6 +366,8 @@ impl Radix {
             workers: Vec::new(),
             stores: Vec::new(),
             next_tier_range_id: 0,
+            next_lookup_version: 0,
+            structure_lookup_version: 0,
             block_size: block_size.max(1),
             kv_bytes_at,
             boundary_bytes: RefCell::new(vec![0]),
@@ -418,6 +429,7 @@ impl Radix {
             policy,
             backed_first,
             tiers: Vec::new(),
+            lookup_version: 0,
         });
     }
 
@@ -427,6 +439,7 @@ impl Radix {
 
     pub fn set_worker_tiers(&mut self, w: WorkerId, tiers: Vec<StoreId>) {
         self.wm(w).tiers = tiers;
+        self.bump_worker_lookup_version(w);
     }
 
     pub fn worker_tiers(&self, w: WorkerId) -> &[StoreId] {
@@ -448,6 +461,7 @@ impl Radix {
             locations: FxHashMap::default(),
             seq: 0,
             eviction,
+            lookup_version: 0,
         });
         self.stores.len() - 1
     }
@@ -479,6 +493,41 @@ impl Radix {
 
     pub fn total_blocks(&self, w: WorkerId) -> u32 {
         self.w(w).total
+    }
+
+    /// Cheap invalidation stamp for the prefix view of worker `w`.
+    ///
+    /// HBM and landing changes are worker-local. Store changes invalidate
+    /// only workers that can reach that store, while radix splits and merges
+    /// invalidate everyone because a cached lookup owns node-relative spans.
+    pub fn lookup_version(&self, w: WorkerId) -> u64 {
+        let worker = self.w(w);
+        worker.tiers.iter().fold(
+            self.structure_lookup_version.max(worker.lookup_version),
+            |version, &store| version.max(self.stores[store].lookup_version),
+        )
+    }
+
+    fn next_lookup_version(&mut self) -> u64 {
+        self.next_lookup_version = self
+            .next_lookup_version
+            .checked_add(1)
+            .expect("lookup version overflow");
+        self.next_lookup_version
+    }
+
+    fn bump_worker_lookup_version(&mut self, w: WorkerId) {
+        let version = self.next_lookup_version();
+        self.wm(w).lookup_version = version;
+    }
+
+    fn bump_store_lookup_version(&mut self, s: StoreId) {
+        let version = self.next_lookup_version();
+        self.stores[s].lookup_version = version;
+    }
+
+    fn bump_structure_lookup_version(&mut self) {
+        self.structure_lookup_version = self.next_lookup_version();
     }
 
     // ------------------------------------------------------------------
@@ -788,6 +837,7 @@ impl Radix {
     /// child takes `[k, len)` with all of the node's children and the tail
     /// of every worker's and store's state.
     fn split(&mut self, node: NodeId, k: u32) -> NodeId {
+        self.bump_structure_lookup_version();
         let tail_hashes = self.nodes[node as usize].hashes.split_off(k as usize);
         let children = std::mem::take(&mut self.nodes[node as usize].children);
         let tail = self.new_node(Some(node), tail_hashes);
@@ -983,7 +1033,11 @@ impl Radix {
         }
         // The last survivor may now be a node with a single child: compact.
         if node != self.root && self.nodes[node as usize].alive {
+            let free_ids_before_merge = self.free_ids.len();
             self.try_merge_down(node);
+            if self.free_ids.len() != free_ids_before_merge {
+                self.bump_structure_lookup_version();
+            }
         }
     }
 
@@ -1538,8 +1592,10 @@ impl Radix {
 
         // Pass 3: allocate fresh blocks (evicting as needed), then extend
         // resident / landing.
+        let mut lookup_changed = false;
         if fresh > 0 {
             let evicted = self.take_free(w, fresh);
+            lookup_changed |= !evicted.is_empty();
             out.evicted = evicted;
         }
         acc = 0;
@@ -1575,9 +1631,13 @@ impl Radix {
                             leader: leader.unwrap_or("").to_string(),
                         });
                     }
+                    lookup_changed = true;
                 }
             }
             acc += seg.len;
+        }
+        if lookup_changed {
+            self.bump_worker_lookup_version(w);
         }
         Some(out)
     }
@@ -1752,6 +1812,7 @@ impl Radix {
     /// Landing blocks `[from, upto)` of `path` for `leader` arrived in
     /// worker `w`'s HBM: they are resident now.
     pub fn landed(&mut self, w: WorkerId, path: &Path, upto: u32) {
+        let mut lookup_changed = false;
         let mut acc = 0u32;
         for seg in &path.segs {
             if acc >= upto {
@@ -1767,6 +1828,7 @@ impl Radix {
                         let e = l.end.min(b);
                         if l.start <= h.resident.max(l.start) && e > h.resident {
                             h.resident = h.resident.max(e);
+                            lookup_changed = true;
                         }
                         if l.end > b {
                             new_landing.push(Landing {
@@ -1784,9 +1846,13 @@ impl Radix {
                 // ensure resident >= b if the path was landing up to b.
                 if h.resident < b && h.landing.iter().all(|l| l.start >= b) {
                     h.resident = h.resident.max(b.min(h.resident.max(b)));
+                    lookup_changed = true;
                 }
             }
             acc += seg.len;
+        }
+        if lookup_changed {
+            self.bump_worker_lookup_version(w);
         }
     }
 
@@ -1929,6 +1995,9 @@ impl Radix {
                 for (id, location) in locations {
                     self.stores[s].locations.insert(id, location);
                 }
+                if split_id.is_some() {
+                    self.bump_store_lookup_version(s);
+                }
             }
             acc += seg.len;
         }
@@ -2029,6 +2098,7 @@ impl Radix {
             return evicted;
         }
         let missing = self.store_missing(s, span);
+        let inserted = !missing.is_empty();
         for m in missing {
             // Split at the outlook boundary so a range has one key.
             let boundary = self.nodes[m.node as usize].outlook_boundary();
@@ -2073,6 +2143,9 @@ impl Radix {
             if let Some(ev) = self.store_evict_entry(s, e, excess) {
                 evicted.push(ev);
             }
+        }
+        if inserted {
+            self.bump_store_lookup_version(s);
         }
         evicted
     }
@@ -2139,6 +2212,7 @@ impl Radix {
         if empty {
             self.nodes[node_id as usize].tiers.remove(&s);
         }
+        self.bump_store_lookup_version(s);
         Some(TierEvicted {
             span,
             write_id,
@@ -2183,6 +2257,7 @@ impl Radix {
     pub fn store_promoted(&mut self, s: StoreId, spans: &[Span], now: f64) -> u64 {
         let refresh = !matches!(self.stores[s].eviction, EvictionPolicy::Fifo {});
         let mut read_bytes = 0u64;
+        let mut ranges_changed = false;
         for sp in spans {
             let node_id = sp.node;
             let depth = self.nodes[node_id as usize].depth;
@@ -2239,6 +2314,7 @@ impl Radix {
             }
             // Splitting retains the leftmost piece's identity. Allocate ids
             // only for the additional pieces before borrowing the ranges.
+            ranges_changed = true;
             let new_id_count: usize = self.nodes[node_id as usize].tiers[&s]
                 .ranges
                 .iter()
@@ -2355,6 +2431,9 @@ impl Radix {
                 self.stores[s].locations.insert(id, location);
             }
         }
+        if ranges_changed {
+            self.bump_store_lookup_version(s);
+        }
         read_bytes
     }
 
@@ -2439,6 +2518,9 @@ impl Radix {
         }
         if empty {
             self.nodes[node_id as usize].tiers.remove(&s);
+        }
+        if removed_blocks > 0 {
+            self.bump_store_lookup_version(s);
         }
         self.prune_if_empty(node_id);
         ids
@@ -2667,6 +2749,57 @@ mod tests {
         assert_eq!(path.segs.len(), 2);
         assert_eq!(path.blocks, 2);
         assert_eq!(r.resolve(&[1, 2]), path);
+    }
+
+    #[test]
+    fn lookup_versions_track_worker_store_and_structure_mutations() {
+        let mut r = radix();
+        r.register_worker(0, 32, HbmEviction::Lru {}, false);
+        r.register_worker(1, 32, HbmEviction::Lru {}, false);
+        let shared = r.add_store(32, EvictionPolicy::Fifo {});
+        r.set_worker_tiers(0, vec![shared]);
+        r.set_worker_tiers(1, vec![shared]);
+        let a = r.insert(&[1, 2]);
+        let b = r.insert(&[3, 4]);
+
+        // Publishing HBM on worker 0 cannot change worker 1's lookup.
+        let (v0, v1) = (r.lookup_version(0), r.lookup_version(1));
+        r.acquire(0, &a, 0, 2, 0, true, None, false).unwrap();
+        assert!(r.lookup_version(0) > v0);
+        assert_eq!(r.lookup_version(1), v1);
+
+        // Both workers can reach the shared store.
+        let (v0, v1) = (r.lookup_version(0), r.lookup_version(1));
+        let stored = Span {
+            node: b.segs[0].node,
+            start: 0,
+            end: 1,
+        };
+        assert!(r.store_insert(shared, stored, None, 0.0).is_empty());
+        assert!(r.lookup_version(0) > v0);
+        assert!(r.lookup_version(1) > v1);
+
+        // A split changes node-relative spans, so it invalidates globally.
+        let (v0, v1) = (r.lookup_version(0), r.lookup_version(1));
+        r.insert(&[1, 9]);
+        assert!(r.lookup_version(0) > v0);
+        assert!(r.lookup_version(1) > v1);
+
+        // Landing state and its transition to resident remain worker-local.
+        let a = r.resolve(&[1, 2]);
+        let (v0, v1) = (r.lookup_version(0), r.lookup_version(1));
+        r.acquire(1, &a, 0, 2, 0, false, Some("leader"), false)
+            .unwrap();
+        assert_eq!(r.lookup_version(0), v0);
+        assert!(r.lookup_version(1) > v1);
+        let (v0, v1) = (r.lookup_version(0), r.lookup_version(1));
+        r.landed(1, &a, 2);
+        assert_eq!(r.lookup_version(0), v0);
+        assert!(r.lookup_version(1) > v1);
+        assert_eq!(
+            (r.lookup(1, &[1, 2]).hbm, r.lookup(1, &[1, 2]).landing),
+            (2, 0)
+        );
     }
 
     #[test]
