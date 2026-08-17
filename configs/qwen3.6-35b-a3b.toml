@@ -7,28 +7,28 @@ policy = "fcfs"
 enable_chunked_prefill = true
 block_size = 64
 
-[hardware.gh200-120]
+[hardware.gh200]
 tp = 1
 
-[hardware.gh200-120.speculative]
+[hardware.gh200.speculative]
 gamma = 8
 policy = "gated_aggregate"
 
-[hardware.gh200-120.speculative.acceptance]
+[hardware.gh200.speculative.acceptance]
 kind = "trace_rounds"
 path = "data/qwen36_gate_gh200_rounds.csv"
 
-[hardware.gh200-120.speculative.measured_cost]
+[hardware.gh200.speculative.measured_cost]
 path = "data/qwen36_gate_gh200_costs.csv"
 ref_seq_len = 1100
 
-[hardware.b200-datasheet]
+[hardware.b200]
 tp = 1
 
-[hardware.b200-datasheet.speculative]
+[hardware.b200.speculative]
 gamma = 8
 policy = "goodput_budget"
 
-[hardware.b200-datasheet.speculative.acceptance]
+[hardware.b200.speculative.acceptance]
 kind = "per_position"
 a = [0.8348, 0.7791, 0.8077, 0.8397, 0.822, 0.8197, 0.8445, 0.8531]

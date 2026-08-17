@@ -13,5 +13,5 @@ tp = 2
 [hardware.b300]
 tp = 2
 
-[hardware.gh200-120]
+[hardware.gh200]
 tp = 4

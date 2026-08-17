@@ -6,7 +6,7 @@ flops_fp8 = 4.5e15
 flops_bf16 = 2.25e15
 flops_fp16 = 2.25e15
 memory_bandwidth = 8.0e12
-memory_capacity = 309237645312
+memory_capacity = 288000000000
 
 # Fabric: HGX B300 — 8 GPUs on NVSwitch (NVLink 5, 900 GB/s per direction,
 # NVLink SHARP), one ConnectX-8 800 Gb/s NIC per GPU rail-optimised across nodes.

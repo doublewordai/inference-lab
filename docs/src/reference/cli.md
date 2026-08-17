@@ -36,7 +36,7 @@ the file has exactly one entry.
 Workload file (`workloads/<name>.toml`). Required for `sim`.
 
 ```bash
-inference-lab -c configs/gpt-oss-120b.toml --hardware gh200-120 -w workloads/quick.toml
+inference-lab -c configs/gpt-oss-120b.toml --hardware gh200 -w workloads/quick.toml
 ```
 
 ### Dataset Mode

@@ -16,7 +16,7 @@
 //! [hardware.b200]                   # key = catalog hardware name
 //! tp = 2
 //!
-//! [hardware.gh200-120]
+//! [hardware.gh200]
 //! tp = 4
 //! scheduler = { max_num_batched_tokens = 4096 }   # per-hardware override
 //! ```
@@ -229,13 +229,13 @@ alpha = 0.75
 [hardware.b200]
 tp = 4
 
-[hardware.gh200-120]
+[hardware.gh200]
 tp = 4
 scheduler = { max_num_batched_tokens = 4096 }
-[hardware.gh200-120.speculative]
+[hardware.gh200.speculative]
 gamma = 2
 policy = "goodput_budget"
-[hardware.gh200-120.speculative.acceptance]
+[hardware.gh200.speculative.acceptance]
 kind = "constant"
 alpha = 0.5
 "#;
@@ -243,7 +243,7 @@ alpha = 0.5
     #[test]
     fn resolves_each_hardware_entry() {
         let cfg = ModelConfig::from_toml(FILE).unwrap();
-        assert_eq!(cfg.hardware_names(), vec!["b200", "gh200-120"]);
+        assert_eq!(cfg.hardware_names(), vec!["b200", "gh200"]);
 
         let b200 = cfg.deployment(Some("b200")).unwrap();
         assert_eq!(b200.hardware.name, "B200");
@@ -252,8 +252,8 @@ alpha = 0.5
         assert_eq!(b200.scheduler.max_num_batched_tokens, 8192);
         assert_eq!(b200.speculative.as_ref().unwrap().gamma, 4);
 
-        let gh = cfg.deployment(Some("gh200-120")).unwrap();
-        assert_eq!(gh.hardware.name, "GH200-120");
+        let gh = cfg.deployment(Some("gh200")).unwrap();
+        assert_eq!(gh.hardware.name, "GH200");
         assert_eq!(gh.scheduler.max_num_batched_tokens, 4096);
         assert_eq!(gh.scheduler.max_num_seqs, 256);
         assert_eq!(gh.speculative.as_ref().unwrap().gamma, 2);
@@ -287,7 +287,7 @@ policy = "fcfs"
 enable_chunked_prefill = true
 block_size = 64
 [hardware.isambard]
-spec = "gh200-120"
+spec = "gh200"
 tp = 4
 [hardware.custom]
 tp = 1
@@ -300,7 +300,7 @@ memory_capacity = 80000000000
         let cfg = ModelConfig::from_toml(src).unwrap();
         assert_eq!(
             cfg.deployment(Some("isambard")).unwrap().hardware.name,
-            "GH200-120"
+            "GH200"
         );
         assert_eq!(
             cfg.deployment(Some("custom")).unwrap().hardware.name,
@@ -312,7 +312,7 @@ memory_capacity = 80000000000
     fn errors_name_the_choices() {
         let cfg = ModelConfig::from_toml(FILE).unwrap();
         let e = cfg.deployment(None).unwrap_err().to_string();
-        assert!(e.contains("b200, gh200-120"), "{e}");
+        assert!(e.contains("b200, gh200"), "{e}");
         let e = cfg.deployment(Some("h100")).unwrap_err().to_string();
         assert!(e.contains("no [hardware.h100]"), "{e}");
     }
@@ -346,7 +346,7 @@ memory_capacity = 80000000000
             "scheduler = { max_num_batched_tokens = 4096, bogus = 1 }",
         );
         let cfg = ModelConfig::from_toml(&src).unwrap();
-        let e = cfg.deployment(Some("gh200-120")).unwrap_err().to_string();
+        let e = cfg.deployment(Some("gh200")).unwrap_err().to_string();
         assert!(e.contains("bogus"), "{e}");
     }
 }

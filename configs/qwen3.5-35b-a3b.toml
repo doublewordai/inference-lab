@@ -15,5 +15,5 @@ policy = "goodput_budget"
 kind = "constant"
 alpha = 0.75
 
-[hardware.b200-datasheet]
+[hardware.b200]
 tp = 1

@@ -27,7 +27,7 @@ tp = 1
 [hardware.b300]
 tp = 1
 
-[hardware.gh200-120]
+[hardware.gh200]
 tp = 1
 scheduler = { max_num_batched_tokens = 8192 }   # per-entry override
 ```
@@ -37,8 +37,7 @@ scheduler = { max_num_batched_tokens = 8192 }   # per-entry override
 - **[scheduler]** — engine arguments: batching, KV blocks, memory
   utilisation, scheduling policy.
 - **[hardware.\<name\>]** — one per hardware the model is deployed on. The
-  name is a hardware preset (`b200`, `b300`, `gh200-120`, `gh200-96`,
-  `b200-datasheet`, `h100`) unless the entry sets `spec`. Each entry gives
+  name is a hardware preset (`b200`, `b300`, `gh200`, `h100`) unless the entry sets `spec`. Each entry gives
   the parallel layout — `tp` (replica world size, weights sharded, per-layer
   all-reduces), `ep` (experts sharded over `ep` ranks), `dp_attention`
   (data-parallel attention: replicated attention weights,
@@ -71,7 +70,7 @@ spillover `kv_tiers`):
 
 ```toml
 [hardware.isambard]
-spec = "gh200-120"
+spec = "gh200"
 tp = 4
 
 [hardware.custom]

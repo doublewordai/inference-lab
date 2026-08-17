@@ -55,7 +55,7 @@ inference-lab -c configs/gpt-oss-120b.toml --hardware b200 -w workloads/chat-clo
 ### Comparing Hardware
 
 ```bash
-for hw in b200 b300 gh200-120; do
+for hw in b200 b300 gh200; do
   inference-lab -c configs/gpt-oss-120b.toml --hardware $hw \
     -w workloads/chat-closed-256.toml -q -o results_$hw.json
 done

@@ -12,7 +12,7 @@ use inference_lab::scheduler::SchedulingPolicy;
 /// Per-GPU B200 at the datasheet memory figures (192 GB, 8 TB/s), dense
 /// peaks — the spec the speculative-decoding post's rooflines use.
 pub fn b200_per_gpu() -> HardwareConfig {
-    catalog::hardware("b200-datasheet").expect("catalog preset")
+    catalog::hardware("b200").expect("catalog preset")
 }
 
 /// DeepSeek-V4-Flash.

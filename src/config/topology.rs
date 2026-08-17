@@ -128,7 +128,7 @@ mod tests {
         cluster.parallel.tp = 2;
         let e = cluster.validate().unwrap_err();
         assert!(e.contains("[fabric]"), "{e}");
-        cluster.hardware = crate::catalog::hardware("gh200-120").unwrap();
+        cluster.hardware = crate::catalog::hardware("gh200").unwrap();
         assert!(cluster.validate().is_ok());
         cluster.parallel.tp = 8;
         assert!(cluster.validate().is_ok(), "gh200 declares scale_out");
