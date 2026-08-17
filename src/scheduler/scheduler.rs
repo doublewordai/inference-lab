@@ -460,14 +460,16 @@ impl Scheduler {
     }
 
     /// Remove and return every running request whose prefill is complete and
-    /// which still has output to generate, freeing its KV here. Used by a
-    /// disaggregated prefill worker to hand requests to the decode pool.
+    /// which still has output to generate. Used by a disaggregated prefill
+    /// worker to hand requests to the decode pool. The requests keep their
+    /// KV blocks here: the transfer reads them, and the engine releases
+    /// them with `release_handed_off` when it drains (as a P worker holds
+    /// its blocks until the connector is done with them).
     pub fn take_prefill_complete(&mut self) -> Vec<Request> {
         let mut handed = Vec::new();
         let mut keep = Vec::with_capacity(self.running.len());
-        for mut r in self.running.drain(..) {
+        for r in self.running.drain(..) {
             if !r.is_prefill() && !r.is_finished() {
-                self.kv_cache_manager.free_request(&mut r);
                 handed.push(r);
             } else {
                 keep.push(r);
@@ -475,6 +477,12 @@ impl Scheduler {
         }
         self.running = keep;
         handed
+    }
+
+    /// A handed-off request's transfer has drained: release the KV it held
+    /// on this worker (its hashes stay hittable until recycled).
+    pub fn release_handed_off(&mut self, request: &mut Request) {
+        self.kv_cache_manager.free_request(request);
     }
 
     pub fn num_running(&self) -> usize {
@@ -1131,7 +1139,7 @@ mod tests {
     }
 
     #[test]
-    fn test_take_prefill_complete_hands_off_and_frees_kv() {
+    fn test_take_prefill_complete_hands_off_and_holds_kv_until_released() {
         let mut scheduler = create_test_scheduler();
         scheduler.add_request(create_test_request("done", 16, 5));
         scheduler.add_request(create_test_request("mid", 64, 5));
@@ -1148,8 +1156,14 @@ mod tests {
         // `done` finished prefill with output left; `one` is finished (stays
         // to be reaped); `mid` is still prefilling.
         assert_eq!(ids, vec!["done"]);
-        assert!(handed[0].kv_blocks.is_empty());
-        assert!(scheduler.kv_cache_manager().num_free_blocks() > free_before);
+        // The blocks stay allocated (the transfer reads them) until the
+        // engine releases them.
+        assert!(!handed[0].kv_blocks.is_empty());
+        assert_eq!(scheduler.kv_cache_manager().num_free_blocks(), free_before);
         assert_eq!(running_ids(&scheduler), vec!["mid", "one"]);
+        let mut done = handed.into_iter().next().unwrap();
+        scheduler.release_handed_off(&mut done);
+        assert!(done.kv_blocks.is_empty());
+        assert!(scheduler.kv_cache_manager().num_free_blocks() > free_before);
     }
 }

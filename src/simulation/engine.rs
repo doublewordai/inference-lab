@@ -30,7 +30,9 @@ pub struct RequestTiming {
     /// Time the KV hand-off transfer completed and the request entered the
     /// decode worker. Equal to `prefill_done_time` for aggregated mode.
     pub handoff_done_time: f64,
-    /// Time the first output token was produced (= TTFT relative to arrival).
+    /// Time the first output token reached the client (= TTFT relative to
+    /// arrival): the end of the pass that completed the prompt, or on a
+    /// disaggregated topology the end of the KV hand-off, which carries it.
     pub first_token_time: f64,
     pub completion_time: f64,
     pub num_prompt_tokens: u32,
@@ -1090,7 +1092,8 @@ impl Engine {
 
         let handed_off = if matches!(role, PoolRole::DisaggPrefill) {
             // Anything whose prefill is now complete leaves this worker via
-            // the link; the scheduler frees its KV on the way out.
+            // the link; its KV stays allocated here until the transfer
+            // drains (`deliver_drained`).
             w.scheduler.take_prefill_complete()
         } else {
             Vec::new()
@@ -1297,8 +1300,23 @@ impl Engine {
                 .parked
                 .remove(&request_id)
                 .ok_or_else(|| format!("hand-off complete for unknown request {request_id}"))?;
-            self.handoff_source.remove(&request_id);
+            // The prefill worker held the request's KV for the transfer;
+            // release it there now (hashes stay hittable).
+            let source = self
+                .handoff_source
+                .remove(&request_id)
+                .ok_or_else(|| format!("hand-off of {request_id} has no source worker"))?;
+            let (sp, si) = self
+                .locate_worker(source)
+                .ok_or_else(|| format!("hand-off source worker {source} not found"))?;
+            self.topology.pools[sp].workers[si]
+                .scheduler
+                .release_handed_off(&mut req);
             req.handoff_done_time = Some(now);
+            // The first token travels with the KV: the decode side emits it
+            // on receipt (Dynamo / sglang PD), so that is when the client
+            // sees it. Decode-side TPOT then runs from here.
+            req.first_token_time = Some(now);
             self.deliver_to_worker(decode_pool, worker_idx, req);
         }
         Ok(())
