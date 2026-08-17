@@ -647,6 +647,59 @@ impl Engine {
             + self.parked.len()
     }
 
+    /// One line per worker holding work, for a stall report: what is
+    /// waiting, parked, and free.
+    pub fn describe_stuck_workers(&self) -> String {
+        let mut out = String::new();
+        for (p, pool) in self.topology.pools.iter().enumerate() {
+            for (i, w) in pool.workers.iter().enumerate() {
+                let s = &w.scheduler;
+                if s.num_running() == 0 && s.num_waiting() == 0 {
+                    continue;
+                }
+                let mgr = s.kv_cache_manager();
+                let parked = s.pending_transfers();
+                let first_parked = parked.first().map(|r| {
+                    format!(
+                        "{}(cached {}, ready_at {:?}, blocks {})",
+                        r.request_id,
+                        r.num_cached_tokens,
+                        r.ready_at,
+                        r.kv_blocks.len()
+                    )
+                });
+                let first_waiting = s.waiting().front().map(|r| {
+                    format!(
+                        "{}(prompt {}, computed {}, blocks {}, needs {} blocks)",
+                        r.request_id,
+                        r.num_prompt_tokens,
+                        r.num_computed_tokens,
+                        r.kv_blocks.len(),
+                        mgr.blocks_for_context(r.planned_positions())
+                    )
+                });
+                let (held, refs, free) = mgr.ref_summary();
+                let by_queue = s.held_blocks_by_queue();
+                out.push_str(&format!(
+                    "\n  refs: {held} blocks referenced ({refs} refs), {free} free; held by (running, waiting, parked, prefetches) = {by_queue:?}"
+                ));
+                out.push_str(&format!(
+                    "\n  pool {p} worker {i} (gid {}): running {}, waiting {}, parked {}, free {}/{} blocks, busy {}; parked[0] {:?}; waiting[0] {:?}",
+                    w.global_id,
+                    s.num_running(),
+                    s.num_waiting(),
+                    parked.len(),
+                    mgr.num_free_blocks(),
+                    mgr.total_blocks(),
+                    self.worker_busy[p][pool.leader_of(i)],
+                    first_parked,
+                    first_waiting
+                ));
+            }
+        }
+        out
+    }
+
     /// Total preemptions across all pools.
     pub fn aggregate_preemptions(&self) -> u64 {
         self.topology

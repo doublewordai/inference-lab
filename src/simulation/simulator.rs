@@ -217,10 +217,11 @@ impl Simulator {
                 // can never be scheduled, e.g. a prompt longer than the KV
                 // cache, or a closed loop with no users).
                 return Err(format!(
-                    "simulation stalled at t={:.3}: {} running, {} waiting, no pending events",
+                    "simulation stalled at t={:.3}: {} running, {} waiting, no pending events{}",
                     self.engine.current_time(),
                     self.engine.aggregate_running(),
-                    self.engine.aggregate_waiting()
+                    self.engine.aggregate_waiting(),
+                    self.engine.describe_stuck_workers()
                 ));
             }
 

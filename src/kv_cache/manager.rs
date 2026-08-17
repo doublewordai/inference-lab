@@ -336,6 +336,14 @@ impl KVCacheManager {
         self.stats.recomputed_tokens += tokens as u64;
     }
 
+    /// `(blocks with references, total references, blocks free per the
+    /// free set)` — for stall diagnostics.
+    pub fn ref_summary(&self) -> (usize, u64, usize) {
+        let held = self.blocks.iter().filter(|b| b.ref_count > 0).count();
+        let refs: u64 = self.blocks.iter().map(|b| b.ref_count as u64).sum();
+        (held, refs, self.free_blocks.len())
+    }
+
     /// The announced re-entry time of `hash`, if any.
     pub fn outlook_of(&self, hash: u64) -> Option<f64> {
         self.outlook.get(&hash).map(|m| m.0)

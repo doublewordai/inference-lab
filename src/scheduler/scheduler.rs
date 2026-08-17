@@ -39,7 +39,9 @@ pub struct Scheduler {
 
     kv_cache_manager: KVCacheManager,
 
-    /// Total preemptions performed so far.
+    /// Total preemptions performed so far (running requests evicted under
+    /// KV pressure, and waiting requests whose promoted prefix was released
+    /// to unblock admission — see `release_waiting_kv`).
     num_preemptions: u64,
 
     /// Where a tier-held prefix comes from at admission.
@@ -251,7 +253,11 @@ impl Scheduler {
                     .publish_transferred_blocks(&hashes, &blocks);
                 req.ready_at = None;
                 req.num_computed_tokens = req.num_cached_tokens;
-                self.waiting.push_back(req);
+                // Its prefix is hot and its landing blocks are held: admit
+                // it ahead of the queue rather than let it hold KV behind
+                // requests that cannot fit (vLLM schedules a request whose
+                // remote KV landed on the next pass).
+                self.waiting.push_front(req);
             } else {
                 let remaining = self
                     .kv_cache_manager
@@ -530,6 +536,16 @@ impl Scheduler {
                     .blocks_for_context(cached_tokens + tokens_to_schedule)
                     .saturating_sub(request.kv_blocks.len());
                 if self.kv_cache_manager.num_free_blocks() < blocks_needed {
+                    // Nothing runs and nothing is in flight, so no block will
+                    // free itself: the KV is held by other waiting requests'
+                    // promoted prefixes. Give those up (tier copies stay)
+                    // from the back of the queue until this one fits.
+                    if self.running.is_empty()
+                        && self.pending_transfers.is_empty()
+                        && self.release_waiting_kv(selected_idx, blocks_needed)
+                    {
+                        continue;
+                    }
                     break; // Can't fit, stop scheduling new requests
                 }
 
@@ -557,6 +573,27 @@ impl Scheduler {
         }
 
         decision
+    }
+
+    /// Release the KV held by waiting requests other than `keep` (their
+    /// promoted prefixes), from the back of the queue, until at least
+    /// `needed` blocks are free. Those requests recompute or re-promote
+    /// later. Returns whether enough was freed.
+    fn release_waiting_kv(&mut self, keep: usize, needed: usize) -> bool {
+        let mut i = self.waiting.len();
+        while self.kv_cache_manager.num_free_blocks() < needed && i > 0 {
+            i -= 1;
+            if i == keep || self.waiting[i].kv_blocks.is_empty() {
+                continue;
+            }
+            let r = &mut self.waiting[i];
+            self.kv_cache_manager.free_blocks(&r.kv_blocks);
+            r.kv_blocks.clear();
+            r.num_computed_tokens = 0;
+            r.num_cached_tokens = 0;
+            self.num_preemptions += 1;
+        }
+        self.kv_cache_manager.num_free_blocks() >= needed
     }
 
     /// Prefix tokens whose compute can be skipped for `request`: block-aligned
@@ -777,6 +814,23 @@ impl Scheduler {
     }
 
     /// Requests parked on an in-flight KV promotion.
+    /// Blocks held by requests in each of this scheduler's queues
+    /// `(running, waiting, parked, prefetches)` — for stall diagnostics.
+    pub fn held_blocks_by_queue(&self) -> (usize, usize, usize, usize) {
+        let n = |v: &[Request]| v.iter().map(|r| r.kv_blocks.len()).sum::<usize>();
+        (
+            n(&self.running),
+            self.waiting.iter().map(|r| r.kv_blocks.len()).sum(),
+            n(&self.pending_transfers),
+            n(&self.prefetches),
+        )
+    }
+
+    /// The waiting queue (admission order), excluding parked requests.
+    pub fn waiting(&self) -> &VecDeque<Request> {
+        &self.waiting
+    }
+
     pub fn pending_transfers(&self) -> &[Request] {
         &self.pending_transfers
     }
@@ -1084,6 +1138,58 @@ mod tests {
         assert_eq!(r.kv_blocks.len(), 2, "A's block plus B's landing block");
         assert_eq!(s.kv_cache_manager.num_free_blocks(), 0);
         assert_eq!(d.batch.len(), 1);
+    }
+
+    #[test]
+    fn landed_promotions_admit_first_and_held_kv_is_released_to_break_a_deadlock() {
+        // HBM of 3 blocks; two 3-block requests each find their first block
+        // in the tier and park holding one landing block. When both land,
+        // neither can take the two more blocks it needs (one free): nothing
+        // runs, nothing is in flight — the scheduler gives up the other's
+        // held prefix so one proceeds, instead of waiting forever.
+        let config = Config::test_default();
+        let bs = config.scheduler.block_size;
+        let per_block = config.model.kv_storage_bytes(bs);
+        let kv = kv_manager(&config, 3 * per_block, true).with_private_tiers(&[(
+            "host_ram",
+            10 * 1024 * 1024 * 1024,
+            per_block as f64,
+        )]);
+        let mut s = scheduler_from(config, kv);
+        s.kv_cache_manager.plant_in_tier(0, 0xA1);
+        s.kv_cache_manager.plant_in_tier(0, 0xA2);
+        let mut x1 = create_test_request("x1", bs * 3, 1);
+        x1.prompt_block_hashes = vec![0xA1, 0xB1, 0xC1];
+        let mut x2 = create_test_request("x2", bs * 3, 1);
+        x2.prompt_block_hashes = vec![0xA2, 0xB2, 0xC2];
+        s.add_request(x1);
+        s.add_request(x2);
+        let d = s.schedule(0.0);
+        assert!(d.batch.is_empty());
+        assert_eq!(s.pending_transfers.len(), 2);
+        assert_eq!(s.kv_cache_manager.num_free_blocks(), 1);
+        let ready = s
+            .pending_transfers
+            .iter()
+            .filter_map(|r| r.ready_at)
+            .fold(0.0, f64::max);
+        let d = s.schedule(ready + 1e-9);
+        // Both landed and re-entered at the front; one runs, the other's
+        // held block was released for it (counted as a preemption).
+        assert_eq!(d.batch.len(), 1);
+        assert_eq!(s.num_running(), 1);
+        assert_eq!(s.num_preemptions(), 1);
+        let waiting = s.waiting();
+        assert_eq!(waiting.len(), 1);
+        assert!(waiting[0].kv_blocks.is_empty());
+        assert_eq!(waiting[0].num_computed_tokens, 0);
+        assert_eq!(s.kv_cache_manager.num_free_blocks(), 0);
+        // The runner finishes; the other re-promotes its first block (still
+        // in the tier) and completes too.
+        apply(&mut s, &d, ready + 1.0);
+        let d = s.schedule(ready + 1.5);
+        assert_eq!(d.completed.len(), 1);
+        assert_eq!(s.pending_transfers.len(), 1, "re-promoting from the tier");
     }
 
     #[test]
