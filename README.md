@@ -17,8 +17,9 @@ performance modeling.
   prefix caching with block sharing, cascade attention
 - **Memory graph**: KV tiers beyond HBM as a graph of stores and links per
   hardware preset (host DRAM / NVMe behind PCIe, Grace memory behind
-  NVLink-C2C, NVLink, NICs); per-GPU or node-shared stores; transfers at
-  max-min fair share over every edge of their path
+  NVLink-C2C, NVLink, NICs); per-GPU or node-shared stores; write-back /
+  write-through / selective writes, FIFO / LRU / TTL eviction; transfers
+  at max-min fair share over every edge of their path
 - **Replicas and routing**: N identical workers behind a pluggable router —
   round-robin, least-loaded, prefix-affinity, KV-aware
 - **Disaggregated serving**: prefill and decode pools; hand-offs ride the

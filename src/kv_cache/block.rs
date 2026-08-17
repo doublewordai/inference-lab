@@ -6,6 +6,9 @@
 pub struct Block {
     pub ref_count: u32,
     pub content_hash: Option<u64>,
+    /// KV bytes this block holds for its content (from the model's KV
+    /// curve at the block's position); what a write to a tier moves.
+    pub content_bytes: u64,
 }
 
 impl Block {

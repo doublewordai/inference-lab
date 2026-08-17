@@ -27,15 +27,28 @@
 //! between its ends; its rate is its max-min fair share on every edge of
 //! the path (see `kv_cache::flows`).
 //!
-//! Deployment side — which stores hold evicted KV, closest first, and how
-//! much of each they may use:
+//! Deployment side — which stores hold evicted KV, closest first, how much
+//! of each they may use, and the write and eviction policies:
 //!
 //! ```toml
 //! [memory]
 //! tiers = ["grace_dram", "nvme"]
+//! write = { policy = "write_through" }        # write_back | write_through | selective
+//! eviction = { policy = "ttl", seconds = 3600 }   # fifo | lru | ttl
+//! hbm_evict_backed_first = true
 //! [memory.capacity]
 //! grace_dram = 200e9
 //! ```
+//!
+//! Tiers are inclusive: a block promoted back to HBM keeps its tier copy
+//! (KV is immutable), so its next eviction from HBM is a free drop. Under
+//! `write_back` a block no tier holds is written when its HBM block is
+//! recycled; under `write_through` every fresh block is written as it is
+//! produced; under `selective` a block is written on its `min_hits`-th HBM
+//! hit and dropped otherwise. Writes are transfers GPU → store on the same
+//! graph as promotions; a block is promotable once its write has landed
+//! (a promotion of a block still arriving waits for it). A full store
+//! evicts into the next tier — a store → store transfer — or drops.
 //!
 //! With no `[memory]` on the deployment there is no tiering (HBM only).
 
@@ -55,14 +68,75 @@ pub enum Scope {
     Node,
 }
 
-/// Which block a store recycles first when full.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// When a block's KV is written to the first tier below HBM.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(tag = "policy", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WritePolicy {
+    /// At eviction from HBM: a block that no tier holds is written out
+    /// when its HBM block is recycled. Writes only what is evicted; the
+    /// block reaches the tier late.
+    WriteBack {},
+    /// At production: every fresh block is written as soon as it is
+    /// computed. Tier ingress is the whole KV production rate; eviction
+    /// from HBM is then free.
+    WriteThrough {},
+    /// At the `min_hits`-th HBM hit: only blocks that prove reusable are
+    /// written; the rest are dropped on eviction (SGLang HiCache's
+    /// `write_through_selective`).
+    Selective {
+        #[serde(default = "default_min_hits")]
+        min_hits: u32,
+    },
+}
+
+fn default_min_hits() -> u32 {
+    1
+}
+
+impl Default for WritePolicy {
+    fn default() -> Self {
+        WritePolicy::WriteBack {}
+    }
+}
+
+impl WritePolicy {
+    pub fn name(&self) -> &'static str {
+        match self {
+            WritePolicy::WriteBack {} => "write_back",
+            WritePolicy::WriteThrough {} => "write_through",
+            WritePolicy::Selective { .. } => "selective",
+        }
+    }
+}
+
+/// Which block a store recycles first when full, and whether it drops
+/// blocks that have gone untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(tag = "policy", rename_all = "snake_case", deny_unknown_fields)]
 pub enum EvictionPolicy {
-    /// Least recently inserted (a demoted block is not touched again until
-    /// it is promoted out, so insertion order is recency order).
-    #[default]
-    Fifo,
+    /// Least recently inserted.
+    Fifo {},
+    /// Least recently inserted or promoted from.
+    Lru {},
+    /// Least recently used, and any block untouched for `seconds` is
+    /// dropped whether or not the store is full.
+    Ttl { seconds: f64 },
+}
+
+impl Default for EvictionPolicy {
+    fn default() -> Self {
+        EvictionPolicy::Fifo {}
+    }
+}
+
+impl EvictionPolicy {
+    pub fn name(&self) -> &'static str {
+        match self {
+            EvictionPolicy::Fifo {} => "fifo",
+            EvictionPolicy::Lru {} => "lru",
+            EvictionPolicy::Ttl { .. } => "ttl",
+        }
+    }
 }
 
 /// A store a node offers for KV beyond HBM.
@@ -78,8 +152,6 @@ pub struct StoreTemplate {
     /// Unset: unbounded — only the links limit.
     #[serde(default)]
     pub bandwidth: Option<f64>,
-    #[serde(default)]
-    pub eviction: EvictionPolicy,
 }
 
 /// A named point on the node with no capacity of its own, so that several
@@ -228,6 +300,17 @@ pub struct MemoryConfig {
     /// the store's full capacity.
     #[serde(default)]
     pub capacity: BTreeMap<String, f64>,
+    /// When KV is written to the first tier. Default `write_back`.
+    #[serde(default)]
+    pub write: WritePolicy,
+    /// How every tier picks what to recycle. Default `fifo`.
+    #[serde(default)]
+    pub eviction: EvictionPolicy,
+    /// When HBM must recycle a block, prefer one whose KV a tier already
+    /// holds (dropping it is free) over the least recently freed one,
+    /// looking a bounded distance up the free queue. Default false.
+    #[serde(default)]
+    pub hbm_evict_backed_first: bool,
 }
 
 impl MemoryConfig {
@@ -338,6 +421,21 @@ bandwidth = 450e9
             "[[stores]]\nname = \"x\"\nper = \"rack\"\ncapacity = 1.0"
         )
         .is_err());
+    }
+
+    #[test]
+    fn parses_write_and_eviction_policies() {
+        let c: MemoryConfig = toml::from_str(
+            "tiers = [\"nvme\"]\nwrite = { policy = \"selective\", min_hits = 2 }\neviction = { policy = \"ttl\", seconds = 60 }\nhbm_evict_backed_first = true",
+        )
+        .unwrap();
+        assert_eq!(c.write, WritePolicy::Selective { min_hits: 2 });
+        assert_eq!(c.eviction, EvictionPolicy::Ttl { seconds: 60.0 });
+        assert!(c.hbm_evict_backed_first);
+        let d: MemoryConfig = toml::from_str("tiers = [\"nvme\"]").unwrap();
+        assert_eq!(d.write, WritePolicy::WriteBack {});
+        assert_eq!(d.eviction, EvictionPolicy::Fifo {});
+        assert!(toml::from_str::<MemoryConfig>("write = { policy = \"nope\" }").is_err());
     }
 
     #[test]

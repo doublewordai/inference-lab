@@ -126,7 +126,7 @@ own.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `gpus_per_node` | U32 | fabric's, else 1 | GPUs sharing a node's `per = "node"` stores |
-| `stores` | Array | `[]` | `{ name, per = "gpu" \| "node", capacity, bandwidth, eviction = "fifo" }` — bytes per instance; a `gpu` store is private to its GPU, a `node` store is one pool for the node's GPUs. `bandwidth` (optional) is the store's own throughput per instance, shared by every transfer in or out of it |
+| `stores` | Array | `[]` | `{ name, per = "gpu" \| "node", capacity, bandwidth }` — bytes per instance; a `gpu` store is private to its GPU, a `node` store is one pool for the node's GPUs. `bandwidth` (optional) is the store's own throughput per instance, shared by every transfer in or out of it |
 | `junctions` | Array | `[]` | `{ name, per }` — a point with no capacity of its own, so that several links can share one (a GPU's PCIe port feeding host DRAM and NVMe) |
 | `links` | Array | `[]` | `{ name, from, to, bandwidth, latency = 0 }` — `from` is `"gpu"` (one port per GPU), a store or a junction; `to` is a store, a junction, `"switch"` (the node's scale-up fabric) or `"network"` (the scale-out core). One instance per instance of `from`, full duplex at `bandwidth` bytes/s each way |
 
@@ -267,21 +267,38 @@ can promote. A worker wider than a node pools the node stores it spans.
 ```toml
 [memory]
 tiers = ["host_dram", "nvme"]
+write = { policy = "write_back" }              # write_back | write_through | selective
+eviction = { policy = "fifo" }                 # fifo | lru | ttl
+hbm_evict_backed_first = false
 [memory.capacity]
 host_dram = 1.0e12          # bytes per instance given to KV
 ```
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `tiers` | Array | `[]` | Store names from the hardware's `[memory]`, closest first. Each needs a direct `gpu → store` link |
+| `tiers` | Array | `[]` | Store names from the hardware's `[memory]`, closest first. Each must be reachable from a GPU over the hardware's links |
 | `capacity` | Table | full | Per-store cap on bytes per instance |
+| `write` | Table | `write_back` | When a block's KV is written to the first tier: `write_back` — when its HBM block is recycled, if no tier holds it; `write_through` — as soon as it is produced; `selective` (`min_hits`, default 1) — on its `min_hits`-th HBM hit, and dropped on eviction otherwise (SGLang HiCache's three positions) |
+| `eviction` | Table | `fifo` | How every tier picks what to recycle: `fifo` (least recently inserted), `lru` (least recently inserted or promoted from), `ttl` (`seconds`: LRU, and any block untouched that long is dropped whether or not the store is full) |
+| `hbm_evict_backed_first` | Bool | false | When HBM must recycle a block, take one whose KV a tier already holds (a free drop) over the least recently freed, looking 16 blocks up the free queue |
 
-Blocks recycled out of HBM fall into the first tier; a full tier evicts its
-oldest into the next; hashes falling off the last are gone. A prompt whose
-blocks sit in a tier is promoted back along the path from that store to the
-worker's GPU — sharing every edge on it (its PCIe port, the NVMe pool's
-drives, …) with whatever else is in flight — while the request waits with
-its landing blocks reserved.
+Tiers are inclusive: a promoted block keeps its tier copy (KV is
+immutable), so its next eviction from HBM is a free drop and only blocks no
+tier holds ever cost a write. Writes are transfers GPU → store on the same
+graph as promotions (full duplex: they share a port with fetches only in
+the reverse direction, but do share an NVMe pool's drives); a block is
+resident once its write lands and a promotion of a block still arriving
+waits for it (the write-before-reuse race). A full store evicts its victim
+into the next tier as a store → store transfer, or drops it; a block
+dropped without ever having been promoted counts as dead bytes. A prompt
+whose blocks sit in a tier is promoted along the path from that store to
+the worker's GPU — sharing every edge on it with whatever else is in
+flight — while the request waits with its landing blocks reserved.
+
+The summary's `memory` section reports, per store name, blocks held, bytes
+written / read / dead, evictions and expiries; per link name, bytes moved
+and utilisation; and totals of bytes written, bytes promoted, and
+promotions that waited on a write.
 
 ## [router] and [decode_router]
 

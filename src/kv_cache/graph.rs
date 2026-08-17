@@ -21,17 +21,41 @@
 //! The graph is shared by the topology's workers behind a mutex; the
 //! engine is single-threaded, so the lock only serialises.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use super::flows::{EdgeId, Flows, Owner};
-use crate::config::{ClusterSpec, MemoryTemplate, Scope};
+use crate::config::{ClusterSpec, EvictionPolicy, MemoryTemplate, Scope, WritePolicy};
 
 pub type StoreId = usize;
 pub type WorkerId = usize;
 pub type VertexId = usize;
 
-/// One instance of a store: a set of block hashes with a capacity.
+/// State of a block in a store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryState {
+    /// The write has landed; promotable.
+    Resident,
+    /// The write is in flight; a promotion waits for it.
+    Arriving,
+}
+
+#[derive(Debug, Clone)]
+struct EntryInfo {
+    state: EntryState,
+    bytes: u64,
+    /// Position in the recycling order (higher = more recent).
+    seq: u64,
+    /// Last insert / promotion time.
+    touched: f64,
+    /// Ever promoted from this store.
+    read: bool,
+    /// Transfer id of the write, while arriving.
+    write_id: Option<String>,
+}
+
+/// One instance of a store: block hashes with a capacity, an eviction
+/// order, and byte accounting.
 #[derive(Debug)]
 pub struct Store {
     pub name: String,
@@ -43,55 +67,161 @@ pub struct Store {
     pub vertex: VertexId,
     /// The store's own throughput, if bounded.
     pub throughput_edge: Option<EdgeId>,
-    members: HashSet<u64>,
-    /// Insertion order; front is oldest.
-    order: VecDeque<u64>,
+    pub eviction: EvictionPolicy,
+    /// The store a full instance evicts into (the next tier), if any.
+    pub next: Option<StoreId>,
+    entries: HashMap<u64, EntryInfo>,
+    /// Recycling order: oldest `seq` first.
+    order: BTreeMap<u64, u64>,
+    next_seq: u64,
     pub num_evictions: u64,
+    /// Entries dropped by TTL.
+    pub num_expired: u64,
+    /// Bytes whose write landed here.
+    pub bytes_written: u64,
+    /// Bytes promoted from here.
+    pub bytes_read: u64,
+    /// Bytes evicted or expired without ever being promoted.
+    pub dead_bytes: u64,
 }
 
 impl Store {
     pub fn contains(&self, hash: u64) -> bool {
-        self.members.contains(&hash)
+        self.entries.contains_key(&hash)
+    }
+
+    pub fn is_resident(&self, hash: u64) -> bool {
+        self.entries
+            .get(&hash)
+            .is_some_and(|e| e.state == EntryState::Resident)
+    }
+
+    fn write_id_of(&self, hash: u64) -> Option<&str> {
+        self.entries.get(&hash).and_then(|e| e.write_id.as_deref())
     }
 
     pub fn len(&self) -> usize {
-        self.members.len()
+        self.entries.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.members.is_empty()
+        self.entries.is_empty()
     }
 
-    /// Insert a hash. Returns `Some(evicted)` if at capacity.
-    fn insert(&mut self, hash: u64) -> Option<u64> {
-        if self.capacity_blocks == 0 {
-            return Some(hash);
+    /// Bytes held (resident + arriving).
+    pub fn bytes_held(&self) -> u64 {
+        self.entries.values().map(|e| e.bytes).sum()
+    }
+
+    fn bump(&mut self, hash: u64, now: f64) {
+        if let Some(e) = self.entries.get_mut(&hash) {
+            self.order.remove(&e.seq);
+            e.seq = self.next_seq;
+            e.touched = now;
+            self.next_seq += 1;
+            self.order.insert(e.seq, hash);
         }
-        if self.members.contains(&hash) {
+    }
+
+    /// Insert `hash`. Returns the evicted entry `(hash, bytes, write id if
+    /// it was still arriving)` if the store was full (or has no capacity).
+    fn insert(
+        &mut self,
+        hash: u64,
+        bytes: u64,
+        state: EntryState,
+        write_id: Option<String>,
+        now: f64,
+    ) -> Option<(u64, u64, Option<String>, bool)> {
+        if self.capacity_blocks == 0 {
+            return Some((hash, bytes, write_id, false));
+        }
+        if self.entries.contains_key(&hash) {
             return None;
         }
-        self.members.insert(hash);
-        self.order.push_back(hash);
-        if self.members.len() as u64 > self.capacity_blocks {
-            let oldest = self.order.pop_front().unwrap();
-            self.members.remove(&oldest);
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.entries.insert(
+            hash,
+            EntryInfo {
+                state,
+                bytes,
+                seq,
+                touched: now,
+                read: false,
+                write_id,
+            },
+        );
+        self.order.insert(seq, hash);
+        if self.entries.len() as u64 > self.capacity_blocks {
+            let (&oldest_seq, &oldest) = self.order.iter().next().unwrap();
+            self.order.remove(&oldest_seq);
+            let e = self.entries.remove(&oldest).unwrap();
             self.num_evictions += 1;
-            Some(oldest)
+            if !e.read {
+                self.dead_bytes += e.bytes;
+            }
+            Some((oldest, e.bytes, e.write_id, e.read))
         } else {
             None
         }
     }
 
-    /// Remove a specific hash (on promotion back to HBM).
-    fn remove(&mut self, hash: u64) -> bool {
-        if self.members.remove(&hash) {
-            if let Some(pos) = self.order.iter().position(|&h| h == hash) {
-                self.order.remove(pos);
-            }
-            true
-        } else {
-            false
+    /// The write for `hash` landed.
+    fn landed(&mut self, hash: u64) {
+        if let Some(e) = self.entries.get_mut(&hash) {
+            e.state = EntryState::Resident;
+            e.write_id = None;
+            self.bytes_written += e.bytes;
         }
+    }
+
+    /// `hash` was promoted from here: mark read; refresh recency under
+    /// LRU / TTL.
+    fn promoted(&mut self, hash: u64, now: f64) {
+        let refresh = !matches!(self.eviction, EvictionPolicy::Fifo {});
+        if let Some(e) = self.entries.get_mut(&hash) {
+            e.read = true;
+            self.bytes_read += e.bytes;
+        }
+        if refresh {
+            self.bump(hash, now);
+        }
+    }
+
+    /// Remove a specific hash. Returns its info if present.
+    fn remove(&mut self, hash: u64) -> Option<EntryInfo> {
+        let e = self.entries.remove(&hash)?;
+        self.order.remove(&e.seq);
+        Some(e)
+    }
+
+    /// Drop entries untouched for longer than the TTL. Returns their write
+    /// ids if still arriving.
+    fn expire(&mut self, now: f64) -> Vec<String> {
+        let EvictionPolicy::Ttl { seconds } = self.eviction else {
+            return Vec::new();
+        };
+        let mut cancelled = Vec::new();
+        loop {
+            let Some((&seq, &hash)) = self.order.iter().next() else {
+                break;
+            };
+            let e = &self.entries[&hash];
+            if now - e.touched <= seconds {
+                break;
+            }
+            self.order.remove(&seq);
+            let e = self.entries.remove(&hash).unwrap();
+            self.num_expired += 1;
+            if !e.read {
+                self.dead_bytes += e.bytes;
+            }
+            if let Some(id) = e.write_id {
+                cancelled.push(id);
+            }
+        }
+        cancelled
     }
 }
 
@@ -103,12 +233,13 @@ pub struct Path {
     pub latency: f64,
 }
 
-/// One worker's access to one store: the store and the path a promotion
-/// from it takes into the worker's HBM.
+/// One worker's access to one store: the store, the path a promotion
+/// from it takes into the worker's HBM, and the path a write takes out.
 #[derive(Debug, Clone)]
 pub struct Tier {
     pub store: StoreId,
     pub fetch_path: Path,
+    pub write_path: Path,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -146,6 +277,14 @@ pub struct MemoryGraph {
     /// Instantiated `(link name, from vertex)` pairs, to create node-level
     /// links once.
     made_links: HashSet<(String, VertexId)>,
+    /// Per worker: when its blocks are written to its first tier, and
+    /// whether HBM prefers recycling blocks a tier already holds.
+    write_of: Vec<WritePolicy>,
+    evict_backed_first: Vec<bool>,
+    /// In-flight writes: transfer id → (destination store, hash).
+    pending_writes: HashMap<String, (StoreId, u64)>,
+    /// Promotions that had to wait for a write still arriving.
+    pub write_race_waits: u64,
 }
 
 /// A graph shared by the topology's workers.
@@ -175,6 +314,10 @@ impl MemoryGraph {
             core_edge: None,
             handoff_paths: HashMap::new(),
             made_links: HashSet::new(),
+            write_of: Vec::new(),
+            evict_backed_first: Vec::new(),
+            pending_writes: HashMap::new(),
+            write_race_waits: 0,
         }
     }
 
@@ -207,6 +350,7 @@ impl MemoryGraph {
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn add_store(
         &mut self,
         name: &str,
@@ -214,6 +358,7 @@ impl MemoryGraph {
         owner: usize,
         capacity_blocks: u64,
         throughput: Option<f64>,
+        eviction: EvictionPolicy,
     ) -> StoreId {
         let vertex = self.vertex(VertexKey::Named(name.to_string(), owner));
         if let Some(pos) = self.stores.iter().position(|s| s.vertex == vertex) {
@@ -227,9 +372,16 @@ impl MemoryGraph {
             capacity_blocks,
             vertex,
             throughput_edge,
-            members: HashSet::new(),
-            order: VecDeque::new(),
+            eviction,
+            next: None,
+            entries: HashMap::new(),
+            order: BTreeMap::new(),
+            next_seq: 0,
             num_evictions: 0,
+            num_expired: 0,
+            bytes_written: 0,
+            bytes_read: 0,
+            dead_bytes: 0,
         });
         self.stores.len() - 1
     }
@@ -298,6 +450,8 @@ impl MemoryGraph {
                 let gv = g.vertex(VertexKey::Gpu(w));
                 g.gpu_vertex.push(gv);
                 g.tiers.push(Vec::new());
+                g.write_of.push(selection.write);
+                g.evict_backed_first.push(selection.hbm_evict_backed_first);
                 let Some(t) = template else { continue };
                 g.instantiate_worker(
                     t,
@@ -308,6 +462,7 @@ impl MemoryGraph {
                     bytes_per_block,
                     &selection.tiers,
                     &selection.capacity,
+                    selection.eviction,
                 )?;
             }
             node_base += num_workers.div_ceil(workers_per_node).max(1);
@@ -326,6 +481,7 @@ impl MemoryGraph {
         bytes_per_block: u64,
         tiers: &[String],
         capacity: &std::collections::BTreeMap<String, f64>,
+        eviction: EvictionPolicy,
     ) -> Result<(), String> {
         let gv = self.gpu_vertex[w];
         // Endpoint → (vertex, instance multiplicity) for this worker.
@@ -365,6 +521,7 @@ impl MemoryGraph {
                 owner,
                 (per_instance as f64 * mult) as u64,
                 st.bandwidth.map(|b| b * mult),
+                eviction,
             );
         }
         // Links: one instance per instance of `from` in this worker's scope.
@@ -373,7 +530,9 @@ impl MemoryGraph {
             let (b, _) = resolve(self, &l.to)?;
             self.link(&l.name, a, b, l.bandwidth * mult, l.latency);
         }
-        // Tiers, closest first, with the promotion path from each.
+        // Tiers, closest first, with the promotion path from each and the
+        // write path into each; each store's `next` is its successor.
+        let mut prev: Option<StoreId> = None;
         for name in tiers {
             let (sv, _) = resolve(self, name)?;
             let store = self
@@ -381,15 +540,26 @@ impl MemoryGraph {
                 .iter()
                 .position(|s| s.vertex == sv)
                 .ok_or_else(|| format!("[memory] tier `{name}` has no store instance"))?;
-            let mut path = self.shortest_path(sv, gv).ok_or_else(|| {
+            let mut fetch = self.shortest_path(sv, gv).ok_or_else(|| {
                 format!("[memory] tier `{name}` is not reachable from worker {w}'s gpu")
             })?;
+            let mut write = self.shortest_path(gv, sv).ok_or_else(|| {
+                format!("[memory] worker {w}'s gpu cannot reach tier `{name}` to write")
+            })?;
             if let Some(e) = self.stores[store].throughput_edge {
-                path.edges.insert(0, e);
+                fetch.edges.insert(0, e);
+                write.edges.push(e);
             }
+            if let Some(p) = prev {
+                if self.stores[p].next.is_none() && p != store {
+                    self.stores[p].next = Some(store);
+                }
+            }
+            prev = Some(store);
             self.tiers[w].push(Tier {
                 store,
-                fetch_path: path,
+                fetch_path: fetch,
+                write_path: write,
             });
         }
         Ok(())
@@ -407,25 +577,75 @@ impl MemoryGraph {
             g.gpu_vertex.push(gv);
             g.node_of.push(0);
             g.tiers.push(Vec::new());
+            g.write_of.push(WritePolicy::default());
+            g.evict_backed_first.push(false);
         }
+        let mut prev: Vec<Option<StoreId>> = vec![None; num_workers];
         for &(name, capacity_blocks, bandwidth, per) in tiers {
+            #[allow(clippy::needless_range_loop)]
             for w in 0..num_workers {
                 let owner = match per {
                     Scope::Gpu => w,
                     Scope::Node => 0,
                 };
-                let store = g.add_store(name, per, owner, capacity_blocks, None);
+                let store = g.add_store(
+                    name,
+                    per,
+                    owner,
+                    capacity_blocks,
+                    None,
+                    EvictionPolicy::default(),
+                );
                 let sv = g.stores[store].vertex;
                 let gv = g.gpu_vertex[w];
                 g.link(&format!("{name}:link:{w}"), gv, sv, bandwidth, 0.0);
-                let path = g.shortest_path(sv, gv).unwrap();
+                let fetch = g.shortest_path(sv, gv).unwrap();
+                let write = g.shortest_path(gv, sv).unwrap();
+                if let Some(p) = prev[w] {
+                    if g.stores[p].next.is_none() && p != store {
+                        g.stores[p].next = Some(store);
+                    }
+                }
+                prev[w] = Some(store);
                 g.tiers[w].push(Tier {
                     store,
-                    fetch_path: path,
+                    fetch_path: fetch,
+                    write_path: write,
                 });
             }
         }
         g
+    }
+
+    /// Set every worker's write policy and every store's eviction policy
+    /// (tests and examples; configs set them through `[memory]`).
+    pub fn with_policies(mut self, write: WritePolicy, eviction: EvictionPolicy) -> Self {
+        for w in &mut self.write_of {
+            *w = write;
+        }
+        for st in &mut self.stores {
+            st.eviction = eviction;
+        }
+        self
+    }
+
+    /// Set every worker's HBM recycling preference (tests and examples).
+    pub fn with_hbm_evict_backed_first(mut self, on: bool) -> Self {
+        for e in &mut self.evict_backed_first {
+            *e = on;
+        }
+        self
+    }
+
+    pub fn write_policy(&self, worker: WorkerId) -> WritePolicy {
+        self.write_of.get(worker).copied().unwrap_or_default()
+    }
+
+    pub fn evict_backed_first(&self, worker: WorkerId) -> bool {
+        self.evict_backed_first
+            .get(worker)
+            .copied()
+            .unwrap_or(false)
     }
 
     /// Private per-worker tiers (see `simple`).
@@ -486,54 +706,183 @@ impl MemoryGraph {
         self.tier_holding(worker, hash).is_some()
     }
 
-    /// Push a hash evicted from `worker`'s HBM down its tiers, starting at
-    /// the first. If a store evicts to make room, the eviction cascades to
-    /// the next tier. Hashes that fall off the bottom are dropped.
-    pub fn demote(&mut self, worker: WorkerId, hash: u64) {
-        self.plant(worker, 0, hash);
+    /// Whether some tier of `worker` holds `hash` (resident or arriving):
+    /// its HBM block can be dropped without a write.
+    pub fn is_backed(&self, worker: WorkerId, hash: u64) -> bool {
+        self.holds(worker, hash)
     }
 
-    /// Put `hash` straight into `worker`'s tier `tier` (pre-warming a
-    /// store; evicts like a demotion into that tier would).
-    pub fn plant(&mut self, worker: WorkerId, tier: usize, hash: u64) {
-        let mut hash = hash;
-        for i in tier..self.tiers[worker].len() {
-            let store = self.tiers[worker][i].store;
-            match self.stores[store].insert(hash) {
-                None => return,
-                Some(evicted) => hash = evicted,
+    /// A fresh block of `bytes` for `hash` was just written into
+    /// `worker`'s HBM. Under `write_through` it starts its way to the
+    /// first tier now.
+    pub fn produced(&mut self, worker: WorkerId, hash: u64, bytes: u64) {
+        if matches!(self.write_policy(worker), WritePolicy::WriteThrough {}) {
+            self.write(worker, hash, bytes);
+        }
+    }
+
+    /// `hash` took its `hits`-th hit in `worker`'s HBM. Under `selective`
+    /// the `min_hits`-th hit starts its write.
+    pub fn hit(&mut self, worker: WorkerId, hash: u64, bytes: u64, hits: u32) {
+        if let WritePolicy::Selective { min_hits } = self.write_policy(worker) {
+            if hits == min_hits.max(1) {
+                self.write(worker, hash, bytes);
             }
         }
     }
 
-    /// Remove `hash` from whichever of `worker`'s tiers holds it (it was
-    /// promoted back to HBM).
+    /// `worker`'s HBM recycled the block holding `hash`. Under
+    /// `write_back` a block no tier holds is written to the first tier
+    /// now; under the other policies an unbacked block is dropped.
+    pub fn demote(&mut self, worker: WorkerId, hash: u64, bytes: u64) {
+        if matches!(self.write_policy(worker), WritePolicy::WriteBack {}) {
+            self.write(worker, hash, bytes);
+        }
+    }
+
+    /// Start writing `hash` (`bytes`) from `worker`'s GPU into its first
+    /// tier, unless a tier already holds it. The entry is `Arriving` until
+    /// the transfer lands.
+    pub fn write(&mut self, worker: WorkerId, hash: u64, bytes: u64) {
+        if self.tiers[worker].is_empty() || self.holds(worker, hash) {
+            return;
+        }
+        let now = self.flows.now();
+        let tier = &self.tiers[worker][0];
+        let (store, path) = (tier.store, tier.write_path.clone());
+        let id = format!("w:{worker}:{store}:{hash}");
+        let evicted =
+            self.stores[store].insert(hash, bytes, EntryState::Arriving, Some(id.clone()), now);
+        self.pending_writes.insert(id.clone(), (store, hash));
+        self.flows
+            .submit(id, Owner::Write, path.edges, bytes, path.latency, now);
+        self.cascade(store, evicted);
+    }
+
+    /// Put `hash` straight into `worker`'s tier `tier` as resident
+    /// (pre-warming a store; evicts like a landing write would).
+    pub fn plant(&mut self, worker: WorkerId, tier: usize, hash: u64) {
+        let now = self.flows.now();
+        let store = self.tiers[worker][tier].store;
+        let bytes = self.default_block_bytes();
+        let evicted = self.stores[store].insert(hash, bytes, EntryState::Resident, None, now);
+        self.cascade(store, evicted);
+    }
+
+    /// Bytes a planted block is taken to hold: the mean of what the store
+    /// holds, else 1 (only affects cascade transfer sizes in tests).
+    fn default_block_bytes(&self) -> u64 {
+        1
+    }
+
+    /// An entry `store` evicted on insert: cancel its write if it was still
+    /// arriving, then move it to `store`'s next tier as a store → store
+    /// transfer, or let it go.
+    fn cascade(&mut self, store: StoreId, evicted: Option<(u64, u64, Option<String>, bool)>) {
+        let Some((hash, bytes, write_id, _read)) = evicted else {
+            return;
+        };
+        if let Some(id) = write_id {
+            self.pending_writes.remove(&id);
+            self.flows.cancel(&id);
+        }
+        let Some(next) = self.stores[store].next else {
+            return;
+        };
+        if self.stores[next].contains(hash) {
+            return;
+        }
+        let now = self.flows.now();
+        let mut path = match self.shortest_path(self.stores[store].vertex, self.stores[next].vertex)
+        {
+            Some(p) => p,
+            None => return,
+        };
+        if let Some(e) = self.stores[store].throughput_edge {
+            path.edges.insert(0, e);
+        }
+        if let Some(e) = self.stores[next].throughput_edge {
+            path.edges.push(e);
+        }
+        let id = format!("c:{store}:{next}:{hash}");
+        let evicted =
+            self.stores[next].insert(hash, bytes, EntryState::Arriving, Some(id.clone()), now);
+        self.pending_writes.insert(id.clone(), (next, hash));
+        self.flows
+            .submit(id, Owner::Write, path.edges, bytes, path.latency, now);
+        self.cascade(next, evicted);
+    }
+
+    /// `hash` was promoted from `worker`'s tiers back into its HBM: the
+    /// tier keeps its copy (KV is immutable); mark it read and, under LRU /
+    /// TTL, recently used.
+    pub fn promoted(&mut self, worker: WorkerId, hash: u64) {
+        let now = self.flows.now();
+        if let Some(i) = self.tier_holding(worker, hash) {
+            let store = self.tiers[worker][i].store;
+            self.stores[store].promoted(hash, now);
+        }
+    }
+
+    /// Remove `hash` from whichever of `worker`'s tiers holds it.
     pub fn remove(&mut self, worker: WorkerId, hash: u64) {
         for i in 0..self.tiers[worker].len() {
             let store = self.tiers[worker][i].store;
-            if self.stores[store].remove(hash) {
+            if let Some(e) = self.stores[store].remove(hash) {
+                if let Some(id) = e.write_id {
+                    self.pending_writes.remove(&id);
+                    self.flows.cancel(&id);
+                }
                 return;
             }
         }
     }
 
+    /// Land finished writes and drop TTL-expired entries.
+    fn settle_writes(&mut self, now: f64) {
+        for id in self.flows.take_completed(Owner::Write) {
+            if let Some((store, hash)) = self.pending_writes.remove(&id) {
+                self.stores[store].landed(hash);
+            }
+        }
+        for s in 0..self.stores.len() {
+            for id in self.stores[s].expire(now) {
+                self.pending_writes.remove(&id);
+                self.flows.cancel(&id);
+            }
+        }
+    }
+
     /// Start moving `bytes` for `request` from `worker`'s tier `tier` into
-    /// its HBM. The transfer's id is `promotion_id(request, tier)`.
+    /// its HBM. The transfer's id is `promotion_id(request, tier)`. If any
+    /// of `hashes` is still arriving in that store, the promotion waits for
+    /// the latest of those writes before its bytes flow.
     pub fn submit_promotion(
         &mut self,
         worker: WorkerId,
         tier: usize,
         request: &str,
         bytes: u64,
+        hashes: &[u64],
         now: f64,
     ) {
         let path = self.tiers[worker][tier].fetch_path.clone();
+        let store = self.tiers[worker][tier].store;
+        let mut wait = 0.0_f64;
+        for &h in hashes {
+            if let Some(id) = self.stores[store].write_id_of(h) {
+                wait = wait.max(self.flows.estimate_remaining(id));
+            }
+        }
+        if wait > 0.0 {
+            self.write_race_waits += 1;
+        }
         self.flows.submit(
             promotion_id(request, tier),
             Owner::Worker(worker),
             path.edges,
             bytes,
-            path.latency,
+            path.latency + wait,
             now,
         );
     }
@@ -614,8 +963,11 @@ impl MemoryGraph {
     }
 
     /// Advance every transfer to `now`; completions are queued per owner.
+    /// Writes that landed become resident; TTL-expired entries are dropped.
     pub fn advance(&mut self, now: f64) -> Vec<(Owner, String)> {
-        self.flows.advance(now)
+        let done = self.flows.advance(now);
+        self.settle_writes(now);
+        done
     }
 
     pub fn take_completed(&mut self, owner: Owner) -> HashSet<String> {
@@ -650,6 +1002,71 @@ impl MemoryGraph {
         }
         out
     }
+
+    /// Per-store-name totals over instances: `(capacity_blocks, held
+    /// blocks, bytes_written, bytes_read, dead_bytes, evictions, expired)`.
+    pub fn store_totals(&self) -> Vec<(String, StoreTotals)> {
+        let mut out: Vec<(String, StoreTotals)> = Vec::new();
+        for s in &self.stores {
+            let t = match out.iter_mut().find(|(n, _)| *n == s.name) {
+                Some((_, t)) => t,
+                None => {
+                    out.push((s.name.clone(), StoreTotals::default()));
+                    &mut out.last_mut().unwrap().1
+                }
+            };
+            t.instances += 1;
+            t.capacity_blocks += s.capacity_blocks;
+            t.held_blocks += s.len() as u64;
+            t.bytes_written += s.bytes_written;
+            t.bytes_read += s.bytes_read;
+            t.dead_bytes += s.dead_bytes;
+            t.evictions += s.num_evictions;
+            t.expired += s.num_expired;
+        }
+        out
+    }
+
+    /// Per-edge-name totals over instances: `(instances, capacity per
+    /// instance, bytes moved)`.
+    pub fn edge_totals(&self) -> Vec<(String, EdgeTotals)> {
+        let mut out: Vec<(String, EdgeTotals)> = Vec::new();
+        for e in self.flows.edges() {
+            let t = match out.iter_mut().find(|(n, _)| *n == e.name) {
+                Some((_, t)) => t,
+                None => {
+                    out.push((e.name.clone(), EdgeTotals::default()));
+                    &mut out.last_mut().unwrap().1
+                }
+            };
+            t.instances += 1;
+            t.capacity = e.capacity;
+            t.bytes_moved += e.bytes_moved;
+        }
+        out
+    }
+}
+
+/// Totals over the instances of one store name.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct StoreTotals {
+    pub instances: u64,
+    pub capacity_blocks: u64,
+    pub held_blocks: u64,
+    pub bytes_written: u64,
+    pub bytes_read: u64,
+    pub dead_bytes: u64,
+    pub evictions: u64,
+    pub expired: u64,
+}
+
+/// Totals over the instances of one edge name (both directions).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct EdgeTotals {
+    pub instances: u64,
+    /// Capacity of one instance, bytes/s.
+    pub capacity: f64,
+    pub bytes_moved: f64,
 }
 
 #[cfg(test)]
@@ -788,12 +1205,12 @@ bandwidth = 3
     #[test]
     fn shared_store_is_visible_across_workers_and_cascades() {
         let mut g = MemoryGraph::shared(2, &[("host", 2, 1.0)]);
-        g.demote(0, 1);
-        g.demote(0, 2);
+        g.plant(0, 0, 1);
+        g.plant(0, 0, 2);
         assert!(g.holds(1, 1));
         assert_eq!(g.tier_holding(1, 2), Some(0));
         // Third insert evicts the oldest (1) off the bottom.
-        g.demote(1, 3);
+        g.plant(1, 0, 3);
         assert!(!g.holds(0, 1));
         assert!(g.holds(0, 3));
         assert_eq!(g.stores()[0].num_evictions, 1);
@@ -805,12 +1222,12 @@ bandwidth = 3
     #[test]
     fn private_stores_do_not_leak_between_workers() {
         let mut g = MemoryGraph::private(2, &[("local", 4, 1.0), ("host", 4, 1.0)]);
-        g.demote(0, 7);
+        g.plant(0, 0, 7);
         assert!(g.holds(0, 7));
         assert!(!g.holds(1, 7));
         // Cascade: fill tier 0 with 4 more, 7 falls to tier 1.
         for h in 10..14 {
-            g.demote(0, h);
+            g.plant(0, 0, h);
         }
         assert_eq!(g.tier_holding(0, 7), Some(1));
         assert_eq!(g.tier_holding(0, 13), Some(0));
@@ -824,9 +1241,9 @@ bandwidth = 3
         // binding); once it completes host gets 10 back.
         let c = cluster(&["host", "nvme"], 1, 1, 4);
         let mut g = MemoryGraph::build(&[&c], 10, None).unwrap();
-        g.submit_promotion(0, 0, "a", 100, 0.0);
+        g.submit_promotion(0, 0, "a", 100, &[], 0.0);
         assert!(close(g.estimate_promotion_remaining(0, "a"), 10.0));
-        g.submit_promotion(0, 1, "b", 25, 0.0);
+        g.submit_promotion(0, 1, "b", 25, &[], 0.0);
         assert!(close(g.estimate_remaining(&promotion_id("a", 0)), 20.0));
         assert!(close(g.estimate_remaining(&promotion_id("b", 1)), 5.0));
         let done = g.advance(5.0);
@@ -835,11 +1252,144 @@ bandwidth = 3
         // a: 75 left at 10 → 7.5 s.
         assert!(close(g.estimate_promotion_remaining(0, "a"), 7.5));
         // Two nvme promotions: the 5-wide drive binds them at 2.5 each.
-        g.submit_promotion(0, 1, "c", 25, 5.0);
-        g.submit_promotion(0, 1, "d", 25, 5.0);
+        g.submit_promotion(0, 1, "c", 25, &[], 5.0);
+        g.submit_promotion(0, 1, "d", 25, &[], 5.0);
         assert!(close(g.estimate_remaining(&promotion_id("c", 1)), 10.0));
         // ...and the port's remaining 5 goes to a (75 left → 15 s).
         assert!(close(g.estimate_promotion_remaining(0, "a"), 15.0));
+    }
+
+    fn two_tier_private(write: WritePolicy, eviction: EvictionPolicy) -> MemoryGraph {
+        // One worker; tier 0 holds 2 blocks at 10 B/s, tier 1 holds 4 at 5 B/s.
+        MemoryGraph::private(1, &[("t0", 2, 10.0), ("t1", 4, 5.0)]).with_policies(write, eviction)
+    }
+
+    #[test]
+    fn write_back_writes_on_eviction_and_promotions_wait_for_arrival() {
+        let mut g = two_tier_private(WritePolicy::WriteBack {}, EvictionPolicy::Fifo {});
+        // Production writes nothing under write-back.
+        g.produced(0, 1, 100);
+        assert!(!g.holds(0, 1));
+        // Eviction from HBM starts a 100-byte write at 10 B/s: arriving now,
+        // resident at t = 10.
+        g.demote(0, 1, 100);
+        assert!(g.holds(0, 1));
+        assert!(!g.stores()[0].is_resident(1));
+        assert!(!g.is_backed(0, 2));
+        assert!(g.is_backed(0, 1));
+        // A promotion of hash 1 submitted at t = 4 waits the remaining 6 s
+        // of the write before its own 100 bytes (10 s at 10 B/s).
+        g.advance(4.0);
+        g.submit_promotion(0, 0, "r", 100, &[1], 4.0);
+        assert_eq!(g.write_race_waits, 1);
+        assert!(close(g.estimate_promotion_remaining(0, "r"), 6.0 + 10.0));
+        g.advance(10.0);
+        assert!(g.stores()[0].is_resident(1));
+        assert_eq!(g.stores()[0].bytes_written, 100);
+        // The write's bytes moved on the write path, the promotion's on the
+        // fetch path (different edges, same link).
+        let done = g.advance(20.0);
+        assert_eq!(done.len(), 1);
+        assert_eq!(g.take_completed(Owner::Worker(0)).len(), 1);
+        // Promotion marks the entry read; the tier keeps its copy.
+        g.promoted(0, 1);
+        assert!(g.holds(0, 1));
+        assert_eq!(g.stores()[0].bytes_read, 100);
+        // Re-eviction of a backed block writes nothing.
+        let before = g.flows().bytes_submitted_write;
+        g.demote(0, 1, 100);
+        assert_eq!(g.flows().bytes_submitted_write, before);
+    }
+
+    #[test]
+    fn write_through_writes_on_production_and_selective_on_the_nth_hit() {
+        let mut g = two_tier_private(WritePolicy::WriteThrough {}, EvictionPolicy::Fifo {});
+        g.produced(0, 7, 50);
+        assert!(g.holds(0, 7));
+        assert!(close(g.flows().bytes_submitted_write, 50.0));
+        g.demote(0, 7, 50); // already backed: nothing more
+        assert!(close(g.flows().bytes_submitted_write, 50.0));
+
+        let mut g = two_tier_private(
+            WritePolicy::Selective { min_hits: 2 },
+            EvictionPolicy::Fifo {},
+        );
+        g.produced(0, 7, 50);
+        g.hit(0, 7, 50, 1);
+        assert!(!g.holds(0, 7));
+        g.hit(0, 7, 50, 2);
+        assert!(g.holds(0, 7));
+        g.hit(0, 7, 50, 3);
+        assert!(close(g.flows().bytes_submitted_write, 50.0));
+        // An unbacked block evicted under selective is dropped.
+        g.demote(0, 8, 50);
+        assert!(!g.holds(0, 8));
+    }
+
+    #[test]
+    fn a_full_store_cascades_into_the_next_as_a_transfer_and_counts_dead_bytes() {
+        let mut g = two_tier_private(WritePolicy::WriteBack {}, EvictionPolicy::Fifo {});
+        // Fill tier 0 (2 blocks) then a third demotion evicts the oldest
+        // into tier 1 over the store → store path (10 → gpu → 5: 5 B/s).
+        for h in [1, 2] {
+            g.plant(0, 0, h);
+        }
+        g.demote(0, 3, 20);
+        assert_eq!(g.tier_holding(0, 1), Some(1));
+        assert!(!g.stores()[1].is_resident(1));
+        assert_eq!(g.tier_holding(0, 3), Some(0));
+        assert_eq!(g.stores()[0].num_evictions, 1);
+        // Planted block 1 carries 1 byte: lands at 1/5 s.
+        g.advance(1.0);
+        assert!(g.stores()[1].is_resident(1));
+        // Fill tier 1 (4) and push one off the bottom unread: dead bytes.
+        for h in [11, 12, 13, 14] {
+            g.plant(0, 1, h);
+        }
+        assert!(!g.holds(0, 1));
+        assert_eq!(g.stores()[1].dead_bytes, 1);
+        assert_eq!(g.stores()[1].num_evictions, 1);
+        let totals = g.store_totals();
+        assert_eq!(totals[1].0, "t1");
+        assert_eq!(totals[1].1.evictions, 1);
+    }
+
+    #[test]
+    fn lru_refreshes_on_promotion_and_ttl_expires_and_cancels_writes() {
+        let mut g = two_tier_private(WritePolicy::WriteBack {}, EvictionPolicy::Lru {});
+        g.plant(0, 0, 1);
+        g.plant(0, 0, 2);
+        // Under LRU, promoting 1 makes 2 the victim.
+        g.promoted(0, 1);
+        g.plant(0, 0, 3);
+        assert!(g.holds(0, 1));
+        assert_eq!(g.tier_holding(0, 2), Some(1)); // cascaded to t1
+                                                   // FIFO would have evicted 1 instead.
+        let mut f = two_tier_private(WritePolicy::WriteBack {}, EvictionPolicy::Fifo {});
+        f.plant(0, 0, 1);
+        f.plant(0, 0, 2);
+        f.promoted(0, 1);
+        f.plant(0, 0, 3);
+        assert_eq!(f.tier_holding(0, 1), Some(1));
+        assert_eq!(f.tier_holding(0, 2), Some(0));
+
+        // TTL: an entry untouched for > 5 s is dropped on advance, an
+        // arriving write is cancelled.
+        let mut t = two_tier_private(
+            WritePolicy::WriteBack {},
+            EvictionPolicy::Ttl { seconds: 5.0 },
+        );
+        t.plant(0, 0, 1);
+        t.advance(3.0);
+        t.demote(0, 2, 100); // 10 s write, arriving
+        assert!(t.holds(0, 1) && t.holds(0, 2));
+        t.advance(6.0);
+        assert!(!t.holds(0, 1), "expired");
+        assert!(t.holds(0, 2), "touched at 3");
+        assert_eq!(t.stores()[0].num_expired, 1);
+        t.advance(9.0);
+        assert!(!t.holds(0, 2), "expired while arriving");
+        assert_eq!(t.flows().num_in_flight(), 0, "write cancelled");
     }
 
     #[test]

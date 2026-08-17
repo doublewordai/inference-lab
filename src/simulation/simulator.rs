@@ -343,12 +343,14 @@ impl Simulator {
                 bytes_skipped: h.bytes_skipped,
             }
         });
+        let memory = self.engine.memory_metrics();
         self.metrics.compute_summary(
             self.engine.current_time(),
             self.engine.aggregate_prefix_cache(),
             router,
             decode_router,
             handoff,
+            memory,
         )
     }
 

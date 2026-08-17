@@ -801,6 +801,43 @@ fn print_final_metrics(
             print_router("DECODE ROUTER", dr);
         }
     }
+    if let Some(m) = &summary.memory {
+        println!("\n{}", "MEMORY".yellow().bold());
+        println!(
+            "  • Write: {}; eviction: {}; written {:.2} GB; promoted {:.2} GB; promotions waiting on a write: {}",
+            m.write_policy,
+            m.eviction_policy,
+            m.bytes_written / 1e9,
+            m.bytes_promoted / 1e9,
+            m.write_race_waits
+        );
+        for st in &m.stores {
+            println!(
+                "  • {}: {} × {} blocks, {} held; written {:.2} GB, read {:.2} GB, dead {:.2} GB; evictions {}, expired {}",
+                st.name,
+                st.instances,
+                st.capacity_blocks,
+                st.held_blocks,
+                st.bytes_written as f64 / 1e9,
+                st.bytes_read as f64 / 1e9,
+                st.dead_bytes as f64 / 1e9,
+                st.evictions,
+                st.expired
+            );
+        }
+        for l in &m.links {
+            if l.bytes_moved > 0.0 {
+                println!(
+                    "  • link {}: {} × {:.1} GB/s; moved {:.2} GB ({:.1}% of capacity)",
+                    l.name,
+                    l.instances / 2,
+                    l.capacity / 1e9,
+                    l.bytes_moved / 1e9,
+                    100.0 * l.utilisation
+                );
+            }
+        }
+    }
     if let Some(h) = &summary.handoff {
         if h.transfers > 0 {
             println!("\n{}", "HAND-OFF".yellow().bold());
