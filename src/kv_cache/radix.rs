@@ -29,6 +29,7 @@ use std::collections::{BTreeMap, BTreeSet};
 pub type NodeId = u32;
 pub type WorkerId = usize;
 pub type StoreId = usize;
+type TierRangeId = u64;
 
 /// KV bytes of a `t`-token sequence, from the model.
 pub type KvBytesFn = std::sync::Arc<dyn Fn(u32) -> u64 + Send + Sync>;
@@ -124,6 +125,9 @@ impl HbmState {
 /// A range a store holds of one node.
 #[derive(Debug, Clone)]
 struct TierRange {
+    /// Stable identity in a store's eviction order. Tree compaction moves
+    /// ranges between nodes, but does not change their ordering identity.
+    id: TierRangeId,
     start: u32,
     end: u32,
     /// Recycling stamp: insertion order (FIFO), refreshed on promotion
@@ -212,14 +216,17 @@ struct WorkerMeta {
     tiers: Vec<StoreId>,
 }
 
-/// Order entry: `(key, seq, node, start)`.
-type TierOrder = BTreeSet<(u64, u64, NodeId, u32)>;
+/// Order entry: `(key, seq, range id)`. The range's current tree position is
+/// deliberately kept out of this tree: radix splits and merges only update
+/// [`StoreMeta::locations`].
+type TierOrder = BTreeSet<(u64, u64, TierRangeId)>;
 
 #[derive(Debug)]
 struct StoreMeta {
     capacity: u32,
     held: u32,
     order: TierOrder,
+    locations: FxHashMap<TierRangeId, (NodeId, u32)>,
     seq: u64,
     eviction: EvictionPolicy,
 }
@@ -287,6 +294,7 @@ pub struct Radix {
     free_ids: Vec<NodeId>,
     workers: Vec<Option<WorkerMeta>>,
     stores: Vec<StoreMeta>,
+    next_tier_range_id: TierRangeId,
     block_size: u32,
     kv_bytes_at: KvBytesFn,
     /// `kv_bytes_at(k × block_size)`, grown on demand.
@@ -321,6 +329,7 @@ impl Radix {
             free_ids: Vec::new(),
             workers: Vec::new(),
             stores: Vec::new(),
+            next_tier_range_id: 0,
             block_size: block_size.max(1),
             kv_bytes_at,
             boundary_bytes: RefCell::new(vec![0]),
@@ -409,6 +418,7 @@ impl Radix {
             capacity,
             held: 0,
             order: BTreeSet::new(),
+            locations: FxHashMap::default(),
             seq: 0,
             eviction,
         });
@@ -662,32 +672,53 @@ impl Radix {
             head.read_upto = head.read_upto.min(k);
             let mut head_ranges = Vec::new();
             for r in head.ranges.drain(..) {
-                self.stores[s].order.remove(&(r.key, r.seq, node, r.start));
                 if r.end <= k {
                     head_ranges.push(r);
                 } else if r.start >= k {
-                    tail_state.ranges.push(TierRange {
+                    let moved = TierRange {
                         start: r.start - k,
                         end: r.end - k,
                         ..r
-                    });
+                    };
+                    self.stores[s]
+                        .locations
+                        .insert(moved.id, (tail, moved.start));
+                    tail_state.ranges.push(moved);
                 } else {
-                    tail_state.ranges.push(TierRange {
+                    let new_id = self.new_tier_range_id();
+                    // Preserve the old `(node, start)` tie-break for the two
+                    // pieces: the lower node keeps the lower, existing id.
+                    let (head_id, tail_id) = if node < tail {
+                        (r.id, new_id)
+                    } else {
+                        (new_id, r.id)
+                    };
+                    let tail_range = TierRange {
+                        id: tail_id,
                         start: 0,
                         end: r.end - k,
                         seq: r.seq,
                         key: r.key,
                         touched: r.touched,
                         arriving: r.arriving.clone(),
-                    });
-                    head_ranges.push(TierRange { end: k, ..r });
+                    };
+                    let head_range = TierRange {
+                        id: head_id,
+                        end: k,
+                        ..r
+                    };
+                    self.stores[s]
+                        .locations
+                        .insert(head_range.id, (node, head_range.start));
+                    self.stores[s]
+                        .locations
+                        .insert(tail_range.id, (tail, tail_range.start));
+                    self.stores[s]
+                        .order
+                        .insert((tail_range.key, tail_range.seq, new_id));
+                    tail_state.ranges.push(tail_range);
+                    head_ranges.push(head_range);
                 }
-            }
-            for r in &head_ranges {
-                self.stores[s].order.insert((r.key, r.seq, node, r.start));
-            }
-            for r in &tail_state.ranges {
-                self.stores[s].order.insert((r.key, r.seq, tail, r.start));
             }
             head.ranges = head_ranges;
             self.nodes[node as usize].tiers.insert(s, head);
@@ -800,24 +831,6 @@ impl Radix {
                 }
             }
         }
-        let stores: Vec<StoreId> = self.nodes[node as usize]
-            .tiers
-            .keys()
-            .chain(cn.tiers.keys())
-            .copied()
-            .collect();
-        for &s in &stores {
-            if let Some(ts) = self.nodes[node as usize].tiers.get(&s) {
-                for r in &ts.ranges {
-                    self.stores[s].order.remove(&(r.key, r.seq, node, r.start));
-                }
-            }
-            if let Some(ts) = cn.tiers.get(&s) {
-                for r in &ts.ranges {
-                    self.stores[s].order.remove(&(r.key, r.seq, child, r.start));
-                }
-            }
-        }
         let n = &mut self.nodes[node as usize];
         n.hashes.append(&mut cn.hashes);
         n.children = std::mem::take(&mut cn.children);
@@ -868,22 +881,19 @@ impl Radix {
                 tp.read_upto = k + tc.read_upto;
             }
             for r in tc.ranges {
-                tp.ranges.push(TierRange {
+                let moved = TierRange {
                     start: k + r.start,
                     end: k + r.end,
                     ..r
-                });
+                };
+                self.stores[s]
+                    .locations
+                    .insert(moved.id, (node, moved.start));
+                tp.ranges.push(moved);
             }
         }
         for &w in &workers_dedup {
             self.order_refresh(w, node);
-        }
-        for &s in &stores {
-            if let Some(ts) = self.nodes[node as usize].tiers.get(&s) {
-                for r in &ts.ranges {
-                    self.stores[s].order.insert((r.key, r.seq, node, r.start));
-                }
-            }
         }
     }
 
@@ -1571,15 +1581,24 @@ impl Radix {
                 if !matches!(self.stores[s].eviction, EvictionPolicy::Outlook {}) {
                     continue;
                 }
+                let boundary = self.nodes[node_id as usize].outlook_boundary();
+                let split_id = boundary
+                    .filter(|&u| {
+                        self.nodes[node_id as usize].tiers[&s]
+                            .ranges
+                            .iter()
+                            .any(|r| r.start < u && u < r.end)
+                    })
+                    .map(|_| self.new_tier_range_id());
                 let node = &mut self.nodes[node_id as usize];
-                let boundary = node.outlook_boundary();
                 let (klo, khi) = (node.outlook_key_at(0).0, node.outlook_key_at(u32::MAX).0);
                 let ts = node.tiers.get_mut(&s).unwrap();
                 let mut ranges = Vec::with_capacity(ts.ranges.len() + 1);
                 let mut removed = Vec::new();
                 let mut added = Vec::new();
+                let mut locations = Vec::new();
                 for r in ts.ranges.drain(..) {
-                    removed.push((r.key, r.seq, node_id, r.start));
+                    let old = (r.key, r.seq, r.id);
                     match boundary {
                         Some(u) if r.start < u && u < r.end => {
                             let a = TierRange {
@@ -1589,23 +1608,37 @@ impl Radix {
                                 ..r
                             };
                             let b = TierRange {
+                                id: split_id.expect("one range straddles an outlook boundary"),
                                 start: u,
                                 key: khi,
                                 ..r
                             };
-                            added.push((a.key, a.seq, node_id, a.start));
-                            added.push((b.key, b.seq, node_id, b.start));
+                            let a_entry = (a.key, a.seq, a.id);
+                            if old != a_entry {
+                                removed.push(old);
+                                added.push(a_entry);
+                            }
+                            added.push((b.key, b.seq, b.id));
+                            locations.push((b.id, (node_id, b.start)));
                             ranges.push(a);
                             ranges.push(b);
                         }
                         Some(u) if r.end <= u => {
                             let a = TierRange { key: klo, ..r };
-                            added.push((a.key, a.seq, node_id, a.start));
+                            let new = (a.key, a.seq, a.id);
+                            if old != new {
+                                removed.push(old);
+                                added.push(new);
+                            }
                             ranges.push(a);
                         }
                         _ => {
                             let a = TierRange { key: khi, ..r };
-                            added.push((a.key, a.seq, node_id, a.start));
+                            let new = (a.key, a.seq, a.id);
+                            if old != new {
+                                removed.push(old);
+                                added.push(new);
+                            }
                             ranges.push(a);
                         }
                     }
@@ -1616,6 +1649,9 @@ impl Radix {
                 }
                 for e in added {
                     self.stores[s].order.insert(e);
+                }
+                for (id, location) in locations {
+                    self.stores[s].locations.insert(id, location);
                 }
             }
             acc += seg.len;
@@ -1632,6 +1668,15 @@ impl Radix {
 
     // ------------------------------------------------------------------
     // Stores
+
+    fn new_tier_range_id(&mut self) -> TierRangeId {
+        let id = self.next_tier_range_id;
+        self.next_tier_range_id = self
+            .next_tier_range_id
+            .checked_add(1)
+            .expect("tier range id overflow");
+        id
+    }
 
     fn store_key(&self, s: StoreId, node: NodeId, p: u32) -> u64 {
         match self.stores[s].eviction {
@@ -1723,9 +1768,11 @@ impl Radix {
                     sm.seq += 1;
                     sm.seq
                 };
+                let id = self.new_tier_range_id();
                 let key = self.store_key(s, piece.node, piece.start);
                 let ts = self.nodes[piece.node as usize].tiers.entry(s).or_default();
                 let r = TierRange {
+                    id,
                     start: piece.start,
                     end: piece.end,
                     seq,
@@ -1735,9 +1782,10 @@ impl Radix {
                 };
                 let at = ts.ranges.partition_point(|x| x.start < r.start);
                 ts.ranges.insert(at, r);
+                self.stores[s].order.insert((key, seq, id));
                 self.stores[s]
-                    .order
-                    .insert((key, seq, piece.node, piece.start));
+                    .locations
+                    .insert(id, (piece.node, piece.start));
                 self.stores[s].held += piece.len();
             }
         }
@@ -1758,25 +1806,36 @@ impl Radix {
     fn store_evict_entry(
         &mut self,
         s: StoreId,
-        e: (u64, u64, NodeId, u32),
+        e: (u64, u64, TierRangeId),
         max: u32,
     ) -> Option<TierEvicted> {
-        self.stores[s].order.remove(&e);
-        let (_, _, node_id, start) = e;
+        let (_, _, id) = e;
+        let Some(&(node_id, start)) = self.stores[s].locations.get(&id) else {
+            self.stores[s].order.remove(&e);
+            return None;
+        };
+        let Some(idx) = self.nodes[node_id as usize]
+            .tiers
+            .get(&s)
+            .and_then(|ts| ts.ranges.iter().position(|r| r.id == id))
+        else {
+            self.stores[s].order.remove(&e);
+            self.stores[s].locations.remove(&id);
+            return None;
+        };
         let node = &mut self.nodes[node_id as usize];
-        let ts = node.tiers.get_mut(&s)?;
-        let idx = ts.ranges.iter().position(|r| r.start == start)?;
+        let ts = node.tiers.get_mut(&s).unwrap();
         let r = ts.ranges[idx].clone();
+        debug_assert_eq!(r.start, start);
         let take = (r.end - r.start).min(max.max(1));
         let ev_start = r.end - take;
         let write_id = r.arriving.clone();
         if ev_start > r.start {
             ts.ranges[idx].end = ev_start;
-            let kept = &ts.ranges[idx];
-            let key = (kept.key, kept.seq, node_id, kept.start);
-            self.stores[s].order.insert(key);
         } else {
             ts.ranges.remove(idx);
+            self.stores[s].order.remove(&e);
+            self.stores[s].locations.remove(&id);
         }
         let read_upto = ts.read_upto;
         let span = Span {
@@ -1873,13 +1932,12 @@ impl Radix {
                     .bytes_at_boundary(depth + b)
                     .saturating_sub(self.bytes_at_boundary(depth + a));
             }
-            let ts = self.nodes[node_id as usize].tiers.get_mut(&s).unwrap();
             if !refresh {
                 continue;
             }
             // Common case: one range, wholly inside the span — re-stamp in
             // place.
-            let overlapping: Vec<usize> = ts
+            let overlapping: Vec<usize> = self.nodes[node_id as usize].tiers[&s]
                 .ranges
                 .iter()
                 .enumerate()
@@ -1888,23 +1946,39 @@ impl Radix {
                 .collect();
             if overlapping.len() == 1 {
                 let i = overlapping[0];
-                let r = &ts.ranges[i];
+                let r = &self.nodes[node_id as usize].tiers[&s].ranges[i];
                 if r.start >= sp.start && r.end <= sp.end {
-                    let old = (r.key, r.seq, node_id, r.start);
+                    let old = (r.key, r.seq, r.id);
                     self.stores[s].seq += 1;
                     let seq = self.stores[s].seq;
+                    let ts = self.nodes[node_id as usize].tiers.get_mut(&s).unwrap();
                     let r = &mut ts.ranges[i];
                     r.seq = seq;
                     r.touched = now;
-                    let new = (r.key, r.seq, node_id, r.start);
+                    let new = (r.key, r.seq, r.id);
                     self.stores[s].order.remove(&old);
                     self.stores[s].order.insert(new);
                     continue;
                 }
             }
+            // Splitting retains the leftmost piece's identity. Allocate ids
+            // only for the additional pieces before borrowing the ranges.
+            let new_id_count: usize = self.nodes[node_id as usize].tiers[&s]
+                .ranges
+                .iter()
+                .filter(|r| r.start < sp.end && sp.start < r.end)
+                .map(|r| usize::from(r.start < sp.start) + usize::from(r.end > sp.end))
+                .sum();
+            let mut new_ids = (0..new_id_count)
+                .map(|_| self.new_tier_range_id())
+                .collect::<Vec<_>>()
+                .into_iter();
+            let ts = self.nodes[node_id as usize].tiers.get_mut(&s).unwrap();
             let mut ranges = Vec::with_capacity(ts.ranges.len() + 1);
             let mut removed = Vec::new();
             let mut added = Vec::new();
+            let mut location_add = Vec::new();
+            let mut location_remove = Vec::new();
             // One stamp per promotion: the touched ranges coalesce.
             self.stores[s].seq += 1;
             let seq = self.stores[s].seq;
@@ -1913,32 +1987,60 @@ impl Radix {
                     ranges.push(r);
                     continue;
                 }
-                removed.push((r.key, r.seq, node_id, r.start));
+                let old = (r.key, r.seq, r.id);
                 if r.start < sp.start {
                     let head = TierRange {
                         end: sp.start,
                         arriving: r.arriving.clone(),
                         ..r
                     };
-                    added.push((head.key, head.seq, node_id, head.start));
                     ranges.push(head);
-                }
-                let mid = TierRange {
-                    start: r.start.max(sp.start),
-                    end: r.end.min(sp.end),
-                    seq,
-                    touched: now,
-                    arriving: r.arriving.clone(),
-                    ..r
-                };
-                added.push((mid.key, mid.seq, node_id, mid.start));
-                ranges.push(mid);
-                if r.end > sp.end {
-                    let tail = TierRange { start: sp.end, ..r };
-                    added.push((tail.key, tail.seq, node_id, tail.start));
-                    ranges.push(tail);
+                    let mid = TierRange {
+                        id: new_ids.next().unwrap(),
+                        start: sp.start,
+                        end: r.end.min(sp.end),
+                        seq,
+                        touched: now,
+                        arriving: r.arriving.clone(),
+                        ..r
+                    };
+                    added.push((mid.key, mid.seq, mid.id));
+                    location_add.push((mid.id, (node_id, mid.start)));
+                    ranges.push(mid);
+                    if r.end > sp.end {
+                        let tail = TierRange {
+                            id: new_ids.next().unwrap(),
+                            start: sp.end,
+                            ..r
+                        };
+                        added.push((tail.key, tail.seq, tail.id));
+                        location_add.push((tail.id, (node_id, tail.start)));
+                        ranges.push(tail);
+                    }
+                } else {
+                    let mid = TierRange {
+                        end: r.end.min(sp.end),
+                        seq,
+                        touched: now,
+                        arriving: r.arriving.clone(),
+                        ..r
+                    };
+                    removed.push(old);
+                    added.push((mid.key, mid.seq, mid.id));
+                    ranges.push(mid);
+                    if r.end > sp.end {
+                        let tail = TierRange {
+                            id: new_ids.next().unwrap(),
+                            start: sp.end,
+                            ..r
+                        };
+                        added.push((tail.key, tail.seq, tail.id));
+                        location_add.push((tail.id, (node_id, tail.start)));
+                        ranges.push(tail);
+                    }
                 }
             }
+            debug_assert!(new_ids.next().is_none());
             ranges.sort_by_key(|r| r.start);
             // Merge adjacent ranges with identical stamps.
             let mut merged: Vec<TierRange> = Vec::with_capacity(ranges.len());
@@ -1949,7 +2051,14 @@ impl Radix {
                         && last.key == r.key
                         && last.arriving == r.arriving
                     {
-                        added.retain(|&e| e != (r.key, r.seq, node_id, r.start));
+                        let redundant = (r.key, r.seq, r.id);
+                        if let Some(i) = added.iter().position(|&e| e == redundant) {
+                            added.swap_remove(i);
+                        } else {
+                            removed.push(redundant);
+                        }
+                        location_add.retain(|&(id, _)| id != r.id);
+                        location_remove.push(r.id);
                         last.end = r.end;
                         continue;
                     }
@@ -1963,6 +2072,12 @@ impl Radix {
             for e in added {
                 self.stores[s].order.insert(e);
             }
+            for id in location_remove {
+                self.stores[s].locations.remove(&id);
+            }
+            for (id, location) in location_add {
+                self.stores[s].locations.insert(id, location);
+            }
         }
         read_bytes
     }
@@ -1972,19 +2087,32 @@ impl Radix {
     pub fn store_remove(&mut self, s: StoreId, span: Span) -> Vec<String> {
         let mut ids = Vec::new();
         let node_id = span.node;
-        let Some(ts) = self.nodes[node_id as usize].tiers.get_mut(&s) else {
+        let Some(ts) = self.nodes[node_id as usize].tiers.get(&s) else {
             return ids;
         };
+        let split_count = ts
+            .ranges
+            .iter()
+            .filter(|r| {
+                r.start < span.end && span.start < r.end && r.start < span.start && span.end < r.end
+            })
+            .count();
+        let mut split_ids = (0..split_count)
+            .map(|_| self.new_tier_range_id())
+            .collect::<Vec<_>>()
+            .into_iter();
+        let ts = self.nodes[node_id as usize].tiers.get_mut(&s).unwrap();
         let mut kept = Vec::new();
         let mut removed_blocks = 0u32;
         let mut order_rm = Vec::new();
         let mut order_add = Vec::new();
+        let mut location_update = Vec::new();
+        let mut location_remove = Vec::new();
         for r in ts.ranges.drain(..) {
             if r.end <= span.start || r.start >= span.end {
                 kept.push(r);
                 continue;
             }
-            order_rm.push((r.key, r.seq, node_id, r.start));
             if let Some(id) = &r.arriving {
                 ids.push(id.clone());
             }
@@ -1997,15 +2125,27 @@ impl Radix {
                     arriving: r.arriving.clone(),
                     ..r
                 };
-                order_add.push((head.key, head.seq, node_id, head.start));
                 kept.push(head);
-            }
-            if cut_e < r.end {
+                if cut_e < r.end {
+                    let tail = TierRange {
+                        id: split_ids.next().unwrap(),
+                        start: cut_e,
+                        ..r
+                    };
+                    order_add.push((tail.key, tail.seq, tail.id));
+                    location_update.push((tail.id, (node_id, tail.start)));
+                    kept.push(tail);
+                }
+            } else if cut_e < r.end {
                 let tail = TierRange { start: cut_e, ..r };
-                order_add.push((tail.key, tail.seq, node_id, tail.start));
+                location_update.push((tail.id, (node_id, tail.start)));
                 kept.push(tail);
+            } else {
+                order_rm.push((r.key, r.seq, r.id));
+                location_remove.push(r.id);
             }
         }
+        debug_assert!(split_ids.next().is_none());
         ts.ranges = kept;
         let empty = ts.ranges.is_empty();
         self.stores[s].held -= removed_blocks;
@@ -2014,6 +2154,12 @@ impl Radix {
         }
         for e in order_add {
             self.stores[s].order.insert(e);
+        }
+        for id in location_remove {
+            self.stores[s].locations.remove(&id);
+        }
+        for (id, location) in location_update {
+            self.stores[s].locations.insert(id, location);
         }
         if empty {
             self.nodes[node_id as usize].tiers.remove(&s);
@@ -2026,12 +2172,14 @@ impl Radix {
     pub fn store_expire(&mut self, s: StoreId, now: f64, seconds: f64) -> Vec<TierEvicted> {
         let mut out = Vec::new();
         while let Some(e) = self.stores[s].order.iter().next().copied() {
-            let (_, _, node_id, start) = e;
-            let touched = self.nodes[node_id as usize]
-                .tiers
-                .get(&s)
-                .and_then(|ts| ts.ranges.iter().find(|r| r.start == start))
-                .map(|r| r.touched);
+            let (_, _, id) = e;
+            let touched = self.stores[s].locations.get(&id).and_then(|&(node_id, _)| {
+                self.nodes[node_id as usize]
+                    .tiers
+                    .get(&s)
+                    .and_then(|ts| ts.ranges.iter().find(|r| r.id == id))
+                    .map(|r| r.touched)
+            });
             match touched {
                 Some(t) if now - t > seconds => {
                     if let Some(ev) = self.store_evict_entry(s, e, u32::MAX) {
@@ -2041,6 +2189,7 @@ impl Radix {
                 Some(_) => break,
                 None => {
                     self.stores[s].order.remove(&e);
+                    self.stores[s].locations.remove(&id);
                 }
             }
         }
@@ -2182,6 +2331,59 @@ mod tests {
         // Unknown: nothing.
         assert_eq!(r.resolve(&[7]).blocks, 0);
         assert_eq!(r.resolve(&[1, 2, 3, 4, 5, 6, 7]).blocks, 6);
+    }
+
+    #[test]
+    fn store_range_ids_survive_radix_split_and_merge() {
+        let mut r = radix();
+        let s = r.add_store(8, EvictionPolicy::Fifo {});
+        let path = r.insert(&[1, 2, 3, 4]);
+        let original_node = path.segs[0].node;
+        assert!(r
+            .store_insert(
+                s,
+                Span {
+                    node: original_node,
+                    start: 0,
+                    end: 4,
+                },
+                None,
+                0.0,
+            )
+            .is_empty());
+        let original_entry = *r.stores[s].order.first().unwrap();
+
+        // A side branch splits the stored range. The existing order entry
+        // stays byte-for-byte unchanged; only one entry is added for the new
+        // physical piece, and both ids resolve through the side map.
+        let branch = r.insert(&[1, 2, 9]);
+        assert!(r.stores[s].order.contains(&original_entry));
+        assert_eq!(r.stores[s].order.len(), 2);
+        for &(key, seq, id) in &r.stores[s].order {
+            let &(node, start) = r.stores[s].locations.get(&id).unwrap();
+            let range = r.nodes[node as usize].tiers[&s]
+                .ranges
+                .iter()
+                .find(|range| range.id == id)
+                .unwrap();
+            assert_eq!((range.key, range.seq, range.start), (key, seq, start));
+        }
+        let split_order = r.stores[s].order.clone();
+
+        // Once the empty side branch dies the chain compacts again. Neither
+        // order key changes; the child range's location alone moves.
+        r.prune_if_empty(branch.segs.last().unwrap().node);
+        let merged = r.resolve(&[1, 2, 3, 4]);
+        assert_eq!(merged.segs.len(), 1);
+        assert_eq!(r.stores[s].order, split_order);
+        for &(_, _, id) in &r.stores[s].order {
+            let &(node, start) = r.stores[s].locations.get(&id).unwrap();
+            assert_eq!(node, merged.segs[0].node);
+            assert!(r.nodes[node as usize].tiers[&s]
+                .ranges
+                .iter()
+                .any(|range| range.id == id && range.start == start));
+        }
     }
 
     #[test]
