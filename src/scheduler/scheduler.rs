@@ -185,6 +185,18 @@ impl Scheduler {
         self.prefetch_plans.first().map(|p| p.fire_at)
     }
 
+    /// Whether calling [`Scheduler::schedule`] can change scheduler-local
+    /// state at `now`. Transfer completions live on the shared memory graph,
+    /// so a caller using this to skip an idle DP-attention rank must check
+    /// that worker's completion queue separately.
+    pub(crate) fn has_local_work_for_schedule(&self, now: f64) -> bool {
+        !self.running.is_empty()
+            || !self.waiting.is_empty()
+            || !self.pending_transfers.is_empty()
+            || !self.rejected.is_empty()
+            || self.next_prefetch_at().is_some_and(|at| at <= now)
+    }
+
     /// Set where a tier-held prefix comes from at admission. `min_time`
     /// needs `recompute_seconds` (the worker's roofline for a prefill
     /// chunk); without it every prefix promotes.
@@ -885,6 +897,45 @@ mod tests {
         let scheduler = create_test_scheduler();
         assert_eq!(scheduler.num_running(), 0);
         assert_eq!(scheduler.num_waiting(), 0);
+    }
+
+    #[test]
+    fn schedule_skip_guard_covers_every_local_mutation_source() {
+        let mut scheduler = create_test_scheduler();
+        assert!(!scheduler.has_local_work_for_schedule(1.0));
+
+        scheduler
+            .waiting
+            .push_back(create_test_request("waiting", 16, 1));
+        assert!(scheduler.has_local_work_for_schedule(1.0));
+        scheduler.waiting.clear();
+
+        scheduler
+            .running
+            .push(create_test_request("running", 16, 1));
+        assert!(scheduler.has_local_work_for_schedule(1.0));
+        scheduler.running.clear();
+
+        scheduler
+            .pending_transfers
+            .push(create_test_request("parked", 16, 1));
+        assert!(scheduler.has_local_work_for_schedule(1.0));
+        scheduler.pending_transfers.clear();
+
+        scheduler
+            .rejected
+            .push(create_test_request("rejected", 16, 1));
+        assert!(scheduler.has_local_work_for_schedule(1.0));
+        scheduler.rejected.clear();
+
+        scheduler.prefetch_plans.push(PrefetchPlan {
+            fire_at: 2.0,
+            hashes: vec![1],
+            tokens: 16,
+            id: "prefetch".into(),
+        });
+        assert!(!scheduler.has_local_work_for_schedule(1.0));
+        assert!(scheduler.has_local_work_for_schedule(2.0));
     }
 
     #[test]

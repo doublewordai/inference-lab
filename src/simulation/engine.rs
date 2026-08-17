@@ -149,6 +149,14 @@ impl Worker {
             rank,
         })
     }
+
+    /// An empty rank need not take the shared graph lock just to discover
+    /// that [`Scheduler::schedule`] has nothing to do. A queued transfer
+    /// completion is graph-owned state and therefore keeps the rank live.
+    fn can_skip_schedule(&self, now: f64, completed_owners: &[Owner]) -> bool {
+        !self.scheduler.has_local_work_for_schedule(now)
+            && !completed_owners.contains(&Owner::Worker(self.global_id))
+    }
 }
 
 pub(crate) struct WorkerPool {
@@ -1158,8 +1166,9 @@ impl Engine {
     }
 
     /// One iteration of `worker`'s lockstep group (a whole replica, or the
-    /// `tp` ranks of a DP-attention replica stepped together). Every
-    /// member schedules; the union batch is priced on the replica-wide
+    /// `tp` ranks of a DP-attention replica stepped together). Members with
+    /// no local work or queued transfer completion are skipped;
+    /// the remaining schedules form a union batch priced on the replica-wide
     /// roofline, plus — with more than one rank — the attention skew: the
     /// slowest rank's own-GPU attention time over the mean rank's, since
     /// the ranks meet at every layer's FFN collective.
@@ -1174,13 +1183,34 @@ impl Engine {
         let members: Vec<usize> = self.topology.pools[pool].members_of(worker).to_vec();
         let grouped = members.len() > 1;
 
-        // Schedule every member; the batch is the union, each entry tagged
-        // with its member and index into that member's running set.
+        // Every member's schedule used to advance the shared graph before
+        // collecting its own completions. Advance once up front so a
+        // completion landing exactly at `now` is visible before deciding an
+        // otherwise-empty rank can be skipped; inspect without draining so
+        // the live rank's schedule remains the sole collector.
+        let completed_owners = if grouped {
+            let mut graph = self.topology.memory.lock().unwrap();
+            graph.advance(now);
+            graph.owners_with_completions()
+        } else {
+            Vec::new()
+        };
+
+        // Schedule each live member; the batch is the union, each entry
+        // tagged with its member and index into that member's running set.
         let mut completed = Vec::new();
         let mut preempted = false;
         let mut entries: Vec<(usize, usize, u32)> = Vec::new();
+        let mut active_members = Vec::new();
         for &m in &members {
-            let decision = self.topology.pools[pool].workers[m].scheduler.schedule(now);
+            let worker = &mut self.topology.pools[pool].workers[m];
+            if grouped && worker.can_skip_schedule(now, &completed_owners) {
+                continue;
+            }
+            let decision = worker.scheduler.schedule(now);
+            if !decision.batch.is_empty() {
+                active_members.push(m);
+            }
             completed.extend(decision.completed);
             preempted |= decision.num_preempted > 0;
             entries.extend(decision.batch.iter().map(|s| (m, s.idx, s.num_tokens)));
@@ -1256,18 +1286,30 @@ impl Engine {
             if grouped {
                 // Attention skew across the ranks: max own-GPU attention
                 // time minus the mean the union pricing already charged.
-                let mut per_rank = Vec::with_capacity(members.len());
-                for &m in &members {
-                    let refs: Vec<&Request> = entries
-                        .iter()
-                        .filter(|e| e.0 == m)
-                        .map(|&(_, idx, _)| &ws[m].scheduler.running()[idx])
-                        .collect();
-                    let toks: Vec<u32> = entries.iter().filter(|e| e.0 == m).map(|e| e.2).collect();
-                    per_rank.push(ce.attention_seconds_on_one_gpu(&refs, &toks));
-                }
-                let max = per_rank.iter().copied().fold(0.0, f64::max);
-                let mean = per_rank.iter().sum::<f64>() / per_rank.len() as f64;
+                // Empty ranks contribute exactly zero. The common one-live-
+                // rank case can reuse the union vectors and avoid building
+                // and filtering one pair of vectors per replica rank.
+                let (max, sum) = if active_members.len() == 1 {
+                    let attention = ce.attention_seconds_on_one_gpu(&batch_refs, &cost_tokens);
+                    (attention, attention)
+                } else {
+                    let mut max = 0.0_f64;
+                    let mut sum = 0.0_f64;
+                    for &m in &active_members {
+                        let refs: Vec<&Request> = entries
+                            .iter()
+                            .filter(|e| e.0 == m)
+                            .map(|&(_, idx, _)| &ws[m].scheduler.running()[idx])
+                            .collect();
+                        let toks: Vec<u32> =
+                            entries.iter().filter(|e| e.0 == m).map(|e| e.2).collect();
+                        let attention = ce.attention_seconds_on_one_gpu(&refs, &toks);
+                        max = max.max(attention);
+                        sum += attention;
+                    }
+                    (max, sum)
+                };
+                let mean = sum / members.len() as f64;
                 t += (max - mean).max(0.0);
             }
             (t, measured, bw_util, fl_util)
@@ -1661,6 +1703,14 @@ mod tests {
                 .total_blocks() as u64,
             whole / per_block
         );
+    }
+
+    #[test]
+    fn idle_rank_skip_guard_includes_graph_completions() {
+        let e = engine(2, true);
+        let rank = &e.topology.pools[0].workers[1];
+        assert!(rank.can_skip_schedule(0.0, &[]));
+        assert!(!rank.can_skip_schedule(0.0, &[Owner::Worker(rank.global_id)]));
     }
 
     #[test]
