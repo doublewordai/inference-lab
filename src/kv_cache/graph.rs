@@ -825,19 +825,8 @@ impl MemoryGraph {
         let stores: Vec<StoreId> = self.tiers[worker].iter().map(|t| t.store).collect();
         let mut r = self.radix.lock().unwrap();
         for s in stores {
-            let mut read = 0u64;
-            for &sp in spans {
-                let held = r.span_bytes(sp)
-                    - r.store_missing(s, sp)
-                        .into_iter()
-                        .map(|m| r.span_bytes(m))
-                        .sum::<u64>();
-                read += held;
-            }
-            if read > 0 {
-                r.store_promoted(s, spans, now);
-                self.stores[s].bytes_read += read;
-            }
+            let read = r.store_promoted(s, spans, now);
+            self.stores[s].bytes_read += read;
         }
     }
 

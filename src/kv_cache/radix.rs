@@ -1809,14 +1809,35 @@ impl Radix {
     /// `[0, upto)` of `path` was promoted from store `s`: mark read, and
     /// refresh recency under LRU / TTL (splitting a range at `upto` so the
     /// untouched tail keeps its stamp).
-    pub fn store_promoted(&mut self, s: StoreId, spans: &[Span], now: f64) {
+    pub fn store_promoted(&mut self, s: StoreId, spans: &[Span], now: f64) -> u64 {
         let refresh = !matches!(self.stores[s].eviction, EvictionPolicy::Fifo {});
+        let mut read_bytes = 0u64;
         for sp in spans {
             let node_id = sp.node;
+            let depth = self.nodes[node_id as usize].depth;
             let Some(ts) = self.nodes[node_id as usize].tiers.get_mut(&s) else {
                 continue;
             };
+            // Bytes of the held part of `sp`, and whether anything overlaps.
+            let mut overlap = false;
+            let mut held_ranges: Vec<(u32, u32)> = Vec::new();
+            for r in &ts.ranges {
+                if r.end <= sp.start || r.start >= sp.end {
+                    continue;
+                }
+                overlap = true;
+                held_ranges.push((r.start.max(sp.start), r.end.min(sp.end)));
+            }
+            if !overlap {
+                continue;
+            }
             ts.read_upto = ts.read_upto.max(sp.end);
+            for (a, b) in held_ranges {
+                read_bytes += self
+                    .bytes_at_boundary(depth + b)
+                    .saturating_sub(self.bytes_at_boundary(depth + a));
+            }
+            let ts = self.nodes[node_id as usize].tiers.get_mut(&s).unwrap();
             if !refresh {
                 continue;
             }
@@ -1882,6 +1903,7 @@ impl Radix {
                 self.stores[s].order.insert(e);
             }
         }
+        read_bytes
     }
 
     /// Remove `span` from store `s` (whatever of it is held). Returns the

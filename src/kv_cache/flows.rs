@@ -95,6 +95,9 @@ pub struct Flows {
     /// the next rate-dependent estimate, so a burst of submissions at one
     /// instant costs one recomputation.
     rates_dirty: bool,
+    /// Absolute time of the next completion under the current rates, valid
+    /// while `rates_dirty` is false; recomputed with the rates.
+    next_done_at: Option<f64>,
     /// Completed transfers not yet collected, per owner.
     completed: HashMap<Owner, HashSet<String>>,
     /// Bytes submitted, by owner kind, for reporting.
@@ -225,10 +228,7 @@ impl Flows {
     /// from the last advance. `None` when nothing in flight can complete.
     pub fn next_completion_delay(&mut self) -> Option<f64> {
         self.ensure_rates();
-        self.in_flight
-            .values()
-            .filter_map(|t| Self::time_to_done(t, self.done_eps()))
-            .min_by(f64::total_cmp)
+        self.next_done_at.map(|t| (t - self.now).max(0.0))
     }
 
     /// Time a new transfer of `bytes` over `path` (after `latency`) would
@@ -351,6 +351,14 @@ impl Flows {
         if self.rates_dirty {
             self.recompute_rates();
             self.rates_dirty = false;
+            let eps = self.done_eps();
+            let now = self.now;
+            self.next_done_at = self
+                .in_flight
+                .values()
+                .filter_map(|t| Self::time_to_done(t, eps))
+                .min_by(f64::total_cmp)
+                .map(|d| now + d);
         }
     }
 
