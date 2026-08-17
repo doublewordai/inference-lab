@@ -13,7 +13,7 @@ pub use deployment::{Deployment, DeploymentError, ModelConfig};
 pub use hardware::{FabricConfig, FabricLink, HardwareConfig, Precision};
 pub use memory::{
     EvictionPolicy, JunctionTemplate, LinkTemplate, MemoryConfig, MemoryTemplate, Scope,
-    StoreTemplate,
+    StoreTemplate, WritePolicy,
 };
 pub use model::{
     expected_distinct_experts, History, Indexer, LayerClass, ModelSpec, Routing, WeightStream,

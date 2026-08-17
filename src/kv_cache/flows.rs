@@ -32,6 +32,9 @@ pub enum Owner {
     Worker(usize),
     /// A prefill → decode hand-off.
     Handoff,
+    /// A write into a store (from a GPU, or a cascade from another store).
+    /// Completed inside the memory graph; never surfaces to the engine.
+    Write,
 }
 
 #[derive(Debug, Clone)]
@@ -89,6 +92,7 @@ pub struct Flows {
     /// Bytes submitted, by owner kind, for reporting.
     pub bytes_submitted_worker: f64,
     pub bytes_submitted_handoff: f64,
+    pub bytes_submitted_write: f64,
     /// Time of the last `advance`; new edges start their accounting here.
     now: f64,
 }
@@ -142,6 +146,7 @@ impl Flows {
         match owner {
             Owner::Worker(_) => self.bytes_submitted_worker += bytes as f64,
             Owner::Handoff => self.bytes_submitted_handoff += bytes as f64,
+            Owner::Write => self.bytes_submitted_write += bytes as f64,
         }
         self.in_flight.insert(
             id,
@@ -176,6 +181,14 @@ impl Flows {
             self.recompute_rates();
         }
         done
+    }
+
+    /// Abandon an in-flight transfer (its bytes so far stay counted on the
+    /// edges). Rates are recomputed. No-op for unknown ids.
+    pub fn cancel(&mut self, id: &str) {
+        if self.in_flight.remove(id).is_some() {
+            self.recompute_rates();
+        }
     }
 
     /// Completed transfers of `owner`, drained.

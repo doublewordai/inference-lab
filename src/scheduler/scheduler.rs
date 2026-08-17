@@ -260,6 +260,7 @@ impl Scheduler {
                         self.kv_cache_manager.start_transfer(
                             request.request_id.clone(),
                             &lookup,
+                            &request.prompt_block_hashes,
                             current_time,
                         );
                     } else {

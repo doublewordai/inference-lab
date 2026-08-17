@@ -692,17 +692,17 @@ bandwidth = 1e12
             g.tiers(0)[1].fetch_path.edges[2]
         );
         // Worker 0: host alone at 64 GB/s.
-        g.submit_promotion(0, 0, "h", 64_000_000_000, 0.0);
+        g.submit_promotion(0, 0, "h", 64_000_000_000, &[], 0.0);
         assert!((g.estimate_promotion_remaining(0, "h") - 1.0).abs() < 1e-9);
         // Add an nvme promotion on worker 0: the port splits 32/32 (the
         // drives at 56 are not binding for one transfer).
-        g.submit_promotion(0, 1, "n0", 32_000_000_000, 0.0);
+        g.submit_promotion(0, 1, "n0", 32_000_000_000, &[], 0.0);
         assert!((g.estimate_promotion_remaining(0, "h") - 2.0).abs() < 1e-9);
         assert!((g.estimate_promotion_remaining(0, "n0") - 1.0).abs() < 1e-9);
         // Worker 1 pulls from nvme too: the drives (56) are now the most
         // contended edge, so both nvme promotions get 28 and worker 0's
         // port hands its remaining 36 to the host promotion.
-        g.submit_promotion(1, 1, "n1", 28_000_000_000, 0.0);
+        g.submit_promotion(1, 1, "n1", 28_000_000_000, &[], 0.0);
         assert!((g.estimate_promotion_remaining(1, "n1") - 1.0).abs() < 1e-9);
         assert!((g.estimate_promotion_remaining(0, "n0") - 32.0 / 28.0).abs() < 1e-9);
         assert!((g.estimate_promotion_remaining(0, "h") - 64.0 / 36.0).abs() < 1e-9);

@@ -26,6 +26,56 @@ pub struct MetricsSummary {
     pub decode_router: Option<RouterMetrics>,
     /// Disaggregated topologies: hand-off transfer totals.
     pub handoff: Option<HandoffMetrics>,
+    /// KV memory beyond HBM: stores and links, when the deployment has
+    /// tiers.
+    pub memory: Option<MemoryMetrics>,
+}
+
+/// One store name of the memory graph, totalled over its instances.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct StoreMetrics {
+    pub name: String,
+    pub instances: u64,
+    pub capacity_blocks: u64,
+    /// Blocks held (resident + arriving) at the end of the run.
+    pub held_blocks: u64,
+    /// Bytes whose write landed in the store.
+    pub bytes_written: u64,
+    /// Bytes promoted out of the store.
+    pub bytes_read: u64,
+    /// Bytes evicted or expired without ever being promoted.
+    pub dead_bytes: u64,
+    pub evictions: u64,
+    pub expired: u64,
+}
+
+/// One link name of the memory graph, totalled over its instances (both
+/// directions).
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct EdgeMetrics {
+    pub name: String,
+    pub instances: u64,
+    /// Capacity of one instance, one direction, bytes/s.
+    pub capacity: f64,
+    pub bytes_moved: f64,
+    /// `bytes_moved / (instances × 2 × capacity × elapsed)`: mean use of
+    /// the link's total capacity over the run.
+    pub utilisation: f64,
+}
+
+/// KV memory beyond HBM over the run.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct MemoryMetrics {
+    pub write_policy: String,
+    pub eviction_policy: String,
+    pub stores: Vec<StoreMetrics>,
+    pub links: Vec<EdgeMetrics>,
+    /// Bytes submitted as writes (GPU → store and cascades).
+    pub bytes_written: f64,
+    /// Bytes submitted as promotions.
+    pub bytes_promoted: f64,
+    /// Promotions that had to wait for a write still arriving.
+    pub write_race_waits: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize)]

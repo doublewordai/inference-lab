@@ -633,6 +633,63 @@ impl Engine {
         self.handoff_stats
     }
 
+    /// The memory graph's stores and links over the run so far, `None`
+    /// when no worker has tiers.
+    pub fn memory_metrics(&self) -> Option<crate::metrics::MemoryMetrics> {
+        let g = self.topology.memory.lock().unwrap();
+        let tiered = (0..g.num_workers()).any(|w| g.num_tiers(w) > 0);
+        if !tiered {
+            return None;
+        }
+        let elapsed = self.current_time.max(f64::MIN_POSITIVE);
+        let stores = g
+            .store_totals()
+            .into_iter()
+            .map(|(name, t)| crate::metrics::StoreMetrics {
+                name,
+                instances: t.instances,
+                capacity_blocks: t.capacity_blocks,
+                held_blocks: t.held_blocks,
+                bytes_written: t.bytes_written,
+                bytes_read: t.bytes_read,
+                dead_bytes: t.dead_bytes,
+                evictions: t.evictions,
+                expired: t.expired,
+            })
+            .collect();
+        let links = g
+            .edge_totals()
+            .into_iter()
+            .map(|(name, t)| crate::metrics::EdgeMetrics {
+                name,
+                instances: t.instances,
+                capacity: t.capacity,
+                bytes_moved: t.bytes_moved,
+                utilisation: if t.capacity > 0.0 && t.instances > 0 {
+                    // `instances` counts both directions of each link.
+                    t.bytes_moved / (t.instances as f64 * t.capacity * elapsed)
+                } else {
+                    0.0
+                },
+            })
+            .collect();
+        let write_policy = g.write_policy(0).name().to_string();
+        let eviction_policy = g
+            .stores()
+            .first()
+            .map(|s| s.eviction.name().to_string())
+            .unwrap_or_default();
+        Some(crate::metrics::MemoryMetrics {
+            write_policy,
+            eviction_policy,
+            stores,
+            links,
+            bytes_written: g.flows().bytes_submitted_write,
+            bytes_promoted: g.flows().bytes_submitted_worker,
+            write_race_waits: g.write_race_waits,
+        })
+    }
+
     /// Prefix-cache lookup statistics summed over every worker's KV manager.
     pub fn aggregate_prefix_cache(&self) -> PrefixCacheStats {
         let mut total = PrefixCacheStats::default();
@@ -803,6 +860,8 @@ impl Engine {
                         self.maybe_wake_worker(pool, idx, now);
                     }
                 }
+                // Writes land inside the graph's own `advance`.
+                Owner::Write => {}
             }
         }
         match next {

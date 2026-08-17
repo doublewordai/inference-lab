@@ -96,6 +96,20 @@ impl FreeQueue {
         true
     }
 
+    /// The first `k` queued ids, least recently freed first.
+    pub fn front(&self, k: usize) -> Vec<BlockId> {
+        let mut out = Vec::with_capacity(k.min(self.len));
+        let mut cur = self.head;
+        while let Some(id) = cur {
+            if out.len() == k {
+                break;
+            }
+            out.push(id);
+            cur = self.next[id as usize];
+        }
+        out
+    }
+
     /// Queued ids, least recently freed first.
     #[cfg(test)]
     pub fn to_vec(&self) -> Vec<BlockId> {

@@ -1,7 +1,7 @@
 use super::distribution::{Distribution, RunningMean};
 use super::summary::{
-    HandoffMetrics, LatencyMetrics, LatencyStats, MetricsSummary, Preemptions, PrefixCacheMetrics,
-    RequestCounts, RouterMetrics, ThroughputMetrics, Utilization,
+    HandoffMetrics, LatencyMetrics, LatencyStats, MemoryMetrics, MetricsSummary, Preemptions,
+    PrefixCacheMetrics, RequestCounts, RouterMetrics, ThroughputMetrics, Utilization,
 };
 use crate::kv_cache::PrefixCacheStats;
 use crate::simulation::RequestTiming;
@@ -277,6 +277,7 @@ impl MetricsCollector {
         router: RouterMetrics,
         decode_router: Option<RouterMetrics>,
         handoff: Option<HandoffMetrics>,
+        memory: Option<MemoryMetrics>,
     ) -> MetricsSummary {
         let elapsed = current_time - self.start_time;
         let per_sec = |n: f64| if elapsed > 0.0 { n / elapsed } else { 0.0 };
@@ -317,6 +318,7 @@ impl MetricsCollector {
             router,
             decode_router,
             handoff,
+            memory,
         }
     }
 }
@@ -361,6 +363,7 @@ mod tests {
             RouterMetrics::default(),
             None,
             None,
+            None,
         );
         assert!((s.latency_metrics.ttft_ms.mean - 1000.0).abs() < 1e-9);
         assert!((s.latency_metrics.e2e_ms.mean - 4000.0).abs() < 1e-9);
@@ -388,6 +391,7 @@ mod tests {
             10.0,
             PrefixCacheStats::default(),
             RouterMetrics::default(),
+            None,
             None,
             None,
         );
@@ -437,6 +441,7 @@ mod tests {
             1.0,
             PrefixCacheStats::default(),
             RouterMetrics::default(),
+            None,
             None,
             None,
         );

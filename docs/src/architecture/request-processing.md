@@ -34,10 +34,14 @@ sliding-window and compressed-history models their real footprint — plus a
 fixed reservation for length-independent per-sequence state (GatedDeltaNet).
 Blocks are reference-counted; freed blocks keep their content hash and can
 be re-hit until they are recycled (least recently freed first, sequences
-tail first), at which point the hash falls into the worker's first memory
-tier. Tiers are stores of the pool's `MemoryGraph`, instantiated from the
+tail first — or, with `hbm_evict_backed_first`, a nearby block a tier
+already holds). Recycling a block whose KV no tier holds writes it to the
+worker's first tier under `write_back`; under `write_through` every fresh
+block was written when produced, under `selective` on its n-th hit. Tiers
+are stores of the topology's `MemoryGraph`, instantiated from the
 hardware's `[memory]` template per GPU (private) or per node (shared by the
-node's workers); each worker reaches a store over its own link.
+node's workers), inclusive of HBM; writes, promotions, cascades between
+tiers and hand-offs are all transfers on the graph's edges.
 
 ## Preemption
 
