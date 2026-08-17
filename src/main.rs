@@ -534,6 +534,20 @@ fn run_sim(args: SimArgs) {
 
     let elapsed = start_time.elapsed();
 
+    if std::env::var_os("INFERENCE_LAB_STEP_COALESCING_STATS").is_some() {
+        let s = simulator.step_coalescing_stats();
+        eprintln!(
+            "step coalescing: fast_forwards={} total_steps={} mean={:.2} p50={} p90={} p99={} max={}",
+            s.fast_forwards,
+            s.total_steps,
+            s.mean_steps,
+            s.p50_steps,
+            s.p90_steps,
+            s.p99_steps,
+            s.max_steps,
+        );
+    }
+
     // Print final metrics
     let summary = simulator.summary();
     print_final_metrics(&summary, simulator.current_time(), elapsed);

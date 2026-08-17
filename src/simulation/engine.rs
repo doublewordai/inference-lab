@@ -542,6 +542,10 @@ pub struct IterationInfo {
     pub batch_size: usize,
     pub bandwidth_util: f64,
     pub flops_util: f64,
+    /// Aggregate KV utilisation immediately after this iteration. Captured
+    /// here because one engine event may expose several coalesced iterations
+    /// to a driver after their state transitions have all been applied.
+    pub kv_cache_util: f64,
     pub progress: Vec<RequestProgress>,
 }
 
@@ -561,7 +565,30 @@ pub struct StepOutcome {
     pub time: f64,
     pub kind: StepKind,
     pub iteration: Option<IterationInfo>,
+    /// Additional static-decode iterations executed without intervening
+    /// scheduler/event-heap passes. Drivers must observe these in order after
+    /// `iteration`; [`Self::iterations`] provides that sequence.
+    pub coalesced_iterations: Vec<IterationInfo>,
     pub completions: Vec<RequestTiming>,
+}
+
+impl StepOutcome {
+    pub fn iterations(&self) -> impl Iterator<Item = &IterationInfo> {
+        self.iteration.iter().chain(&self.coalesced_iterations)
+    }
+}
+
+/// Distribution of successful static-decode fast-forwards. A length includes
+/// the normally scheduled first step plus the scheduler passes it subsumed.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct StepCoalescingStats {
+    pub fast_forwards: u64,
+    pub total_steps: u64,
+    pub mean_steps: f64,
+    pub p50_steps: u32,
+    pub p90_steps: u32,
+    pub p99_steps: u32,
+    pub max_steps: u32,
 }
 
 pub struct Engine {
@@ -593,6 +620,10 @@ pub struct Engine {
     spec: Option<SpecPlanner>,
     /// Optional affine step-time correction (alpha, beta seconds).
     time_correction: Option<(f64, f64)>,
+    /// Batch-mode optimization. Kept off in the core engine so real-time
+    /// serving cannot run ahead of HTTP arrivals which are not in the heap.
+    step_coalescing: bool,
+    coalesced_lengths: Vec<u32>,
 }
 
 impl Engine {
@@ -619,6 +650,37 @@ impl Engine {
             seq_counter: 0,
             spec: None,
             time_correction: None,
+            step_coalescing: false,
+            coalesced_lengths: Vec::new(),
+        }
+    }
+
+    /// Enable static decode step coalescing. Batch drivers opt in; real-time
+    /// serving deliberately leaves it disabled because future HTTP arrivals
+    /// are external to the engine event heap.
+    pub fn set_step_coalescing(&mut self, enabled: bool) {
+        self.step_coalescing = enabled;
+    }
+
+    pub fn step_coalescing_stats(&self) -> StepCoalescingStats {
+        if self.coalesced_lengths.is_empty() {
+            return StepCoalescingStats::default();
+        }
+        let mut lengths = self.coalesced_lengths.clone();
+        lengths.sort_unstable();
+        let percentile = |q: f64| {
+            let idx = (q * (lengths.len() - 1) as f64).round() as usize;
+            lengths[idx]
+        };
+        let total_steps = lengths.iter().map(|&k| k as u64).sum::<u64>();
+        StepCoalescingStats {
+            fast_forwards: lengths.len() as u64,
+            total_steps,
+            mean_steps: total_steps as f64 / lengths.len() as f64,
+            p50_steps: percentile(0.50),
+            p90_steps: percentile(0.90),
+            p99_steps: percentile(0.99),
+            max_steps: *lengths.last().unwrap(),
         }
     }
 
@@ -998,15 +1060,18 @@ impl Engine {
                     time: self.current_time,
                     kind: StepKind::Arrival,
                     iteration: None,
+                    coalesced_iterations: Vec::new(),
                     completions: Vec::new(),
                 })
             }
             EventKind::WorkerReady { pool, worker } => {
-                let (iteration, completions) = self.handle_worker_ready(pool, worker);
+                let (iteration, coalesced_iterations, completions) =
+                    self.handle_worker_ready(pool, worker);
                 Ok(StepOutcome {
                     time: self.current_time,
                     kind: StepKind::Iteration,
                     iteration,
+                    coalesced_iterations,
                     completions,
                 })
             }
@@ -1018,6 +1083,7 @@ impl Engine {
                     time: self.current_time,
                     kind: StepKind::LinkComplete,
                     iteration: None,
+                    coalesced_iterations: Vec::new(),
                     completions: Vec::new(),
                 })
             }
@@ -1029,6 +1095,7 @@ impl Engine {
                     time: self.current_time,
                     kind: StepKind::PrefetchDue,
                     iteration: None,
+                    coalesced_iterations: Vec::new(),
                     completions: Vec::new(),
                 })
             }
@@ -1038,6 +1105,7 @@ impl Engine {
                     time: self.current_time,
                     kind: StepKind::HandoffStart,
                     iteration: None,
+                    coalesced_iterations: Vec::new(),
                     completions: Vec::new(),
                 })
             }
@@ -1152,13 +1220,45 @@ impl Engine {
         &mut self,
         pool: PoolId,
         worker: usize,
-    ) -> (Option<IterationInfo>, Vec<RequestTiming>) {
+    ) -> (
+        Option<IterationInfo>,
+        Vec<IterationInfo>,
+        Vec<RequestTiming>,
+    ) {
         // `WorkerReady` fires at the END of the worker's prior iteration (or
         // at t=0 when the worker first wakes). Mark idle and re-evaluate.
         self.worker_busy[pool][worker] = false;
         let now = self.current_time;
         let role = self.topology.role_for_pool(pool);
         let outcome = self.run_iteration(pool, worker, role, now);
+
+        // A closed-loop completion immediately creates a new arrival in the
+        // batch driver, so never run past a reap that the driver has not yet
+        // observed. Handoffs and preemption are likewise explicit batch
+        // boundaries. Everything else is re-checked by the conservative
+        // scheduler and event horizons inside `coalesce_decode_steps`.
+        let coalesced_iterations = if self.step_coalescing
+            && self.spec.is_none()
+            && outcome.completed.is_empty()
+            && outcome.handed_off.is_empty()
+            && !outcome.preempted
+        {
+            outcome
+                .iteration
+                .as_ref()
+                .map(|first| self.coalesce_decode_steps(pool, worker, first))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        if let Some(last) = coalesced_iterations.last() {
+            // These are the WorkerReady start events the fast-forward
+            // consumed. The final end remains armed below, just as it would
+            // after processing the last start event separately.
+            self.current_time = last.start_time;
+            self.coalesced_lengths
+                .push(1 + coalesced_iterations.len() as u32);
+        }
 
         // Completions from `schedule()` finished at the end of the *previous*
         // iteration, i.e. `now`. Handoffs finished prefill in the iter that
@@ -1178,7 +1278,11 @@ impl Engine {
             self.handoff_source.insert(req.request_id.clone(), source);
             self.push(handoff_time, EventKind::HandoffStart(req));
         }
-        if let Some(end) = outcome.iteration.as_ref().map(|i| i.end_time) {
+        let next_ready = coalesced_iterations
+            .last()
+            .or(outcome.iteration.as_ref())
+            .map(|i| i.end_time);
+        if let Some(end) = next_ready {
             self.worker_busy[pool][worker] = true;
             self.push(end, EventKind::WorkerReady { pool, worker });
         } else if outcome.preempted {
@@ -1208,13 +1312,243 @@ impl Engine {
                 .scheduler
                 .next_prefetch_at()
             {
-                if t > now && self.prefetch_armed[pool][m] != Some(t) {
+                if t > self.current_time && self.prefetch_armed[pool][m] != Some(t) {
                     self.prefetch_armed[pool][m] = Some(t);
                     self.push(t, EventKind::PrefetchDue { pool, worker: m });
                 }
             }
         }
-        (outcome.iteration, timings)
+        (outcome.iteration, coalesced_iterations, timings)
+    }
+
+    /// Run the scheduler-invariant suffix of a plain-decode batch. The
+    /// normal first step supplies a conservative time estimate; every later
+    /// step is still priced independently and is abandoned before mutation
+    /// if its end would cross an event/flow boundary.
+    fn coalesce_decode_steps(
+        &mut self,
+        pool: PoolId,
+        worker: usize,
+        first: &IterationInfo,
+    ) -> Vec<IterationInfo> {
+        if first.iteration_time <= 0.0
+            || first
+                .progress
+                .iter()
+                .any(|p| p.was_prefill || p.num_tokens != 1)
+        {
+            return Vec::new();
+        }
+        let members: Vec<usize> = self.topology.pools[pool].members_of(worker).to_vec();
+
+        // The scheduled first batch must be exactly the carry-over running
+        // set. Otherwise a token-budget omission or admission can make the
+        // next scheduler decision different.
+        let running_ids: Vec<&str> = members
+            .iter()
+            .flat_map(|&m| {
+                self.topology.pools[pool].workers[m]
+                    .scheduler
+                    .running()
+                    .iter()
+                    .map(|r| r.request_id.as_str())
+            })
+            .collect();
+        if running_ids.len() != first.progress.len()
+            || running_ids
+                .iter()
+                .zip(&first.progress)
+                .any(|(&id, p)| id != p.request_id)
+        {
+            return Vec::new();
+        }
+
+        let mut max_steps = members
+            .iter()
+            .map(|&m| {
+                self.topology.pools[pool].workers[m]
+                    .scheduler
+                    .decode_coalescing_limit()
+            })
+            .min()
+            .unwrap_or(0);
+        if max_steps == 0 {
+            return Vec::new();
+        }
+
+        // Existing heap events cover arrivals, prefetches, other groups, and
+        // armed drains. The direct graph query also catches a transfer which
+        // the normally scheduled first allocation started before `pump_flows`
+        // has had a chance to arm its drain event.
+        let heap_limit = self.events.peek().map(|e| e.time);
+        let flow_limit = {
+            let mut graph = self.topology.memory.lock().unwrap();
+            graph
+                .next_completion_delay()
+                .map(|delay| first.start_time + delay)
+        };
+        let event_limit = match (heap_limit, flow_limit) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        if let Some(limit) = event_limit {
+            if limit <= first.end_time {
+                return Vec::new();
+            }
+            let by_time = ((limit - first.end_time) / first.iteration_time).floor() as u32;
+            max_steps = max_steps.min(by_time);
+        }
+        if max_steps == 0 {
+            return Vec::new();
+        }
+
+        // Capacity/side-effect feasibility is monotone in the number of
+        // decode steps, so find the largest prefix whose allocations use
+        // only untouched blocks and new content suffixes.
+        let feasible = |steps: u32, engine: &Engine| {
+            members.iter().all(|&m| {
+                engine.topology.pools[pool].workers[m]
+                    .scheduler
+                    .can_coalesce_decode_steps(steps)
+            })
+        };
+        let (mut lo, mut hi) = (0u32, max_steps);
+        while lo < hi {
+            let mid = lo + (hi - lo).div_ceil(2);
+            if feasible(mid, self) {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+
+        let mut iterations = Vec::with_capacity(lo as usize);
+        let mut start_time = first.end_time;
+        for _ in 0..lo {
+            let Some(iteration) =
+                self.run_coalesced_decode_step(pool, worker, start_time, event_limit)
+            else {
+                break;
+            };
+            start_time = iteration.end_time;
+            iterations.push(iteration);
+        }
+        iterations
+    }
+
+    /// One decode step with batch membership already proven invariant.
+    /// Pricing, allocation, progress, utilisation, and batch accounting stay
+    /// per-step so their floating-point operation order matches the ordinary
+    /// engine path.
+    fn run_coalesced_decode_step(
+        &mut self,
+        pool: PoolId,
+        worker: usize,
+        start_time: f64,
+        event_limit: Option<f64>,
+    ) -> Option<IterationInfo> {
+        let members: Vec<usize> = self.topology.pools[pool].members_of(worker).to_vec();
+        let grouped = members.len() > 1;
+        let entries: Vec<(usize, usize)> = members
+            .iter()
+            .flat_map(|&m| {
+                (0..self.topology.pools[pool].workers[m]
+                    .scheduler
+                    .running()
+                    .len())
+                    .map(move |idx| (m, idx))
+            })
+            .collect();
+        if entries.is_empty() {
+            return None;
+        }
+        let batch_size = entries.len();
+        let cost_tokens = vec![1u32; batch_size];
+        let was_prefill = vec![false; batch_size];
+
+        let (iter_time, _, bandwidth_util, flops_util) = {
+            let ws = &self.topology.pools[pool].workers;
+            let batch_refs: Vec<&Request> = entries
+                .iter()
+                .map(|&(m, idx)| &ws[m].scheduler.running()[idx])
+                .collect();
+            let ce = &ws[worker].compute_engine;
+            let (mut t, measured, bw, flops) = Self::price_step(
+                None,
+                ce,
+                &batch_refs,
+                &cost_tokens,
+                &was_prefill,
+                self.time_correction,
+            );
+            debug_assert!(!measured);
+            if grouped {
+                let mut max = 0.0_f64;
+                let mut sum = 0.0_f64;
+                for &m in &members {
+                    let refs: Vec<&Request> = entries
+                        .iter()
+                        .filter(|e| e.0 == m)
+                        .map(|&(_, idx)| &ws[m].scheduler.running()[idx])
+                        .collect();
+                    let attention = if refs.is_empty() {
+                        0.0
+                    } else {
+                        ce.attention_seconds_on_one_gpu(&refs, &vec![1; refs.len()])
+                    };
+                    max = max.max(attention);
+                    sum += attention;
+                }
+                t += (max - sum / members.len() as f64).max(0.0);
+            }
+            (t, measured, bw, flops)
+        };
+        let end_time = start_time + iter_time;
+        if event_limit.is_some_and(|limit| end_time > limit) {
+            return None;
+        }
+
+        for &m in &members {
+            self.topology.pools[pool].workers[m]
+                .scheduler
+                .allocate_coalesced_decode_step();
+        }
+
+        let mut progress = Vec::with_capacity(batch_size);
+        for &(m, idx) in &entries {
+            let request_id = self.topology.pools[pool].workers[m].scheduler.running()[idx]
+                .request_id
+                .clone();
+            let num_output = self.topology.pools[pool].workers[m]
+                .scheduler
+                .record_progress(idx, 1, end_time);
+            progress.push(RequestProgress {
+                request_id,
+                was_prefill: false,
+                num_tokens: 1,
+                num_output,
+            });
+        }
+
+        let dt = (end_time - start_time).max(0.0);
+        let acc = &mut self.pool_batch_acc[pool];
+        acc.0 += batch_size as f64 * dt;
+        acc.1 += dt;
+
+        Some(IterationInfo {
+            pool,
+            worker,
+            start_time,
+            end_time,
+            iteration_time: iter_time,
+            batch_size,
+            bandwidth_util,
+            flops_util,
+            kv_cache_util: self.kv_cache_util(),
+            progress,
+        })
     }
 
     /// One iteration of `worker`'s lockstep group (a whole replica, or the
@@ -1478,6 +1812,7 @@ impl Engine {
                 batch_size,
                 bandwidth_util,
                 flops_util,
+                kv_cache_util: self.kv_cache_util(),
                 progress,
             }),
             completed,
@@ -1822,5 +2157,75 @@ mod tests {
         let r2 = Request::new("p".into(), 0, 0.0, 4096, 1);
         let union2 = ce.calculate_iteration_time(&[&r2, &r2], &[ca, cb]);
         assert!((step.iteration_time - union2).abs() < 1e-12);
+    }
+
+    #[test]
+    fn coalesced_static_decode_is_bit_identical_to_individual_steps() {
+        fn run_mode(enabled: bool) -> (Vec<IterationInfo>, Vec<RequestTiming>, Engine) {
+            let mut e = engine(1, false);
+            e.set_step_coalescing(enabled);
+            for i in 0..8 {
+                let mut req = Request::new(format!("r{i}"), 0, 0.0, 64, 96);
+                req.mark_prefilled(0.0);
+                e.submit(req);
+            }
+            // Land inside the first batch's decode lifetime: the coalesced
+            // engine must stop before this heap event, admit it, and then
+            // produce the same mixed-batch sequence as the plain engine.
+            let mut late = Request::new("late".into(), 0, 0.05, 64, 48);
+            late.mark_prefilled(0.05);
+            e.submit(late);
+            let mut iterations = Vec::new();
+            let mut completions = Vec::new();
+            while !e.is_idle() {
+                let out = e.step().unwrap();
+                iterations.extend(out.iterations().cloned());
+                completions.extend(out.completions);
+            }
+            (iterations, completions, e)
+        }
+
+        let (plain_iters, plain_done, plain) = run_mode(false);
+        let (fast_iters, fast_done, fast) = run_mode(true);
+        assert!(fast.step_coalescing_stats().fast_forwards > 0);
+        assert_eq!(plain_iters.len(), fast_iters.len());
+        for (a, b) in plain_iters.iter().zip(&fast_iters) {
+            assert_eq!(
+                (a.pool, a.worker, a.batch_size),
+                (b.pool, b.worker, b.batch_size)
+            );
+            assert_eq!(a.start_time.to_bits(), b.start_time.to_bits());
+            assert_eq!(a.end_time.to_bits(), b.end_time.to_bits());
+            assert_eq!(a.iteration_time.to_bits(), b.iteration_time.to_bits());
+            assert_eq!(a.bandwidth_util.to_bits(), b.bandwidth_util.to_bits());
+            assert_eq!(a.flops_util.to_bits(), b.flops_util.to_bits());
+            assert_eq!(a.kv_cache_util.to_bits(), b.kv_cache_util.to_bits());
+            assert_eq!(a.progress.len(), b.progress.len());
+            for (ap, bp) in a.progress.iter().zip(&b.progress) {
+                assert_eq!(ap.request_id, bp.request_id);
+                assert_eq!(ap.was_prefill, bp.was_prefill);
+                assert_eq!(ap.num_tokens, bp.num_tokens);
+                assert_eq!(ap.num_output, bp.num_output);
+            }
+        }
+        assert_eq!(plain_done.len(), fast_done.len());
+        for (a, b) in plain_done.iter().zip(&fast_done) {
+            assert_eq!(a.request_id, b.request_id);
+            assert_eq!(a.arrival_time.to_bits(), b.arrival_time.to_bits());
+            assert_eq!(a.first_token_time.to_bits(), b.first_token_time.to_bits());
+            assert_eq!(a.completion_time.to_bits(), b.completion_time.to_bits());
+            assert_eq!(a.num_prompt_tokens, b.num_prompt_tokens);
+            assert_eq!(a.num_output_tokens, b.num_output_tokens);
+            assert_eq!(a.num_cached_tokens, b.num_cached_tokens);
+            assert_eq!(a.num_preemptions, b.num_preemptions);
+            assert_eq!(a.rejected, b.rejected);
+        }
+        assert_eq!(
+            plain.current_time().to_bits(),
+            fast.current_time().to_bits()
+        );
+        assert_eq!(plain.pool_batch_means(), fast.pool_batch_means());
+        assert_eq!(plain.kv_bytes_written(), fast.kv_bytes_written());
+        assert_eq!(plain.kv_bytes_touched(), fast.kv_bytes_touched());
     }
 }

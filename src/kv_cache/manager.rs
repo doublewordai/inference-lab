@@ -1,7 +1,7 @@
 use super::flows::Owner;
 use super::graph::{promotion_request, MemoryGraph, SharedMemoryGraph, WorkerId};
 use super::radix::{HbmLookup, KvBytesFn, Path, Radix, SharedRadix, Span};
-use crate::config::{HbmEviction, ModelSpec};
+use crate::config::{HbmEviction, ModelSpec, WritePolicy};
 use crate::request::{KvLeaf, Outlook, Request};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -180,6 +180,7 @@ pub struct KVCacheManager {
 
     hbm_eviction: HbmEviction,
     backed_first: bool,
+    write_through: bool,
 }
 
 impl KVCacheManager {
@@ -218,6 +219,7 @@ impl KVCacheManager {
             bytes_touched: 0,
             hbm_eviction: HbmEviction::Lru {},
             backed_first: false,
+            write_through: false,
         }
     }
 
@@ -285,15 +287,20 @@ impl KVCacheManager {
     /// The manager's blocks move into the graph's tree (call before any
     /// allocation).
     pub fn with_memory(mut self, graph: SharedMemoryGraph, worker: WorkerId) -> Self {
-        let (radix, backed_first) = {
+        let (radix, backed_first, write_through, tiers) = {
             let g = graph.lock().unwrap();
-            (g.radix(), g.evict_backed_first(worker))
+            (
+                g.radix(),
+                g.evict_backed_first(worker),
+                matches!(g.write_policy(worker), WritePolicy::WriteThrough {}),
+                g.store_ids_of(worker),
+            )
         };
         self.backed_first = backed_first;
+        self.write_through = write_through;
         {
             let mut r = radix.lock().unwrap();
             r.register_worker(worker, self.total_blocks, self.hbm_eviction, backed_first);
-            let tiers = graph.lock().unwrap().store_ids_of(worker);
             r.set_worker_tiers(worker, tiers);
         }
         self.radix = radix;
@@ -638,6 +645,59 @@ impl KVCacheManager {
 
     pub fn num_free_blocks(&self) -> usize {
         self.radix.lock().unwrap().free_blocks(self.worker) as usize
+    }
+
+    /// Capacity which has never held KV. Growing into this space cannot
+    /// recycle a free cached range (and therefore cannot trigger a demotion).
+    pub(crate) fn num_unused_blocks(&self) -> usize {
+        self.radix.lock().unwrap().unused_blocks(self.worker) as usize
+    }
+
+    /// Whether growing `request` to `total_tokens` only extends its current
+    /// content path. A pre-existing suffix would be a cache hit; keeping the
+    /// step-coalescing path to new suffixes avoids changing hit counters or
+    /// starting a selective write while scheduler passes are skipped.
+    pub(crate) fn growth_has_no_cached_suffix(&self, request: &Request, total_tokens: u32) -> bool {
+        let target = (self.content_blocks_for_tokens(total_tokens) as u32).min(
+            if self.enable_prefix_caching {
+                request.prompt_block_hashes.len() as u32
+            } else {
+                0
+            },
+        );
+        let held = (request.kv_blocks.len() as u32).min(target);
+        if target <= held {
+            return true;
+        }
+        let r = self.radix.lock().unwrap();
+        let hashes = &request.prompt_block_hashes[..target as usize];
+        let matched = request
+            .kv_leaf
+            .and_then(|leaf| {
+                let last_hash = request
+                    .prompt_block_hashes
+                    .get(leaf.blocks.saturating_sub(1) as usize)?;
+                r.matching_blocks_from_cached(leaf.node, leaf.blocks, *last_hash, hashes)
+            })
+            .unwrap_or_else(|| r.resolve(hashes).blocks);
+        matched <= held
+    }
+
+    /// Whether this growth publishes a new hashed range under write-through,
+    /// which immediately starts a graph transfer and therefore must remain an
+    /// engine event boundary.
+    pub(crate) fn growth_starts_write_through(&self, request: &Request, total_tokens: u32) -> bool {
+        if !self.write_through {
+            return false;
+        }
+        let target = self
+            .content_blocks_for_tokens(total_tokens)
+            .min(request.prompt_block_hashes.len());
+        let held = request
+            .kv_blocks
+            .len()
+            .min(request.prompt_block_hashes.len());
+        target > held
     }
 
     pub fn total_blocks(&self) -> usize {
@@ -1300,8 +1360,10 @@ mod tests {
         // unhashed block): 3 × 1600 bytes are written through.
         let mut r = create_test_request("r", 48);
         r.prompt_block_hashes = vec![1, 2, 3];
+        assert!(m.growth_starts_write_through(&r, 48));
         alloc(&mut m, &mut r, 48);
         r.num_computed_tokens = 48;
+        assert!(!m.growth_starts_write_through(&r, 64));
         alloc(&mut m, &mut r, 16);
         let g = graph.lock().unwrap();
         assert!((g.flows().bytes_submitted_write - 3.0 * 1600.0).abs() < 1e-9);

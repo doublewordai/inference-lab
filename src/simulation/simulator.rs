@@ -5,7 +5,9 @@
 //! For real-time HTTP serving, see `crate::serve::engine` — same `Engine`,
 //! different driver.
 
-use super::engine::{Engine, IterationInfo, RequestTiming, StepKind, Topology};
+use super::engine::{
+    Engine, IterationInfo, RequestTiming, StepCoalescingStats, StepKind, Topology,
+};
 use super::spec::DepthSample;
 use crate::config::Config;
 use crate::dataset::{BatchTokenizerFn, DatasetLoader};
@@ -137,6 +139,12 @@ impl Simulator {
         };
 
         let mut engine = Engine::new(topology);
+        // Hidden A/B knob used by the correctness harness. Presence disables
+        // the optimization; the core engine itself defaults off so real-time
+        // serving never runs ahead of arrivals outside its event heap.
+        if std::env::var_os("INFERENCE_LAB_DISABLE_STEP_COALESCING").is_none() {
+            engine.set_step_coalescing(true);
+        }
         if let Some(tc) = &config.time_correction {
             engine.set_time_correction(tc.alpha, tc.beta);
         }
@@ -241,52 +249,48 @@ impl Simulator {
             }
 
             let outcome = self.engine.step()?;
-            if let Some(iter) = &outcome.iteration {
-                self.handle_iteration(iter);
-            }
-            for completion in &outcome.completions {
-                self.handle_completion(completion);
-            }
+            if outcome.coalesced_iterations.is_empty() {
+                for iter in outcome.iterations() {
+                    self.handle_iteration(iter);
+                }
+                for completion in &outcome.completions {
+                    self.handle_completion(completion);
+                }
+                if self
+                    .sample_interval
+                    .is_some_and(|_| self.engine.current_time() >= self.next_sample_time)
+                {
+                    self.sample_time_series(
+                        self.engine.current_time(),
+                        self.engine.kv_cache_util(),
+                    );
+                }
 
-            // Sample the time series at fixed sim-time intervals.
-            while self
-                .sample_interval
-                .is_some_and(|_| self.engine.current_time() >= self.next_sample_time)
-            {
-                let interval = self.sample_interval.unwrap();
-                let prefilling = self.engine.aggregate_prefilling();
-                let decoding = self.engine.aggregate_running() - prefilling;
-
-                let prefill_tokens = self.window_prefill_tokens;
-                let decode_tokens = self.window_decode_tokens;
-                let (ttft_mean, tpot_mean) = self.metrics.take_interval_latencies();
-
-                self.time_series.push(TimeSeriesPoint {
-                    time: self.engine.current_time(),
-                    arrivals: self.metrics.total_requests,
-                    running: self.engine.aggregate_running(),
-                    waiting: self.engine.aggregate_waiting(),
-                    kv_cache_util: self.engine.kv_cache_util(),
-                    num_prefilling: prefilling,
-                    num_decoding: decoding,
-                    prefill_tokens,
-                    decode_tokens,
-                    input_throughput: prefill_tokens as f64 / interval,
-                    output_throughput: decode_tokens as f64 / interval,
-                    ttft_interval_mean_ms: ttft_mean,
-                    tpot_interval_mean_ms: tpot_mean,
-                });
-                self.window_prefill_tokens = 0;
-                self.window_decode_tokens = 0;
-                self.next_sample_time += interval;
-            }
-
-            // Progress callback every callback_interval of sim time.
-            if matches!(outcome.kind, StepKind::Iteration)
-                && self.engine.current_time() - last_callback_time >= callback_interval
-            {
-                self.emit_progress(&mut callback);
-                last_callback_time = self.engine.current_time();
+                // Progress callback every callback_interval of sim time.
+                if matches!(outcome.kind, StepKind::Iteration)
+                    && self.engine.current_time() - last_callback_time >= callback_interval
+                {
+                    self.emit_progress(&mut callback);
+                    last_callback_time = self.engine.current_time();
+                }
+            } else {
+                debug_assert!(outcome.completions.is_empty());
+                // Replay every fused iteration through the driver's normal
+                // observation points. Batch membership is invariant, and KV
+                // utilisation was captured per step before later allocations.
+                for iter in outcome.iterations() {
+                    self.handle_iteration(iter);
+                    if self
+                        .sample_interval
+                        .is_some_and(|_| iter.start_time >= self.next_sample_time)
+                    {
+                        self.sample_time_series(iter.start_time, iter.kv_cache_util);
+                    }
+                    if iter.start_time - last_callback_time >= callback_interval {
+                        self.emit_progress_at(&mut callback, iter.start_time, iter.kv_cache_util);
+                        last_callback_time = iter.start_time;
+                    }
+                }
             }
 
             if self.should_terminate() {
@@ -306,10 +310,42 @@ impl Simulator {
             self.window_decode_tokens += prog.num_output;
         }
         self.metrics.record_iteration_metrics(
-            self.engine.kv_cache_util(),
+            iter.kv_cache_util,
             iter.flops_util,
             iter.bandwidth_util,
         );
+    }
+
+    fn sample_time_series(&mut self, at_time: f64, kv_cache_util: f64) {
+        let Some(interval) = self.sample_interval else {
+            return;
+        };
+        while at_time >= self.next_sample_time {
+            let prefilling = self.engine.aggregate_prefilling();
+            let decoding = self.engine.aggregate_running() - prefilling;
+            let prefill_tokens = self.window_prefill_tokens;
+            let decode_tokens = self.window_decode_tokens;
+            let (ttft_mean, tpot_mean) = self.metrics.take_interval_latencies();
+
+            self.time_series.push(TimeSeriesPoint {
+                time: at_time,
+                arrivals: self.metrics.total_requests,
+                running: self.engine.aggregate_running(),
+                waiting: self.engine.aggregate_waiting(),
+                kv_cache_util,
+                num_prefilling: prefilling,
+                num_decoding: decoding,
+                prefill_tokens,
+                decode_tokens,
+                input_throughput: prefill_tokens as f64 / interval,
+                output_throughput: decode_tokens as f64 / interval,
+                ttft_interval_mean_ms: ttft_mean,
+                tpot_interval_mean_ms: tpot_mean,
+            });
+            self.window_prefill_tokens = 0;
+            self.window_decode_tokens = 0;
+            self.next_sample_time += interval;
+        }
     }
 
     fn handle_completion(&mut self, timing: &RequestTiming) {
@@ -329,16 +365,29 @@ impl Simulator {
     }
 
     fn emit_progress<F: FnMut(ProgressInfo)>(&mut self, callback: &mut F) {
-        let metrics = self.summary();
+        self.emit_progress_at(
+            callback,
+            self.engine.current_time(),
+            self.engine.kv_cache_util(),
+        );
+    }
+
+    fn emit_progress_at<F: FnMut(ProgressInfo)>(
+        &mut self,
+        callback: &mut F,
+        current_time: f64,
+        kv_cache_util: f64,
+    ) {
+        let metrics = self.summary_at(current_time);
         let (latency_samples, (input_lengths, output_lengths)) =
             self.metrics.samples_since(&mut self.sent);
         callback(ProgressInfo {
-            current_time: self.engine.current_time(),
+            current_time,
             completed_requests: self.metrics.completed_requests,
             total_requests: self.metrics.total_requests,
             running: self.engine.aggregate_running(),
             waiting: self.engine.aggregate_waiting(),
-            kv_cache_util: self.engine.kv_cache_util(),
+            kv_cache_util,
             time_series: &self.time_series,
             metrics,
             latency_samples,
@@ -349,6 +398,10 @@ impl Simulator {
 
     /// Metrics summary as of the current simulated time.
     pub fn summary(&mut self) -> MetricsSummary {
+        self.summary_at(self.engine.current_time())
+    }
+
+    fn summary_at(&mut self, current_time: f64) -> MetricsSummary {
         let router =
             RouterMetrics::from_stats(self.config.router.name(), self.engine.router_stats());
         let decode_router = self
@@ -365,7 +418,7 @@ impl Simulator {
         });
         let memory = self.engine.memory_metrics();
         self.metrics.compute_summary(
-            self.engine.current_time(),
+            current_time,
             self.engine.aggregate_prefix_cache(),
             router,
             decode_router,
@@ -382,6 +435,10 @@ impl Simulator {
     /// Per-second speculative draft-depth series from the engine.
     pub fn spec_depth_series(&self) -> Vec<DepthSample> {
         self.engine.spec_depth_series()
+    }
+
+    pub fn step_coalescing_stats(&self) -> StepCoalescingStats {
+        self.engine.step_coalescing_stats()
     }
 
     pub fn time_series(&self) -> &[TimeSeriesPoint] {
@@ -584,5 +641,58 @@ mod tests {
             .unwrap();
         assert_eq!(streamed, simulator.latency_samples().ttft.values.len());
         assert_eq!(streamed, 10);
+    }
+
+    #[test]
+    fn coalescing_preserves_progress_callback_and_time_series_sequence() {
+        type Callback = (u64, u64, usize, usize, u64, usize);
+        type Sample = (u64, u64, usize, usize, u64, u32, u32);
+
+        fn run_mode(enabled: bool) -> (Vec<Callback>, Vec<Sample>, String, StepCoalescingStats) {
+            let mut config = create_minimal_test_config();
+            config.workload.arrival_pattern = crate::config::ArrivalPattern::Batched;
+            config.workload.input_len_dist = LengthDistribution::Fixed { value: 64 };
+            config.workload.output_len_dist = LengthDistribution::Fixed { value: 256 };
+            let mut simulator = Simulator::new(config, None).unwrap().with_time_series(0.1);
+            simulator.engine.set_step_coalescing(enabled);
+            let mut callbacks = Vec::new();
+            simulator
+                .run_with_callback(|p| {
+                    callbacks.push((
+                        p.current_time.to_bits(),
+                        p.completed_requests,
+                        p.running,
+                        p.waiting,
+                        p.kv_cache_util.to_bits(),
+                        p.time_series.len(),
+                    ));
+                })
+                .unwrap();
+            let samples = simulator
+                .time_series()
+                .iter()
+                .map(|p| {
+                    (
+                        p.time.to_bits(),
+                        p.arrivals,
+                        p.running,
+                        p.waiting,
+                        p.kv_cache_util.to_bits(),
+                        p.prefill_tokens,
+                        p.decode_tokens,
+                    )
+                })
+                .collect();
+            let stats = simulator.step_coalescing_stats();
+            let summary = serde_json::to_string(&simulator.summary()).unwrap();
+            (callbacks, samples, summary, stats)
+        }
+
+        let (plain_callbacks, plain_samples, plain_summary, _) = run_mode(false);
+        let (fast_callbacks, fast_samples, fast_summary, stats) = run_mode(true);
+        assert!(stats.fast_forwards > 0);
+        assert_eq!(plain_callbacks, fast_callbacks);
+        assert_eq!(plain_samples, fast_samples);
+        assert_eq!(plain_summary, fast_summary);
     }
 }

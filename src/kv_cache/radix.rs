@@ -477,6 +477,12 @@ impl Radix {
         m.unused + m.free_in_runs
     }
 
+    /// Blocks of worker `w` which have never held KV. Unlike
+    /// [`Self::free_blocks`], allocating these cannot evict a cached range.
+    pub(crate) fn unused_blocks(&self, w: WorkerId) -> u32 {
+        self.w(w).unused
+    }
+
     pub fn total_blocks(&self, w: WorkerId) -> u32 {
         self.w(w).total
     }
@@ -634,6 +640,53 @@ impl Radix {
         }
         out.segs.reverse();
         true
+    }
+
+    /// Length of `hashes` already present when continuing from a validated
+    /// request leaf. This is the read-only counterpart of
+    /// [`Self::insert_from_cached`]: step-coalescing uses it to prove future
+    /// decode blocks are new without resolving a long session path from the
+    /// root. `None` means the hint is stale and the caller must fall back.
+    pub(crate) fn matching_blocks_from_cached(
+        &self,
+        leaf: NodeId,
+        cached_blocks: u32,
+        cached_hash: u64,
+        hashes: &[u64],
+    ) -> Option<u32> {
+        let node = self.nodes.get(leaf as usize)?;
+        let local_end = cached_blocks.checked_sub(node.depth)?;
+        if !node.alive
+            || local_end == 0
+            || local_end > node.len()
+            || node.hashes[local_end as usize - 1] != cached_hash
+            || cached_blocks as usize > hashes.len()
+        {
+            return None;
+        }
+
+        let mut cur = leaf;
+        let mut pos = cached_blocks as usize;
+        while pos < hashes.len() {
+            let node = &self.nodes[cur as usize];
+            let local = pos as u32 - node.depth;
+            if local < node.len() {
+                let cmp = ((node.len() - local) as usize).min(hashes.len() - pos);
+                let matched = Self::matching_hashes(
+                    &node.hashes[local as usize..local as usize + cmp],
+                    &hashes[pos..pos + cmp],
+                );
+                pos += matched;
+                if matched < cmp || pos == hashes.len() {
+                    break;
+                }
+            }
+            let Some(child) = self.nodes[cur as usize].child(hashes[pos]) else {
+                break;
+            };
+            cur = child;
+        }
+        Some(pos as u32)
     }
 
     /// Insert `hashes` by continuing from a validated request leaf instead of
@@ -2645,6 +2698,10 @@ mod tests {
         assert_eq!(path.segs.len(), 1);
         assert_eq!(path.segs[0].node, leaf);
         assert_eq!(path, r.resolve(&[1, 2, 3, 4]));
+        assert_eq!(
+            r.matching_blocks_from_cached(leaf, 2, 2, &[1, 2, 3, 4, 5]),
+            Some(4)
+        );
 
         // A request cached at the middle of that node can diverge there
         // without walking from the root; the existing suffix becomes a peer.
@@ -2653,6 +2710,11 @@ mod tests {
         assert!(r.insert_from_cached(leaf, 2, 2, &[1, 2, 9], &mut partial));
         assert_eq!(partial, r.resolve(&[1, 2, 9]));
         assert_eq!(r.resolve(&[1, 2, 3, 4]).blocks, 4);
+        assert_eq!(
+            r.matching_blocks_from_cached(leaf, 2, 2, &[1, 2, 3, 4]),
+            Some(4)
+        );
+        assert_eq!(r.matching_blocks_from_cached(leaf, 2, 99, &[1, 2]), None);
     }
 
     #[test]
