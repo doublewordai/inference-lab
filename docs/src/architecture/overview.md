@@ -54,7 +54,8 @@ worker's `KVCacheManager`. Each iteration:
 config) picks the worker each arrival enters. `Topology::from_disagg` is a
 prefill pool and a decode pool joined by a KV hand-off `Link` whose
 bandwidth is shared by every hand-off in flight (processor sharing,
-event-driven); the same router fronts both pools.
+event-driven); `[router]` fronts the prefill pool and `[decode_router]`
+the decode pool.
 
 ## Time
 

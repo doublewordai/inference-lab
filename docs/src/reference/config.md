@@ -12,6 +12,7 @@ model = "deepseek-v4-flash"    # catalog preset, or an inline [model] table
 [scheduler]                    # engine args shared by every hardware entry
 [speculative]                  # optional: speculative decoding, shared default
 [router]                       # optional: how requests spread over replicas
+[decode_router]                # optional: disagg decode pool (defaults to [router])
 [fault]                        # optional: serve-mode static fault injection
 
 [hardware.b200]                # one entry per hardware the model runs on
@@ -38,7 +39,7 @@ runs one; `--hardware` may be omitted when the file has one entry. In Rust,
 (model on hardware) and `.with_workload(WorkloadConfig::from_file(..))` a
 `Config`. The WASM API takes that resolved `Config` as JSON: `hardware`,
 `parallel`, `model`, `scheduler`, `workload`, optional `replicas`, `router`,
-`speculative`.
+`decode_router`, `speculative`.
 
 ## Catalog presets
 
@@ -65,6 +66,7 @@ hardware preset unless `spec` says otherwise.
 | `scheduler` | Table | `{}` | Keys merged over the shared `[scheduler]` for this entry |
 | `speculative` | Table | shared `[speculative]` | Replaces the shared block for this entry |
 | `router` | Table | shared `[router]` | Replaces the shared block for this entry |
+| `decode_router` | Table | shared `[decode_router]` | Replaces the shared block for this entry |
 
 Collectives are priced on the hardware's `[fabric]` (below) and added
 serially to the step; an entry with `tp > 1` or `ep > 1` on hardware without
@@ -224,34 +226,43 @@ The `[workload]` table, at top level of `workloads/<name>.toml`.
 
 ---
 
-## [router]
+## [router] and [decode_router]
 
-Optional; `round_robin` when absent. Picks the replica each arriving
-request enters (`replicas` on the hardware entry). Only `prefix_affinity`
-and `kv_aware` look at the replicas' KV caches: on every arrival they read
-each replica's cached-prefix length for the prompt (an estimate from the
-replica's block index, as a KV-aware front end sees it, not the
-scheduler's admission-time lookup).
+Optional; `round_robin` when absent. `[router]` picks the replica each
+arriving request enters (`replicas` on the hardware entry; the prefill
+pool on a disaggregated topology). `[decode_router]` picks the decode
+worker each hand-off goes to on a disaggregated topology, and defaults to
+`[router]`. The KV-reading policies look up each replica's state for the
+prompt on every decision — an estimate from the replica's block index, as
+a KV-aware front end sees it, not the scheduler's admission-time lookup.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `policy` | String | `"round_robin"` | `round_robin`, `least_loaded`, `prefix_affinity`, `kv_aware` |
+| `policy` | String | `"round_robin"` | `round_robin`, `least_loaded`, `prefix_affinity`, `kv_aware`, `kv_aware_decode` |
 | `max_load_ratio` | F64 | unset | `prefix_affinity` only: pass over the prefix holder for the least-loaded replica when its requests in system exceed `max_load_ratio ×` the pool mean (bounded-load affinity) |
-| `load_weight` | F64 | 1.0 | `kv_aware` only: weight on the replica's queued prefill tokens |
+| `load_weight` | F64 | 1.0 / 64.0 | `kv_aware`: weight on the replica's queued prefill tokens. `kv_aware_decode`: tokens of transfer one running sequence is worth (default one 64-token block) |
 
 - `round_robin` cycles through the replicas.
 - `least_loaded` picks the fewest requests in system (running + waiting),
   ties by queued prefill tokens, then index.
 - `prefix_affinity` picks the replica holding the longest cached prefix of
-  the prompt; with none anywhere it falls back to `least_loaded`.
+  the prompt (any tier); with none anywhere it falls back to
+  `least_loaded`.
 - `kv_aware` minimises `(prompt − cached prefix) + load_weight × queued
   prefill tokens`: the prefill work the request adds plus the prefill work
-  already ahead of it, in tokens.
+  already ahead of it, in tokens. A prefill-side policy: on a decode pool
+  the load term is always zero.
+- `kv_aware_decode` minimises `(context − prompt prefix resident in the
+  decoder's HBM) + load_weight × running sequences`: the KV the hand-off
+  must move plus the decode batch it joins, in tokens. Decoders whose free
+  KV cannot hold the incoming context are passed over while any can.
 
-The summary's `router` section reports requests per replica and, for the
-prefix-reading policies, how many arrivals had a cached prefix on some
-replica, how many were routed to a holder, and how many were routed away
-from the longest holder.
+The summary's `router` section (and `decode_router` on a disaggregated
+topology) reports requests per replica and, for the KV-reading policies,
+how many decisions had a cached prefix on some replica, how many went to
+a holder, and how many went away from the longest holder. `handoff`
+reports transfers, bytes moved, and bytes skipped because the chosen
+decoder already held the prefix.
 
 ## [speculative]
 

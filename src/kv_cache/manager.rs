@@ -296,6 +296,10 @@ impl KVCacheManager {
     }
 
     /// Bytes per block: the KV footprint of a `block_size`-token sequence.
+    pub fn block_size(&self) -> u32 {
+        self.block_size
+    }
+
     pub fn bytes_per_block(&self) -> u64 {
         self.bytes_per_block
     }

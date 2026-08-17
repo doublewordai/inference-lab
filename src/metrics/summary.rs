@@ -20,7 +20,12 @@ pub struct MetricsSummary {
     pub preemptions: Preemptions,
     pub requests: RequestCounts,
     pub prefix_cache: PrefixCacheMetrics,
+    /// Routing into the pool arrivals enter.
     pub router: RouterMetrics,
+    /// Disaggregated topologies: routing of hand-offs into the decode pool.
+    pub decode_router: Option<RouterMetrics>,
+    /// Disaggregated topologies: hand-off transfer totals.
+    pub handoff: Option<HandoffMetrics>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize)]
@@ -76,6 +81,29 @@ pub struct RouterMetrics {
     pub prefix_routed: u64,
     /// Of those, requests routed away from the longest-prefix holder.
     pub prefix_forgone: u64,
+}
+
+impl RouterMetrics {
+    pub fn from_stats(policy: &str, stats: &crate::router::RouterStats) -> Self {
+        Self {
+            policy: policy.to_string(),
+            per_replica: stats.per_worker.clone(),
+            prefix_available: stats.prefix_available,
+            prefix_routed: stats.prefix_routed,
+            prefix_forgone: stats.prefix_forgone,
+        }
+    }
+}
+
+/// Hand-off transfers on a disaggregated topology.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct HandoffMetrics {
+    pub transfers: u64,
+    /// Bytes put on the hand-off link.
+    pub bytes: u64,
+    /// Bytes not transferred because the chosen decoder already held that
+    /// prompt prefix in HBM.
+    pub bytes_skipped: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize)]

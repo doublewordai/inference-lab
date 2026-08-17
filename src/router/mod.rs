@@ -25,10 +25,26 @@ pub struct WorkerSignal {
     pub queued_prefill_tokens: u64,
     /// KV cache occupancy, 0..1.
     pub kv_util: f64,
-    /// Estimated prompt tokens the replica holds in its KV cache (HBM,
-    /// in flight, or a spillover tier). `None` when the router did not ask
-    /// (`Router::wants_prefix_signal` returned false).
+    /// Tokens of context the replica's free KV blocks could hold right now.
+    pub free_kv_tokens: u64,
+    /// Estimated prompt tokens the replica holds for this request. Which
+    /// tiers count depends on what the router asked for
+    /// (`Router::prefix_signal`): any tier, or HBM-resident only. `None`
+    /// when the router did not ask.
     pub cached_prefix_tokens: Option<u32>,
+}
+
+/// Which prefix estimate a router wants in `WorkerSignal::cached_prefix_tokens`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrefixSignal {
+    /// None: the router ignores KV state.
+    None,
+    /// Prompt tokens held anywhere on the replica (HBM, in flight, or a
+    /// spillover tier): what a prefill there could skip computing.
+    Cached,
+    /// Prompt tokens resident in the replica's HBM: what a KV transfer to
+    /// it could skip moving.
+    Resident,
 }
 
 impl WorkerSignal {
@@ -40,10 +56,11 @@ impl WorkerSignal {
 
 /// Picks a replica for each request.
 pub trait Router: Send {
-    /// Whether the engine should fill `WorkerSignal::cached_prefix_tokens`
-    /// (a prefix lookup on every replica per arrival). Off by default.
-    fn wants_prefix_signal(&self) -> bool {
-        false
+    /// Which prefix estimate the engine should put in
+    /// `WorkerSignal::cached_prefix_tokens` (a lookup on every replica per
+    /// routing decision). None by default.
+    fn prefix_signal(&self) -> PrefixSignal {
+        PrefixSignal::None
     }
 
     /// Replica index for `req`. `workers` has one entry per replica and is
@@ -60,6 +77,9 @@ pub fn build_router(cfg: &RouterConfig) -> Box<dyn Router> {
             max_load_ratio: *max_load_ratio,
         }),
         RouterConfig::KvAware { load_weight } => Box::new(KvAware {
+            load_weight: *load_weight,
+        }),
+        RouterConfig::KvAwareDecode { load_weight } => Box::new(KvAwareDecode {
             load_weight: *load_weight,
         }),
     }
@@ -113,8 +133,8 @@ pub struct PrefixAffinity {
 }
 
 impl Router for PrefixAffinity {
-    fn wants_prefix_signal(&self) -> bool {
-        true
+    fn prefix_signal(&self) -> PrefixSignal {
+        PrefixSignal::Cached
     }
 
     fn route(&mut self, _req: &Request, workers: &[WorkerSignal]) -> usize {
@@ -168,8 +188,8 @@ pub struct KvAware {
 }
 
 impl Router for KvAware {
-    fn wants_prefix_signal(&self) -> bool {
-        true
+    fn prefix_signal(&self) -> PrefixSignal {
+        PrefixSignal::Cached
     }
 
     fn route(&mut self, req: &Request, workers: &[WorkerSignal]) -> usize {
@@ -188,6 +208,51 @@ impl Router for KvAware {
             }
         }
         best
+    }
+}
+
+/// Decode-side routing for hand-offs. Minimise the KV the transfer must
+/// move (context minus the prompt prefix resident in the decoder's HBM, in
+/// tokens) plus `load_weight` × the decoder's running sequences — the
+/// batch the request joins, whose every step it lengthens. Decoders whose
+/// free KV cannot hold the incoming context are passed over while any can;
+/// if none can, the cheapest is chosen and the request waits there.
+#[derive(Debug)]
+pub struct KvAwareDecode {
+    pub load_weight: f64,
+}
+
+impl Router for KvAwareDecode {
+    fn prefix_signal(&self) -> PrefixSignal {
+        PrefixSignal::Resident
+    }
+
+    fn route(&mut self, req: &Request, workers: &[WorkerSignal]) -> usize {
+        // The transferred context is the prompt: the first output token's
+        // KV is produced on the decoder.
+        let context = req.num_prompt_tokens;
+        let cost = |w: &WorkerSignal| {
+            let resident = w.cached_prefix_tokens.unwrap_or(0).min(context);
+            (context - resident) as f64 + self.load_weight * w.running as f64
+        };
+        let fits = |w: &WorkerSignal| {
+            let resident = w.cached_prefix_tokens.unwrap_or(0).min(context) as u64;
+            w.free_kv_tokens >= (context as u64).saturating_sub(resident)
+        };
+        let pick = |only_fitting: bool| {
+            let mut best: Option<(usize, f64)> = None;
+            for (i, w) in workers.iter().enumerate() {
+                if only_fitting && !fits(w) {
+                    continue;
+                }
+                let c = cost(w);
+                if best.is_none_or(|(_, bc)| c < bc) {
+                    best = Some((i, c));
+                }
+            }
+            best.map(|(i, _)| i)
+        };
+        pick(true).or_else(|| pick(false)).unwrap_or(0)
     }
 }
 
@@ -272,6 +337,7 @@ mod tests {
             waiting,
             queued_prefill_tokens: queued,
             kv_util: 0.0,
+            free_kv_tokens: u64::MAX,
             cached_prefix_tokens: cached,
         }
     }
@@ -364,6 +430,39 @@ mod tests {
         let mut r = KvAware { load_weight: 0.0 };
         let ws = vec![sig(0, 0, 1_000_000, Some(900)), sig(0, 0, 0, Some(0))];
         assert_eq!(r.route(&req(1000), &ws), 0);
+    }
+
+    #[test]
+    fn kv_aware_decode_prices_transfer_and_batch_and_checks_fit() {
+        let mut r = KvAwareDecode { load_weight: 64.0 };
+        // Cold context everywhere: pick the smallest running batch.
+        let ws = vec![
+            sig(10, 0, 0, Some(0)),
+            sig(3, 0, 0, Some(0)),
+            sig(7, 0, 0, Some(0)),
+        ];
+        assert_eq!(r.route(&req(1024), &ws), 1);
+        // A decoder holding 512 of 1024 saves 512 tokens of transfer, worth
+        // 8 running sequences at load_weight 64: 10 running (512 + 640 =
+        // 1152) beats 3 running cold (1024 + 192 = 1216).
+        let ws = vec![sig(10, 0, 0, Some(512)), sig(3, 0, 0, Some(0))];
+        assert_eq!(r.route(&req(1024), &ws), 0);
+        // With 12 running the holder loses: 512 + 768 = 1280 > 1216.
+        let ws = vec![sig(12, 0, 0, Some(512)), sig(3, 0, 0, Some(0))];
+        assert_eq!(r.route(&req(1024), &ws), 1);
+        // The emptiest decoder can't fit the context: skipped for one that can.
+        let mut ws = vec![sig(0, 0, 0, Some(0)), sig(5, 0, 0, Some(0))];
+        ws[0].free_kv_tokens = 100;
+        assert_eq!(r.route(&req(1024), &ws), 1);
+        // A holder needs room only for what it lacks.
+        let mut ws = vec![sig(0, 0, 0, Some(1000)), sig(5, 0, 0, Some(0))];
+        ws[0].free_kv_tokens = 100;
+        assert_eq!(r.route(&req(1024), &ws), 0);
+        // Nobody fits: cheapest anyway.
+        let mut ws = vec![sig(4, 0, 0, Some(0)), sig(2, 0, 0, Some(0))];
+        ws[0].free_kv_tokens = 0;
+        ws[1].free_kv_tokens = 0;
+        assert_eq!(r.route(&req(1024), &ws), 1);
     }
 
     #[test]

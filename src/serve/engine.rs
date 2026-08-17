@@ -51,7 +51,7 @@ impl RealtimeEngine {
             deployment.model.clone(),
             deployment.scheduler.clone(),
         )?
-        .with_router(&deployment.router);
+        .with_routers(&deployment.router, deployment.decode_router());
         Ok(Self {
             engine: Engine::new(topology),
             workload,

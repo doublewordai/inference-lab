@@ -767,9 +767,8 @@ fn print_final_metrics(
     }
 
     // Router Section (only interesting with more than one replica)
-    let rt = &summary.router;
-    if rt.per_replica.len() > 1 {
-        println!("\n{}", "ROUTER".yellow().bold());
+    let print_router = |title: &str, rt: &inference_lab::metrics::RouterMetrics| {
+        println!("\n{}", title.yellow().bold());
         println!("  • Policy:    {}", rt.policy);
         let per: Vec<String> = rt.per_replica.iter().map(|n| n.to_string()).collect();
         println!("  • Per replica: [{}]", per.join(", "));
@@ -781,6 +780,26 @@ fn print_final_metrics(
                 rt.prefix_routed,
                 100.0 * rt.prefix_routed as f64 / rt.prefix_available as f64,
                 rt.prefix_forgone
+            );
+        }
+    };
+    if summary.router.per_replica.len() > 1 {
+        print_router("ROUTER", &summary.router);
+    }
+    if let Some(dr) = &summary.decode_router {
+        if dr.per_replica.len() > 1 {
+            print_router("DECODE ROUTER", dr);
+        }
+    }
+    if let Some(h) = &summary.handoff {
+        if h.transfers > 0 {
+            println!("\n{}", "HAND-OFF".yellow().bold());
+            println!("  • Transfers: {}", h.transfers);
+            println!(
+                "  • Bytes moved: {:.2} GB; skipped (resident on decoder): {:.2} GB ({:.1}%)",
+                h.bytes as f64 / 1e9,
+                h.bytes_skipped as f64 / 1e9,
+                100.0 * h.bytes_skipped as f64 / (h.bytes + h.bytes_skipped).max(1) as f64
             );
         }
     }

@@ -16,7 +16,8 @@ pub mod simulator;
 pub mod spec;
 
 pub use engine::{
-    Engine, IterationInfo, RequestProgress, RequestTiming, StepKind, StepOutcome, Topology,
+    Engine, HandoffStats, IterationInfo, RequestProgress, RequestTiming, StepKind, StepOutcome,
+    Topology,
 };
 pub use roofline::{predict_decode_tpot, predict_prefill_time};
 pub use simulator::{ProgressInfo, Simulator, TimeSeriesPoint};
@@ -485,6 +486,76 @@ mod tests {
                 st[1].per_worker
             );
         }
+    }
+
+    #[test]
+    fn decode_router_is_separate_and_kv_aware_decode_spreads_and_prefers_holders() {
+        // The prefill-side kv_aware policy has no load signal on a decode
+        // pool (decoders never prefill) and piles every hand-off onto the
+        // first decoder; kv_aware_decode weighs running sequences.
+        let build = |decode: RouterConfig| {
+            let (mut cluster, model, sched) = small_dense_parts();
+            cluster.num_workers = 4;
+            let topo = DisaggTopology {
+                prefill: cluster.clone(),
+                decode: cluster,
+                kv_link_bw: 1e12,
+            };
+            Engine::new(
+                Topology::from_disagg(&topo, model, sched)
+                    .unwrap()
+                    .with_routers(&RouterConfig::LeastLoaded {}, &decode),
+            )
+        };
+        let cold = |engine: &mut Engine| {
+            for i in 0..32u64 {
+                let mut r = Request::new(format!("r{i}"), 0, i as f64 * 0.001, 512, 200);
+                r.prompt_block_hashes = (1..=32).map(|b| 100_000 * (i + 1) + b).collect();
+                engine.submit(r);
+            }
+            run_until(engine, 32);
+        };
+        let mut kv = build(RouterConfig::KvAware { load_weight: 1.0 });
+        cold(&mut kv);
+        assert_eq!(
+            kv.decode_router_stats().unwrap().per_worker,
+            vec![32, 0, 0, 0]
+        );
+
+        let mut kd = build(RouterConfig::KvAwareDecode { load_weight: 64.0 });
+        cold(&mut kd);
+        assert_eq!(
+            kd.decode_router_stats().unwrap().per_worker,
+            vec![8, 8, 8, 8]
+        );
+        // Prefill pool kept its own (least-loaded) policy.
+        assert_eq!(kd.router_stats().total(), 32);
+        assert_eq!(kd.handoff_stats().transfers, 32);
+        assert_eq!(kd.handoff_stats().bytes_skipped, 0);
+
+        // Re-entries: each of the 32 sessions returns with one more block
+        // after everything drained. The decoder that ran the session holds
+        // its prompt; kv_aware_decode sends the hand-off back there and the
+        // transfer skips the resident 32 blocks.
+        for i in 0..32u64 {
+            let mut r = Request::new(format!("r{i}-2"), 0, 10.0 + i as f64 * 0.001, 528, 8);
+            r.prompt_block_hashes = (1..=33).map(|b| 100_000 * (i + 1) + b).collect();
+            kd.submit(r);
+        }
+        run_until(&mut kd, 32);
+        let st = kd.decode_router_stats().unwrap();
+        assert_eq!(st.prefix_available, 32);
+        assert_eq!(st.prefix_routed, 32);
+        assert_eq!(st.prefix_forgone, 0);
+        let h = kd.handoff_stats();
+        assert_eq!(h.transfers, 64);
+        assert!(h.bytes_skipped > 0);
+        // Round 1 moved 32 blocks per session, round 2 one (KV is linear
+        // in position on this model, so bytes are per-block exact).
+        let (_, model, _) = small_dense_parts();
+        let per_block = model.kv_storage_bytes(16);
+        assert_eq!(h.bytes_skipped, 32 * 32 * per_block);
+        assert_eq!(h.bytes, 32 * 33 * per_block);
     }
 
     #[test]

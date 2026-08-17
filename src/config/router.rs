@@ -14,6 +14,10 @@
 //! [router]
 //! policy = "kv_aware"
 //! load_weight = 1.0
+//!
+//! [decode_router]                           # disaggregated: the decode pool
+//! policy = "kv_aware_decode"                # (defaults to [router])
+//! load_weight = 64.0
 //! ```
 
 use serde::Deserialize;
@@ -36,15 +40,29 @@ pub enum RouterConfig {
     },
     /// Minimise `(prompt − cached prefix) + load_weight × queued prefill
     /// tokens`: the prefill work the request adds plus the prefill work
-    /// queued ahead of it, in tokens.
+    /// queued ahead of it, in tokens. A prefill-side policy.
     KvAware {
         #[serde(default = "default_load_weight")]
+        load_weight: f64,
+    },
+    /// Decode-side counterpart for hand-offs: minimise `(context − prompt
+    /// prefix resident in the decoder's HBM) + load_weight × running
+    /// sequences`, in tokens — the KV the transfer must move plus the
+    /// decode batch it joins. Decoders whose free KV cannot hold the
+    /// context are passed over while any can.
+    KvAwareDecode {
+        #[serde(default = "default_decode_load_weight")]
         load_weight: f64,
     },
 }
 
 fn default_load_weight() -> f64 {
     1.0
+}
+
+/// One running sequence weighs one block of transfer by default.
+fn default_decode_load_weight() -> f64 {
+    64.0
 }
 
 impl Default for RouterConfig {
@@ -61,6 +79,7 @@ impl RouterConfig {
             RouterConfig::LeastLoaded {} => "least_loaded",
             RouterConfig::PrefixAffinity { .. } => "prefix_affinity",
             RouterConfig::KvAware { .. } => "kv_aware",
+            RouterConfig::KvAwareDecode { .. } => "kv_aware_decode",
         }
     }
 }
@@ -85,6 +104,8 @@ mod tests {
         );
         let kv: RouterConfig = toml::from_str("policy = \"kv_aware\"").unwrap();
         assert_eq!(kv, RouterConfig::KvAware { load_weight: 1.0 });
+        let kd: RouterConfig = toml::from_str("policy = \"kv_aware_decode\"").unwrap();
+        assert_eq!(kd, RouterConfig::KvAwareDecode { load_weight: 64.0 });
     }
 
     #[test]

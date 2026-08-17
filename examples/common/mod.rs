@@ -60,6 +60,7 @@ pub fn closed_loop_config(
         },
         replicas: 1,
         router: Default::default(),
+        decode_router: None,
         workload: WorkloadConfig {
             dataset_path: None,
             arrival_pattern: ArrivalPattern::ClosedLoop,

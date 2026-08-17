@@ -76,6 +76,10 @@ pub struct Config {
     /// How requests are spread across the replicas.
     #[serde(default)]
     pub router: RouterConfig,
+    /// Disaggregated topologies: how hand-offs are spread across the decode
+    /// pool. Defaults to `router`.
+    #[serde(default)]
+    pub decode_router: Option<RouterConfig>,
     pub workload: WorkloadConfig,
     /// Optional speculative decoding. When set, decode steps verify `gamma + 1`
     /// tokens and advance by `accepted + 1` per the acceptance model.
@@ -122,6 +126,7 @@ impl Config {
             scheduler,
             replicas,
             router,
+            decode_router,
             speculative,
             fault,
         } = deployment;
@@ -132,6 +137,7 @@ impl Config {
             scheduler,
             replicas,
             router,
+            decode_router,
             workload,
             speculative,
             fault,
@@ -148,6 +154,12 @@ impl Config {
             .max_model_len
             .unwrap_or(self.model.max_seq_len);
         self.scheduler.set_default_prefill_threshold(max_model_len);
+    }
+
+    /// Router for the decode pool of a disaggregated topology: the
+    /// `decode_router` block, or `router` when there is none.
+    pub fn decode_router(&self) -> &RouterConfig {
+        self.decode_router.as_ref().unwrap_or(&self.router)
     }
 
     /// The worker pool this config describes: its hardware and parallel
@@ -238,6 +250,7 @@ impl Config {
             scheduler,
             replicas: 1,
             router: RouterConfig::default(),
+            decode_router: None,
             workload,
             speculative: None,
             fault: None,

@@ -29,7 +29,9 @@
 //!
 //! `replicas` (default 1) is how many identical workers of this deployment
 //! run behind the router; `[router]` picks the policy that spreads requests
-//! across them (see [`super::router`]).
+//! across them, and `[decode_router]` (default: `[router]`) the policy that
+//! spreads hand-offs across a disaggregated decode pool (see
+//! [`super::router`]).
 //!
 //! [`ModelConfig::deployment`] resolves one entry into a [`Deployment`]: the
 //! model on that hardware, with no workload. A [`Deployment`] plus a
@@ -65,6 +67,10 @@ pub struct Deployment {
     pub replicas: u32,
     #[serde(default)]
     pub router: RouterConfig,
+    /// Disaggregated topologies: router for the decode pool. Defaults to
+    /// `router`.
+    #[serde(default)]
+    pub decode_router: Option<RouterConfig>,
     #[serde(default)]
     pub speculative: Option<SpeculativeConfig>,
     #[serde(default)]
@@ -76,6 +82,12 @@ fn default_replicas() -> u32 {
 }
 
 impl Deployment {
+    /// Router for the decode pool of a disaggregated topology: the
+    /// `decode_router` block, or `router` when there is none.
+    pub fn decode_router(&self) -> &RouterConfig {
+        self.decode_router.as_ref().unwrap_or(&self.router)
+    }
+
     /// This deployment's hardware and parallel layout as one worker pool of
     /// `replicas` workers.
     pub fn cluster(&self) -> ClusterSpec {
@@ -129,6 +141,9 @@ struct HardwareEntry {
     /// Replaces the shared `[router]` block for this hardware.
     #[serde(default)]
     router: Option<Table>,
+    /// Replaces the shared `[decode_router]` block for this hardware.
+    #[serde(default)]
+    decode_router: Option<Table>,
 }
 
 /// A parsed model config file. Resolve a hardware entry with
@@ -142,6 +157,8 @@ pub struct ModelConfig {
     speculative: Option<Table>,
     #[serde(default)]
     router: Option<Table>,
+    #[serde(default)]
+    decode_router: Option<Table>,
     #[serde(default)]
     fault: Option<Table>,
     hardware: BTreeMap<String, HardwareEntry>,
@@ -221,6 +238,9 @@ impl ModelConfig {
         if let Some(router) = entry.router.as_ref().or(self.router.as_ref()) {
             merged.insert("router".into(), Value::Table(router.clone()));
         }
+        if let Some(router) = entry.decode_router.as_ref().or(self.decode_router.as_ref()) {
+            merged.insert("decode_router".into(), Value::Table(router.clone()));
+        }
         if let Some(fault) = &self.fault {
             merged.insert("fault".into(), Value::Table(fault.clone()));
         }
@@ -258,6 +278,9 @@ alpha = 0.75
 [router]
 policy = "least_loaded"
 
+[decode_router]
+policy = "kv_aware_decode"
+
 [hardware.b200]
 tp = 4
 replicas = 4
@@ -287,6 +310,10 @@ alpha = 0.5
         assert_eq!(b200.speculative.as_ref().unwrap().gamma, 4);
         assert_eq!(b200.replicas, 4);
         assert_eq!(b200.router, RouterConfig::LeastLoaded {});
+        assert_eq!(
+            *b200.decode_router(),
+            RouterConfig::KvAwareDecode { load_weight: 64.0 }
+        );
         assert_eq!(b200.cluster().num_workers, 4);
 
         let gh = cfg.deployment(Some("gh200")).unwrap();
@@ -296,6 +323,11 @@ alpha = 0.5
             RouterConfig::PrefixAffinity {
                 max_load_ratio: Some(1.5)
             }
+        );
+        // No per-entry decode_router: the shared block applies.
+        assert_eq!(
+            *gh.decode_router(),
+            RouterConfig::KvAwareDecode { load_weight: 64.0 }
         );
         assert_eq!(gh.hardware.name, "GH200");
         assert_eq!(gh.scheduler.max_num_batched_tokens, 4096);
