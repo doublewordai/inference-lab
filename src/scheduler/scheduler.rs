@@ -1,6 +1,6 @@
 use super::{decision::ScheduleDecision, decision::ScheduledSeq, policy::SchedulingPolicy};
-use crate::config::SchedulerConfig;
-use crate::kv_cache::KVCacheManager;
+use crate::config::{SchedulerConfig, SourcePolicy};
+use crate::kv_cache::{KVCacheManager, PrefixCacheLookup};
 use crate::request::Request;
 use ordered_float::OrderedFloat;
 use std::collections::VecDeque;
@@ -30,7 +30,18 @@ pub struct Scheduler {
 
     /// Total preemptions performed so far.
     num_preemptions: u64,
+
+    /// Where a tier-held prefix comes from at admission.
+    source: SourcePolicy,
+
+    /// Roofline seconds to recompute `tokens` positions of `request`
+    /// starting at position `from`, alone on the worker; set by the worker
+    /// from its compute engine. Needed by `source = min_time`.
+    recompute_seconds: Option<RecomputeFn>,
 }
+
+/// `(request, from, tokens) -> seconds`.
+pub type RecomputeFn = Box<dyn Fn(&Request, u32, u32) -> f64 + Send + Sync>;
 
 impl Scheduler {
     pub fn new(config: SchedulerConfig, kv_cache_manager: KVCacheManager) -> Self {
@@ -42,7 +53,47 @@ impl Scheduler {
             pending_transfers: Vec::new(),
             kv_cache_manager,
             num_preemptions: 0,
+            source: SourcePolicy::Promote {},
+            recompute_seconds: None,
         }
+    }
+
+    /// Set where a tier-held prefix comes from at admission. `min_time`
+    /// needs `recompute_seconds` (the worker's roofline for a prefill
+    /// chunk); without it every prefix promotes.
+    pub fn with_source(
+        mut self,
+        source: SourcePolicy,
+        recompute_seconds: Option<RecomputeFn>,
+    ) -> Self {
+        self.source = source;
+        self.recompute_seconds = recompute_seconds;
+        self
+    }
+
+    /// Fetch or recompute the tier-held part of `lookup` for `request`:
+    /// under `min_time`, recompute when the roofline prefill of those
+    /// tokens (from position `resident`, the HBM + in-flight prefix)
+    /// beats the promotion at the fetch path's current fair share.
+    fn recompute_instead(
+        &self,
+        request: &Request,
+        lookup: &PrefixCacheLookup,
+        resident: u32,
+    ) -> bool {
+        let SourcePolicy::MinTime {} = self.source else {
+            return false;
+        };
+        let Some(est) = &self.recompute_seconds else {
+            return false;
+        };
+        let promote_tokens: u32 = lookup.promote_tokens_per_tier.iter().sum();
+        if promote_tokens == 0 {
+            return false;
+        }
+        let fetch = self.kv_cache_manager.estimate_fetch(lookup);
+        let recompute = est(request, resident, promote_tokens);
+        recompute <= fetch
     }
 
     /// Promote any pending KV-transfer requests whose transfer has finished
@@ -228,7 +279,24 @@ impl Scheduler {
                     continue;
                 }
 
-                let lookup = self.kv_cache_manager.peek_prefix_cache(request);
+                let mut lookup = self.kv_cache_manager.peek_prefix_cache(request);
+                // Fetch or recompute the tier-held part: recomputing
+                // shrinks the lookup to the HBM + in-flight prefix (the
+                // tier keeps its copy).
+                let resident = lookup.hbm_tokens + lookup.in_flight_tokens;
+                if self.recompute_instead(request, &lookup, resident) {
+                    let recomputed: u32 = lookup.promote_tokens_per_tier.iter().sum();
+                    self.kv_cache_manager.record_recompute(recomputed);
+                    lookup.total_cached_tokens = resident;
+                    lookup
+                        .promote_tokens_per_tier
+                        .iter_mut()
+                        .for_each(|t| *t = 0);
+                    lookup
+                        .promote_bytes_per_tier
+                        .iter_mut()
+                        .for_each(|b| *b = 0);
+                }
                 let cached_tokens = self.usable_cached_tokens(request, lookup.total_cached_tokens);
 
                 // If part of the prefix lives in a slower tier (or is in
@@ -624,6 +692,101 @@ mod tests {
         let mut scheduler = create_test_scheduler();
         scheduler.add_request(create_test_request("req-1", 100, 50));
         assert_eq!(scheduler.num_waiting(), 1);
+    }
+
+    /// Scheduler with one private tier at `bw` bytes/s holding `prefix_hash`
+    /// (demoted out of a 4-block HBM), under `source`, pricing recompute at
+    /// `recompute_seconds_per_token`.
+    fn tiered_scheduler(
+        bw: f64,
+        source: SourcePolicy,
+        recompute_per_token: f64,
+    ) -> (Scheduler, u64) {
+        let config = Config::test_default();
+        let block_size = config.scheduler.block_size;
+        let per_block = config.model.kv_storage_bytes(block_size);
+        let kv = kv_manager(&config, 4 * per_block, true).with_private_tiers(&[(
+            "host_ram",
+            10 * 1024 * 1024 * 1024,
+            bw,
+        )]);
+        let est: RecomputeFn = Box::new(move |_r: &Request, _from: u32, tokens: u32| {
+            tokens as f64 * recompute_per_token
+        });
+        let mut scheduler = scheduler_from(config, kv).with_source(source, Some(est));
+        let prefix_hash = 0xCAFE_u64;
+        let mgr = &mut scheduler.kv_cache_manager;
+        let mut seed = create_test_request("seed", block_size, 1);
+        seed.prompt_block_hashes = vec![prefix_hash];
+        let blocks = mgr.allocate_blocks(&seed, block_size).unwrap();
+        mgr.free_blocks(&blocks);
+        let mut churn = create_test_request("churn", block_size * 4, 1);
+        churn.prompt_block_hashes = vec![0xDEAD_u64, 0xDEAE, 0xDEAF, 0xDEB0];
+        let cb = mgr.allocate_blocks(&churn, block_size * 4).unwrap();
+        mgr.free_blocks(&cb);
+        assert!(mgr.num_tiers() == 1 && mgr.peek_prefix_cache(&seed).needs_promotion());
+        (scheduler, prefix_hash)
+    }
+
+    #[test]
+    fn min_time_recomputes_a_slow_fetch_and_promotes_a_fast_one() {
+        let config = Config::test_default();
+        let block_size = config.scheduler.block_size;
+        let per_block = config.model.kv_storage_bytes(block_size) as f64;
+        // Recompute at 1 ms/token: a block takes block_size ms.
+        let recompute = 1e-3;
+        // Slow tier: the block's bytes take 10× longer than recomputing.
+        let slow = per_block / (10.0 * recompute * block_size as f64);
+        let (mut s, h) = tiered_scheduler(slow, SourcePolicy::MinTime {}, recompute);
+        let mut req = create_test_request("req", block_size * 2, 1);
+        req.prompt_block_hashes = vec![h, 0xBEEF_u64];
+        s.add_request(req);
+        let d = s.schedule(0.0);
+        assert_eq!(d.batch.len(), 1, "admitted straight into the batch");
+        assert!(
+            s.pending_transfers.is_empty(),
+            "nothing parked on a transfer"
+        );
+        assert_eq!(
+            d.batch[0].num_tokens,
+            block_size * 2,
+            "whole prompt recomputed"
+        );
+        let st = s.kv_cache_manager.prefix_cache_stats();
+        assert_eq!(
+            (st.recomputed, st.recomputed_tokens),
+            (1, block_size as u64)
+        );
+        assert!(s.kv_cache_manager.num_tiers() == 1);
+        // The tier keeps its copy.
+        assert!(s
+            .kv_cache_manager
+            .memory()
+            .unwrap()
+            .0
+            .lock()
+            .unwrap()
+            .holds(0, h));
+
+        // Fast tier: 10× faster than recomputing → promote as before.
+        let fast = per_block * 10.0 / (recompute * block_size as f64);
+        let (mut s, h) = tiered_scheduler(fast, SourcePolicy::MinTime {}, recompute);
+        let mut req = create_test_request("req", block_size * 2, 1);
+        req.prompt_block_hashes = vec![h, 0xBEEF_u64];
+        s.add_request(req);
+        let d = s.schedule(0.0);
+        assert!(d.batch.is_empty());
+        assert_eq!(s.pending_transfers.len(), 1);
+        assert_eq!(s.kv_cache_manager.prefix_cache_stats().recomputed, 0);
+
+        // `promote` ignores the comparison: even the slow tier is fetched.
+        let (mut s, h) = tiered_scheduler(slow, SourcePolicy::Promote {}, recompute);
+        let mut req = create_test_request("req", block_size * 2, 1);
+        req.prompt_block_hashes = vec![h, 0xBEEF_u64];
+        s.add_request(req);
+        let d = s.schedule(0.0);
+        assert!(d.batch.is_empty());
+        assert_eq!(s.pending_transfers.len(), 1);
     }
 
     #[test]

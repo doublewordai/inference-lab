@@ -10,12 +10,13 @@ use std::collections::{BinaryHeap, HashMap};
 use super::spec::{DepthSample, PlanCosts, SpecPlanner};
 use crate::compute::ComputeEngine;
 use crate::config::{
-    ClusterSpec, DisaggTopology, ModelSpec, RouterConfig, SchedulerConfig, SpeculativeConfig,
+    ClusterSpec, DisaggTopology, ModelSpec, RouterConfig, SchedulerConfig, SourcePolicy,
+    SpeculativeConfig,
 };
 use crate::kv_cache::{KVCacheManager, MemoryGraph, Owner, PrefixCacheStats, SharedMemoryGraph};
 use crate::request::{Request, SessionStep};
 use crate::router::{build_router, PrefixSignal, Router, RouterStats, WorkerSignal};
-use crate::scheduler::Scheduler;
+use crate::scheduler::{RecomputeFn, Scheduler};
 
 pub type PoolId = usize;
 
@@ -112,11 +113,28 @@ impl Worker {
             ));
         }
 
-        let scheduler = Scheduler::new(scheduler_config.clone(), kv_cache_manager);
-        let compute_engine = cluster.compute_engine(model).with_cascade_attention(
-            scheduler_config.enable_cascade_attention,
-            scheduler_config.block_size,
-        );
+        let compute_engine = cluster
+            .compute_engine(model.clone())
+            .with_cascade_attention(
+                scheduler_config.enable_cascade_attention,
+                scheduler_config.block_size,
+            );
+        // `source = min_time` prices recomputing a tier-held prefix at the
+        // worker's own roofline: a second engine over the same hardware.
+        let recompute: Option<RecomputeFn> = match policies.source {
+            SourcePolicy::Promote {} => None,
+            SourcePolicy::MinTime {} => {
+                let pricer = cluster.compute_engine(model);
+                Some(Box::new(move |req: &Request, from: u32, tokens: u32| {
+                    let mut probe = req.clone();
+                    probe.num_computed_tokens = from;
+                    probe.kv_blocks.clear();
+                    pricer.calculate_iteration_time(&[&probe], &[tokens])
+                }))
+            }
+        };
+        let scheduler = Scheduler::new(scheduler_config.clone(), kv_cache_manager)
+            .with_source(policies.source, recompute);
         Ok(Self {
             scheduler,
             compute_engine,

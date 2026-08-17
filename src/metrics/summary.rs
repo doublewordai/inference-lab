@@ -163,4 +163,8 @@ pub struct PrefixCacheMetrics {
     pub hit_rate: f64,
     /// Mean cached prefix length per lookup, in tokens.
     pub mean_hit_size: f64,
+    /// Lookups whose tier-held prefix was recomputed rather than fetched
+    /// (`[memory] source = min_time`), and the tokens recomputed.
+    pub recomputed: u64,
+    pub recomputed_tokens: u64,
 }

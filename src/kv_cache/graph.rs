@@ -939,6 +939,15 @@ impl MemoryGraph {
         }
     }
 
+    /// Time promoting `bytes` from `worker`'s tier `tier` into its HBM
+    /// would take if started now, at the fetch path's current fair share
+    /// (see [`Flows::estimate_new`]).
+    pub fn estimate_promotion(&self, worker: WorkerId, tier: usize, bytes: u64) -> f64 {
+        let path = &self.tiers[worker][tier].fetch_path;
+        self.flows
+            .estimate_new(&path.edges, bytes as f64, path.latency)
+    }
+
     /// Start moving `bytes` for `request` from `worker`'s tier `tier` into
     /// its HBM. The transfer's id is `promotion_id(request, tier)`. If any
     /// of `hashes` is still arriving in that store, the promotion waits for

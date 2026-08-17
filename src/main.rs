@@ -774,6 +774,12 @@ fn print_final_metrics(
         println!("  • Misses:    {}", pc.misses);
         println!("  • Avg hit size: {:.1} tokens", pc.mean_hit_size);
         println!("  • Hit Rate:  {:.1}%", pc.hit_rate * 100.0);
+        if pc.recomputed > 0 {
+            println!(
+                "  • Recomputed instead of fetched: {} lookups, {} tokens",
+                pc.recomputed, pc.recomputed_tokens
+            );
+        }
     }
 
     // Router Section (only interesting with more than one replica)

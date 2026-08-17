@@ -97,7 +97,9 @@ impl Request {
     /// step with a successor: arrival at `completion_time` plus the harness
     /// gap, reusing `shared_tokens` of this context.
     pub fn outlook_at(&self, completion_time: f64) -> Option<Outlook> {
-        self.session.as_ref().and_then(|s| s.outlook_at(completion_time))
+        self.session
+            .as_ref()
+            .and_then(|s| s.outlook_at(completion_time))
     }
 
     /// Create a request that will produce `target_output_tokens` tokens (at

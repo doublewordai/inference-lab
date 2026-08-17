@@ -158,6 +158,10 @@ pub struct PrefixCacheStats {
     pub hit_size_sum: u64,
     /// Number of lookups (hits + misses).
     pub lookups: u64,
+    /// Lookups whose tier-held prefix was recomputed instead of fetched
+    /// (`source = min_time`), and the tokens that recomputed.
+    pub recomputed: u64,
+    pub recomputed_tokens: u64,
 }
 
 impl PrefixCacheStats {
@@ -182,6 +186,8 @@ impl PrefixCacheStats {
 
 impl std::ops::AddAssign for PrefixCacheStats {
     fn add_assign(&mut self, o: Self) {
+        self.recomputed += o.recomputed;
+        self.recomputed_tokens += o.recomputed_tokens;
         self.hits += o.hits;
         self.misses += o.misses;
         self.hit_size_sum += o.hit_size_sum;
@@ -273,6 +279,35 @@ impl KVCacheManager {
                 g.lock().unwrap().set_outlook(*w, hash, mark.map(|m| m.0));
             }
         }
+    }
+
+    /// Time the promotions a lookup needs would take if started now:
+    /// every tier's share moves in parallel, so the slowest of them, at
+    /// each fetch path's current fair share. 0 when nothing needs
+    /// promoting; infinite without a memory graph.
+    pub fn estimate_fetch(&self, lookup: &PrefixCacheLookup) -> f64 {
+        let Some((g, w)) = &self.memory else {
+            return if lookup.needs_promotion() {
+                f64::INFINITY
+            } else {
+                0.0
+            };
+        };
+        let g = g.lock().unwrap();
+        lookup
+            .promote_bytes_per_tier
+            .iter()
+            .enumerate()
+            .filter(|(_, &b)| b > 0)
+            .map(|(tier, &b)| g.estimate_promotion(*w, tier, b))
+            .fold(0.0, f64::max)
+    }
+
+    /// The tier-held part of a lookup is being recomputed rather than
+    /// fetched: count it.
+    pub fn record_recompute(&mut self, tokens: u32) {
+        self.stats.recomputed += 1;
+        self.stats.recomputed_tokens += tokens as u64;
     }
 
     /// The announced re-entry time of `hash`, if any.
@@ -1197,8 +1232,22 @@ mod tests {
                 .with_hbm_eviction(policy);
             let mut ids = Vec::new();
             for (name, hashes, outlook) in [
-                ("a", vec![1u64, 2], Some(Outlook { next_arrival: 100.0, shared_tokens: 32 })),
-                ("b", vec![3, 4], Some(Outlook { next_arrival: 10.0, shared_tokens: 32 })),
+                (
+                    "a",
+                    vec![1u64, 2],
+                    Some(Outlook {
+                        next_arrival: 100.0,
+                        shared_tokens: 32,
+                    }),
+                ),
+                (
+                    "b",
+                    vec![3, 4],
+                    Some(Outlook {
+                        next_arrival: 10.0,
+                        shared_tokens: 32,
+                    }),
+                ),
                 ("c", vec![5, 6], None),
             ] {
                 let mut r = create_test_request(name, 32);
@@ -1228,11 +1277,26 @@ mod tests {
         assert!(o.hbm_contains(3), "B's head survives: nearest re-entry");
         // Announcing a nearer re-entry for a free block re-orders it.
         let (mut o, ids) = build(HbmEviction::Outlook {});
-        o.set_outlook(&[1, 2], Some(Outlook { next_arrival: 1.0, shared_tokens: 32 }));
-        assert_eq!(recycle(&mut o, 4), vec![ids[2][1], ids[2][0], ids[1][1], ids[1][0]]);
+        o.set_outlook(
+            &[1, 2],
+            Some(Outlook {
+                next_arrival: 1.0,
+                shared_tokens: 32,
+            }),
+        );
+        assert_eq!(
+            recycle(&mut o, 4),
+            vec![ids[2][1], ids[2][0], ids[1][1], ids[1][0]]
+        );
         // A partial outlook marks only the shared prefix: A's tail is dead.
         let (mut o, ids) = build(HbmEviction::Outlook {});
-        o.set_outlook(&[1, 2], Some(Outlook { next_arrival: 1.0, shared_tokens: 16 }));
+        o.set_outlook(
+            &[1, 2],
+            Some(Outlook {
+                next_arrival: 1.0,
+                shared_tokens: 16,
+            }),
+        );
         assert_eq!(recycle(&mut o, 3), vec![ids[2][1], ids[2][0], ids[0][1]]);
     }
 

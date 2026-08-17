@@ -508,10 +508,7 @@ impl MemoryConfig {
     /// The policies this deployment runs: the preset's choices (or the
     /// defaults) with every explicit field applied over them.
     pub fn policies(&self) -> MemoryPolicies {
-        let mut p = self
-            .preset
-            .map(MemoryPolicies::preset)
-            .unwrap_or_default();
+        let mut p = self.preset.map(MemoryPolicies::preset).unwrap_or_default();
         if let Some(v) = self.source {
             p.source = v;
         }

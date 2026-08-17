@@ -214,6 +214,34 @@ impl Flows {
             .min_by(f64::total_cmp)
     }
 
+    /// Time a new transfer of `bytes` over `path` (after `latency`) would
+    /// take at the share it would get now: on every edge, capacity over
+    /// one more than the transfers already moving bytes on it, the
+    /// smallest along the path. A lower bound on its max-min share, so an
+    /// upper bound on the time; exact on an idle path.
+    pub fn estimate_new(&self, path: &[EdgeId], bytes: f64, latency: f64) -> f64 {
+        if path.is_empty() {
+            return latency.max(0.0);
+        }
+        let mut load = vec![0usize; self.edges.len()];
+        for t in self.in_flight.values() {
+            if t.bytes_remaining <= DONE_EPSILON_BYTES {
+                continue;
+            }
+            for &e in &t.path {
+                load[e] += 1;
+            }
+        }
+        let share = path
+            .iter()
+            .map(|&e| self.edges[e].capacity / (load[e] + 1) as f64)
+            .fold(f64::INFINITY, f64::min);
+        if share <= 0.0 || !share.is_finite() {
+            return f64::INFINITY;
+        }
+        latency.max(0.0) + bytes / share
+    }
+
     /// Projected remaining time for `id` under the current rates; 0 if
     /// unknown.
     pub fn estimate_remaining(&self, id: &str) -> f64 {
