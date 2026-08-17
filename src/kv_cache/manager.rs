@@ -623,6 +623,21 @@ impl KVCacheManager {
         lo as u32 * self.block_size
     }
 
+    /// Contiguous prompt prefix already resident in HBM, in tokens: the part
+    /// of an incoming context a remote KV transfer (disaggregated hand-off)
+    /// can skip. Stops at the first block that is not in HBM (in flight or
+    /// in a spillover tier counts as not resident).
+    pub fn hbm_prefix_tokens(&self, hashes: &[u64]) -> u32 {
+        if !self.enable_prefix_caching {
+            return 0;
+        }
+        let held = hashes
+            .iter()
+            .take_while(|h| self.prefix_cache.contains_key(h))
+            .count();
+        held as u32 * self.block_size
+    }
+
     /// Record a prefix-cache lookup in the hit/miss statistics.
     pub fn record_prefix_lookup(&mut self, lookup: &PrefixCacheLookup) {
         let tokens = lookup.total_cached_tokens;

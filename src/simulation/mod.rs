@@ -339,6 +339,107 @@ mod tests {
         assert_eq!(kv.aggregate_prefix_cache().hits, aff_stats.hits);
     }
 
+    /// `(pool, request_id, was_prefill, num_tokens)` for one request in one
+    /// iteration.
+    type Progress = (usize, String, bool, u32);
+
+    /// Run `engine` until `n` requests complete; returns their timings and
+    /// every iteration's per-request progress.
+    fn run_until_with_progress(
+        engine: &mut Engine,
+        n: usize,
+    ) -> (Vec<RequestTiming>, Vec<Progress>) {
+        let mut done = Vec::new();
+        let mut progress = Vec::new();
+        while done.len() < n {
+            assert!(engine.next_event_time().is_some(), "queue drained");
+            let out = engine.step().unwrap();
+            if let Some(it) = &out.iteration {
+                for p in &it.progress {
+                    progress.push((it.pool, p.request_id.clone(), p.was_prefill, p.num_tokens));
+                }
+            }
+            done.extend(out.completions);
+        }
+        (done, progress)
+    }
+
+    #[test]
+    fn disagg_decode_pool_does_not_reprefill_handed_off_requests() {
+        let (cluster, model, sched) = small_dense_parts();
+        let topo = DisaggTopology {
+            prefill: cluster.clone(),
+            decode: cluster,
+            kv_link_bw: 1e12,
+        };
+        let mut engine = Engine::new(Topology::from_disagg(&topo, model, sched).unwrap());
+        engine.submit(Request::new("a".into(), 0, 0.0, 640, 4));
+        let (timings, progress) = run_until_with_progress(&mut engine, 1);
+        // Exactly one prefill pass, on the prefill pool (pool 0).
+        let prefills: Vec<_> = progress.iter().filter(|p| p.2).collect();
+        assert_eq!(prefills.len(), 1, "{progress:?}");
+        assert_eq!(prefills[0].0, 0);
+        assert_eq!(prefills[0].3, 640);
+        // Every decode-pool pass is a decode step.
+        assert!(
+            progress
+                .iter()
+                .filter(|p| p.0 == 1)
+                .all(|p| !p.2 && p.3 == 1),
+            "{progress:?}"
+        );
+        assert_eq!(timings[0].num_output_tokens, 4);
+    }
+
+    #[test]
+    fn disagg_handoff_skips_the_prefix_the_decoder_already_holds() {
+        let (cluster, model, sched) = small_dense_parts();
+        // The link moves the KV of 16 tokens in exactly 1.0 s.
+        let kv16 = model.kv_storage_bytes(16) as f64;
+        let topo = DisaggTopology {
+            prefill: cluster.clone(),
+            decode: cluster,
+            kv_link_bw: kv16,
+        };
+        let mut engine = Engine::new(Topology::from_disagg(&topo, model, sched).unwrap());
+        // Round 1: 64-token prompt, blocks 1..4. Round 2 arrives well after
+        // round 1 finished: same session, one more block (hashes 1..5).
+        let mut r1 = Request::new("r1".into(), 0, 0.0, 64, 2);
+        r1.prompt_block_hashes = (1..=4).collect();
+        let mut r2 = Request::new("r2".into(), 0, 100.0, 80, 2);
+        r2.prompt_block_hashes = (1..=5).collect();
+        engine.submit(r1);
+        engine.submit(r2);
+        let (timings, progress) = run_until_with_progress(&mut engine, 2);
+        let get = |id: &str| timings.iter().find(|t| t.request_id == id).unwrap();
+        let handoff = |t: &RequestTiming| t.handoff_done_time - t.prefill_done_time;
+        // Round 1 ships all 64 tokens (4.0 s); round 2 only the 16 the
+        // decoder does not already hold (1.0 s).
+        assert!(
+            (handoff(get("r1")) - 4.0).abs() < 1e-6,
+            "{}",
+            handoff(get("r1"))
+        );
+        assert!(
+            (handoff(get("r2")) - 1.0).abs() < 1e-6,
+            "{}",
+            handoff(get("r2"))
+        );
+        // And the prefill pool only computed the new block of round 2 (its
+        // own cache held blocks 1..4 from round 1).
+        let r2_prefill: Vec<_> = progress
+            .iter()
+            .filter(|p| p.0 == 0 && p.1 == "r2" && p.2)
+            .collect();
+        assert_eq!(r2_prefill.len(), 1, "{progress:?}");
+        assert_eq!(r2_prefill[0].3, 16);
+        // The decoder never prefilled anything.
+        assert!(
+            progress.iter().filter(|p| p.0 == 1).all(|p| !p.2),
+            "{progress:?}"
+        );
+    }
+
     #[test]
     fn disagg_handoffs_share_the_link_bandwidth() {
         let (cluster, model, sched) = small_dense_parts();

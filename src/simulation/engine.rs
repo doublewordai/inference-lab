@@ -371,8 +371,9 @@ pub struct Engine {
     topology: Topology,
     events: BinaryHeap<TimedEvent>,
     /// Requests that finished prefill on the P pool and are mid-handoff over
-    /// the link.
-    parked: HashMap<String, Request>,
+    /// the link, with the decode worker each was routed to when the transfer
+    /// began.
+    parked: HashMap<String, (Request, usize)>,
     /// Per-link generation of the scheduled `LinkDrain` event; only the
     /// event carrying the current generation is acted on.
     link_generation: Vec<u64>,
@@ -640,6 +641,10 @@ impl Engine {
 
     fn route_into_pool(&mut self, pool_id: PoolId, req: Request) {
         let worker_idx = self.topology.pools[pool_id].pick(&req);
+        self.deliver_to_worker(pool_id, worker_idx, req);
+    }
+
+    fn deliver_to_worker(&mut self, pool_id: PoolId, worker_idx: usize, req: Request) {
         self.topology.pools[pool_id].workers[worker_idx]
             .scheduler
             .add_request(req);
@@ -964,24 +969,39 @@ impl Engine {
         (iter_time, measured_time.is_some(), bw, flops)
     }
 
+    /// A request has finished prefill on the P pool. Pick its decode worker
+    /// now (the router sees the decode pool's load and, for the KV-aware
+    /// policies, which decoders already hold part of this context), size the
+    /// transfer at the context minus the prompt prefix that decoder already
+    /// has resident, and start it on the hand-off link. The request is
+    /// delivered to that worker when the transfer drains.
     fn start_handoff(&mut self, mut req: Request, prefill_done_at: f64) {
         req.prefill_done_time = Some(prefill_done_at);
+        let (link, decode) = match self.topology.roles {
+            Roles::Disagg {
+                handoff, decode, ..
+            } => (handoff, decode),
+            _ => return,
+        };
+        let worker_idx = self.topology.pools[decode].pick(&req);
+        let resident = self.topology.pools[decode].workers[worker_idx]
+            .scheduler
+            .kv_cache_manager()
+            .hbm_prefix_tokens(&req.prompt_block_hashes)
+            .min(req.num_computed_tokens);
         let kv_bytes = self
             .topology
             .model
-            .kv_storage_bytes(req.num_computed_tokens);
+            .kv_storage_bytes(req.num_computed_tokens)
+            .saturating_sub(self.topology.model.kv_storage_bytes(resident));
         let id = req.request_id.clone();
-        let link = match self.topology.roles {
-            Roles::Disagg { handoff, .. } => handoff,
-            _ => return,
-        };
         // Bring the link up to date under the old contention, then add the
         // new transfer and re-plan the next completion under the new one.
         // (`advance` returns nothing here: any completion due before now was
         // handled by its own drain event.)
         let _ = self.topology.links[link].advance(prefill_done_at);
         self.topology.links[link].submit(id.clone(), kv_bytes, prefill_done_at);
-        self.parked.insert(id, req);
+        self.parked.insert(id, (req, worker_idx));
         self.schedule_link_drain(link, prefill_done_at);
     }
 
@@ -1005,16 +1025,17 @@ impl Engine {
             Roles::Disagg { decode, .. } => decode,
             _ => return Err("link drain on an aggregated topology".to_string()),
         };
-        // Route completed hand-offs in a deterministic order.
+        // Deliver completed hand-offs in a deterministic order, each to the
+        // decode worker chosen when its transfer began.
         let mut done: Vec<String> = done.into_iter().collect();
         done.sort();
         for request_id in done {
-            let mut req = self
+            let (mut req, worker_idx) = self
                 .parked
                 .remove(&request_id)
                 .ok_or_else(|| format!("link complete for unknown request {request_id}"))?;
             req.handoff_done_time = Some(now);
-            self.route_into_pool(decode_pool, req);
+            self.deliver_to_worker(decode_pool, worker_idx, req);
         }
         self.schedule_link_drain(link, now);
         Ok(())

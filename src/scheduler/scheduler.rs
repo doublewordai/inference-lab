@@ -187,6 +187,42 @@ impl Scheduler {
                     break; // Can't admit without risking future preemption need
                 }
 
+                // KV for the first `num_computed_tokens` positions arrived
+                // from outside this worker (a disaggregated hand-off): it is
+                // resident, needs blocks, and needs no compute. A preempted
+                // request never takes this path (preemption zeroes
+                // `num_computed_tokens`); a request parked on a tier
+                // promotion holds its reserved blocks so it doesn't either.
+                if request.num_computed_tokens > 0 && request.kv_blocks.is_empty() {
+                    let tokens_to_schedule = self.tokens_to_schedule(request, token_budget);
+                    if tokens_to_schedule == 0 {
+                        break;
+                    }
+                    let blocks_needed = self
+                        .kv_cache_manager
+                        .blocks_needed(request, tokens_to_schedule);
+                    if self.kv_cache_manager.num_free_blocks() < blocks_needed {
+                        break;
+                    }
+                    let mut request = self.waiting.remove(selected_idx).unwrap();
+                    // Blocks for the transferred context plus this step.
+                    // Prompt blocks this worker already holds are shared by
+                    // reference (they were skipped by the transfer); the
+                    // rest are fresh and publish the prompt's hashes here.
+                    let blocks = self
+                        .kv_cache_manager
+                        .allocate_blocks(&request, tokens_to_schedule)
+                        .expect("free-block check above guarantees allocation");
+                    request.kv_blocks.extend(blocks);
+                    decision.batch.push(ScheduledSeq {
+                        idx: self.running.len(),
+                        num_tokens: tokens_to_schedule,
+                    });
+                    token_budget -= tokens_to_schedule;
+                    self.running.push(request);
+                    continue;
+                }
+
                 let lookup = self.kv_cache_manager.peek_prefix_cache(request);
                 let cached_tokens = self.usable_cached_tokens(request, lookup.total_cached_tokens);
 
