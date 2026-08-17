@@ -763,6 +763,13 @@ fn print_final_metrics(
         "  • Total Requests: {} completed",
         summary.requests.completed
     );
+    if summary.requests.rejected > 0 {
+        println!(
+            "  • {} {} rejected: context larger than a worker's KV cache",
+            "⚠".yellow(),
+            summary.requests.rejected
+        );
+    }
     println!("  • Simulation Time: {:.1}s", sim_time);
     println!("  • Real Time: {:.2}s", real_time.as_secs_f64());
 

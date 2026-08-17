@@ -62,6 +62,12 @@ pub struct Request {
     /// Number of times this request has been preempted.
     pub num_preemptions: u32,
 
+    /// The scheduler refused it at submission: its whole context (prompt +
+    /// planned output) needs more KV blocks than the worker has, so it
+    /// could never run to completion. Completed at once with no output;
+    /// counted apart from served requests.
+    pub rejected: bool,
+
     /// Time the first output token was produced (end of the prefill pass).
     pub first_token_time: Option<f64>,
 
@@ -128,6 +134,7 @@ impl Request {
             session: None,
             kv_blocks: Vec::new(),
             num_preemptions: 0,
+            rejected: false,
             first_token_time: None,
             prefill_done_time: None,
             handoff_done_time: None,

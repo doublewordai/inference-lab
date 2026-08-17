@@ -474,16 +474,18 @@ mod tests {
     }
 
     #[test]
-    fn unschedulable_request_is_an_error_not_a_hang() {
+    fn unschedulable_request_is_rejected_not_a_hang() {
         let mut config = create_minimal_test_config();
         // A prompt longer than the whole KV cache (64 blocks of 16 tokens)
-        // can never be admitted.
+        // can never be admitted: refused at submission, run completes.
         config.scheduler.kv_cache_capacity = 64 * config.model.kv_storage_bytes(16);
         config.workload.input_len_dist = LengthDistribution::Fixed { value: 4096 };
         config.workload.num_requests = Some(1);
         let mut simulator = Simulator::new(config, None).unwrap();
-        let err = simulator.run_with_callback(|_| {}).unwrap_err();
-        assert!(err.contains("stalled"), "{err}");
+        simulator.run_with_callback(|_| {}).unwrap();
+        let summary = simulator.summary();
+        assert_eq!(summary.requests.rejected, 1);
+        assert_eq!(summary.requests.completed, 0);
     }
 
     #[test]

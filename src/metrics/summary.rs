@@ -116,6 +116,10 @@ pub struct Preemptions {
 pub struct RequestCounts {
     pub completed: u64,
     pub total: u64,
+    /// Refused at submission: the request's whole context needs more KV
+    /// than a worker has, so it could never complete.
+    #[serde(default)]
+    pub rejected: u64,
 }
 
 /// What the entry pool's router did (see `crate::router::RouterStats`).

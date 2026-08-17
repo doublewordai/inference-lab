@@ -42,6 +42,8 @@ pub struct RequestTiming {
     pub session: Option<Box<SessionStep>>,
     /// Times the request was preempted (and recomputed) before completing.
     pub num_preemptions: u32,
+    /// Refused at submission (context larger than the worker's KV cache).
+    pub rejected: bool,
 }
 
 impl RequestTiming {
@@ -1353,6 +1355,7 @@ impl Engine {
             num_cached_tokens: req.num_cached_tokens,
             session: req.session,
             num_preemptions: req.num_preemptions,
+            rejected: req.rejected,
         }
     }
 }

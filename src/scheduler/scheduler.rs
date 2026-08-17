@@ -59,6 +59,10 @@ pub struct Scheduler {
     /// (hittable) instead of scheduled.
     prefetches: Vec<Request>,
     next_prefetch_seq: u64,
+
+    /// Requests refused at submission, handed back as completed on the
+    /// next pass.
+    rejected: Vec<Request>,
 }
 
 /// `(request, from, tokens) -> seconds`.
@@ -80,6 +84,7 @@ impl Scheduler {
             prefetch_plans: Vec::new(),
             prefetches: Vec::new(),
             next_prefetch_seq: 0,
+            rejected: Vec::new(),
         }
     }
 
@@ -290,6 +295,7 @@ impl Scheduler {
 
         let mut decision = ScheduleDecision::default();
         let mut token_budget = self.config.max_num_batched_tokens;
+        decision.completed.append(&mut self.rejected);
 
         // Phase 0: reap finished requests, freeing their blocks BEFORE any
         // allocation this pass. Within a step, retirement must precede
@@ -667,7 +673,17 @@ impl Scheduler {
     }
 
     /// Add a new request to the waiting queue.
-    pub fn add_request(&mut self, request: Request) {
+    pub fn add_request(&mut self, mut request: Request) {
+        // A context that can never fit in this worker's KV cache would
+        // wait forever (admitted, preempted, re-queued): refuse it now.
+        let needed = self
+            .kv_cache_manager
+            .blocks_for_context(request.planned_positions());
+        if needed > self.kv_cache_manager.total_blocks() {
+            request.rejected = true;
+            self.rejected.push(request);
+            return;
+        }
         self.waiting.push_back(request);
     }
 
@@ -988,6 +1004,30 @@ mod tests {
     }
 
     #[test]
+    fn a_context_larger_than_the_kv_cache_is_rejected_not_queued() {
+        let config = Config::test_default();
+        let block_size = config.scheduler.block_size;
+        let mut s = scheduler_with_blocks("fcfs", 4);
+        // 4 blocks: a prompt of 3 blocks + 1 output block fits exactly...
+        s.add_request(create_test_request("fits", block_size * 3, block_size));
+        assert_eq!(s.num_waiting(), 1);
+        // ...one more output token would need a fifth block: refused.
+        s.add_request(create_test_request(
+            "too_big",
+            block_size * 3,
+            block_size + 2,
+        ));
+        assert_eq!(s.num_waiting(), 1);
+        let d = s.schedule(0.0);
+        assert_eq!(d.completed.len(), 1);
+        assert!(d.completed[0].rejected);
+        assert_eq!(d.completed[0].request_id, "too_big");
+        assert_eq!(d.completed[0].num_output_tokens, 0);
+        assert_eq!(d.batch.len(), 1, "the fitting request runs");
+        assert!(s.schedule(1.0).completed.iter().all(|r| !r.rejected));
+    }
+
+    #[test]
     fn min_time_recomputes_a_slow_fetch_and_promotes_a_fast_one() {
         let config = Config::test_default();
         let block_size = config.scheduler.block_size;
@@ -1283,9 +1323,9 @@ mod tests {
         // 31-token prompts so the prefill pass fills two blocks exactly at
         // computed=32 after the first decode.
         let mut scheduler = scheduler_with_blocks("fcfs", 5);
-        scheduler.add_request(create_test_request("a", 32, 100));
-        scheduler.add_request(create_test_request("b", 32, 100));
-        scheduler.add_request(create_test_request("late", 16, 100));
+        scheduler.add_request(create_test_request("a", 32, 10));
+        scheduler.add_request(create_test_request("b", 32, 10));
+        scheduler.add_request(create_test_request("late", 16, 10));
         let d = scheduler.schedule(0.0); // a, b prefill (4 blocks); late waits
         assert_eq!(d.batch.len(), 3); // 4 + 1 blocks fit
         apply(&mut scheduler, &d, 1.0);

@@ -459,6 +459,7 @@ mod tests {
             num_cached_tokens: 0,
             session: None,
             num_preemptions: 0,
+            rejected: false,
         }
     }
 
@@ -476,6 +477,7 @@ mod tests {
             num_cached_tokens: 0,
             session: req.session.clone(),
             num_preemptions: 0,
+            rejected: false,
         }
     }
 
