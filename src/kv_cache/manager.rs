@@ -1,8 +1,9 @@
 use super::block::Block;
 use super::flows::Owner;
-use super::free_queue::FreeQueue;
+use super::free_queue::{FreeQueue, FreeSet, OutlookFree};
 use super::graph::{promotion_request, MemoryGraph, SharedMemoryGraph, WorkerId};
-use crate::request::{BlockId, Request};
+use crate::config::HbmEviction;
+use crate::request::{BlockId, Outlook, Request};
 use std::collections::{HashMap, HashSet};
 
 /// Bytes of KV a sequence of `t` tokens occupies. Supplied by the model
@@ -80,11 +81,18 @@ pub struct KVCacheManager {
     /// All blocks.
     blocks: Vec<Block>,
 
-    /// Free blocks, least recently freed first. A freed block keeps its
-    /// hash and stays hittable until it is recycled from the front of this
-    /// queue, so recycling order is the prefix cache's eviction order: LRU
-    /// by free time. A hit on a free block pulls it back out.
-    free_blocks: FreeQueue,
+    /// Free blocks in recycling order. A freed block keeps its hash and
+    /// stays hittable until it is recycled from the front, so recycling
+    /// order is the prefix cache's eviction order: LRU by free time, or
+    /// (under `hbm_eviction = outlook`) farthest announced re-entry first.
+    /// A hit on a free block pulls it back out.
+    free_blocks: FreeSet,
+
+    /// Announced re-entry per resident hash: `(next_arrival, position in
+    /// its sequence)`, set when the session step holding it completes.
+    /// Only the shared prefix of the next step is marked; everything else
+    /// is unmarked (no re-entry). Read by the outlook policies.
+    outlook: HashMap<u64, (f64, u32)>,
 
     /// Enable prefix caching.
     enable_prefix_caching: bool,
@@ -204,7 +212,7 @@ impl KVCacheManager {
         };
 
         let blocks = vec![Block::default(); total_blocks as usize];
-        let free_blocks = FreeQueue::new(total_blocks as usize);
+        let free_blocks = FreeSet::Lru(FreeQueue::new(total_blocks as usize));
 
         Self {
             block_size,
@@ -213,6 +221,7 @@ impl KVCacheManager {
             total_blocks,
             blocks,
             free_blocks,
+            outlook: HashMap::new(),
             enable_prefix_caching,
             prefix_cache: HashMap::new(),
             memory: None,
@@ -226,6 +235,49 @@ impl KVCacheManager {
             bytes_written: 0,
             bytes_touched: 0,
         }
+    }
+
+    /// Set the HBM eviction policy. Only meaningful before any allocation
+    /// (the free set is rebuilt in id order).
+    pub fn with_hbm_eviction(mut self, policy: HbmEviction) -> Self {
+        let n = self.total_blocks as usize;
+        self.free_blocks = match policy {
+            HbmEviction::Lru {} => FreeSet::Lru(FreeQueue::new(n)),
+            HbmEviction::Outlook {} => FreeSet::Outlook(OutlookFree::new(n)),
+        };
+        self
+    }
+
+    /// The session step holding `hashes` completed with `outlook`: mark the
+    /// hashes its next step re-enters with (the first `shared_tokens` worth)
+    /// and unmark the rest. Free blocks are re-ordered; tiers holding the
+    /// hashes learn the outlook too. `None` = the trajectory is over.
+    pub fn set_outlook(&mut self, hashes: &[u64], outlook: Option<Outlook>) {
+        let shared_blocks = outlook.map_or(0, |o| (o.shared_tokens / self.block_size) as usize);
+        for (pos, &hash) in hashes.iter().enumerate() {
+            let mark = outlook
+                .filter(|_| pos < shared_blocks)
+                .map(|o| (o.next_arrival, pos as u32));
+            match mark {
+                Some(m) => {
+                    self.outlook.insert(hash, m);
+                }
+                None => {
+                    self.outlook.remove(&hash);
+                }
+            }
+            if let Some(&id) = self.prefix_cache.get(&hash) {
+                self.free_blocks.rekey(id, mark);
+            }
+            if let Some((g, w)) = &self.memory {
+                g.lock().unwrap().set_outlook(*w, hash, mark.map(|m| m.0));
+            }
+        }
+    }
+
+    /// The announced re-entry time of `hash`, if any.
+    pub fn outlook_of(&self, hash: u64) -> Option<f64> {
+        self.outlook.get(&hash).map(|m| m.0)
     }
 
     /// Attach the pool's KV memory graph; this manager is `worker` in it.
@@ -305,8 +357,9 @@ impl KVCacheManager {
     /// The block holding `hash` was recycled: under `write_back` its KV is
     /// written to the first tier now (see `MemoryGraph::demote`).
     fn on_evicted(&mut self, hash: u64, bytes: u64) {
+        let outlook = self.outlook.remove(&hash).map(|m| m.0);
         if let Some((g, w)) = &self.memory {
-            g.lock().unwrap().demote(*w, hash, bytes);
+            g.lock().unwrap().demote(*w, hash, bytes, outlook);
         }
     }
 
@@ -551,7 +604,10 @@ impl KVCacheManager {
     pub fn free_blocks(&mut self, block_ids: &[BlockId]) {
         for &block_id in block_ids.iter().rev() {
             if self.blocks[block_id as usize].release() {
-                self.free_blocks.push_back(block_id);
+                let mark = self.blocks[block_id as usize]
+                    .content_hash
+                    .and_then(|h| self.outlook.get(&h).copied());
+                self.free_blocks.push_back(block_id, mark);
             }
         }
     }
@@ -1126,6 +1182,58 @@ mod tests {
         let m = build(true);
         assert!(m.hbm_contains(1));
         assert!(!m.hbm_contains(2));
+    }
+
+    #[test]
+    fn hbm_outlook_recycles_dead_then_farthest_then_tail_first() {
+        use crate::config::HbmEviction;
+        use crate::request::Outlook;
+        // 6 blocks. Three two-block sessions freed in order A, B, C:
+        // A announces a re-entry at t=100 over both blocks, B at t=10, C
+        // has none. Under LRU A's blocks go first; under outlook C's go
+        // first, then A's (farthest), tail block first, then B's.
+        let build = |policy: HbmEviction| {
+            let mut m = KVCacheManager::new(6 * 16 * 100, 16, |t| 100 * t as u64, 0, true)
+                .with_hbm_eviction(policy);
+            let mut ids = Vec::new();
+            for (name, hashes, outlook) in [
+                ("a", vec![1u64, 2], Some(Outlook { next_arrival: 100.0, shared_tokens: 32 })),
+                ("b", vec![3, 4], Some(Outlook { next_arrival: 10.0, shared_tokens: 32 })),
+                ("c", vec![5, 6], None),
+            ] {
+                let mut r = create_test_request(name, 32);
+                r.prompt_block_hashes = hashes.clone();
+                let b = m.allocate_blocks(&r, 32).unwrap();
+                m.set_outlook(&hashes, outlook);
+                m.free_blocks(&b);
+                ids.push(b);
+            }
+            (m, ids)
+        };
+        let recycle = |m: &mut KVCacheManager, k: usize| -> Vec<BlockId> {
+            let mut d = create_test_request("d", 16 * k as u32);
+            d.prompt_block_hashes = (100..100 + k as u64).collect();
+            m.allocate_blocks(&d, 16 * k as u32).unwrap()
+        };
+        let (mut lru, ids) = build(HbmEviction::Lru {});
+        // A freed first, tail (block index 1) queued before head.
+        assert_eq!(recycle(&mut lru, 2), vec![ids[0][1], ids[0][0]]);
+        let (mut o, ids) = build(HbmEviction::Outlook {});
+        let got = recycle(&mut o, 5);
+        assert_eq!(
+            got,
+            vec![ids[2][1], ids[2][0], ids[0][1], ids[0][0], ids[1][1]],
+            "dead C first, then far A tail-first, then B's tail"
+        );
+        assert!(o.hbm_contains(3), "B's head survives: nearest re-entry");
+        // Announcing a nearer re-entry for a free block re-orders it.
+        let (mut o, ids) = build(HbmEviction::Outlook {});
+        o.set_outlook(&[1, 2], Some(Outlook { next_arrival: 1.0, shared_tokens: 32 }));
+        assert_eq!(recycle(&mut o, 4), vec![ids[2][1], ids[2][0], ids[1][1], ids[1][0]]);
+        // A partial outlook marks only the shared prefix: A's tail is dead.
+        let (mut o, ids) = build(HbmEviction::Outlook {});
+        o.set_outlook(&[1, 2], Some(Outlook { next_arrival: 1.0, shared_tokens: 16 }));
+        assert_eq!(recycle(&mut o, 3), vec![ids[2][1], ids[2][0], ids[0][1]]);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use super::session::SessionStep;
+use super::session::{Outlook, SessionStep};
 
 pub type BlockId = u32;
 
@@ -93,6 +93,13 @@ pub struct Request {
 }
 
 impl Request {
+    /// The re-entry this request's session announces, if it is a session
+    /// step with a successor: arrival at `completion_time` plus the harness
+    /// gap, reusing `shared_tokens` of this context.
+    pub fn outlook_at(&self, completion_time: f64) -> Option<Outlook> {
+        self.session.as_ref().and_then(|s| s.outlook_at(completion_time))
+    }
+
     /// Create a request that will produce `target_output_tokens` tokens (at
     /// least one: the prefill pass always yields a token) out of an allowed
     /// `max_output_tokens`.

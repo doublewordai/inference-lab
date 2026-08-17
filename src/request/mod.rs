@@ -6,4 +6,4 @@ pub mod session;
 
 pub use generator::RequestGenerator;
 pub use request::{BlockId, Request};
-pub use session::{SessionSource, SessionSpec, SessionStep, StepSpec};
+pub use session::{Outlook, SessionSource, SessionSpec, SessionStep, StepSpec};

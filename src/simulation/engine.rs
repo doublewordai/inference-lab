@@ -90,13 +90,15 @@ impl Worker {
         // nonlinear in position (sliding window, DeepSeek-V4's window +
         // compressed history) get their real bytes.
         let kv_model = model.clone();
+        let policies = cluster.memory.policies();
         let mut kv_cache_manager = KVCacheManager::new(
             kv_capacity,
             scheduler_config.block_size,
             move |t| kv_model.kv_storage_bytes(t),
             model.per_sequence_state_bytes(),
             true,
-        );
+        )
+        .with_hbm_eviction(policies.hbm_eviction);
         if graph.lock().unwrap().num_tiers(global_id) > 0 {
             kv_cache_manager = kv_cache_manager.with_memory(graph.clone(), global_id);
         }

@@ -25,6 +25,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use super::flows::{EdgeId, Flows, Owner};
+use super::free_queue::outlook_key;
 use crate::config::{ClusterSpec, EvictionPolicy, MemoryTemplate, Scope, WritePolicy};
 
 pub type StoreId = usize;
@@ -44,6 +45,11 @@ pub enum EntryState {
 struct EntryInfo {
     state: EntryState,
     bytes: u64,
+    /// Primary recycling key: `0` except under `outlook` eviction, where it
+    /// orders blocks farthest-re-entry first (`outlook_key`).
+    key: u64,
+    /// Announced re-entry, if known; carried down a cascade.
+    outlook: Option<f64>,
     /// Position in the recycling order (higher = more recent).
     seq: u64,
     /// Last insert / promotion time.
@@ -52,6 +58,16 @@ struct EntryInfo {
     read: bool,
     /// Transfer id of the write, while arriving.
     write_id: Option<String>,
+}
+
+/// An entry a full store pushed out on insert.
+#[derive(Debug)]
+struct Evicted {
+    hash: u64,
+    bytes: u64,
+    /// Transfer id of its write, if still arriving.
+    write_id: Option<String>,
+    outlook: Option<f64>,
 }
 
 /// One instance of a store: block hashes with a capacity, an eviction
@@ -71,8 +87,8 @@ pub struct Store {
     /// The store a full instance evicts into (the next tier), if any.
     pub next: Option<StoreId>,
     entries: HashMap<u64, EntryInfo>,
-    /// Recycling order: oldest `seq` first.
-    order: BTreeMap<u64, u64>,
+    /// Recycling order: smallest `(key, seq)` first.
+    order: BTreeMap<(u64, u64), u64>,
     next_seq: u64,
     pub num_evictions: u64,
     /// Entries dropped by TTL.
@@ -115,11 +131,35 @@ impl Store {
 
     fn bump(&mut self, hash: u64, now: f64) {
         if let Some(e) = self.entries.get_mut(&hash) {
-            self.order.remove(&e.seq);
+            self.order.remove(&(e.key, e.seq));
             e.seq = self.next_seq;
             e.touched = now;
             self.next_seq += 1;
-            self.order.insert(e.seq, hash);
+            self.order.insert((e.key, e.seq), hash);
+        }
+    }
+
+    /// The primary recycling key of an entry with `outlook` under this
+    /// store's policy.
+    fn key_for(&self, outlook: Option<f64>) -> u64 {
+        match self.eviction {
+            EvictionPolicy::Outlook {} => outlook_key(outlook),
+            _ => 0,
+        }
+    }
+
+    /// `hash`'s announced re-entry changed: re-order it under `outlook`
+    /// eviction (other policies ignore it).
+    fn set_outlook(&mut self, hash: u64, outlook: Option<f64>) {
+        let key = self.key_for(outlook);
+        if let Some(e) = self.entries.get_mut(&hash) {
+            e.outlook = outlook;
+            if e.key == key {
+                return;
+            }
+            self.order.remove(&(e.key, e.seq));
+            e.key = key;
+            self.order.insert((e.key, e.seq), hash);
         }
     }
 
@@ -131,37 +171,51 @@ impl Store {
         bytes: u64,
         state: EntryState,
         write_id: Option<String>,
+        outlook: Option<f64>,
         now: f64,
-    ) -> Option<(u64, u64, Option<String>, bool)> {
+    ) -> Option<Evicted> {
         if self.capacity_blocks == 0 {
-            return Some((hash, bytes, write_id, false));
+            return Some(Evicted {
+                hash,
+                bytes,
+                write_id,
+                outlook,
+            });
         }
         if self.entries.contains_key(&hash) {
             return None;
         }
         let seq = self.next_seq;
         self.next_seq += 1;
+        let key = self.key_for(outlook);
         self.entries.insert(
             hash,
             EntryInfo {
                 state,
                 bytes,
+                key,
+                outlook,
                 seq,
                 touched: now,
                 read: false,
                 write_id,
             },
         );
-        self.order.insert(seq, hash);
+        self.order.insert((key, seq), hash);
         if self.entries.len() as u64 > self.capacity_blocks {
-            let (&oldest_seq, &oldest) = self.order.iter().next().unwrap();
-            self.order.remove(&oldest_seq);
+            let (&oldest_key, &oldest) = self.order.iter().next().unwrap();
+            self.order.remove(&oldest_key);
             let e = self.entries.remove(&oldest).unwrap();
             self.num_evictions += 1;
             if !e.read {
                 self.dead_bytes += e.bytes;
             }
-            Some((oldest, e.bytes, e.write_id, e.read))
+            Some(Evicted {
+                hash: oldest,
+                bytes: e.bytes,
+                write_id: e.write_id,
+                outlook: e.outlook,
+            })
         } else {
             None
         }
@@ -192,7 +246,7 @@ impl Store {
     /// Remove a specific hash. Returns its info if present.
     fn remove(&mut self, hash: u64) -> Option<EntryInfo> {
         let e = self.entries.remove(&hash)?;
-        self.order.remove(&e.seq);
+        self.order.remove(&(e.key, e.seq));
         Some(e)
     }
 
@@ -203,12 +257,12 @@ impl Store {
             return Vec::new();
         };
         let mut cancelled = Vec::new();
-        while let Some((&seq, &hash)) = self.order.first_key_value() {
+        while let Some((&key, &hash)) = self.order.first_key_value() {
             let e = &self.entries[&hash];
             if now - e.touched <= seconds {
                 break;
             }
-            self.order.remove(&seq);
+            self.order.remove(&key);
             let e = self.entries.remove(&hash).unwrap();
             self.num_expired += 1;
             if !e.read {
@@ -715,7 +769,7 @@ impl MemoryGraph {
     /// first tier now.
     pub fn produced(&mut self, worker: WorkerId, hash: u64, bytes: u64) {
         if matches!(self.write_policy(worker), WritePolicy::WriteThrough {}) {
-            self.write(worker, hash, bytes);
+            self.write(worker, hash, bytes, None);
         }
     }
 
@@ -724,24 +778,40 @@ impl MemoryGraph {
     pub fn hit(&mut self, worker: WorkerId, hash: u64, bytes: u64, hits: u32) {
         if let WritePolicy::Selective { min_hits } = self.write_policy(worker) {
             if hits == min_hits.max(1) {
-                self.write(worker, hash, bytes);
+                self.write(worker, hash, bytes, None);
             }
         }
     }
 
-    /// `worker`'s HBM recycled the block holding `hash`. Under
-    /// `write_back` a block no tier holds is written to the first tier
-    /// now; under the other policies an unbacked block is dropped.
-    pub fn demote(&mut self, worker: WorkerId, hash: u64, bytes: u64) {
-        if matches!(self.write_policy(worker), WritePolicy::WriteBack {}) {
-            self.write(worker, hash, bytes);
+    /// `worker`'s HBM recycled the block holding `hash`, whose announced
+    /// re-entry (if any) is `outlook`. Under `write_back` a block no tier
+    /// holds is written to the first tier now; under `live` only if a
+    /// re-entry is announced; under the other policies an unbacked block
+    /// is dropped.
+    pub fn demote(&mut self, worker: WorkerId, hash: u64, bytes: u64, outlook: Option<f64>) {
+        let write = match self.write_policy(worker) {
+            WritePolicy::WriteBack {} => true,
+            WritePolicy::Live {} => outlook.is_some(),
+            _ => false,
+        };
+        if write {
+            self.write(worker, hash, bytes, outlook);
+        }
+    }
+
+    /// `hash`'s announced re-entry changed (or ended): whichever of
+    /// `worker`'s tiers holds it re-orders it under `outlook` eviction.
+    pub fn set_outlook(&mut self, worker: WorkerId, hash: u64, outlook: Option<f64>) {
+        if let Some(i) = self.tier_holding(worker, hash) {
+            let store = self.tiers[worker][i].store;
+            self.stores[store].set_outlook(hash, outlook);
         }
     }
 
     /// Start writing `hash` (`bytes`) from `worker`'s GPU into its first
     /// tier, unless a tier already holds it. The entry is `Arriving` until
-    /// the transfer lands.
-    pub fn write(&mut self, worker: WorkerId, hash: u64, bytes: u64) {
+    /// the transfer lands; `outlook` is its announced re-entry, if known.
+    pub fn write(&mut self, worker: WorkerId, hash: u64, bytes: u64, outlook: Option<f64>) {
         if self.tiers[worker].is_empty() || self.holds(worker, hash) {
             return;
         }
@@ -749,8 +819,14 @@ impl MemoryGraph {
         let tier = &self.tiers[worker][0];
         let (store, path) = (tier.store, tier.write_path.clone());
         let id = format!("w:{worker}:{store}:{hash}");
-        let evicted =
-            self.stores[store].insert(hash, bytes, EntryState::Arriving, Some(id.clone()), now);
+        let evicted = self.stores[store].insert(
+            hash,
+            bytes,
+            EntryState::Arriving,
+            Some(id.clone()),
+            outlook,
+            now,
+        );
         self.pending_writes.insert(id.clone(), (store, hash));
         self.flows
             .submit(id, Owner::Write, path.edges, bytes, path.latency, now);
@@ -763,7 +839,7 @@ impl MemoryGraph {
         let now = self.flows.now();
         let store = self.tiers[worker][tier].store;
         let bytes = self.default_block_bytes();
-        let evicted = self.stores[store].insert(hash, bytes, EntryState::Resident, None, now);
+        let evicted = self.stores[store].insert(hash, bytes, EntryState::Resident, None, None, now);
         self.cascade(store, evicted);
     }
 
@@ -776,8 +852,14 @@ impl MemoryGraph {
     /// An entry `store` evicted on insert: cancel its write if it was still
     /// arriving, then move it to `store`'s next tier as a store → store
     /// transfer, or let it go.
-    fn cascade(&mut self, store: StoreId, evicted: Option<(u64, u64, Option<String>, bool)>) {
-        let Some((hash, bytes, write_id, _read)) = evicted else {
+    fn cascade(&mut self, store: StoreId, evicted: Option<Evicted>) {
+        let Some(Evicted {
+            hash,
+            bytes,
+            write_id,
+            outlook,
+        }) = evicted
+        else {
             return;
         };
         if let Some(id) = write_id {
@@ -803,8 +885,14 @@ impl MemoryGraph {
             path.edges.push(e);
         }
         let id = format!("c:{store}:{next}:{hash}");
-        let evicted =
-            self.stores[next].insert(hash, bytes, EntryState::Arriving, Some(id.clone()), now);
+        let evicted = self.stores[next].insert(
+            hash,
+            bytes,
+            EntryState::Arriving,
+            Some(id.clone()),
+            outlook,
+            now,
+        );
         self.pending_writes.insert(id.clone(), (next, hash));
         self.flows
             .submit(id, Owner::Write, path.edges, bytes, path.latency, now);
@@ -1270,7 +1358,7 @@ bandwidth = 3
         assert!(!g.holds(0, 1));
         // Eviction from HBM starts a 100-byte write at 10 B/s: arriving now,
         // resident at t = 10.
-        g.demote(0, 1, 100);
+        g.demote(0, 1, 100, None);
         assert!(g.holds(0, 1));
         assert!(!g.stores()[0].is_resident(1));
         assert!(!g.is_backed(0, 2));
@@ -1295,7 +1383,7 @@ bandwidth = 3
         assert_eq!(g.stores()[0].bytes_read, 100);
         // Re-eviction of a backed block writes nothing.
         let before = g.flows().bytes_submitted_write;
-        g.demote(0, 1, 100);
+        g.demote(0, 1, 100, None);
         assert_eq!(g.flows().bytes_submitted_write, before);
     }
 
@@ -1305,7 +1393,7 @@ bandwidth = 3
         g.produced(0, 7, 50);
         assert!(g.holds(0, 7));
         assert!(close(g.flows().bytes_submitted_write, 50.0));
-        g.demote(0, 7, 50); // already backed: nothing more
+        g.demote(0, 7, 50, None); // already backed: nothing more
         assert!(close(g.flows().bytes_submitted_write, 50.0));
 
         let mut g = two_tier_private(
@@ -1320,7 +1408,7 @@ bandwidth = 3
         g.hit(0, 7, 50, 3);
         assert!(close(g.flows().bytes_submitted_write, 50.0));
         // An unbacked block evicted under selective is dropped.
-        g.demote(0, 8, 50);
+        g.demote(0, 8, 50, None);
         assert!(!g.holds(0, 8));
     }
 
@@ -1332,7 +1420,7 @@ bandwidth = 3
         for h in [1, 2] {
             g.plant(0, 0, h);
         }
-        g.demote(0, 3, 20);
+        g.demote(0, 3, 20, None);
         assert_eq!(g.tier_holding(0, 1), Some(1));
         assert!(!g.stores()[1].is_resident(1));
         assert_eq!(g.tier_holding(0, 3), Some(0));
@@ -1379,7 +1467,7 @@ bandwidth = 3
         );
         t.plant(0, 0, 1);
         t.advance(3.0);
-        t.demote(0, 2, 100); // 10 s write, arriving
+        t.demote(0, 2, 100, None); // 10 s write, arriving
         assert!(t.holds(0, 1) && t.holds(0, 2));
         t.advance(6.0);
         assert!(!t.holds(0, 1), "expired");
@@ -1388,6 +1476,37 @@ bandwidth = 3
         t.advance(9.0);
         assert!(!t.holds(0, 2), "expired while arriving");
         assert_eq!(t.flows().num_in_flight(), 0, "write cancelled");
+    }
+
+    #[test]
+    fn outlook_eviction_drops_dead_then_farthest_and_live_writes_only_announced() {
+        // Store t0 holds 2 blocks. Under `outlook` the victim is a block
+        // with no re-entry announced, then the farthest re-entry.
+        let mut g = two_tier_private(WritePolicy::Live {}, EvictionPolicy::Outlook {});
+        g.demote(0, 1, 100, Some(50.0)); // re-entry at 50
+        g.demote(0, 2, 100, Some(500.0)); // re-entry at 500
+        g.demote(0, 3, 100, None); // trajectory over: not written at all
+        assert!(g.holds(0, 1) && g.holds(0, 2));
+        assert!(!g.holds(0, 3), "live: no announced re-entry, no write");
+        // A third announced block: the farthest (2 @ 500) cascades to t1.
+        g.demote(0, 4, 100, Some(100.0));
+        assert_eq!(g.tier_holding(0, 1), Some(0));
+        assert_eq!(g.tier_holding(0, 4), Some(0));
+        assert_eq!(g.tier_holding(0, 2), Some(1));
+        // The re-entry of 1 moves out past 4's: now 1 is the victim.
+        g.set_outlook(0, 1, Some(1000.0));
+        g.demote(0, 5, 100, Some(60.0));
+        assert_eq!(g.tier_holding(0, 1), Some(1));
+        assert!(g.holds(0, 4) && g.holds(0, 5));
+        // Ending 5's trajectory makes it the victim before any announced one.
+        g.set_outlook(0, 5, None);
+        g.demote(0, 6, 100, Some(60.0));
+        assert!(!g.stores()[0].contains(5));
+        assert!(g.holds(0, 4) && g.holds(0, 6));
+        // write_back with outlook eviction still writes everything.
+        let mut w = two_tier_private(WritePolicy::WriteBack {}, EvictionPolicy::Outlook {});
+        w.demote(0, 3, 100, None);
+        assert!(w.holds(0, 3));
     }
 
     #[test]

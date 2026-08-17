@@ -104,6 +104,11 @@ impl Scheduler {
         while idx < self.running.len() {
             if self.running[idx].is_finished() {
                 let mut req = self.running.remove(idx);
+                // A session step announces its re-entry to the cache
+                // before its blocks go back on the free list, so the
+                // outlook policies see the marks as the blocks are freed.
+                self.kv_cache_manager
+                    .set_outlook(&req.prompt_block_hashes, req.outlook_at(current_time));
                 self.kv_cache_manager.free_blocks(&req.kv_blocks);
                 req.kv_blocks.clear();
                 decision.completed.push(req);
