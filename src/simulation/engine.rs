@@ -929,34 +929,6 @@ impl Engine {
         }
         self.current_time = ev.time;
 
-        if std::env::var_os("IL_EVENT_DEBUG").is_some() {
-            static COUNTS: std::sync::Mutex<[u64; 6]> = std::sync::Mutex::new([0; 6]);
-            let k = match &ev.kind {
-                EventKind::Arrival(_) => 0,
-                EventKind::WorkerReady { .. } => 1,
-                EventKind::FlowDrain { .. } => 2,
-                EventKind::HandoffStart(_) => 3,
-                EventKind::PrefetchDue { .. } => 4,
-            };
-            let mut c = COUNTS.lock().unwrap();
-            c[k] += 1;
-            c[5] += 1;
-            if c[5] % 200_000 == 0 {
-                let g = self.topology.memory.lock().unwrap();
-                eprintln!(
-                    "[events] t={:.1} arrivals={} ready={} drain={} handoff={} prefetch={} in_flight={} submitted={:?} events={}",
-                    self.current_time,
-                    c[0],
-                    c[1],
-                    c[2],
-                    c[3],
-                    c[4],
-                    g.flows().num_in_flight(),
-                    g.flows().submitted_counts(),
-                    c[5]
-                );
-            }
-        }
         let outcome = match ev.kind {
             EventKind::Arrival(mut req) => {
                 if let Some(step) = &mut req.session {

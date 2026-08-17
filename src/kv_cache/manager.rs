@@ -1166,14 +1166,13 @@ mod landing_tests {
 
     #[test]
     fn a_multi_block_promotion_lands_resident_and_is_not_promoted_again() {
-        let graph = MemoryGraph::private_with(
-            1,
-            &[("host", 100, 1e9)],
-            16,
-            Arc::new(|t| 100 * t as u64),
-        )
-        .with_policies(WritePolicy::Selective { min_hits: 1 }, EvictionPolicy::Lru {})
-        .shared_handle();
+        let graph =
+            MemoryGraph::private_with(1, &[("host", 100, 1e9)], 16, Arc::new(|t| 100 * t as u64))
+                .with_policies(
+                    WritePolicy::Selective { min_hits: 1 },
+                    EvictionPolicy::Lru {},
+                )
+                .shared_handle();
         let mut m = KVCacheManager::new(16 * 16 * 100, 16, |t| 100 * t as u64, 0, true)
             .with_memory(graph.clone(), 0);
         // Chain [1,2,3,4] sits in the tier (planted at its positions).
@@ -1204,7 +1203,11 @@ mod landing_tests {
         m.publish_transferred_blocks(&r, 4);
         r.num_computed_tokens = 64;
         let lk2 = m.peek_prefix_cache(&r);
-        assert_eq!((lk2.hbm_tokens, lk2.in_flight_tokens), (64, 0), "landed → resident");
+        assert_eq!(
+            (lk2.hbm_tokens, lk2.in_flight_tokens),
+            (64, 0),
+            "landed → resident"
+        );
         assert!(!lk2.needs_promotion());
         // It now allocates its fifth block and runs.
         let n = m.allocate_blocks(&r, 16).unwrap();

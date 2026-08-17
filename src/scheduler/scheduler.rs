@@ -244,19 +244,6 @@ impl Scheduler {
                     .content_blocks_for_tokens(req.num_cached_tokens);
                 self.kv_cache_manager
                     .publish_transferred_blocks(&req, cached_blocks);
-                if std::env::var_os("IL_PARK_DEBUG").is_some() && req.debug_parks >= 3 && req.debug_parks <= 6 {
-                    let lk = self.kv_cache_manager.peek_prefix_cache(&req);
-                    eprintln!(
-                        "[landed#{}] {} t={current_time:.2} cached_blocks={} held={} after: hbm={} inflight={} tiers={:?}",
-                        req.debug_parks,
-                        req.request_id,
-                        cached_blocks,
-                        req.kv_blocks.len(),
-                        lk.hbm_tokens,
-                        lk.in_flight_tokens,
-                        lk.promote_tokens_per_tier
-                    );
-                }
                 req.ready_at = None;
                 req.num_computed_tokens = req.num_cached_tokens;
                 // Its prefix is hot and its landing blocks are held: admit
@@ -478,25 +465,6 @@ impl Scheduler {
                     }
                     let mut request = self.waiting.remove(selected_idx).unwrap();
                     self.kv_cache_manager.record_prefix_lookup(&lookup);
-                    if std::env::var_os("IL_PARK_DEBUG").is_some() {
-                        request.debug_parks += 1;
-                        if request.debug_parks >= 3 && request.debug_parks <= 6 {
-                            eprintln!(
-                                "[park#{}] {} t={current_time:.2} computed={} held={} cached={} lookup: hbm={} inflight={} tiers={:?} bytes={:?} join={:?} spans={:?}",
-                                request.debug_parks,
-                                request.request_id,
-                                request.num_computed_tokens,
-                                request.kv_blocks.len(),
-                                cached_tokens,
-                                lookup.hbm_tokens,
-                                lookup.in_flight_tokens,
-                                lookup.promote_tokens_per_tier,
-                                lookup.promote_bytes_per_tier,
-                                lookup.join_leader,
-                                lookup.tier_spans
-                            );
-                        }
-                    }
                     request.num_cached_tokens = cached_tokens;
                     // A request back from an earlier promotion already holds
                     // (and has computed) that prefix; reserve only the
@@ -811,11 +779,7 @@ impl Scheduler {
     pub fn earliest_pending_ready(&self, now: f64) -> Option<f64> {
         self.pending_transfers
             .iter()
-            .map(|r| {
-                now + self
-                    .kv_cache_manager
-                    .estimate_remaining_time(&r.request_id)
-            })
+            .map(|r| now + self.kv_cache_manager.estimate_remaining_time(&r.request_id))
             .min_by(f64::total_cmp)
     }
 
