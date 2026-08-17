@@ -1,8 +1,9 @@
-//! KV memory beyond HBM: the stores a node offers and the links that reach
+//! KV memory beyond HBM: the stores a topology offers and the links that reach
 //! them (on the hardware), and which of those a deployment uses as KV
 //! tiers (on the deployment).
 //!
-//! Hardware side — a template instantiated per GPU or per node:
+//! Hardware side — a template instantiated per GPU, per node, or once for
+//! the whole cluster:
 //!
 //! ```toml
 //! # catalog/hardware/gh200.toml
@@ -11,10 +12,15 @@
 //! name = "grace_dram"; per = "gpu"; capacity = 480e9      # one per superchip
 //! [[memory.stores]]
 //! name = "nvme"; per = "node"; capacity = 8e12
+//! [[memory.stores]]
+//! name = "cluster_nvme"; per = "cluster"; capacity = 120e12
+//! bandwidth = 56e9; stripe = 4; latency = 2e-3
 //! [[memory.links]]
 //! name = "c2c"; from = "gpu"; to = "grace_dram"; bandwidth = 450e9
 //! [[memory.links]]
 //! name = "pcie"; from = "gpu"; to = "nvme"; bandwidth = 64e9
+//! [[memory.links]]
+//! name = "cluster-storage"; from = "network"; to = "cluster_nvme"; bandwidth = 1e12
 //! ```
 //!
 //! Endpoints are `"gpu"` (one instance per GPU), `"switch"` (the node's
@@ -25,7 +31,9 @@
 //! nvme`). Every link is full duplex: a template link instantiates one edge
 //! each way at `bandwidth`. A transfer's path is the shortest hop path
 //! between its ends; its rate is its max-min fair share on every edge of
-//! the path (see `kv_cache::flows`).
+//! the path (see `kv_cache::flows`). A cluster store has one shared aggregate
+//! throughput edge (`aggregate_bandwidth`, or `nodes × bandwidth`) and a
+//! private `stripe × bandwidth` cap on each transfer.
 //!
 //! Deployment side — which stores hold evicted KV, closest first, how much
 //! of each they may use, and the write and eviction policies:
@@ -56,7 +64,7 @@ use std::collections::BTreeMap;
 
 use serde::Deserialize;
 
-/// How many instances of a store or link a node has.
+/// How many instances of a store or junction the topology has.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Scope {
@@ -66,6 +74,8 @@ pub enum Scope {
     /// One per node, shared by the node's GPUs (host DRAM over PCIe, a
     /// node-local NVMe pool).
     Node,
+    /// One for the whole topology, reachable through the scale-out network.
+    Cluster,
 }
 
 /// When a block's KV is written to the first tier below HBM.
@@ -315,7 +325,7 @@ impl MemoryPolicies {
     }
 }
 
-/// A store a node offers for KV beyond HBM.
+/// A store a hardware topology offers for KV beyond HBM.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StoreTemplate {
@@ -324,13 +334,30 @@ pub struct StoreTemplate {
     /// Bytes per instance.
     pub capacity: f64,
     /// The store's own throughput per instance, bytes/s (an NVMe pool's
-    /// aggregate drive rate), shared by every transfer in or out of it.
+    /// aggregate drive rate). For a cluster store this is one node's rate;
+    /// `stripe` and `aggregate_bandwidth` turn it into the two access limits.
     /// Unset: unbounded — only the links limit.
     #[serde(default)]
     pub bandwidth: Option<f64>,
+    /// Number of this cluster store's bandwidth units one transfer may use
+    /// in parallel. The transfer is still bounded by the shared aggregate
+    /// throughput. Defaults to one.
+    #[serde(default = "default_stripe")]
+    pub stripe: u32,
+    /// Explicit shared throughput across every transfer to or from a cluster
+    /// store, bytes/s. By default this is `nodes × bandwidth`.
+    #[serde(default)]
+    pub aggregate_bandwidth: Option<f64>,
+    /// Fixed access cost per fetch or write, seconds.
+    #[serde(default)]
+    pub latency: f64,
 }
 
-/// A named point on the node with no capacity of its own, so that several
+fn default_stripe() -> u32 {
+    1
+}
+
+/// A named point in the graph with no capacity of its own, so that several
 /// links can share one (a GPU's PCIe port feeding host DRAM and NVMe).
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -339,8 +366,8 @@ pub struct JunctionTemplate {
     pub per: Scope,
 }
 
-/// A link on the node. `from` is `"gpu"` (one instance per GPU, its own
-/// port), a store or a junction; `to` is a store, a junction, `"switch"`
+/// A graph link. `from` is `"gpu"` (one instance per GPU, its own port),
+/// `"network"`, a store or a junction; `to` is a store, a junction, `"switch"`
 /// (the node's scale-up fabric) or `"network"` (the scale-out core). One
 /// instance per instance of `from`, full duplex at `bandwidth` each way.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -356,7 +383,7 @@ pub struct LinkTemplate {
     pub latency: f64,
 }
 
-/// The KV memory a node class offers: stores and the links that reach
+/// The KV memory a hardware class offers: stores and the links that reach
 /// them. Ships with the hardware preset; a deployment picks tiers from it.
 #[derive(Debug, Clone, PartialEq, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -418,6 +445,24 @@ impl MemoryTemplate {
             if s.bandwidth.is_some_and(|b| b <= 0.0) {
                 return Err(format!("[memory] store `{}` needs bandwidth > 0", s.name));
             }
+            if s.stripe == 0 {
+                return Err(format!("[memory] store `{}` needs stripe > 0", s.name));
+            }
+            if s.aggregate_bandwidth.is_some_and(|b| b <= 0.0) {
+                return Err(format!(
+                    "[memory] store `{}` needs aggregate_bandwidth > 0",
+                    s.name
+                ));
+            }
+            if s.latency < 0.0 {
+                return Err(format!("[memory] store `{}` needs latency >= 0", s.name));
+            }
+            if s.per != Scope::Cluster && (s.stripe != 1 || s.aggregate_bandwidth.is_some()) {
+                return Err(format!(
+                    "[memory] store `{}` uses stripe/aggregate_bandwidth but is not per = \"cluster\"",
+                    s.name
+                ));
+            }
         }
         for j in &self.junctions {
             if ["gpu", "switch", "network"].contains(&j.name.as_str())
@@ -431,11 +476,12 @@ impl MemoryTemplate {
         }
         for l in &self.links {
             let from_ok = l.from == "gpu"
+                || l.from == "network"
                 || self.store(&l.from).is_some()
                 || self.junction(&l.from).is_some();
             if !from_ok {
                 return Err(format!(
-                    "[memory] link `{}`: from must be \"gpu\", a store or a junction, got \"{}\"",
+                    "[memory] link `{}`: from must be \"gpu\", \"network\", a store or a junction, got \"{}\"",
                     l.name, l.from
                 ));
             }
@@ -627,6 +673,42 @@ bandwidth = 450e9
     }
 
     #[test]
+    fn parses_cluster_store_controls_and_their_defaults() {
+        let t: MemoryTemplate = toml::from_str(
+            r#"
+[[stores]]
+name = "pool"
+per = "cluster"
+capacity = 120e12
+bandwidth = 56e9
+stripe = 4
+aggregate_bandwidth = 200e9
+latency = 2e-3
+[[links]]
+name = "pool-core"
+from = "network"
+to = "pool"
+bandwidth = 1e12
+"#,
+        )
+        .unwrap();
+        t.validate().unwrap();
+        let pool = t.store("pool").unwrap();
+        assert_eq!(pool.per, Scope::Cluster);
+        assert_eq!(pool.stripe, 4);
+        assert_eq!(pool.aggregate_bandwidth, Some(200e9));
+        assert_eq!(pool.latency, 2e-3);
+
+        let defaults: MemoryTemplate =
+            toml::from_str("[[stores]]\nname = \"pool\"\nper = \"cluster\"\ncapacity = 1.0")
+                .unwrap();
+        let pool = defaults.store("pool").unwrap();
+        assert_eq!(pool.stripe, 1);
+        assert_eq!(pool.aggregate_bandwidth, None);
+        assert_eq!(pool.latency, 0.0);
+    }
+
+    #[test]
     fn rejects_bad_endpoints_and_duplicates() {
         let bad = TEMPLATE.replace("to = \"nvme\"", "to = \"ssd\"");
         let t: MemoryTemplate = toml::from_str(&bad).unwrap();
@@ -639,6 +721,12 @@ bandwidth = 450e9
             "[[stores]]\nname = \"x\"\nper = \"rack\"\ncapacity = 1.0"
         )
         .is_err());
+
+        for bad in ["stripe = 0", "aggregate_bandwidth = 0", "latency = -1"] {
+            let raw = format!("[[stores]]\nname = \"x\"\nper = \"cluster\"\ncapacity = 1.0\n{bad}");
+            let t: MemoryTemplate = toml::from_str(&raw).unwrap();
+            assert!(t.validate().is_err(), "{bad}");
+        }
     }
 
     #[test]

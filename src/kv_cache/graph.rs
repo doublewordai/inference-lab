@@ -1,6 +1,7 @@
 //! The KV memory of a topology beyond HBM, as a graph: stores and links
-//! instantiated from each pool's hardware `[memory]` template per GPU or
-//! per node, joined across nodes by the scale-out network.
+//! instantiated from each pool's hardware `[memory]` template per GPU, per
+//! node, or once for the cluster, joined across nodes by the scale-out
+//! network.
 //!
 //! *Vertices*: each worker's GPU (a `tp`-GPU replica, its ports pooled),
 //! each node's switch, the network core, every store instance and every
@@ -13,10 +14,13 @@
 //! `[memory] tiers`. A `per = "gpu"` store is private to the worker (its
 //! `tp` GPUs' instances pooled); a `per = "node"` store is one instance
 //! shared by every worker on that node — what one worker demotes, its
-//! neighbours can promote. A promotion moves bytes along the shortest path
-//! from the store to the worker's GPU; a prefill → decode hand-off along
-//! the shortest path from one GPU to the other (through the network when
-//! they are on different nodes, with an optional core capacity).
+//! neighbours can promote. A `per = "cluster"` store is one instance behind
+//! the scale-out network and visible to every worker. Its striped bandwidth
+//! caps one transfer while an aggregate edge is shared topology-wide. A
+//! promotion moves bytes along the shortest path from the store to the
+//! worker's GPU; a prefill → decode hand-off along the shortest path from one
+//! GPU to the other (through the network when they are on different nodes,
+//! with an optional core capacity).
 //!
 //! The graph is shared by the topology's workers behind a mutex; the
 //! engine is single-threaded, so the lock only serialises.
@@ -39,13 +43,19 @@ pub type VertexId = usize;
 pub struct Store {
     pub name: String,
     pub scope: Scope,
-    /// Node (for `Node` scope) or worker (for `Gpu` scope) this instance
-    /// belongs to.
+    /// Node (for `Node` scope), worker (for `Gpu` scope), or zero (for the
+    /// topology-wide `Cluster` scope) this instance belongs to.
     pub owner: usize,
     pub capacity_blocks: u64,
     pub vertex: VertexId,
-    /// The store's own throughput, if bounded.
+    /// Shared throughput: the instance rate for GPU/node stores or the
+    /// topology-wide aggregate rate for a cluster store.
     pub throughput_edge: Option<EdgeId>,
+    /// Per-transfer cap from striping, bytes/s. This is a private edge in
+    /// the flow solver rather than a shared graph edge.
+    pub transfer_bandwidth: Option<f64>,
+    /// Fixed cost paid by every fetch or write touching the store.
+    pub latency: f64,
     pub eviction: EvictionPolicy,
     /// The store a full instance evicts into (the next tier), if any.
     pub next: Option<StoreId>,
@@ -83,8 +93,8 @@ enum VertexKey {
     Gpu(WorkerId),
     Switch(usize),
     Network,
-    /// Store or junction: name and scope key (worker for `Gpu` scope,
-    /// node for `Node` scope).
+    /// Store or junction: name and scope key (worker for `Gpu` scope, node
+    /// for `Node` scope, zero for `Cluster` scope).
     Named(String, usize),
 }
 
@@ -203,6 +213,8 @@ impl MemoryGraph {
         owner: usize,
         capacity_blocks: u64,
         throughput: Option<f64>,
+        transfer_bandwidth: Option<f64>,
+        latency: f64,
         eviction: EvictionPolicy,
     ) -> StoreId {
         let vertex = self.vertex(VertexKey::Named(name.to_string(), owner));
@@ -223,6 +235,8 @@ impl MemoryGraph {
             capacity_blocks,
             vertex,
             throughput_edge,
+            transfer_bandwidth,
+            latency,
             eviction,
             next: None,
             num_evictions: 0,
@@ -280,6 +294,15 @@ impl MemoryGraph {
         let bytes_per_block = kv_bytes_at(block_size);
         let mut g = Self::empty_with(block_size, kv_bytes_at);
         g.core_edge = core_bw.map(|bw| g.flows.add_edge("core", bw));
+        let total_nodes: u64 = pools
+            .iter()
+            .map(|cluster| {
+                let (workers, tp) = cluster.graph_workers();
+                let gpus_per_node = cluster.hardware.gpus_per_node().max(1) as u64;
+                (workers as u64 * tp as u64).div_ceil(gpus_per_node)
+            })
+            .sum::<u64>()
+            .max(1);
         let mut node_base = 0usize;
         for cluster in pools {
             let selection = &cluster.memory;
@@ -311,6 +334,7 @@ impl MemoryGraph {
                     node,
                     tp as f64,
                     nodes_per_worker as f64,
+                    total_nodes as f64,
                     bytes_per_block,
                     &selection.tiers,
                     &selection.capacity,
@@ -330,6 +354,7 @@ impl MemoryGraph {
         node: usize,
         gpu_mult: f64,
         node_mult: f64,
+        total_nodes: f64,
         bytes_per_block: u64,
         tiers: &[String],
         capacity: &std::collections::BTreeMap<String, f64>,
@@ -354,6 +379,7 @@ impl MemoryGraph {
                             g.vertex(VertexKey::Named(other.to_string(), node)),
                             node_mult,
                         ),
+                        Scope::Cluster => (g.vertex(VertexKey::Named(other.to_string(), 0)), 1.0),
                     }
                 }
             })
@@ -361,23 +387,46 @@ impl MemoryGraph {
         // Stores: every one the template declares, capacity from the
         // selection's override or the template.
         for st in &t.stores {
+            // A shipped cluster store is an opt-in example. Leaving it out
+            // of `tiers` must not add zero-use stores or edges to existing
+            // simulations and their summaries.
+            if st.per == Scope::Cluster && !tiers.iter().any(|name| name == &st.name) {
+                continue;
+            }
             let cap_bytes = capacity.get(&st.name).copied().unwrap_or(st.capacity);
             let per_instance = (cap_bytes / bytes_per_block.max(1) as f64).floor() as u64;
-            let (owner, mult) = match st.per {
-                Scope::Gpu => (w, gpu_mult),
-                Scope::Node => (node, node_mult),
+            let (owner, mult, throughput, transfer_bandwidth) = match st.per {
+                Scope::Gpu => (w, gpu_mult, st.bandwidth.map(|b| b * gpu_mult), None),
+                Scope::Node => (node, node_mult, st.bandwidth.map(|b| b * node_mult), None),
+                Scope::Cluster => (
+                    0,
+                    1.0,
+                    st.aggregate_bandwidth
+                        .or_else(|| st.bandwidth.map(|b| b * total_nodes)),
+                    st.bandwidth.map(|b| b * st.stripe as f64),
+                ),
             };
             self.add_store(
                 &st.name,
                 st.per,
                 owner,
                 (per_instance as f64 * mult) as u64,
-                st.bandwidth.map(|b| b * mult),
+                throughput,
+                transfer_bandwidth,
+                st.latency,
                 eviction,
             );
         }
         // Links: one instance per instance of `from` in this worker's scope.
         for l in &t.links {
+            let inactive_cluster_store = |endpoint: &str| {
+                t.store(endpoint).is_some_and(|s| {
+                    s.per == Scope::Cluster && !tiers.iter().any(|name| name == endpoint)
+                })
+            };
+            if inactive_cluster_store(&l.from) || inactive_cluster_store(&l.to) {
+                continue;
+            }
             let (a, mult) = resolve(self, &l.from)?;
             let (b, _) = resolve(self, &l.to)?;
             self.link(&l.name, a, b, l.bandwidth * mult, l.latency);
@@ -402,6 +451,8 @@ impl MemoryGraph {
                 fetch.edges.insert(0, e);
                 write.edges.push(e);
             }
+            fetch.latency += self.stores[store].latency;
+            write.latency += self.stores[store].latency;
             if let Some(p) = prev {
                 if self.stores[p].next.is_none() && p != store {
                     self.stores[p].next = Some(store);
@@ -421,7 +472,7 @@ impl MemoryGraph {
     /// closest first, each `(name, capacity_blocks, bandwidth, per)`: a
     /// `Gpu` store is private per worker, a `Node` store shared by all;
     /// every worker has its own link to each store. For tests and the
-    /// hierarchy example.
+    /// hierarchy example. `Cluster` behaves like one topology-wide store.
     pub fn simple(num_workers: usize, tiers: &[(&str, u64, f64, Scope)]) -> Self {
         Self::simple_with(num_workers, tiers, 1, Arc::new(|t| t as u64))
     }
@@ -449,6 +500,7 @@ impl MemoryGraph {
                 let owner = match per {
                     Scope::Gpu => w,
                     Scope::Node => 0,
+                    Scope::Cluster => 0,
                 };
                 let store = g.add_store(
                     name,
@@ -456,6 +508,8 @@ impl MemoryGraph {
                     owner,
                     capacity_blocks,
                     None,
+                    None,
+                    0.0,
                     EvictionPolicy::default(),
                 );
                 let sv = g.stores[store].vertex;
@@ -678,6 +732,7 @@ impl MemoryGraph {
         let now = self.flows.now();
         let tier = &self.tiers[worker][0];
         let (store, path) = (tier.store, tier.write_path.clone());
+        let transfer_bandwidth = self.stores[store].transfer_bandwidth;
         let id = format!("w:{worker}:{store}:{}", self.next_write_seq);
         self.next_write_seq += 1;
         let mut total = 0u64;
@@ -709,8 +764,15 @@ impl MemoryGraph {
             return;
         }
         self.pending_writes.insert(id.clone(), entries);
-        self.flows
-            .submit(id, Owner::Write, path.edges, total, path.latency, now);
+        self.flows.submit_capped(
+            id,
+            Owner::Write,
+            path.edges,
+            total,
+            path.latency,
+            transfer_bandwidth,
+            now,
+        );
         self.cascade_batch(store, evicted);
     }
 
@@ -787,6 +849,15 @@ impl MemoryGraph {
         if let Some(e) = self.stores[next].throughput_edge {
             path.edges.push(e);
         }
+        path.latency += self.stores[store].latency + self.stores[next].latency;
+        let transfer_bandwidth = match (
+            self.stores[store].transfer_bandwidth,
+            self.stores[next].transfer_bandwidth,
+        ) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (None, None) => None,
+        };
         let id = format!("c:{store}:{next}:{}", self.next_write_seq);
         self.next_write_seq += 1;
         let mut total = 0u64;
@@ -812,8 +883,15 @@ impl MemoryGraph {
             return;
         }
         self.pending_writes.insert(id.clone(), entries);
-        self.flows
-            .submit(id, Owner::Write, path.edges, total, path.latency, now);
+        self.flows.submit_capped(
+            id,
+            Owner::Write,
+            path.edges,
+            total,
+            path.latency,
+            transfer_bandwidth,
+            now,
+        );
         self.cascade_batch(next, evicted);
     }
 
@@ -878,8 +956,12 @@ impl MemoryGraph {
     /// (see [`Flows::estimate_new`]).
     pub fn estimate_promotion(&self, worker: WorkerId, tier: usize, bytes: u64) -> f64 {
         let path = &self.tiers[worker][tier].fetch_path;
-        self.flows
-            .estimate_new(&path.edges, bytes as f64, path.latency)
+        self.flows.estimate_new_capped(
+            &path.edges,
+            bytes as f64,
+            path.latency,
+            self.stores[self.tiers[worker][tier].store].transfer_bandwidth,
+        )
     }
 
     /// Start moving `bytes` for `request` from `worker`'s tier `tier` into
@@ -909,12 +991,13 @@ impl MemoryGraph {
         if wait > 0.0 {
             self.write_race_waits += 1;
         }
-        self.flows.submit(
+        self.flows.submit_capped(
             promotion_id(request, tier),
             Owner::Worker(worker),
             path.edges,
             bytes,
             path.latency + wait,
+            self.stores[store].transfer_bandwidth,
             now,
         );
     }
@@ -1170,6 +1253,29 @@ to = "network"
 bandwidth = 3
 "#;
 
+    const CLUSTER_MEM: &str = r#"
+gpus_per_node = 1
+[[stores]]
+name = "pool"
+per = "cluster"
+capacity = 1000
+bandwidth = 10
+stripe = 2
+latency = 2
+[[links]]
+name = "nic"
+from = "gpu"
+to = "network"
+bandwidth = 100
+latency = 0.5
+[[links]]
+name = "core"
+from = "network"
+to = "pool"
+bandwidth = 100
+latency = 0.25
+"#;
+
     fn cluster(tiers: &[&str], num_workers: u32, tp: u32, gpus_per_node: u32) -> ClusterSpec {
         let sel: MemoryConfig = toml::from_str(&format!(
             "tiers = [{}]",
@@ -1267,10 +1373,83 @@ bandwidth = 3
     }
 
     #[test]
+    fn cluster_store_is_shared_across_nodes_and_routes_over_nic_and_core() {
+        let mut c = cluster(&["pool"], 4, 1, 1);
+        c.hardware.memory = Some(toml::from_str(CLUSTER_MEM).unwrap());
+        c.memory = toml::from_str("tiers = [\"pool\"]\n[capacity]\npool = 500").unwrap();
+        let g = build10(&[&c], None).unwrap();
+
+        assert_eq!(g.stores().len(), 1, "one store for the topology");
+        assert_eq!(g.stores()[0].scope, Scope::Cluster);
+        assert_eq!(g.stores()[0].owner, 0);
+        assert_eq!(g.stores()[0].capacity_blocks, 50, "capacity override");
+        assert_eq!(g.tiers(0)[0].store, g.tiers(3)[0].store);
+        assert_ne!(g.node_of(0), g.node_of(3));
+
+        let path = &g.tiers(3)[0].fetch_path;
+        let names: Vec<&str> = path
+            .edges
+            .iter()
+            .map(|&e| g.flows().edges()[e].name.as_str())
+            .collect();
+        assert_eq!(names, ["pool:store", "core", "nic"]);
+        assert!(close(path.latency, 2.75), "store and link latency");
+        assert_eq!(g.stores()[0].transfer_bandwidth, Some(20.0));
+        assert_eq!(g.tiers(3)[0].write_path.edges.len(), 3);
+        assert!(close(g.tiers(3)[0].write_path.latency, 2.75));
+        // Four one-GPU nodes contribute 10 B/s each to the shared edge.
+        assert_eq!(
+            g.flows().edges()[g.stores()[0].throughput_edge.unwrap()].capacity,
+            40.0
+        );
+        // One access can stripe over two bandwidth units, but no more.
+        assert!(close(g.estimate_promotion(3, 0, 100), 2.75 + 5.0));
+    }
+
+    #[test]
+    fn cluster_stripes_are_per_transfer_and_share_the_aggregate() {
+        let mut c = cluster(&["pool"], 4, 1, 1);
+        c.hardware.memory = Some(toml::from_str(CLUSTER_MEM).unwrap());
+        let mut g = build10(&[&c], None).unwrap();
+        for w in 0..3 {
+            g.submit_promotion(w, 0, &format!("p{w}"), 100, &[], 0.0);
+        }
+        // stripe = 2 caps each transfer at 20 B/s; three transfers also
+        // share the 4-node aggregate (40 B/s), so each receives 40/3.
+        for w in 0..3 {
+            assert!(close(
+                g.estimate_promotion_remaining(w, &format!("p{w}")),
+                2.75 + 7.5
+            ));
+        }
+
+        let explicit = CLUSTER_MEM.replace("stripe = 2", "stripe = 2\naggregate_bandwidth = 25");
+        let mut c = cluster(&["pool"], 2, 1, 1);
+        c.hardware.memory = Some(toml::from_str(&explicit).unwrap());
+        let mut g = build10(&[&c], None).unwrap();
+        g.submit_promotion(0, 0, "a", 100, &[], 0.0);
+        g.submit_promotion(1, 0, "b", 100, &[], 0.0);
+        // Each transfer could use 20, but the explicit 25 aggregate splits
+        // to 12.5 under contention.
+        assert!(close(g.estimate_promotion_remaining(0, "a"), 2.75 + 8.0));
+        assert!(close(g.estimate_promotion_remaining(1, "b"), 10.75));
+    }
+
+    #[test]
     fn empty_selection_builds_a_bare_graph_and_missing_template_errors() {
         let g = build10(&[&cluster(&[], 2, 1, 4)], None).unwrap();
         assert_eq!(g.num_workers(), 2);
         assert_eq!(g.num_tiers(0), 0);
+
+        let mut inactive = cluster(&[], 2, 1, 1);
+        inactive.hardware.memory = Some(toml::from_str(CLUSTER_MEM).unwrap());
+        let g = build10(&[&inactive], None).unwrap();
+        assert!(g.stores().is_empty(), "unselected cluster store is absent");
+        assert!(
+            g.flows().edges().iter().all(|e| e.name == "nic"),
+            "its network and throughput edges are absent too"
+        );
+
         let mut c = cluster(&["host"], 2, 1, 4);
         c.hardware.memory = None;
         assert!(build10(&[&c], None).is_err());

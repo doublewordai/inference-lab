@@ -54,8 +54,12 @@ worker's first tier under `write_back`; under `write_through` every fresh
 block was written when produced, under `selective` on its n-th hit. Tiers
 are stores of the topology's `MemoryGraph`, instantiated from the
 hardware's `[memory]` template per GPU (private) or per node (shared by the
-node's workers), inclusive of HBM; writes, promotions, cascades between
-tiers and hand-offs are all transfers on the graph's edges.
+node's workers), or once per cluster (shared by every worker through its NIC
+and the network core), inclusive of HBM. Cluster stores may stripe one access
+over several bandwidth units while a separate aggregate edge is the single
+contention point for all accesses; store access latency is paid before bytes
+flow. Writes, promotions, cascades between tiers and hand-offs are all
+transfers on the graph's edges.
 
 ## Preemption
 

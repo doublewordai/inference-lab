@@ -27,10 +27,11 @@ absolute figures are needed.
   hardware preset (host DRAM / NVMe behind PCIe, Grace memory behind
   NVLink-C2C, NVLink, NICs); per-GPU or node-shared stores; write-back /
   write-through / selective / live writes, FIFO / LRU / TTL / outlook
-  eviction, fetch-vs-recompute, prefetch; `reactive` and `oracle` policy
-  presets (what shipped stacks decide from vs what knowing every session's
-  re-entry buys); transfers at max-min fair share over every edge of their
-  path
+  eviction, fetch-vs-recompute, prefetch; topology-wide pooled stores with
+  per-access striping, aggregate contention and access latency; `reactive`
+  and `oracle` policy presets (what shipped stacks decide from vs what knowing
+  every session's re-entry buys); transfers at max-min fair share over every
+  edge of their path
 - **Replicas and routing**: N identical workers behind a pluggable router —
   round-robin, least-loaded, prefix-affinity, KV-aware; DP-attention ranks
   are workers too (own KV, flat routing, lockstep steps with attention skew)

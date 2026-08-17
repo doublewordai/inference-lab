@@ -35,6 +35,16 @@ per = "node"
 capacity = 3.0e13
 bandwidth = 5.6e10
 
+# Optional four-node storage pool. Deployments must name `cluster_nvme` in
+# their `[memory] tiers` to instantiate it; the default catalog entries do not.
+[[memory.stores]]
+name = "cluster_nvme"
+per = "cluster"
+capacity = 1.2e14
+bandwidth = 5.6e10
+stripe = 4
+latency = 2e-3
+
 [[memory.junctions]]
 name = "pcie"
 per = "gpu"
@@ -68,3 +78,9 @@ name = "nic"
 from = "gpu"
 to = "network"
 bandwidth = 5.0e10
+
+[[memory.links]]
+name = "cluster-storage"
+from = "network"
+to = "cluster_nvme"
+bandwidth = 1.0e12

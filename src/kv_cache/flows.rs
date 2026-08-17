@@ -6,7 +6,10 @@
 //! rate first, the residual capacity is shared among the rest, and so on.
 //! Rates are recomputed whenever the set of in-flight transfers changes;
 //! between changes each transfer drains at its rate. An optional fixed
-//! latency is paid before bytes flow.
+//! latency is paid before bytes flow. A transfer may also have a private
+//! rate cap, mathematically an extra edge used by that transfer alone; this
+//! models how many drives one striped access can use while a separate graph
+//! edge enforces the store's aggregate throughput.
 //!
 //! Event-driven: `next_completion_delay` says when the next transfer
 //! finishes under the current rates; `advance(now)` drains everything to
@@ -79,6 +82,8 @@ struct Transfer {
     path: Vec<EdgeId>,
     latency_remaining: f64,
     bytes_remaining: f64,
+    /// Optional private-edge capacity, bytes/s.
+    rate_cap: Option<f64>,
     /// Current max-min rate, bytes/s (0 while latency is being paid or
     /// when the path has no capacity).
     rate: f64,
@@ -164,6 +169,23 @@ impl Flows {
         latency: f64,
         now: f64,
     ) {
+        self.submit_capped(id, owner, path, bytes, latency, None, now);
+    }
+
+    /// Start a transfer with an optional per-transfer bandwidth cap. The cap
+    /// behaves as a private edge: it limits this transfer without being
+    /// shared by other transfers on the same graph path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_capped(
+        &mut self,
+        id: String,
+        owner: Owner,
+        path: Vec<EdgeId>,
+        bytes: u64,
+        latency: f64,
+        rate_cap: Option<f64>,
+        now: f64,
+    ) {
         if self.in_flight.contains_key(&id) {
             return;
         }
@@ -190,6 +212,7 @@ impl Flows {
                 path,
                 latency_remaining: latency.max(0.0),
                 bytes_remaining: bytes as f64,
+                rate_cap,
                 rate: 0.0,
                 last_update: now,
             },
@@ -275,8 +298,22 @@ impl Flows {
     /// smallest along the path. A lower bound on its max-min share, so an
     /// upper bound on the time; exact on an idle path.
     pub fn estimate_new(&self, path: &[EdgeId], bytes: f64, latency: f64) -> f64 {
+        self.estimate_new_capped(path, bytes, latency, None)
+    }
+
+    /// [`Self::estimate_new`] with a private-edge bandwidth cap.
+    pub fn estimate_new_capped(
+        &self,
+        path: &[EdgeId],
+        bytes: f64,
+        latency: f64,
+        rate_cap: Option<f64>,
+    ) -> f64 {
         if path.is_empty() {
-            return latency.max(0.0);
+            return match rate_cap {
+                Some(cap) if cap > 0.0 => latency.max(0.0) + bytes / cap,
+                _ => latency.max(0.0),
+            };
         }
         let mut load = vec![0usize; self.edges.len()];
         for t in self.in_flight.values() {
@@ -287,10 +324,13 @@ impl Flows {
                 load[e] += 1;
             }
         }
-        let share = path
+        let mut share = path
             .iter()
             .map(|&e| self.edges[e].capacity / (load[e] + 1) as f64)
             .fold(f64::INFINITY, f64::min);
+        if let Some(cap) = rate_cap {
+            share = share.min(cap);
+        }
         if share <= 0.0 || !share.is_finite() {
             return f64::INFINITY;
         }
@@ -415,8 +455,8 @@ impl Flows {
     /// transfer. A transfer still paying its latency holds its share from
     /// submission (it moves no bytes until the latency is paid, so the
     /// share is reserved rather than used for those microseconds).
-    /// Transfers are bucketed by edge once, so the fill is linear in the
-    /// number of transfers (each is frozen exactly once).
+    /// Transfers are bucketed by edge and private caps are ordered once;
+    /// each transfer is frozen exactly once.
     fn recompute_rates(&mut self) {
         let mut ts: Vec<&mut Transfer> = self
             .in_flight
@@ -432,8 +472,9 @@ impl Flows {
         let mut unfrozen = 0usize;
         for (i, t) in ts.iter_mut().enumerate() {
             if t.path.is_empty() {
-                // No edges: unconstrained; treat as instantaneous.
-                t.rate = f64::INFINITY;
+                // No shared edges: a private cap binds, otherwise the
+                // transfer is unconstrained and therefore instantaneous.
+                t.rate = t.rate_cap.unwrap_or(f64::INFINITY);
                 frozen[i] = true;
                 continue;
             }
@@ -443,6 +484,13 @@ impl Flows {
                 on_edge[e].push(i);
             }
         }
+        let mut cap_order: Vec<(usize, f64)> = ts
+            .iter()
+            .enumerate()
+            .filter_map(|(i, t)| t.rate_cap.map(|cap| (i, cap)))
+            .collect();
+        cap_order.sort_by(|a, b| a.1.total_cmp(&b.1));
+        let mut cap_cursor = 0;
         while unfrozen > 0 {
             // Most contended edge: smallest fair share among edges with load.
             let mut best: Option<(EdgeId, f64)> = None;
@@ -453,6 +501,25 @@ impl Flows {
                 let share = residual[e] / l as f64;
                 if best.is_none_or(|(_, s)| share < s) {
                     best = Some((e, share));
+                }
+            }
+            // A private rate cap is an edge with one member. If it is the
+            // tightest constraint, freeze just that transfer and return its
+            // unused shared-edge capacity to the rest.
+            while cap_order.get(cap_cursor).is_some_and(|(i, _)| frozen[*i]) {
+                cap_cursor += 1;
+            }
+            let capped = cap_order.get(cap_cursor).copied();
+            if let Some((i, cap)) = capped {
+                if best.is_none_or(|(_, share)| cap < share) {
+                    frozen[i] = true;
+                    unfrozen -= 1;
+                    ts[i].rate = cap.max(0.0);
+                    for &e in &ts[i].path {
+                        residual[e] = (residual[e] - cap).max(0.0);
+                        load[e] -= 1;
+                    }
+                    continue;
                 }
             }
             let Some((edge, share)) = best else { break };
@@ -563,6 +630,35 @@ mod tests {
         assert!(approx(f.next_completion_delay().unwrap(), 10.0));
         let done = f.advance(10.0);
         assert_eq!(done.len(), 2);
+    }
+
+    #[test]
+    fn private_caps_leave_aggregate_capacity_for_other_transfers() {
+        let mut f = Flows::new();
+        let aggregate = f.add_edge("aggregate", 30.0);
+        f.submit_capped(
+            "striped".into(),
+            Owner::Worker(0),
+            vec![aggregate],
+            100,
+            0.0,
+            Some(10.0),
+            0.0,
+        );
+        f.submit_capped(
+            "wide".into(),
+            Owner::Worker(1),
+            vec![aggregate],
+            200,
+            0.0,
+            Some(30.0),
+            0.0,
+        );
+        // The first transfer's private edge fixes it at 10; the second gets
+        // the aggregate edge's remaining 20 rather than an equal 15/15.
+        assert!(approx(f.estimate_remaining("striped"), 10.0));
+        assert!(approx(f.estimate_remaining("wide"), 10.0));
+        assert_eq!(f.advance(10.0).len(), 2);
     }
 
     #[test]
