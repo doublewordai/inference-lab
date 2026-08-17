@@ -441,6 +441,53 @@ mod tests {
     }
 
     #[test]
+    fn disagg_many_prefill_workers_on_a_fast_link_never_stall() {
+        // Four prefill workers finishing at different instants, and a link
+        // that moves a prompt's KV in microseconds (far less than an
+        // iteration): every hand-off must still drain and be delivered.
+        // (Starting a hand-off from inside the iteration that produced it
+        // used to advance the link to that iteration's end time and drop
+        // transfers that completed in between.)
+        for cfg in [
+            RouterConfig::LeastLoaded {},
+            RouterConfig::PrefixAffinity {
+                max_load_ratio: None,
+            },
+        ] {
+            let (mut cluster, model, sched) = small_dense_parts();
+            cluster.num_workers = 4;
+            let topo = DisaggTopology {
+                prefill: cluster.clone(),
+                decode: cluster,
+                kv_link_bw: 1e12,
+            };
+            let mut engine = Engine::new(
+                Topology::from_disagg(&topo, model, sched)
+                    .unwrap()
+                    .with_router(&cfg),
+            );
+            for i in 0..32u64 {
+                let mut r = Request::new(format!("r{i}"), 0, i as f64 * 0.001, 512, 200);
+                r.prompt_block_hashes = (1..=32).map(|b| 100_000 * (i + 1) + b).collect();
+                engine.submit(r);
+            }
+            let timings = run_until(&mut engine, 32);
+            assert!(engine.is_idle(), "{cfg:?}: work left after 32 completions");
+            assert!(timings
+                .iter()
+                .all(|t| t.handoff_done_time >= t.prefill_done_time));
+            // Cold contexts on the decode pool: both policies spread them.
+            let st = engine.pool_router_stats();
+            assert_eq!(
+                st[1].per_worker,
+                vec![8, 8, 8, 8],
+                "{cfg:?}: {:?}",
+                st[1].per_worker
+            );
+        }
+    }
+
+    #[test]
     fn disagg_handoffs_share_the_link_bandwidth() {
         let (cluster, model, sched) = small_dense_parts();
         // KV of a 64-token prompt takes exactly 1.0 s alone on the link.
