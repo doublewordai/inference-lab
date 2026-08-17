@@ -430,6 +430,7 @@ impl MemoryGraph {
         let mut node_base = 0usize;
         for cluster in pools {
             let selection = &cluster.memory;
+            let policies = selection.policies();
             let template = cluster.hardware.memory.as_ref();
             selection.validate(template)?;
             let num_workers = cluster.num_workers.max(1) as usize;
@@ -447,8 +448,8 @@ impl MemoryGraph {
                 let gv = g.vertex(VertexKey::Gpu(w));
                 g.gpu_vertex.push(gv);
                 g.tiers.push(Vec::new());
-                g.write_of.push(selection.write);
-                g.evict_backed_first.push(selection.hbm_evict_backed_first);
+                g.write_of.push(policies.write);
+                g.evict_backed_first.push(policies.hbm_evict_backed_first);
                 let Some(t) = template else { continue };
                 g.instantiate_worker(
                     t,
@@ -459,7 +460,7 @@ impl MemoryGraph {
                     bytes_per_block,
                     &selection.tiers,
                     &selection.capacity,
-                    selection.eviction,
+                    policies.eviction,
                 )?;
             }
             node_base += num_workers.div_ceil(workers_per_node).max(1);
