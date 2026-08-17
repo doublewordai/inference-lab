@@ -258,7 +258,7 @@ impl Scheduler {
                     .kv_cache_manager
                     .content_blocks_for_tokens(req.num_cached_tokens);
                 self.kv_cache_manager
-                    .publish_transferred_blocks(&req, cached_blocks);
+                    .publish_transferred_blocks(&mut req, cached_blocks);
                 req.ready_at = None;
                 req.num_computed_tokens = req.num_cached_tokens;
                 // Its prefix is hot and its landing blocks are held: admit
@@ -278,7 +278,7 @@ impl Scheduler {
         // Landed prefetches: publish and free (hittable, keeping their
         // outlook order); the rest wait on.
         let mut still_flying = Vec::with_capacity(self.prefetches.len());
-        for req in self.prefetches.drain(..) {
+        for mut req in self.prefetches.drain(..) {
             if completed
                 .as_ref()
                 .is_some_and(|completed| completed.contains(&req.request_id))
@@ -287,8 +287,7 @@ impl Scheduler {
                     .kv_cache_manager
                     .content_blocks_for_tokens(req.num_cached_tokens);
                 self.kv_cache_manager
-                    .publish_transferred_blocks(&req, cached_blocks);
-                let mut req = req;
+                    .publish_transferred_blocks(&mut req, cached_blocks);
                 self.kv_cache_manager.free_request(&mut req);
             } else {
                 still_flying.push(req);
@@ -318,8 +317,8 @@ impl Scheduler {
                 // A session step announces its re-entry to the cache
                 // before its blocks go back on the free list, so the
                 // outlook policies see the marks as the blocks are freed.
-                self.kv_cache_manager
-                    .set_outlook(&req.prompt_block_hashes, req.outlook_at(current_time));
+                let outlook = req.outlook_at(current_time);
+                self.kv_cache_manager.set_request_outlook(&mut req, outlook);
                 self.plan_prefetch(&req, current_time);
                 self.kv_cache_manager.free_request(&mut req);
                 decision.completed.push(req);

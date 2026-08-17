@@ -2,7 +2,7 @@ use super::flows::Owner;
 use super::graph::{promotion_request, MemoryGraph, SharedMemoryGraph, WorkerId};
 use super::radix::{HbmLookup, KvBytesFn, Path, Radix, SharedRadix, Span};
 use crate::config::{HbmEviction, ModelSpec};
-use crate::request::{Outlook, Request};
+use crate::request::{KvLeaf, Outlook, Request};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
@@ -115,8 +115,10 @@ impl std::ops::AddAssign for PrefixCacheStats {
 ///
 /// The blocks themselves live in the topology's [`Radix`] tree, shared with
 /// the memory graph: this manager is one worker's view of it. A request's
-/// KV is a path through the tree; what it holds is a count (`kv_blocks`),
-/// and every operation works on ranges of the path rather than on blocks.
+/// KV is a path through the tree; what it holds is a count (`kv_blocks`) plus
+/// a validated leaf hint on the request, and every operation works on ranges
+/// of the path rather than on blocks. The hint avoids resolving a growing
+/// session's full cumulative-hash chain at every decode block boundary.
 pub struct KVCacheManager {
     /// Block size in tokens.
     block_size: u32,
@@ -409,6 +411,28 @@ impl KVCacheManager {
         (in_path, held - in_path)
     }
 
+    /// Materialise `[0, upto)` into the request's reusable path buffer from
+    /// its leaf hint. Structural tree changes are safe: the radix validates
+    /// the cached cumulative hash and follows the current parent chain.
+    fn rebuild_request_path(r: &Radix, request: &mut Request, upto: u32) -> bool {
+        let Some(leaf) = request.kv_leaf else {
+            return false;
+        };
+        let Some(&last_hash) = request
+            .prompt_block_hashes
+            .get(leaf.blocks.saturating_sub(1) as usize)
+        else {
+            return false;
+        };
+        r.rebuild_cached_path(
+            leaf.node,
+            leaf.blocks,
+            last_hash,
+            upto,
+            &mut request.kv_path,
+        )
+    }
+
     /// Whether `request` can grow to `total_tokens` of context: the free
     /// blocks cover its content misses and hits on free-but-cached blocks
     /// (hits held by other requests are shared) plus its auxiliary blocks.
@@ -493,14 +517,33 @@ impl KVCacheManager {
         };
 
         let mut r = self.radix.lock().unwrap();
-        let path = if in_path_target > 0 {
-            r.insert(&request.prompt_block_hashes[..in_path_target as usize])
+        if in_path_target > 0 {
+            let hashes = &request.prompt_block_hashes[..in_path_target as usize];
+            let from_leaf = request.kv_leaf.is_some_and(|leaf| {
+                let Some(&last_hash) = request
+                    .prompt_block_hashes
+                    .get(leaf.blocks.saturating_sub(1) as usize)
+                else {
+                    return false;
+                };
+                r.insert_from_cached(
+                    leaf.node,
+                    leaf.blocks,
+                    last_hash,
+                    hashes,
+                    &mut request.kv_path,
+                )
+            });
+            if !from_leaf {
+                request.kv_path = r.insert(hashes);
+            }
         } else {
-            Path::default()
-        };
+            request.kv_path.segs.clear();
+            request.kv_path.blocks = 0;
+        }
         let got = r.acquire(
             self.worker,
-            &path,
+            &request.kv_path,
             in_path_held,
             in_path_target,
             anon_new + aux_new,
@@ -508,6 +551,10 @@ impl KVCacheManager {
             leader.as_deref(),
             false,
         )?;
+        request.kv_leaf = request.kv_path.segs.last().map(|seg| KvLeaf {
+            node: seg.node,
+            blocks: request.kv_path.blocks,
+        });
         drop(r);
         let content_added = content_target.saturating_sub(held_total);
         request.kv_blocks.extend(content_added);
@@ -534,16 +581,18 @@ impl KVCacheManager {
     /// A completed transfer's blocks (the first `cached_blocks` content
     /// blocks of `request`) landed in HBM: subsequent lookups see them as
     /// resident.
-    pub fn publish_transferred_blocks(&mut self, request: &Request, cached_blocks: usize) {
+    pub fn publish_transferred_blocks(&mut self, request: &mut Request, cached_blocks: usize) {
         if !self.enable_prefix_caching || cached_blocks == 0 {
             return;
         }
         let n = cached_blocks.min(request.prompt_block_hashes.len());
         let spans = {
             let mut r = self.radix.lock().unwrap();
-            let path = r.resolve(&request.prompt_block_hashes[..n]);
-            r.landed(self.worker, &path, n as u32);
-            path_spans(&path, n as u32)
+            if !Self::rebuild_request_path(&r, request, n as u32) {
+                request.kv_path = r.resolve(&request.prompt_block_hashes[..n]);
+            }
+            r.landed(self.worker, &request.kv_path, n as u32);
+            path_spans(&request.kv_path, n as u32)
         };
         if let Some((g, w)) = &self.memory {
             g.lock().unwrap().promoted_batch(*w, &spans);
@@ -561,15 +610,20 @@ impl KVCacheManager {
         request.kv_blocks.clear();
         request.aux_blocks.clear();
         if in_path + anon + aux == 0 {
+            request.kv_leaf = None;
             return;
         }
         let mut r = self.radix.lock().unwrap();
-        let path = if in_path > 0 {
-            r.resolve(&request.prompt_block_hashes[..in_path as usize])
+        if in_path > 0 {
+            if !Self::rebuild_request_path(&r, request, in_path) {
+                request.kv_path = r.resolve(&request.prompt_block_hashes[..in_path as usize]);
+            }
         } else {
-            Path::default()
-        };
-        r.release(self.worker, &path, in_path, anon + aux);
+            request.kv_path.segs.clear();
+            request.kv_path.blocks = 0;
+        }
+        r.release(self.worker, &request.kv_path, in_path, anon + aux);
+        request.kv_leaf = None;
     }
 
     /// KV bytes written into HBM so far (every fresh block allocation).
@@ -741,6 +795,21 @@ impl KVCacheManager {
         let mut r = self.radix.lock().unwrap();
         let path = r.resolve(hashes);
         r.set_outlook(&path, outlook.map(|o| o.next_arrival), shared);
+    }
+
+    /// Request-aware outlook update: use the live request's validated leaf
+    /// instead of resolving its entire session hash chain from the root.
+    pub fn set_request_outlook(&mut self, request: &mut Request, outlook: Option<Outlook>) {
+        if !self.enable_prefix_caching || request.prompt_block_hashes.is_empty() {
+            return;
+        }
+        let shared = outlook.map_or(0, |o| o.shared_tokens / self.block_size);
+        let mut r = self.radix.lock().unwrap();
+        let blocks = request.prompt_block_hashes.len() as u32;
+        if !Self::rebuild_request_path(&r, request, blocks) {
+            request.kv_path = r.resolve(&request.prompt_block_hashes);
+        }
+        r.set_outlook(&request.kv_path, outlook.map(|o| o.next_arrival), shared);
     }
 
     /// The announced re-entry time of the sequence starting with `hash`.
@@ -985,6 +1054,35 @@ mod tests {
         // 3 of the 4 blocks are usable prefix (the last prompt block is
         // always computed).
         assert_eq!(m.peek_prefix_cache(&probe).hbm_tokens, 48);
+    }
+
+    #[test]
+    fn request_leaf_cache_extends_in_place_and_falls_back_after_a_split() {
+        let mut m = KVCacheManager::new(16 * 100 * 100, 16, |t| 100 * t as u64, 0, true);
+        let mut a = create_test_request("a", 80);
+        a.prompt_block_hashes = vec![1, 2, 3, 4, 5];
+
+        alloc(&mut m, &mut a, 16);
+        let first_leaf = a.kv_leaf.unwrap();
+        a.num_computed_tokens = 16;
+        alloc(&mut m, &mut a, 16);
+        assert_eq!(a.kv_leaf.unwrap().node, first_leaf.node);
+        assert_eq!(a.kv_leaf.unwrap().blocks, 2);
+
+        // This live side branch splits a's cached node at block one. The next
+        // growth rejects the stale endpoint and falls back to a normal insert.
+        let stale = a.kv_leaf.unwrap();
+        let mut b = create_test_request("b", 32);
+        b.prompt_block_hashes = vec![1, 9];
+        alloc(&mut m, &mut b, 32);
+        a.num_computed_tokens = 32;
+        alloc(&mut m, &mut a, 16);
+        assert_eq!(a.kv_leaf.unwrap().blocks, 3);
+        assert_ne!(a.kv_leaf.unwrap().node, stale.node);
+
+        free(&mut m, &mut a);
+        free(&mut m, &mut b);
+        assert_eq!(m.num_free_blocks(), 100);
     }
 
     #[test]
@@ -1315,7 +1413,7 @@ mod landing_tests {
         // Land it.
         let done = m.advance_transfers(10.0);
         assert!(done.as_ref().is_some_and(|done| done.contains("r")));
-        m.publish_transferred_blocks(&r, 4);
+        m.publish_transferred_blocks(&mut r, 4);
         r.num_computed_tokens = 64;
         let lk2 = m.peek_prefix_cache(&r);
         assert_eq!(
