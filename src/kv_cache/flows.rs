@@ -22,7 +22,8 @@ pub type EdgeId = usize;
 const DONE_EPSILON_BYTES: f64 = 1e-6;
 /// A remainder that would drain in less than this counts as done: an event
 /// scheduled that soon lands at the same instant in floating point and
-/// would never move it.
+/// would never move it. Floor of the tolerance; see [`Flows::done_eps`],
+/// which widens it to the resolution of the clock at the current time.
 const DONE_EPSILON_SECONDS: f64 = 1e-12;
 
 /// Who a transfer belongs to: which completion queue it lands in.
@@ -166,10 +167,11 @@ impl Flows {
     /// transfer that completed, and queues them per owner too.
     pub fn advance(&mut self, now: f64) -> Vec<(Owner, String)> {
         self.drain_to(now);
+        let eps = self.done_eps();
         let mut done: Vec<(Owner, String)> = self
             .in_flight
             .iter()
-            .filter(|(_, t)| Self::is_done(t))
+            .filter(|(_, t)| Self::is_done(t, eps))
             .map(|(id, t)| (t.owner, id.clone()))
             .collect();
         done.sort_by(|a, b| a.1.cmp(&b.1));
@@ -210,7 +212,7 @@ impl Flows {
     pub fn next_completion_delay(&self) -> Option<f64> {
         self.in_flight
             .values()
-            .filter_map(Self::time_to_done)
+            .filter_map(|t| Self::time_to_done(t, self.done_eps()))
             .min_by(f64::total_cmp)
     }
 
@@ -247,12 +249,20 @@ impl Flows {
     pub fn estimate_remaining(&self, id: &str) -> f64 {
         self.in_flight
             .get(id)
-            .and_then(Self::time_to_done)
+            .and_then(|t| Self::time_to_done(t, self.done_eps()))
             .unwrap_or(0.0)
     }
 
-    fn time_to_done(t: &Transfer) -> Option<f64> {
-        if Self::is_done(t) {
+    /// Remaining time below which a transfer counts as finished: the
+    /// float resolution of the clock at `now` (a completion event closer
+    /// than that lands at the same instant and moves nothing), with
+    /// `DONE_EPSILON_SECONDS` as the floor.
+    fn done_eps(&self) -> f64 {
+        (self.now.abs() * 4.0 * f64::EPSILON).max(DONE_EPSILON_SECONDS)
+    }
+
+    fn time_to_done(t: &Transfer, eps: f64) -> Option<f64> {
+        if Self::is_done(t, eps) {
             return Some(0.0);
         }
         if t.bytes_remaining <= DONE_EPSILON_BYTES {
@@ -266,14 +276,14 @@ impl Flows {
     }
 
     /// Whether `t` has finished within float drift: no latency left and
-    /// no bytes, or a remainder that would drain in under
-    /// `DONE_EPSILON_SECONDS` at its rate.
-    fn is_done(t: &Transfer) -> bool {
-        if t.latency_remaining > DONE_EPSILON_SECONDS {
+    /// no bytes, or a remainder that would drain in under `eps` at its
+    /// rate.
+    fn is_done(t: &Transfer, eps: f64) -> bool {
+        if t.latency_remaining > eps {
             return false;
         }
         t.bytes_remaining <= DONE_EPSILON_BYTES
-            || (t.rate > 0.0 && t.bytes_remaining / t.rate <= DONE_EPSILON_SECONDS)
+            || (t.rate > 0.0 && t.bytes_remaining / t.rate <= eps)
     }
 
     /// Move every transfer forward to `now` at its current rate.
@@ -420,6 +430,26 @@ mod tests {
             f.take_completed(Owner::Worker(1)),
             HashSet::from(["b".to_string()])
         );
+    }
+
+    #[test]
+    fn a_remainder_below_the_clocks_resolution_counts_as_done() {
+        // At t ≈ 16649 s the clock's ulp is ~3.6e-12 s. A transfer with
+        // 2e-12 s of bytes left is neither drainable (its completion event
+        // lands at the same instant) nor, under a fixed 1e-12 s epsilon,
+        // done — the engine would re-fire that event forever.
+        let mut f = Flows::new();
+        let e = f.add_edge("pcie", 1e9);
+        let t0 = 16648.7;
+        f.submit("w".into(), Owner::Write, vec![e], 1_000_000_000, 0.0, t0);
+        // Drain to 2e-12 s short of the end.
+        let done = f.advance(t0 + 1.0 - 2e-12);
+        assert!(
+            done.iter().any(|(_, id)| id == "w"),
+            "counted done within the clock's resolution"
+        );
+        assert_eq!(f.next_completion_delay(), None);
+        assert_eq!(f.num_in_flight(), 0);
     }
 
     #[test]
