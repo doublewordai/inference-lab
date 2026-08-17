@@ -475,9 +475,14 @@ impl Scheduler {
                     let mut request = self.waiting.remove(selected_idx).unwrap();
                     self.kv_cache_manager.record_prefix_lookup(&lookup);
                     request.num_cached_tokens = cached_tokens;
+                    // A request back from an earlier promotion already holds
+                    // (and has computed) that prefix; reserve only the
+                    // positions beyond it — a sibling on a node-shared tier
+                    // may have backed more of its prompt since.
+                    let beyond_held = cached_tokens.saturating_sub(request.num_computed_tokens);
                     let allocated = self
                         .kv_cache_manager
-                        .reserve_blocks_for_transfer(&request, cached_tokens)
+                        .reserve_blocks_for_transfer(&request, beyond_held)
                         .expect("blocks_needed already verified against capacity");
                     request.kv_blocks.extend(allocated);
 
@@ -1025,6 +1030,60 @@ mod tests {
         assert_eq!(d.completed[0].num_output_tokens, 0);
         assert_eq!(d.batch.len(), 1, "the fitting request runs");
         assert!(s.schedule(1.0).completed.iter().all(|r| !r.rejected));
+    }
+
+    #[test]
+    fn a_second_promotion_reserves_only_beyond_the_prefix_already_held() {
+        // HBM of 3 blocks, one private tier. A request whose prompt is
+        // [A, B, C] finds A in the tier, promotes it, and by the time it is
+        // re-admitted B has been backed too (a sibling wrote it): the second
+        // reservation must cover B only, not A again — with one other block
+        // held there is room for exactly one more.
+        let config = Config::test_default();
+        let bs = config.scheduler.block_size;
+        let per_block = config.model.kv_storage_bytes(bs);
+        let kv = kv_manager(&config, 3 * per_block, true).with_private_tiers(&[(
+            "host_ram",
+            10 * 1024 * 1024 * 1024,
+            per_block as f64, // one block per second
+        )]);
+        let mut s = scheduler_from(config, kv);
+        let (a, b, c) = (0xA_u64, 0xB_u64, 0xC_u64);
+        {
+            let mgr = &mut s.kv_cache_manager;
+            let mut seed = create_test_request("seed", bs, 1);
+            seed.prompt_block_hashes = vec![a];
+            let blocks = mgr.allocate_blocks(&seed, bs).unwrap();
+            mgr.free_blocks(&blocks);
+            let mut churn = create_test_request("churn", bs * 3, 1);
+            churn.prompt_block_hashes = vec![0xD1, 0xD2, 0xD3];
+            let cb = mgr.allocate_blocks(&churn, bs * 3).unwrap();
+            mgr.free_blocks(&cb);
+            assert!(mgr.memory().unwrap().0.lock().unwrap().holds(0, a));
+        }
+        // A one-block request that keeps decoding holds a block throughout.
+        s.add_request(create_test_request("hold", 1, bs - 1));
+        let mut req = create_test_request("req", bs * 3, 1);
+        req.prompt_block_hashes = vec![a, b, c];
+        s.add_request(req);
+        let d = s.schedule(0.0);
+        assert_eq!(d.batch.len(), 1, "hold runs; req parks on A's promotion");
+        assert_eq!(s.pending_transfers.len(), 1);
+        assert_eq!(s.pending_transfers[0].num_cached_tokens, bs);
+        // B lands in the tier while A is in flight.
+        s.kv_cache_manager.plant_in_tier(0, b);
+        // A lands: req is re-admitted, sees B in the tier, and parks again
+        // — reserving one block for B (free: 3 − hold − A = 1).
+        let ready = s.pending_transfers[0].ready_at.unwrap();
+        apply(&mut s, &d, ready / 2.0);
+        let d = s.schedule(ready + 1e-9);
+        assert_eq!(s.pending_transfers.len(), 1);
+        let r = &s.pending_transfers[0];
+        assert_eq!(r.request_id, "req");
+        assert_eq!(r.num_cached_tokens, 2 * bs);
+        assert_eq!(r.kv_blocks.len(), 2, "A's block plus B's landing block");
+        assert_eq!(s.kv_cache_manager.num_free_blocks(), 0);
+        assert_eq!(d.batch.len(), 1);
     }
 
     #[test]
