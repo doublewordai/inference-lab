@@ -800,7 +800,7 @@ fn print_final_metrics(
         println!("\n{}", title.yellow().bold());
         println!("  • Policy:    {}", rt.policy);
         let per: Vec<String> = rt.per_replica.iter().map(|n| n.to_string()).collect();
-        println!("  • Per replica: [{}]", per.join(", "));
+        println!("  • Per worker: [{}]", per.join(", "));
         if rt.prefix_available > 0 {
             println!(
                 "  • Prefix held somewhere: {} requests; routed to a holder: {} ({:.1}%); \

@@ -70,23 +70,32 @@ pub(crate) struct Worker {
     pub scheduler: Scheduler,
     pub compute_engine: ComputeEngine,
     /// This worker's id in the topology's memory graph (pools numbered in
-    /// order: prefill workers, then decode workers).
+    /// order: prefill workers, then decode workers; a DP-attention replica
+    /// is `ranks` consecutive ids).
     pub global_id: usize,
+    /// DP-attention: this worker's rank within its replica (0 for a whole
+    /// replica). The ranks of a replica step in lockstep as one group (see
+    /// `WorkerPool::groups`).
+    pub rank: usize,
 }
 
 impl Worker {
     /// `graph` is the topology's KV memory graph and `global_id` this
     /// worker's id in it; the manager is attached to the graph only when
-    /// the worker has tiers there.
+    /// the worker has tiers there. A DP-attention rank gets `1 / ranks` of
+    /// the replica's KV capacity and the replica-wide compute engine.
     pub fn new(
         cluster: &ClusterSpec,
         model: ModelSpec,
         scheduler_config: SchedulerConfig,
         graph: &SharedMemoryGraph,
         global_id: usize,
+        rank: usize,
+        ranks: usize,
     ) -> Result<Self, String> {
-        let kv_capacity =
-            cluster.kv_cache_capacity(&scheduler_config, cluster.resident_weight_bytes(&model));
+        let kv_capacity = cluster
+            .kv_cache_capacity(&scheduler_config, cluster.resident_weight_bytes(&model))
+            / ranks.max(1) as u64;
 
         // Blocks are charged from the model's exact KV curve: linear-KV
         // models get ceil(t / block_size), models whose footprint is
@@ -142,6 +151,7 @@ impl Worker {
             scheduler,
             compute_engine,
             global_id,
+            rank,
         })
     }
 }
@@ -149,19 +159,52 @@ impl Worker {
 pub(crate) struct WorkerPool {
     pub workers: Vec<Worker>,
     /// Picks the worker each request enters. Round-robin unless
-    /// [`Topology::with_router`] set another.
+    /// [`Topology::with_router`] set another. Routes flat over every
+    /// worker, so on a DP-attention pool it places requests on ranks.
     router: Box<dyn Router>,
     router_stats: RouterStats,
+    /// Lockstep groups: the ranks of one replica, stepped together as one
+    /// iteration (they meet at every layer's FFN collective). Each group
+    /// lists its members' worker indices; the first is the leader that
+    /// carries the group's events.
+    groups: Vec<Vec<usize>>,
+    group_of: Vec<usize>,
 }
 
 impl WorkerPool {
     pub fn new(workers: Vec<Worker>) -> Self {
         let n = workers.len();
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+        let mut group_of = Vec::with_capacity(n);
+        for (i, w) in workers.iter().enumerate() {
+            if w.rank == 0 || groups.is_empty() {
+                groups.push(Vec::new());
+            }
+            group_of.push(groups.len() - 1);
+            groups.last_mut().unwrap().push(i);
+        }
         Self {
             workers,
             router: build_router(&RouterConfig::RoundRobin {}),
             router_stats: RouterStats::new(n),
+            groups,
+            group_of,
         }
+    }
+
+    /// The worker that carries `worker`'s group's events.
+    fn leader_of(&self, worker: usize) -> usize {
+        self.groups[self.group_of[worker]][0]
+    }
+
+    /// The workers stepped together with `worker` (itself included).
+    fn members_of(&self, worker: usize) -> &[usize] {
+        &self.groups[self.group_of[worker]]
+    }
+
+    /// Whether any group has more than one rank.
+    pub fn has_rank_groups(&self) -> bool {
+        self.groups.iter().any(|g| g.len() > 1)
     }
 
     fn set_router(&mut self, cfg: &RouterConfig) {
@@ -247,15 +290,20 @@ impl Topology {
         first_id: usize,
     ) -> Result<Vec<Worker>, String> {
         let n = cluster.num_workers.max(1) as usize;
-        let mut workers = Vec::with_capacity(n);
+        let ranks = cluster.kv_ranks() as usize;
+        let mut workers = Vec::with_capacity(n * ranks);
         for w in 0..n {
-            workers.push(Worker::new(
-                cluster,
-                model.clone(),
-                scheduler_config.clone(),
-                memory,
-                first_id + w,
-            )?);
+            for r in 0..ranks {
+                workers.push(Worker::new(
+                    cluster,
+                    model.clone(),
+                    scheduler_config.clone(),
+                    memory,
+                    first_id + w * ranks + r,
+                    r,
+                    ranks,
+                )?);
+            }
         }
         Ok(workers)
     }
@@ -272,7 +320,7 @@ impl Topology {
             topology.kv_link_bw,
         )?
         .shared_handle();
-        let p_count = topology.prefill.num_workers.max(1) as usize;
+        let p_count = topology.prefill.graph_workers().0;
         let p_workers = Self::build_pool(&topology.prefill, &model, &scheduler_config, &memory, 0)?;
         let d_workers = Self::build_pool(
             &topology.decode,
@@ -285,7 +333,7 @@ impl Topology {
         // and no `kv_link_bw` is a config error, not a run-time one).
         {
             let mut g = memory.lock().unwrap();
-            let d_count = topology.decode.num_workers.max(1) as usize;
+            let d_count = topology.decode.graph_workers().0;
             for p in 0..p_count {
                 for d in 0..d_count {
                     g.handoff_path(p, p_count + d)?;
@@ -531,6 +579,12 @@ impl Engine {
     /// Loads the trace bank / measured cost table the config names; a bad
     /// path is returned as an error.
     pub fn enable_speculative(&mut self, cfg: SpeculativeConfig, seed: u64) -> Result<(), String> {
+        if self.topology.pools.iter().any(|p| p.has_rank_groups()) {
+            return Err(
+                "speculative decoding is not modelled with dp_attention rank groups (tp > 1 with dp_attention = true)"
+                    .into(),
+            );
+        }
         self.spec = Some(SpecPlanner::new(cfg, seed)?);
         Ok(())
     }
@@ -962,10 +1016,19 @@ impl Engine {
         self.maybe_wake_worker(pool_id, worker_idx, self.current_time);
     }
 
+    /// Wake `worker`'s lockstep group (through its leader) at `when`,
+    /// unless it is already busy or armed.
     fn maybe_wake_worker(&mut self, pool: PoolId, worker: usize, when: f64) {
-        if !self.worker_busy[pool][worker] {
-            self.worker_busy[pool][worker] = true;
-            self.push(when, EventKind::WorkerReady { pool, worker });
+        let leader = self.topology.pools[pool].leader_of(worker);
+        if !self.worker_busy[pool][leader] {
+            self.worker_busy[pool][leader] = true;
+            self.push(
+                when,
+                EventKind::WorkerReady {
+                    pool,
+                    worker: leader,
+                },
+            );
         }
     }
 
@@ -995,8 +1058,7 @@ impl Engine {
             .as_ref()
             .map(|i| i.end_time)
             .unwrap_or(now);
-        let source = self.topology.pools[pool].workers[worker].global_id;
-        for req in outcome.handed_off {
+        for (source, req) in outcome.handed_off {
             self.handoff_source.insert(req.request_id.clone(), source);
             self.push(handoff_time, EventKind::HandoffStart(req));
         }
@@ -1011,14 +1073,21 @@ impl Engine {
             // queued. This can't loop at one timestamp: a preempt-only pass
             // empties `running`, and the re-run either schedules something
             // or preempts nothing.
-            let w = &self.topology.pools[pool].workers[worker];
-            if w.scheduler.num_running() > 0 || w.scheduler.num_waiting() > 0 {
+            let p = &self.topology.pools[pool];
+            let has_work = p.members_of(worker).iter().any(|&m| {
+                let sch = &p.workers[m].scheduler;
+                sch.num_running() > 0 || sch.num_waiting() > 0
+            });
+            if has_work {
                 self.maybe_wake_worker(pool, worker, now);
             }
-        } else if let Some(ready) = self.topology.pools[pool].workers[worker]
-            .scheduler
-            .earliest_pending_ready()
-        {
+        } else if let Some(ready) = {
+            let p = &self.topology.pools[pool];
+            p.members_of(worker)
+                .iter()
+                .filter_map(|&m| p.workers[m].scheduler.earliest_pending_ready())
+                .min_by(f64::total_cmp)
+        } {
             // Nothing ran, but a request is parked on a KV tier promotion.
             // Its `ready_at` is the estimate made when it parked; the
             // memory graph's `FlowDrain` wakes this worker when the
@@ -1028,20 +1097,29 @@ impl Engine {
                 self.maybe_wake_worker(pool, worker, ready);
             }
         }
-        // Arm the worker's next prefetch plan as its own event, so it fires
-        // whether or not the worker is busy then.
-        if let Some(t) = self.topology.pools[pool].workers[worker]
-            .scheduler
-            .next_prefetch_at()
-        {
-            if t > now && self.prefetch_armed[pool][worker] != Some(t) {
-                self.prefetch_armed[pool][worker] = Some(t);
-                self.push(t, EventKind::PrefetchDue { pool, worker });
+        // Arm each member's next prefetch plan as its own event, so it
+        // fires whether or not the group is busy then.
+        let members: Vec<usize> = self.topology.pools[pool].members_of(worker).to_vec();
+        for m in members {
+            if let Some(t) = self.topology.pools[pool].workers[m]
+                .scheduler
+                .next_prefetch_at()
+            {
+                if t > now && self.prefetch_armed[pool][m] != Some(t) {
+                    self.prefetch_armed[pool][m] = Some(t);
+                    self.push(t, EventKind::PrefetchDue { pool, worker: m });
+                }
             }
         }
         (outcome.iteration, timings)
     }
 
+    /// One iteration of `worker`'s lockstep group (a whole replica, or the
+    /// `tp` ranks of a DP-attention replica stepped together). Every
+    /// member schedules; the union batch is priced on the replica-wide
+    /// roofline, plus — with more than one rank — the attention skew: the
+    /// slowest rank's own-GPU attention time over the mean rank's, since
+    /// the ranks meet at every layer's FFN collective.
     fn run_iteration(
         &mut self,
         pool: PoolId,
@@ -1050,15 +1128,21 @@ impl Engine {
         now: f64,
     ) -> RunIterationOutcome {
         let correction = self.time_correction;
-        let w = &mut self.topology.pools[pool].workers[worker];
-        let decision = w.scheduler.schedule(now);
-        let completed = decision.completed;
-        let preempted = decision.num_preempted > 0;
+        let members: Vec<usize> = self.topology.pools[pool].members_of(worker).to_vec();
+        let grouped = members.len() > 1;
 
-        let batch_indices: Vec<usize> = decision.batch.iter().map(|s| s.idx).collect();
-        let tokens_per_request: Vec<u32> = decision.batch.iter().map(|s| s.num_tokens).collect();
-
-        if batch_indices.is_empty() {
+        // Schedule every member; the batch is the union, each entry tagged
+        // with its member and index into that member's running set.
+        let mut completed = Vec::new();
+        let mut preempted = false;
+        let mut entries: Vec<(usize, usize, u32)> = Vec::new();
+        for &m in &members {
+            let decision = self.topology.pools[pool].workers[m].scheduler.schedule(now);
+            completed.extend(decision.completed);
+            preempted |= decision.num_preempted > 0;
+            entries.extend(decision.batch.iter().map(|s| (m, s.idx, s.num_tokens)));
+        }
+        if entries.is_empty() {
             return RunIterationOutcome {
                 iteration: None,
                 completed,
@@ -1066,24 +1150,23 @@ impl Engine {
                 preempted,
             };
         }
-
-        let batch_size = batch_indices.len();
+        let batch_size = entries.len();
+        let tokens_per_request: Vec<u32> = entries.iter().map(|e| e.2).collect();
 
         // Capture per-request progress (and was_prefill) before mutating.
         let mut progress = Vec::with_capacity(batch_size);
-        let mut round_commits: Vec<Option<u32>> = Vec::with_capacity(batch_indices.len());
+        let mut round_commits: Vec<Option<u32>> = Vec::with_capacity(batch_size);
         {
-            let running = w.scheduler.running();
-            for (i, &idx) in batch_indices.iter().enumerate() {
-                if let Some(req) = running.get(idx) {
-                    progress.push(RequestProgress {
-                        request_id: req.request_id.clone(),
-                        was_prefill: req.is_prefill(),
-                        num_tokens: tokens_per_request[i],
-                        num_output: 0,
-                    });
-                    round_commits.push(req.pending_round_commits);
-                }
+            let ws = &self.topology.pools[pool].workers;
+            for &(m, idx, tokens) in &entries {
+                let req = &ws[m].scheduler.running()[idx];
+                progress.push(RequestProgress {
+                    request_id: req.request_id.clone(),
+                    was_prefill: req.is_prefill(),
+                    num_tokens: tokens,
+                    num_output: 0,
+                });
+                round_commits.push(req.pending_round_commits);
             }
         }
 
@@ -1096,11 +1179,11 @@ impl Engine {
         // how many of the reserved draft tokens are accepted, and advance by
         // `accepted + 1`. The verify pass itself (`1 + draft` tokens) is the
         // cost. Prefill and chunked-prefill continuations (was_prefill) are
-        // never speculated.
+        // never speculated. Not modelled across rank groups.
         let cost_tokens = tokens_per_request.clone(); // verify width per request
         let mut accepted_extra = vec![0u32; batch_size];
         let mut draft_widths: Vec<u32> = Vec::new(); // decode sequences only
-        if self.spec.is_some() {
+        if self.spec.is_some() && !grouped {
             for j in 0..batch_size {
                 if progress[j].was_prefill {
                     continue;
@@ -1112,61 +1195,97 @@ impl Engine {
         }
 
         let (mut iter_time, measured, bandwidth_util, flops_util) = {
-            let running = w.scheduler.running();
-            let batch_refs: Vec<&Request> = batch_indices.iter().map(|&i| &running[i]).collect();
+            let ws = &self.topology.pools[pool].workers;
+            let batch_refs: Vec<&Request> = entries
+                .iter()
+                .map(|&(m, idx, _)| &ws[m].scheduler.running()[idx])
+                .collect();
             let was_prefill: Vec<bool> = progress.iter().map(|p| p.was_prefill).collect();
-            Self::price_step(
+            let ce = &ws[worker].compute_engine;
+            let (mut t, measured, bw_util, fl_util) = Self::price_step(
                 self.spec.as_ref(),
-                &w.compute_engine,
+                ce,
                 &batch_refs,
                 &cost_tokens,
                 &was_prefill,
                 correction,
-            )
+            );
+            if grouped {
+                // Attention skew across the ranks: max own-GPU attention
+                // time minus the mean the union pricing already charged.
+                let mut per_rank = Vec::with_capacity(members.len());
+                for &m in &members {
+                    let refs: Vec<&Request> = entries
+                        .iter()
+                        .filter(|e| e.0 == m)
+                        .map(|&(_, idx, _)| &ws[m].scheduler.running()[idx])
+                        .collect();
+                    let toks: Vec<u32> = entries.iter().filter(|e| e.0 == m).map(|e| e.2).collect();
+                    per_rank.push(ce.attention_seconds_on_one_gpu(&refs, &toks));
+                }
+                let max = per_rank.iter().copied().fold(0.0, f64::max);
+                let mean = per_rank.iter().sum::<f64>() / per_rank.len() as f64;
+                t += (max - mean).max(0.0);
+            }
+            (t, measured, bw_util, fl_util)
         };
         if let Some(spec) = &mut self.spec {
-            // Drafter overhead on roofline-priced speculated steps. Table-priced
-            // steps skip this — the measured wall gap already embodies the full
-            // engine step, drafter included.
-            if !measured && draft_widths.iter().any(|&d| d > 0) {
-                let peak = w.compute_engine.bf16_peak_flops();
-                let bw = w.compute_engine.mem_bandwidth();
-                iter_time += spec.drafter_seconds(&draft_widths, peak, bw, iter_time);
+            if !grouped {
+                let ce = &self.topology.pools[pool].workers[worker].compute_engine;
+                // Drafter overhead on roofline-priced speculated steps.
+                // Table-priced steps skip this — the measured wall gap
+                // already embodies the full engine step, drafter included.
+                if !measured && draft_widths.iter().any(|&d| d > 0) {
+                    let peak = ce.bf16_peak_flops();
+                    let bw = ce.mem_bandwidth();
+                    iter_time += spec.drafter_seconds(&draft_widths, peak, bw, iter_time);
+                }
+                // Constrained-GatedAggregate per-switch stall: a width change
+                // decided at the end of the previous round costs the engine a
+                // rebuild on the first round executed at the new width.
+                iter_time += spec.take_pending_switch_cost((pool, worker));
             }
-            // Constrained-GatedAggregate per-switch stall: a width change
-            // decided at the end of the previous round costs the engine a
-            // rebuild on the first round executed at the new width — this one.
-            iter_time += spec.take_pending_switch_cost((pool, worker));
         }
         let end_time = now + iter_time;
 
-        for (j, &idx) in batch_indices.iter().enumerate() {
+        for (j, &(m, idx, tokens)) in entries.iter().enumerate() {
             // Decode: advance by the verified tokens (bonus + accepted), NOT
             // the verify width (`num_tokens` = 1 + draft, the cost). Prefill
             // (including chunked continuations and recompute after
             // preemption): advance by the scheduled chunk.
             let adv = if progress[j].was_prefill {
-                tokens_per_request[j]
+                tokens
             } else {
                 1 + accepted_extra[j]
             };
-            progress[j].num_output = w.scheduler.record_progress(idx, adv, end_time);
+            progress[j].num_output = self.topology.pools[pool].workers[m]
+                .scheduler
+                .record_progress(idx, adv, end_time);
         }
 
-        let handed_off = if matches!(role, PoolRole::DisaggPrefill) {
-            // Anything whose prefill is now complete leaves this worker via
+        let mut handed_off = Vec::new();
+        if matches!(role, PoolRole::DisaggPrefill) {
+            // Anything whose prefill is now complete leaves its worker via
             // the link; the scheduler frees its KV on the way out.
-            w.scheduler.take_prefill_complete()
-        } else {
-            Vec::new()
-        };
+            for &m in &members {
+                let w = &mut self.topology.pools[pool].workers[m];
+                let gid = w.global_id;
+                handed_off.extend(
+                    w.scheduler
+                        .take_prefill_complete()
+                        .into_iter()
+                        .map(|r| (gid, r)),
+                );
+            }
+        }
 
         // Decide the decode batch's draft depth for its NEXT step. Drafting
         // happens here, at the end of the step -- the one instant when the
         // drafter is about to run AND the carry-over decode set is known.
         // The next scheduler pass reads `pending_draft_len` and reserves
         // `1 + draft` of budget + KV.
-        if let Some(spec) = &mut self.spec {
+        if let (Some(spec), false) = (&mut self.spec, grouped) {
+            let w = &mut self.topology.pools[pool].workers[worker];
             let dec: Vec<&Request> = w
                 .scheduler
                 .running()
@@ -1406,9 +1525,139 @@ pub struct HandoffStats {
 struct RunIterationOutcome {
     iteration: Option<IterationInfo>,
     completed: Vec<Request>,
-    handed_off: Vec<Request>,
+    /// Requests whose prefill finished, with the memory-graph id of the
+    /// worker they leave.
+    handed_off: Vec<(usize, Request)>,
     /// The scheduler preempted at least one request this pass. Relevant when
     /// `iteration` is `None`: state changed even though nothing ran, so the
     /// worker must be re-armed rather than left to wait for a new arrival.
     preempted: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Config, FabricConfig, FabricLink};
+
+    /// One replica of `tp` GPUs with a fabric, DP-attention on or off.
+    fn cluster(tp: u32, dp_attention: bool) -> (ClusterSpec, ModelSpec, SchedulerConfig) {
+        let base = Config::test_default();
+        let mut cluster = base.cluster();
+        cluster.hardware.fabric = Some(FabricConfig {
+            gpus_per_node: 8,
+            scale_up: FabricLink {
+                bandwidth: 1e12,
+                latency: 1e-6,
+                in_network_reduction: false,
+            },
+            scale_out: None,
+        });
+        cluster.parallel.tp = tp;
+        cluster.parallel.dp_attention = dp_attention;
+        cluster.num_workers = 1;
+        (cluster, base.model.clone(), base.scheduler.clone())
+    }
+
+    fn engine(tp: u32, dp_attention: bool) -> Engine {
+        let (c, m, s) = cluster(tp, dp_attention);
+        Engine::new(Topology::aggregated(c, m, s).unwrap())
+    }
+
+    /// Run until idle; return every iteration in order.
+    fn run(engine: &mut Engine) -> Vec<IterationInfo> {
+        let mut iters = Vec::new();
+        while !engine.is_idle() {
+            if let Some(it) = engine.step().unwrap().iteration {
+                iters.push(it);
+            }
+        }
+        iters
+    }
+
+    #[test]
+    fn dp_attention_replica_is_tp_rank_workers_stepped_as_one_group() {
+        let e = engine(2, true);
+        let pool = &e.topology.pools[0];
+        assert_eq!(pool.workers.len(), 2, "one worker per rank");
+        assert_eq!(pool.groups, vec![vec![0, 1]]);
+        assert!(pool.has_rank_groups());
+        assert_eq!(pool.workers[0].global_id, 0);
+        assert_eq!(pool.workers[1].global_id, 1);
+        // Each rank holds half the replica's KV.
+        let (c, m, s) = cluster(2, true);
+        let whole = c.kv_cache_capacity(&s, c.resident_weight_bytes(&m));
+        let per_block = m.kv_storage_bytes(s.block_size);
+        let rank_blocks = pool.workers[0].scheduler.kv_cache_manager().total_blocks() as u64;
+        assert_eq!(rank_blocks, whole / 2 / per_block);
+        // Without DP-attention the same tp is one worker with all of it.
+        let e1 = engine(2, false);
+        assert_eq!(e1.topology.pools[0].workers.len(), 1);
+        assert!(!e1.topology.pools[0].has_rank_groups());
+        assert_eq!(
+            e1.topology.pools[0].workers[0]
+                .scheduler
+                .kv_cache_manager()
+                .total_blocks() as u64,
+            whole / per_block
+        );
+    }
+
+    #[test]
+    fn ranks_route_flat_and_an_iteration_covers_every_rank() {
+        let mut e = engine(2, true);
+        for i in 0..4 {
+            e.submit(Request::new(format!("r{i}"), 0, 0.0, 64, 4));
+        }
+        let iters = run(&mut e);
+        // Round-robin over ranks: 2 each.
+        assert_eq!(e.router_stats().per_worker, vec![2, 2]);
+        // The first iteration is one group step carrying all four prefills,
+        // reported under the leader.
+        let first = &iters[0];
+        assert_eq!(first.worker, 0);
+        assert_eq!(first.batch_size, 4);
+        assert!(
+            iters.iter().all(|i| i.worker == 0),
+            "events ride the leader"
+        );
+    }
+
+    #[test]
+    fn a_lopsided_rank_pays_the_attention_skew() {
+        // One long prefill on a 2-rank replica lands on one rank: the step
+        // costs the union price plus (max − mean) of the ranks' own-GPU
+        // attention time = a/2 for one loaded rank and one idle one.
+        let mut e = engine(2, true);
+        e.submit(Request::new("long".into(), 0, 0.0, 4096, 1));
+        let iters = run(&mut e);
+        let step = &iters[0];
+        assert_eq!(step.batch_size, 1);
+        // The first step is the first prefill chunk (chunked prefill).
+        let chunk = step.progress[0].num_tokens;
+        let (c, m, _) = cluster(2, true);
+        let ce = c.compute_engine(m);
+        let req = Request::new("probe".into(), 0, 0.0, 4096, 1);
+        let union = ce.calculate_iteration_time(&[&req], &[chunk]);
+        let a = ce.attention_seconds_on_one_gpu(&[&req], &[chunk]);
+        assert!(a > 0.0);
+        assert!(
+            (step.iteration_time - (union + a / 2.0)).abs() < 1e-12,
+            "{} vs {} + {}",
+            step.iteration_time,
+            union,
+            a
+        );
+        // Two equal prefills, one per rank: no skew — the union price alone.
+        let mut e = engine(2, true);
+        e.submit(Request::new("a".into(), 0, 0.0, 4096, 1));
+        e.submit(Request::new("b".into(), 0, 0.0, 4096, 1));
+        let iters = run(&mut e);
+        let step = &iters[0];
+        assert_eq!(step.batch_size, 2);
+        let (ca, cb) = (step.progress[0].num_tokens, step.progress[1].num_tokens);
+        assert_eq!(ca, cb);
+        let r2 = Request::new("p".into(), 0, 0.0, 4096, 1);
+        let union2 = ce.calculate_iteration_time(&[&r2, &r2], &[ca, cb]);
+        assert!((step.iteration_time - union2).abs() < 1e-12);
+    }
 }

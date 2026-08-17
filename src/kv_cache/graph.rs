@@ -491,8 +491,9 @@ impl MemoryGraph {
             let policies = selection.policies();
             let template = cluster.hardware.memory.as_ref();
             selection.validate(template)?;
-            let num_workers = cluster.num_workers.max(1) as usize;
-            let tp = cluster.parallel.tp.max(1);
+            // Under DP-attention every rank of a replica is its own worker
+            // in the graph: one GPU, its own port into the node's stores.
+            let (num_workers, tp) = cluster.graph_workers();
             let gpus_per_node = cluster.hardware.gpus_per_node();
             // Workers packed node by node. A worker wider than a node spans
             // `nodes_per_worker` nodes and pools their node-scoped stores.

@@ -24,7 +24,8 @@ performance modeling.
   re-entry buys); transfers at max-min fair share over every edge of their
   path
 - **Replicas and routing**: N identical workers behind a pluggable router —
-  round-robin, least-loaded, prefix-affinity, KV-aware
+  round-robin, least-loaded, prefix-affinity, KV-aware; DP-attention ranks
+  are workers too (own KV, flat routing, lockstep steps with attention skew)
 - **Disaggregated serving**: prefill and decode pools; hand-offs ride the
   memory graph's NICs and network core
 - **Speculative decoding**: analytic or trace-replayed acceptance, fixed and
