@@ -174,8 +174,6 @@ impl Scheduler {
             );
             let promoted: u32 = lookup.promote_tokens_per_tier.iter().sum();
             self.kv_cache_manager.record_prefetch(promoted);
-            let remaining = self.kv_cache_manager.estimate_remaining_time(&plan.id);
-            probe.ready_at = Some(now + remaining);
             self.prefetches.push(probe);
         }
     }
@@ -491,18 +489,10 @@ impl Scheduler {
                         self.kv_cache_manager
                             .join_transfer(request.request_id.clone(), &lookup);
                     }
-                    let own_remaining = if lookup.needs_promotion() {
-                        self.kv_cache_manager
-                            .estimate_remaining_time(&request.request_id)
-                    } else {
-                        0.0
-                    };
-                    let join_remaining = lookup
-                        .join_leader
-                        .as_deref()
-                        .map(|leader| self.kv_cache_manager.estimate_remaining_time(leader))
-                        .unwrap_or(0.0);
-                    request.ready_at = Some(current_time + own_remaining.max(join_remaining));
+                    // Its ready time is projected on demand (see
+                    // `earliest_pending_ready`): the memory graph's drain
+                    // event wakes the worker when the transfer completes.
+                    request.ready_at = None;
                     self.pending_transfers.push(request);
                     continue;
                 }
@@ -1122,7 +1112,7 @@ mod tests {
         s.kv_cache_manager.plant_in_tier_path(0, &[a, b]);
         // A lands: req is re-admitted, sees B in the tier, and parks again
         // — reserving one block for B (free: 3 − hold − A = 1).
-        let ready = s.pending_transfers[0].ready_at.unwrap();
+        let ready = s.earliest_pending_ready(0.0).unwrap();
         apply(&mut s, &d, ready / 2.0);
         let d = s.schedule(ready + 1e-9);
         assert_eq!(s.pending_transfers.len(), 1);
@@ -1165,7 +1155,7 @@ mod tests {
         let ready = s
             .pending_transfers
             .iter()
-            .filter_map(|r| r.ready_at)
+            .map(|r| s.kv_cache_manager.estimate_remaining_time(&r.request_id))
             .fold(0.0, f64::max);
         let d = s.schedule(ready + 1e-9);
         // Both landed and re-entered at the front; one runs, the other's
@@ -1287,9 +1277,8 @@ mod tests {
         assert!(decision.batch.is_empty());
         assert_eq!(scheduler.num_waiting(), 1); // parked requests count as waiting
         assert_eq!(scheduler.pending_transfers.len(), 1);
-        let ready_at = scheduler.pending_transfers[0].ready_at.unwrap();
+        let ready_at = scheduler.earliest_pending_ready(0.0).unwrap();
         assert!(ready_at > 0.0);
-        assert!((scheduler.earliest_pending_ready(0.0).unwrap() - ready_at).abs() < 1e-9);
 
         // Before the transfer completes: still pending.
         let decision = scheduler.schedule(ready_at / 2.0);
