@@ -1,6 +1,16 @@
 use super::session::{Outlook, SessionStep};
+use crate::kv_cache::radix::Path;
 
 pub type BlockId = u32;
+
+/// Stable hint for finding a request's hashed KV without resolving its hashes
+/// from the radix root. The radix validates the node and cumulative hash before
+/// use because splits, compaction, and pruning can move or recycle node ids.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct KvLeaf {
+    pub(crate) node: u32,
+    pub(crate) blocks: u32,
+}
 
 /// One inference request as the scheduler and engine see it.
 ///
@@ -65,6 +75,12 @@ pub struct Request {
     /// Auxiliary KV blocks: fixed per-sequence state and sliding windows.
     /// Unshared; released with the request. A count.
     pub aux_blocks: KvHold,
+
+    /// Last radix node and block offset reached by this request's hashed KV.
+    /// `kv_path` is scratch storage reused when materialising the full path;
+    /// its segments may be stale whenever another request mutates the tree.
+    pub(crate) kv_leaf: Option<KvLeaf>,
+    pub(crate) kv_path: Path,
 
     /// Number of times this request has been preempted.
     pub num_preemptions: u32,
@@ -165,6 +181,8 @@ impl Request {
             session: None,
             kv_blocks: KvHold::default(),
             aux_blocks: KvHold::default(),
+            kv_leaf: None,
+            kv_path: Path::default(),
             num_preemptions: 0,
             rejected: false,
             first_token_time: None,

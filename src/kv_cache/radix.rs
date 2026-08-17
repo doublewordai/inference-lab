@@ -484,6 +484,29 @@ impl Radix {
     // ------------------------------------------------------------------
     // Paths
 
+    /// Length of the common prefix of two cumulative-hash slices. Once a
+    /// cumulative hash differs, later positions cannot match the same chain,
+    /// so one last-position check and a binary search are sufficient.
+    fn matching_hashes(a: &[u64], b: &[u64]) -> usize {
+        let cmp = a.len().min(b.len());
+        if cmp == 0 || a[0] != b[0] {
+            return 0;
+        }
+        if a[cmp - 1] == b[cmp - 1] {
+            return cmp;
+        }
+        let (mut lo, mut hi) = (0usize, cmp - 1);
+        while hi - lo > 1 {
+            let mid = (lo + hi) / 2;
+            if a[mid] == b[mid] {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        hi
+    }
+
     /// Longest matching prefix of `hashes` in the tree, without inserting.
     /// Node segments are compared at their last covered hash (hashes are
     /// cumulative), so a mismatch inside a node is located by binary search.
@@ -556,6 +579,185 @@ impl Radix {
         });
         path.blocks += rest.len() as u32;
         path
+    }
+
+    /// Rebuild `[0, upto)` through parent pointers from a cached request leaf.
+    ///
+    /// The leaf hint is valid only while its node is alive and the cumulative
+    /// hash at `cached_blocks` still identifies the request. A split that moves
+    /// that position or a merge that removes the child therefore fails this
+    /// O(1) validation; splits above the leaf remain valid and the new parent
+    /// chain is picked up here. `out` is cleared in place so live requests
+    /// reuse their path allocation.
+    pub(crate) fn rebuild_cached_path(
+        &self,
+        leaf: NodeId,
+        cached_blocks: u32,
+        cached_hash: u64,
+        upto: u32,
+        out: &mut Path,
+    ) -> bool {
+        let Some(node) = self.nodes.get(leaf as usize) else {
+            return false;
+        };
+        let local_end = cached_blocks.saturating_sub(node.depth);
+        if !node.alive
+            || cached_blocks <= node.depth
+            || local_end > node.len()
+            || node.hashes[local_end as usize - 1] != cached_hash
+            || upto > cached_blocks
+        {
+            return false;
+        }
+
+        out.segs.clear();
+        out.blocks = upto;
+        if upto == 0 {
+            return true;
+        }
+
+        let mut cur = leaf;
+        while cur != self.root && self.nodes[cur as usize].depth >= upto {
+            cur = self.nodes[cur as usize]
+                .parent
+                .expect("non-root radix node has a parent");
+        }
+        while cur != self.root {
+            let node = &self.nodes[cur as usize];
+            debug_assert!(node.alive, "live leaf has a live parent chain");
+            debug_assert!(node.depth < upto);
+            out.segs.push(Seg {
+                node: cur,
+                len: (upto - node.depth).min(node.len()),
+            });
+            cur = node.parent.expect("non-root radix node has a parent");
+        }
+        out.segs.reverse();
+        true
+    }
+
+    /// Insert `hashes` by continuing from a validated request leaf instead of
+    /// resolving its full prefix from the root. The common decode-growth case
+    /// extends a childless leaf in place; branches are followed or split from
+    /// the cached position exactly as [`Self::insert`] would do.
+    ///
+    /// Returns `false` without changing the tree when the hint is stale, so the
+    /// caller can fall back to a root-based insert.
+    pub(crate) fn insert_from_cached(
+        &mut self,
+        leaf: NodeId,
+        cached_blocks: u32,
+        cached_hash: u64,
+        hashes: &[u64],
+        out: &mut Path,
+    ) -> bool {
+        if cached_blocks as usize > hashes.len()
+            || !self.rebuild_cached_path(leaf, cached_blocks, cached_hash, cached_blocks, out)
+        {
+            return false;
+        }
+        if cached_blocks as usize == hashes.len() {
+            return true;
+        }
+
+        let mut cur = leaf;
+        let mut pos = cached_blocks as usize;
+        loop {
+            let local = pos as u32 - self.nodes[cur as usize].depth;
+            let node_len = self.nodes[cur as usize].len();
+
+            // A request may have ended part-way through a node which another
+            // request already extended. Match that suffix before branching.
+            if local < node_len {
+                let available = (node_len - local) as usize;
+                let wanted = hashes.len() - pos;
+                let cmp = available.min(wanted);
+                let node = &self.nodes[cur as usize];
+                let node_hashes = &node.hashes[local as usize..local as usize + cmp];
+                let request_hashes = &hashes[pos..pos + cmp];
+                let matched = Self::matching_hashes(node_hashes, request_hashes);
+                out.segs.last_mut().expect("cached path has a leaf").len += matched as u32;
+                out.blocks += matched as u32;
+                pos += matched;
+                if pos == hashes.len() {
+                    return true;
+                }
+                if local + (matched as u32) < node_len {
+                    self.split(cur, local + matched as u32);
+                    let rest = &hashes[pos..];
+                    let new_leaf = self.new_node(Some(cur), rest.to_vec());
+                    self.nodes[cur as usize].children.push((rest[0], new_leaf));
+                    out.segs.push(Seg {
+                        node: new_leaf,
+                        len: rest.len() as u32,
+                    });
+                    out.blocks += rest.len() as u32;
+                    return true;
+                }
+            }
+
+            debug_assert_eq!(pos as u32, self.nodes[cur as usize].depth + node_len);
+            let next = hashes[pos];
+            let Some(child) = self.nodes[cur as usize].child(next) else {
+                // Backed-first HBM recycling deliberately looks ahead by node
+                // tail-runs. Keep its node boundaries stable; otherwise a
+                // compacted run changes which backed block is selected. With
+                // no such state, extending a childless leaf is range-equivalent.
+                let append_in_place = {
+                    let node = &self.nodes[cur as usize];
+                    node.children.is_empty()
+                        && node.tiers.is_empty()
+                        && node.hbm.keys().all(|&w| !self.w(w).backed_first)
+                };
+                if append_in_place {
+                    let rest = &hashes[pos..];
+                    self.nodes[cur as usize].hashes.extend_from_slice(rest);
+                    out.segs.last_mut().expect("cached path has a leaf").len += rest.len() as u32;
+                    out.blocks += rest.len() as u32;
+                    return true;
+                }
+                let rest = &hashes[pos..];
+                let new_leaf = self.new_node(Some(cur), rest.to_vec());
+                self.nodes[cur as usize].children.push((rest[0], new_leaf));
+                out.segs.push(Seg {
+                    node: new_leaf,
+                    len: rest.len() as u32,
+                });
+                out.blocks += rest.len() as u32;
+                return true;
+            };
+
+            let child_len = self.nodes[child as usize].len() as usize;
+            let cmp = child_len.min(hashes.len() - pos);
+            let node_hashes = &self.nodes[child as usize].hashes[..cmp];
+            let request_hashes = &hashes[pos..pos + cmp];
+            let matched = Self::matching_hashes(node_hashes, request_hashes);
+            debug_assert!(matched > 0, "child key matched the next hash");
+            out.segs.push(Seg {
+                node: child,
+                len: matched as u32,
+            });
+            out.blocks += matched as u32;
+            pos += matched;
+            cur = child;
+            if pos == hashes.len() {
+                return true;
+            }
+            if matched < child_len {
+                self.split(child, matched as u32);
+                let rest = &hashes[pos..];
+                let new_leaf = self.new_node(Some(child), rest.to_vec());
+                self.nodes[child as usize]
+                    .children
+                    .push((rest[0], new_leaf));
+                out.segs.push(Seg {
+                    node: new_leaf,
+                    len: rest.len() as u32,
+                });
+                out.blocks += rest.len() as u32;
+                return true;
+            }
+        }
     }
 
     fn new_node(&mut self, parent: Option<NodeId>, hashes: Vec<u64>) -> NodeId {
@@ -2405,6 +2607,66 @@ mod tests {
         // Unknown: nothing.
         assert_eq!(r.resolve(&[7]).blocks, 0);
         assert_eq!(r.resolve(&[1, 2, 3, 4, 5, 6, 7]).blocks, 6);
+    }
+
+    #[test]
+    fn cached_leaf_validation_tracks_splits_and_merges() {
+        let mut r = radix();
+        let base = r.insert(&[1, 2, 3, 4]);
+        let base_leaf = base.segs.last().unwrap().node;
+        let descendant = r.insert(&[1, 2, 3, 4, 5, 6]);
+        let descendant_leaf = descendant.segs.last().unwrap().node;
+
+        // Splitting above a descendant keeps that leaf valid: rebuilding via
+        // current parents discovers the newly inserted intermediate node.
+        let branch = r.insert(&[1, 2, 9]);
+        let mut rebuilt = Path::default();
+        assert!(r.rebuild_cached_path(descendant_leaf, 6, 6, 6, &mut rebuilt));
+        assert_eq!(rebuilt, r.resolve(&[1, 2, 3, 4, 5, 6]));
+
+        // The split moved base's old end out of its cached node.
+        assert!(!r.rebuild_cached_path(base_leaf, 4, 4, 4, &mut rebuilt));
+        let split_tail = r.resolve(&[1, 2, 3, 4]).segs.last().unwrap().node;
+
+        // Removing the side branch merges that tail away. Its dead id is
+        // rejected, while the descendant leaf follows the compacted parent.
+        r.prune_if_empty(branch.segs.last().unwrap().node);
+        assert!(!r.rebuild_cached_path(split_tail, 4, 4, 4, &mut rebuilt));
+        assert!(r.rebuild_cached_path(descendant_leaf, 6, 6, 6, &mut rebuilt));
+        assert_eq!(rebuilt, r.resolve(&[1, 2, 3, 4, 5, 6]));
+    }
+
+    #[test]
+    fn cached_insert_extends_a_leaf_and_branches_from_a_partial_node() {
+        let mut r = radix();
+        let mut path = r.insert(&[1, 2]);
+        let leaf = path.segs.last().unwrap().node;
+        assert!(r.insert_from_cached(leaf, 2, 2, &[1, 2, 3, 4], &mut path));
+        assert_eq!(path.segs.len(), 1);
+        assert_eq!(path.segs[0].node, leaf);
+        assert_eq!(path, r.resolve(&[1, 2, 3, 4]));
+
+        // A request cached at the middle of that node can diverge there
+        // without walking from the root; the existing suffix becomes a peer.
+        let mut partial = Path::default();
+        assert!(r.rebuild_cached_path(leaf, 2, 2, 2, &mut partial));
+        assert!(r.insert_from_cached(leaf, 2, 2, &[1, 2, 9], &mut partial));
+        assert_eq!(partial, r.resolve(&[1, 2, 9]));
+        assert_eq!(r.resolve(&[1, 2, 3, 4]).blocks, 4);
+    }
+
+    #[test]
+    fn cached_insert_preserves_backed_first_node_boundaries() {
+        let mut r = radix();
+        r.register_worker(0, 8, HbmEviction::Lru {}, true);
+        let mut path = r.insert(&[1]);
+        r.acquire(0, &path, 0, 1, 0, true, None, false).unwrap();
+        let leaf = path.segs[0].node;
+
+        assert!(r.insert_from_cached(leaf, 1, 1, &[1, 2], &mut path));
+        assert_eq!(path.segs.len(), 2);
+        assert_eq!(path.blocks, 2);
+        assert_eq!(r.resolve(&[1, 2]), path);
     }
 
     #[test]
