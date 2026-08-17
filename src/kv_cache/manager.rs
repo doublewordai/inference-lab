@@ -415,31 +415,6 @@ impl KVCacheManager {
             .saturating_sub(request.kv_blocks.len())
     }
 
-    /// The block holding `hash` was recycled: under `write_back` its KV is
-    /// written to the first tier now (see `MemoryGraph::demote`).
-    fn on_evicted(&mut self, hash: u64, bytes: u64) {
-        let outlook = self.outlook.remove(&hash).map(|m| m.0);
-        if let Some((g, w)) = &self.memory {
-            g.lock().unwrap().demote(*w, hash, bytes, outlook);
-        }
-    }
-
-    /// A fresh block for `hash` was written into HBM: under
-    /// `write_through` it starts its way to the first tier now.
-    fn on_produced(&mut self, hash: u64, bytes: u64) {
-        if let Some((g, w)) = &self.memory {
-            g.lock().unwrap().produced(*w, hash, bytes);
-        }
-    }
-
-    /// `hash` took its `n`-th hit in HBM: under `selective` the
-    /// `min_hits`-th hit starts its write.
-    fn on_hit(&mut self, hash: u64, bytes: u64, n: u32) {
-        if let Some((g, w)) = &self.memory {
-            g.lock().unwrap().hit(*w, hash, bytes, n);
-        }
-    }
-
     /// `hash` was promoted from a tier into HBM: the tier keeps its copy.
     fn on_promoted(&mut self, hash: u64) {
         if let Some((g, w)) = &self.memory {
@@ -624,21 +599,32 @@ impl KVCacheManager {
         let allocated: Vec<BlockId> = allocated.into_iter().map(|b| b.unwrap()).collect();
 
         if self.enable_prefix_caching {
+            let mut demoted = Vec::with_capacity(evicted.len());
             for (hash, bytes) in evicted {
                 self.prefix_cache.remove(&hash);
                 self.hit_counts.remove(&hash);
-                self.on_evicted(hash, bytes);
+                let outlook = self.outlook.remove(&hash).map(|m| m.0);
+                demoted.push((hash, bytes, outlook));
             }
+            let mut hit_items = Vec::with_capacity(hits.len());
             for (hash, bytes) in hits {
                 let n = self.hit_counts.entry(hash).or_insert(0);
                 *n += 1;
-                let n = *n;
-                self.on_hit(hash, bytes, n);
+                hit_items.push((hash, bytes, *n));
+            }
+            if let Some((g, w)) = &self.memory {
+                let mut g = g.lock().unwrap();
+                g.demote_batch(*w, &demoted);
+                g.hit_batch(*w, &hit_items);
             }
             if publish_to_hbm {
+                let mut produced = Vec::with_capacity(newly_allocated.len());
                 for &(hash, block_id, bytes) in &newly_allocated {
                     self.prefix_cache.insert(hash, block_id);
-                    self.on_produced(hash, bytes);
+                    produced.push((hash, bytes));
+                }
+                if let Some((g, w)) = &self.memory {
+                    g.lock().unwrap().produced_batch(*w, &produced);
                 }
             } else {
                 // Reservation for an in-flight transfer: register the

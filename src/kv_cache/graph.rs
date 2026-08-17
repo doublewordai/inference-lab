@@ -250,9 +250,9 @@ impl Store {
         Some(e)
     }
 
-    /// Drop entries untouched for longer than the TTL. Returns their write
-    /// ids if still arriving.
-    fn expire(&mut self, now: f64) -> Vec<String> {
+    /// Drop entries untouched for longer than the TTL. Returns `(hash,
+    /// write id)` for those still arriving.
+    fn expire(&mut self, now: f64) -> Vec<(u64, String)> {
         let EvictionPolicy::Ttl { seconds } = self.eviction else {
             return Vec::new();
         };
@@ -269,7 +269,7 @@ impl Store {
                 self.dead_bytes += e.bytes;
             }
             if let Some(id) = e.write_id {
-                cancelled.push(id);
+                cancelled.push((hash, id));
             }
         }
         cancelled
@@ -332,8 +332,11 @@ pub struct MemoryGraph {
     /// whether HBM prefers recycling blocks a tier already holds.
     write_of: Vec<WritePolicy>,
     evict_backed_first: Vec<bool>,
-    /// In-flight writes: transfer id → (destination store, hash).
-    pending_writes: HashMap<String, (StoreId, u64)>,
+    /// In-flight writes: transfer id → the (destination store, hash)
+    /// entries it carries that have not landed or been dropped. A batch of
+    /// blocks written together moves as one transfer.
+    pending_writes: HashMap<String, Vec<(StoreId, u64)>>,
+    next_write_seq: u64,
     /// Promotions that had to wait for a write still arriving.
     pub write_race_waits: u64,
 }
@@ -368,6 +371,7 @@ impl MemoryGraph {
             write_of: Vec::new(),
             evict_backed_first: Vec::new(),
             pending_writes: HashMap::new(),
+            next_write_seq: 0,
             write_race_waits: 0,
         }
     }
@@ -768,18 +772,37 @@ impl MemoryGraph {
     /// `worker`'s HBM. Under `write_through` it starts its way to the
     /// first tier now.
     pub fn produced(&mut self, worker: WorkerId, hash: u64, bytes: u64) {
+        self.produced_batch(worker, &[(hash, bytes)]);
+    }
+
+    /// Fresh blocks written into `worker`'s HBM in one allocation: under
+    /// `write_through` they go to the first tier as one transfer.
+    pub fn produced_batch(&mut self, worker: WorkerId, items: &[(u64, u64)]) {
         if matches!(self.write_policy(worker), WritePolicy::WriteThrough {}) {
-            self.write(worker, hash, bytes, None);
+            let batch: Vec<(u64, u64, Option<f64>)> =
+                items.iter().map(|&(h, b)| (h, b, None)).collect();
+            self.write_batch(worker, &batch);
         }
     }
 
     /// `hash` took its `hits`-th hit in `worker`'s HBM. Under `selective`
     /// the `min_hits`-th hit starts its write.
     pub fn hit(&mut self, worker: WorkerId, hash: u64, bytes: u64, hits: u32) {
+        self.hit_batch(worker, &[(hash, bytes, hits)]);
+    }
+
+    /// HBM hits of one allocation (`(hash, bytes, hits so far)`): under
+    /// `selective` those on their `min_hits`-th hit go to the first tier
+    /// as one transfer.
+    pub fn hit_batch(&mut self, worker: WorkerId, items: &[(u64, u64, u32)]) {
         if let WritePolicy::Selective { min_hits } = self.write_policy(worker) {
-            if hits == min_hits.max(1) {
-                self.write(worker, hash, bytes, None);
-            }
+            let n = min_hits.max(1);
+            let batch: Vec<(u64, u64, Option<f64>)> = items
+                .iter()
+                .filter(|&&(_, _, hits)| hits == n)
+                .map(|&(h, b, _)| (h, b, None))
+                .collect();
+            self.write_batch(worker, &batch);
         }
     }
 
@@ -789,14 +812,19 @@ impl MemoryGraph {
     /// re-entry is announced; under the other policies an unbacked block
     /// is dropped.
     pub fn demote(&mut self, worker: WorkerId, hash: u64, bytes: u64, outlook: Option<f64>) {
-        let write = match self.write_policy(worker) {
-            WritePolicy::WriteBack {} => true,
-            WritePolicy::Live {} => outlook.is_some(),
-            _ => false,
+        self.demote_batch(worker, &[(hash, bytes, outlook)]);
+    }
+
+    /// Blocks recycled from `worker`'s HBM in one allocation (`(hash,
+    /// bytes, outlook)`); the ones the write policy keeps go to the first
+    /// tier as one transfer.
+    pub fn demote_batch(&mut self, worker: WorkerId, items: &[(u64, u64, Option<f64>)]) {
+        let batch: Vec<(u64, u64, Option<f64>)> = match self.write_policy(worker) {
+            WritePolicy::WriteBack {} => items.to_vec(),
+            WritePolicy::Live {} => items.iter().filter(|i| i.2.is_some()).copied().collect(),
+            _ => Vec::new(),
         };
-        if write {
-            self.write(worker, hash, bytes, outlook);
-        }
+        self.write_batch(worker, &batch);
     }
 
     /// `hash`'s announced re-entry changed (or ended): whichever of
@@ -812,25 +840,68 @@ impl MemoryGraph {
     /// tier, unless a tier already holds it. The entry is `Arriving` until
     /// the transfer lands; `outlook` is its announced re-entry, if known.
     pub fn write(&mut self, worker: WorkerId, hash: u64, bytes: u64, outlook: Option<f64>) {
-        if self.tiers[worker].is_empty() || self.holds(worker, hash) {
+        self.write_batch(worker, &[(hash, bytes, outlook)]);
+    }
+
+    /// Write a batch of blocks (`(hash, bytes, outlook)`) from `worker`'s
+    /// GPU into its first tier as one transfer, skipping any a tier
+    /// already holds. Every entry is `Arriving` until the transfer lands.
+    pub fn write_batch(&mut self, worker: WorkerId, items: &[(u64, u64, Option<f64>)]) {
+        if self.tiers[worker].is_empty() {
+            return;
+        }
+        let items: Vec<&(u64, u64, Option<f64>)> = items
+            .iter()
+            .filter(|(h, _, _)| !self.holds(worker, *h))
+            .collect();
+        if items.is_empty() {
             return;
         }
         let now = self.flows.now();
         let tier = &self.tiers[worker][0];
         let (store, path) = (tier.store, tier.write_path.clone());
-        let id = format!("w:{worker}:{store}:{hash}");
-        let evicted = self.stores[store].insert(
-            hash,
-            bytes,
-            EntryState::Arriving,
-            Some(id.clone()),
-            outlook,
-            now,
-        );
-        self.pending_writes.insert(id.clone(), (store, hash));
+        let id = format!("w:{worker}:{store}:{}", self.next_write_seq);
+        self.next_write_seq += 1;
+        let mut total = 0u64;
+        let mut entries = Vec::with_capacity(items.len());
+        let mut evicted = Vec::new();
+        for &&(hash, bytes, outlook) in &items {
+            if let Some(e) = self.stores[store].insert(
+                hash,
+                bytes,
+                EntryState::Arriving,
+                Some(id.clone()),
+                outlook,
+                now,
+            ) {
+                evicted.push(e);
+            }
+            // The store may have evicted an earlier entry of this same
+            // batch; only entries still present ride the transfer.
+            total += bytes;
+            entries.push((store, hash));
+        }
+        self.pending_writes.insert(id.clone(), entries);
         self.flows
-            .submit(id, Owner::Write, path.edges, bytes, path.latency, now);
-        self.cascade(store, evicted);
+            .submit(id, Owner::Write, path.edges, total, path.latency, now);
+        self.cascade_batch(store, evicted);
+    }
+
+    /// An arriving entry of write `id` was dropped (evicted, expired or
+    /// removed) before landing: the transfer keeps moving for the rest of
+    /// its batch and is cancelled once none remain.
+    fn drop_pending(&mut self, id: &str, store: StoreId, hash: u64) {
+        let empty = match self.pending_writes.get_mut(id) {
+            Some(v) => {
+                v.retain(|&(s, h)| !(s == store && h == hash));
+                v.is_empty()
+            }
+            None => false,
+        };
+        if empty {
+            self.pending_writes.remove(id);
+            self.flows.cancel(id);
+        }
     }
 
     /// Put `hash` straight into `worker`'s tier `tier` as resident
@@ -849,29 +920,34 @@ impl MemoryGraph {
         1
     }
 
-    /// An entry `store` evicted on insert: cancel its write if it was still
+    /// An entry `store` evicted on insert: drop its write if it was still
     /// arriving, then move it to `store`'s next tier as a store → store
     /// transfer, or let it go.
     fn cascade(&mut self, store: StoreId, evicted: Option<Evicted>) {
-        let Some(Evicted {
-            hash,
-            bytes,
-            write_id,
-            outlook,
-        }) = evicted
-        else {
-            return;
-        };
-        if let Some(id) = write_id {
-            self.pending_writes.remove(&id);
-            self.flows.cancel(&id);
+        if let Some(e) = evicted {
+            self.cascade_batch(store, vec![e]);
         }
-        let Some(next) = self.stores[store].next else {
-            return;
-        };
-        if self.stores[next].contains(hash) {
+    }
+
+    /// Entries `store` evicted while inserting a batch: those going to the
+    /// next tier move as one store → store transfer.
+    fn cascade_batch(&mut self, store: StoreId, evicted: Vec<Evicted>) {
+        if evicted.is_empty() {
             return;
         }
+        let next = self.stores[store].next;
+        let mut moving: Vec<Evicted> = Vec::new();
+        for e in evicted {
+            if let Some(id) = &e.write_id {
+                self.drop_pending(&id.clone(), store, e.hash);
+            }
+            if next.is_some_and(|n| !self.stores[n].contains(e.hash)) {
+                moving.push(e);
+            }
+        }
+        let (Some(next), false) = (next, moving.is_empty()) else {
+            return;
+        };
         let now = self.flows.now();
         let mut path = match self.shortest_path(self.stores[store].vertex, self.stores[next].vertex)
         {
@@ -884,19 +960,29 @@ impl MemoryGraph {
         if let Some(e) = self.stores[next].throughput_edge {
             path.edges.push(e);
         }
-        let id = format!("c:{store}:{next}:{hash}");
-        let evicted = self.stores[next].insert(
-            hash,
-            bytes,
-            EntryState::Arriving,
-            Some(id.clone()),
-            outlook,
-            now,
-        );
-        self.pending_writes.insert(id.clone(), (next, hash));
+        let id = format!("c:{store}:{next}:{}", self.next_write_seq);
+        self.next_write_seq += 1;
+        let mut total = 0u64;
+        let mut entries = Vec::with_capacity(moving.len());
+        let mut evicted = Vec::new();
+        for e in moving {
+            if let Some(ev) = self.stores[next].insert(
+                e.hash,
+                e.bytes,
+                EntryState::Arriving,
+                Some(id.clone()),
+                e.outlook,
+                now,
+            ) {
+                evicted.push(ev);
+            }
+            total += e.bytes;
+            entries.push((next, e.hash));
+        }
+        self.pending_writes.insert(id.clone(), entries);
         self.flows
-            .submit(id, Owner::Write, path.edges, bytes, path.latency, now);
-        self.cascade(next, evicted);
+            .submit(id, Owner::Write, path.edges, total, path.latency, now);
+        self.cascade_batch(next, evicted);
     }
 
     /// `hash` was promoted from `worker`'s tiers back into its HBM: the
@@ -916,8 +1002,7 @@ impl MemoryGraph {
             let store = self.tiers[worker][i].store;
             if let Some(e) = self.stores[store].remove(hash) {
                 if let Some(id) = e.write_id {
-                    self.pending_writes.remove(&id);
-                    self.flows.cancel(&id);
+                    self.drop_pending(&id, store, hash);
                 }
                 return;
             }
@@ -927,14 +1012,15 @@ impl MemoryGraph {
     /// Land finished writes and drop TTL-expired entries.
     fn settle_writes(&mut self, now: f64) {
         for id in self.flows.take_completed(Owner::Write) {
-            if let Some((store, hash)) = self.pending_writes.remove(&id) {
-                self.stores[store].landed(hash);
+            if let Some(entries) = self.pending_writes.remove(&id) {
+                for (store, hash) in entries {
+                    self.stores[store].landed(hash);
+                }
             }
         }
         for s in 0..self.stores.len() {
-            for id in self.stores[s].expire(now) {
-                self.pending_writes.remove(&id);
-                self.flows.cancel(&id);
+            for (hash, id) in self.stores[s].expire(now) {
+                self.drop_pending(&id, s, hash);
             }
         }
     }
