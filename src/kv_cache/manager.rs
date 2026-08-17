@@ -64,6 +64,13 @@ impl PrefixCacheLookup {
 /// DeepSeek-V4's window + compressed history) it charges the model's actual
 /// bytes. Sequences additionally hold `state_blocks` fixed blocks for
 /// length-independent per-sequence state (Mamba / GatedDeltaNet).
+/// How one block of an allocation is satisfied.
+#[derive(Clone, Copy)]
+enum Decision {
+    Fresh,
+    RefExisting(BlockId),
+}
+
 pub struct KVCacheManager {
     /// Block size in tokens.
     block_size: u32,
@@ -395,6 +402,66 @@ impl KVCacheManager {
         }
     }
 
+    /// Pass 1 of an allocation: for each of the `blocks_needed` blocks that
+    /// would continue `request`'s allocation, whether it references an
+    /// existing block (HBM-resident or in flight for someone else) or needs
+    /// a fresh one, plus how many free-queue blocks the call consumes:
+    /// the fresh blocks and the hits on free-but-cached blocks (those leave
+    /// the queue when referenced). Hits on blocks other requests hold cost
+    /// nothing — vLLM's `allocate_slots` rule.
+    fn plan_allocation(&self, request: &Request, blocks_needed: usize) -> (Vec<Decision>, usize) {
+        let hashes = request.prompt_block_hashes.as_slice();
+        // The i-th block continues the request's existing allocation. Its
+        // index into the prompt hashes must skip the per-sequence state
+        // blocks and the content blocks already held — otherwise an
+        // incremental (decode-step) allocation looks up hash 0 and aliases
+        // the request's own first prompt block.
+        let state_blocks = self.state_blocks;
+        let already_allocated = request.kv_blocks.len();
+        let hash_at = |i: usize| {
+            (already_allocated + i)
+                .checked_sub(state_blocks)
+                .and_then(|idx| hashes.get(idx))
+                .copied()
+        };
+        let mut decisions: Vec<Decision> = Vec::with_capacity(blocks_needed);
+        let mut from_free_queue = 0usize;
+        for i in 0..blocks_needed {
+            let dec = match hash_at(i) {
+                Some(h) if self.enable_prefix_caching => {
+                    if let Some(&block_id) = self.prefix_cache.get(&h) {
+                        Decision::RefExisting(block_id)
+                    } else if let Some(entry) = self.in_flight_cache.get(&h) {
+                        Decision::RefExisting(entry.block_id)
+                    } else {
+                        Decision::Fresh
+                    }
+                }
+                _ => Decision::Fresh,
+            };
+            match dec {
+                Decision::Fresh => from_free_queue += 1,
+                Decision::RefExisting(id) if self.free_blocks.contains(id) => from_free_queue += 1,
+                Decision::RefExisting(_) => {}
+            }
+            decisions.push(dec);
+        }
+        (decisions, from_free_queue)
+    }
+
+    /// Whether `request` can grow to `total_tokens` of context right now:
+    /// the free queue covers the blocks it lacks that are misses or hits on
+    /// free-but-cached blocks (hits held by other requests are shared).
+    /// This is the check `allocate_blocks` applies; the scheduler uses it
+    /// before admitting a request without mutating anything.
+    pub fn can_grow_to(&self, request: &Request, total_tokens: u32) -> bool {
+        let blocks_needed = self
+            .blocks_for_context(total_tokens)
+            .saturating_sub(request.kv_blocks.len());
+        let (_, from_free_queue) = self.plan_allocation(request, blocks_needed);
+        self.free_blocks.len() >= from_free_queue
+    }
+
     fn allocate_blocks_inner(
         &mut self,
         request: &Request,
@@ -403,12 +470,6 @@ impl KVCacheManager {
     ) -> Option<Vec<BlockId>> {
         let blocks_needed = self.blocks_needed(request, num_tokens);
         let hashes = request.prompt_block_hashes.as_slice();
-
-        // The i-th block allocated in this call continues the request's
-        // existing allocation. Its index into the prompt hashes must skip the
-        // per-sequence state blocks and the content blocks already held —
-        // otherwise an incremental (decode-step) allocation looks up hash 0
-        // and aliases the request's own first prompt block.
         let state_blocks = self.state_blocks;
         let already_allocated = request.kv_blocks.len();
         let hash_at = |i: usize| {
@@ -418,46 +479,13 @@ impl KVCacheManager {
                 .copied()
         };
 
-        // Pass 1: decide for each requested block whether to ref an
-        // existing block (HBM-resident or already in-flight for someone
-        // else) or to allocate a fresh one. Bail early if there aren't
-        // enough fresh blocks for the misses.
-        enum Decision {
-            Fresh,
-            RefExisting(BlockId),
-        }
-        let mut decisions: Vec<Decision> = Vec::with_capacity(blocks_needed);
-        let mut fresh_needed = 0usize;
-        for i in 0..blocks_needed {
-            let dec = match hash_at(i) {
-                Some(h) if self.enable_prefix_caching => {
-                    if let Some(&block_id) = self.prefix_cache.get(&h) {
-                        Decision::RefExisting(block_id)
-                    } else if let Some(entry) = self.in_flight_cache.get(&h) {
-                        Decision::RefExisting(entry.block_id)
-                    } else {
-                        fresh_needed += 1;
-                        Decision::Fresh
-                    }
-                }
-                _ => {
-                    fresh_needed += 1;
-                    Decision::Fresh
-                }
-            };
-            decisions.push(dec);
-        }
-
-        // Hits on free-but-cached blocks leave the free queue when they are
-        // referenced below, so they are not available to the misses.
-        let hits_on_free = decisions
-            .iter()
-            .filter(|d| matches!(d, Decision::RefExisting(id) if self.free_blocks.contains(*id)))
-            .count();
-        if self.free_blocks.len() < fresh_needed + hits_on_free {
+        // Pass 1: decide per block; bail if the free queue can't cover the
+        // misses plus the hits that leave it.
+        let (decisions, from_free_queue) = self.plan_allocation(request, blocks_needed);
+        if self.free_blocks.len() < from_free_queue {
             return None;
         }
-        self.bytes_touched += (fresh_needed + hits_on_free) as u64 * self.bytes_per_block;
+        self.bytes_touched += from_free_queue as u64 * self.bytes_per_block;
 
         // KV bytes the i-th allocated block holds, from the model's curve
         // at its position (content blocks after the state blocks).

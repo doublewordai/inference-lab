@@ -198,10 +198,10 @@ impl Scheduler {
                     if tokens_to_schedule == 0 {
                         break;
                     }
-                    let blocks_needed = self
+                    if !self
                         .kv_cache_manager
-                        .blocks_needed(request, tokens_to_schedule);
-                    if self.kv_cache_manager.num_free_blocks() < blocks_needed {
+                        .can_grow_to(request, request.num_computed_tokens + tokens_to_schedule)
+                    {
                         break;
                     }
                     let mut request = self.waiting.remove(selected_idx).unwrap();
@@ -237,11 +237,7 @@ impl Scheduler {
                     // already in flight for a leader are shared by
                     // reference. Bytes/PCIe cost is only paid for the
                     // spillover portion; the in-flight portion is joined.
-                    let blocks_needed = self
-                        .kv_cache_manager
-                        .blocks_for_context(cached_tokens)
-                        .saturating_sub(request.kv_blocks.len());
-                    if self.kv_cache_manager.num_free_blocks() < blocks_needed {
+                    if !self.kv_cache_manager.can_grow_to(request, cached_tokens) {
                         break;
                     }
                     let mut request = self.waiting.remove(selected_idx).unwrap();
@@ -291,12 +287,13 @@ impl Scheduler {
                 if tokens_to_schedule == 0 {
                     break;
                 }
-                // A promoted request already holds its cached-prefix blocks.
-                let blocks_needed = self
+                // Cached-prefix blocks held by running requests are shared by
+                // reference and cost no free blocks; a promoted request already
+                // holds its own. Same rule as the allocation below.
+                if !self
                     .kv_cache_manager
-                    .blocks_for_context(cached_tokens + tokens_to_schedule)
-                    .saturating_sub(request.kv_blocks.len());
-                if self.kv_cache_manager.num_free_blocks() < blocks_needed {
+                    .can_grow_to(request, cached_tokens + tokens_to_schedule)
+                {
                     break; // Can't fit, stop scheduling new requests
                 }
 
@@ -777,6 +774,35 @@ mod tests {
         let c_entry = d.batch.iter().find(|s| s.idx == 2).unwrap();
         assert_eq!(c_entry.num_tokens, bs);
         assert_eq!(scheduler.running()[2].num_computed_tokens, 3 * bs);
+    }
+
+    #[test]
+    fn test_admission_shares_held_prefix_blocks() {
+        // KV holds exactly 6 blocks. `a` (4 prompt blocks + 1 for its first
+        // decode step) is running; `b` shares a's first three blocks and
+        // needs one fresh block. vLLM admits it: hits on blocks a holds cost
+        // nothing, and one block is free.
+        let config = Config::test_default();
+        let bs = config.scheduler.block_size;
+        let per_block = config.model.kv_storage_bytes(bs);
+        let kv = kv_manager(&config, 6 * per_block, true);
+        let mut scheduler = scheduler_from(config, kv);
+
+        let mut a = create_test_request("a", 4 * bs, 10);
+        a.prompt_block_hashes = vec![1, 2, 3, 4];
+        scheduler.add_request(a);
+        let d = scheduler.schedule(0.0);
+        apply(&mut scheduler, &d, 1.0);
+        assert_eq!(scheduler.kv_cache_manager().num_free_blocks(), 2);
+
+        let mut b = create_test_request("b", 4 * bs, 10);
+        b.prompt_block_hashes = vec![1, 2, 3, 9];
+        scheduler.add_request(b);
+        let d = scheduler.schedule(1.0);
+        assert_eq!(running_ids(&scheduler), vec!["a", "b"]);
+        let b_entry = d.batch.iter().find(|s| s.idx == 1).unwrap();
+        assert_eq!(b_entry.num_tokens, bs);
+        assert_eq!(scheduler.kv_cache_manager().num_free_blocks(), 0);
     }
 
     #[test]
