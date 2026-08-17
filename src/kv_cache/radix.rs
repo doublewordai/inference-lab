@@ -1529,13 +1529,9 @@ impl Radix {
             // Only positions this path covers are re-marked; a node's
             // outlook covers its prefix, so a shorter mark shrinks it.
             let node = &mut self.nodes[node_id as usize];
-            node.outlook = match (mark, node.outlook) {
-                (Some(m), _) => Some(m),
-                (None, Some((_, u))) if u > seg.len => {
-                    Some((node.outlook.unwrap().0, seg.len)).filter(|_| false)
-                }
-                (None, _) => None,
-            };
+            // A `None` mark clears the node's outlook outright: the
+            // trajectory is over (or the step announces nothing).
+            node.outlook = mark;
             // Re-key HBM runs on every outlook-ordered worker.
             let workers: Vec<WorkerId> = self.nodes[node_id as usize].hbm.keys().copied().collect();
             for w in workers {
@@ -2029,10 +2025,7 @@ impl Radix {
     /// Drop ranges of store `s` untouched for more than `seconds`.
     pub fn store_expire(&mut self, s: StoreId, now: f64, seconds: f64) -> Vec<TierEvicted> {
         let mut out = Vec::new();
-        loop {
-            let Some(e) = self.stores[s].order.iter().next().copied() else {
-                break;
-            };
+        while let Some(e) = self.stores[s].order.iter().next().copied() {
             let (_, _, node_id, start) = e;
             let touched = self.nodes[node_id as usize]
                 .tiers
