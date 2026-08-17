@@ -298,10 +298,16 @@ impl LayerClass {
         }
     }
 
-    /// Attention FLOPs for `s` new tokens against a `t`-token context (one
-    /// layer): score + AV over the attended positions, plus indexer scoring
-    /// over every compressed candidate.
-    fn attention_flops(&self, hidden_dim: u32, s: u32, t: u32) -> f64 {
+    /// Attention FLOPs for `s` new tokens each against a `t`-token context
+    /// (one layer): score + AV over the attended positions, plus indexer
+    /// scoring over every compressed candidate. Callers pass the chunk's
+    /// mean context so a causal prefill is priced at ~s²/2 pairs.
+    ///
+    /// `decode` selects the MLA kernel: decode runs weight-absorbed (queries
+    /// projected into the latent space, so each pair costs
+    /// `2 × heads × (2 × latent + rope)`), prefill materialises per-head
+    /// K/V (`2 × heads × (qk + v)`).
+    fn attention_flops(&self, hidden_dim: u32, s: u32, t: u32, decode: bool) -> f64 {
         let (s, attended) = (s as f64, self.attended(t) as f64);
         match self {
             LayerClass::Attention {
@@ -311,10 +317,15 @@ impl LayerClass {
                 heads,
                 qk_head_dim,
                 v_head_dim,
+                latent_dim,
+                rope_dim,
                 history,
                 ..
             } => {
                 let per_pair = match (heads, qk_head_dim, v_head_dim) {
+                    (Some(h), _, _) if decode => {
+                        2.0 * *h as f64 * (2.0 * *latent_dim as f64 + *rope_dim as f64)
+                    }
                     (Some(h), Some(qk), Some(v)) => 2.0 * *h as f64 * (*qk as f64 + *v as f64),
                     _ => 4.0 * hidden_dim as f64,
                 };
@@ -479,11 +490,12 @@ impl ModelSpec {
 
     /// Self-attention compute (score plus AV) for `new_tokens` against
     /// `attended_tokens` of context, summed across layers.
-    pub fn attention_flops(&self, new_tokens: u32, attended_tokens: u32) -> u64 {
+    pub fn attention_flops(&self, new_tokens: u32, attended_tokens: u32, decode: bool) -> u64 {
         self.layers
             .iter()
             .map(|l| {
-                l.count() as f64 * l.attention_flops(self.hidden_dim, new_tokens, attended_tokens)
+                l.count() as f64
+                    * l.attention_flops(self.hidden_dim, new_tokens, attended_tokens, decode)
             })
             .sum::<f64>() as u64
     }
@@ -721,7 +733,7 @@ mod tests {
         assert_eq!(m.kv_storage_bytes(100), 131_072 * 100);
         assert_eq!(m.kv_bytes_read_per_decode_step(100), 131_072 * 100);
         // 4 * heads*head_dim * S * T per layer = 4 * 4096 * 1 * 100 * 32.
-        assert_eq!(m.attention_flops(1, 100), 4 * 4096 * 100 * 32);
+        assert_eq!(m.attention_flops(1, 100, false), 4 * 4096 * 100 * 32);
         assert_eq!(m.weight_residency_bytes(), 14_000_000_000);
         assert_eq!(m.per_sequence_state_bytes(), 0);
         assert_eq!(m.num_layers(), 32);
@@ -805,7 +817,7 @@ mod tests {
         let mut cached = m.clone();
         cached.layers = vec![near(1, Some(ix)), near(3, None)];
         let ix_flops = |m: &ModelSpec| {
-            m.attention_flops(1, t) - {
+            m.attention_flops(1, t, false) - {
                 let mut n = m.clone();
                 for l in n.layers.iter_mut() {
                     if let LayerClass::Mla {
@@ -815,7 +827,7 @@ mod tests {
                         h.indexer = None;
                     }
                 }
-                n.attention_flops(1, t)
+                n.attention_flops(1, t, false)
             }
         };
         assert_eq!(ix_flops(&cached) * 4, ix_flops(&m));
@@ -831,7 +843,7 @@ mod tests {
         assert_eq!(cached.kv_storage_bytes(t), 4 * 256 * 512 + 256 * 16);
         // Attention priced at 4 * hidden per pair when the head shape is absent.
         assert_eq!(
-            m.attention_flops(1, t),
+            m.attention_flops(1, t, false),
             4 * 4 * 1024 * 256 + 4 * (2 * 16 * 256)
         );
     }
@@ -853,7 +865,12 @@ mod tests {
             o_latent_dim: None,
         }];
         // Full context: attends and stores every position.
-        assert_eq!(m.attention_flops(1, 100), 2 * 64 * (192 + 128) * 100);
+        assert_eq!(m.attention_flops(1, 100, false), 2 * 64 * (192 + 128) * 100);
+        // Decode is weight-absorbed: scores and AV both run in the latent.
+        assert_eq!(
+            m.attention_flops(1, 100, true),
+            2 * 64 * (2 * 512 + 64) * 100
+        );
         assert_eq!(m.kv_storage_bytes(100), (512 + 64) * 2 * 100);
         // Window + history (DeepSeek-V4 style): 128 recent + T/128 far entries.
         m.layers = vec![LayerClass::Mla {
@@ -874,7 +891,7 @@ mod tests {
             o_latent_dim: None,
         }];
         assert_eq!(m.kv_storage_bytes(4096), (512 + 64) * (128 + 32));
-        assert_eq!(m.attention_flops(1, 4096), 4 * 7168 * (128 + 32));
+        assert_eq!(m.attention_flops(1, 4096, false), 4 * 7168 * (128 + 32));
         // History-only top-k selection (GLM-5 DSA): no local window.
         m.layers = vec![LayerClass::Mla {
             count: 1,
@@ -893,7 +910,7 @@ mod tests {
             q_latent_dim: None,
             o_latent_dim: None,
         }];
-        assert_eq!(m.attention_flops(1, 4096), 4 * 7168 * 2048);
+        assert_eq!(m.attention_flops(1, 4096, false), 4 * 7168 * 2048);
         assert_eq!(m.kv_storage_bytes(4096), (512 + 64) * 2 * 4096);
     }
 
@@ -918,7 +935,7 @@ mod tests {
         assert_eq!(m.per_sequence_state_bytes(), 30_000_000);
         // Linear layers add nothing to the growing KV or the attention FLOPs.
         assert_eq!(m.kv_storage_bytes(64), 10 * 2 * 2 * 256 * 2 * 64);
-        assert_eq!(m.attention_flops(1, 64), 10 * 4 * 16 * 256 * 64);
+        assert_eq!(m.attention_flops(1, 64, false), 10 * 4 * 16 * 256 * 64);
         assert_eq!(m.num_layers(), 40);
     }
 

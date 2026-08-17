@@ -185,11 +185,18 @@ impl ComputeEngine {
         // sequence per step, independent of context length.
         let state_bytes = self.model.per_sequence_state_bytes() as f64;
         for (req, &num_new) in batch_requests.iter().zip(tokens_per_request) {
-            let attended = req.num_computed_tokens + num_new;
-            attn.flops += self.model.attention_flops(num_new, attended) as f64;
+            // Causal attention: the k-th new position attends
+            // `computed + k` positions, so the chunk's score/AV work and KV
+            // reads are those of `num_new` queries against the mean context
+            // `computed + (num_new+1)/2` (a fresh s-token prompt costs
+            // ~s²/2 pairs, a decode token attends `computed + 1`).
+            let mean_context = req.num_computed_tokens + num_new.div_ceil(2);
+            attn.flops += self
+                .model
+                .attention_flops(num_new, mean_context, !req.is_prefill())
+                as f64;
 
-            let avg_seq_len = req.num_computed_tokens + num_new / 2;
-            let unshared = avg_seq_len.saturating_sub(shared_prefix_tokens);
+            let unshared = mean_context.saturating_sub(shared_prefix_tokens);
             attn.bytes += self.model.kv_bytes_read_per_decode_step(unshared) as f64 + state_bytes;
         }
 
