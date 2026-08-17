@@ -32,10 +32,19 @@ The `KVCacheManager` charges a sequence of `t` tokens
 from the model's own KV curve — linear models get `ceil(t / block_size)`,
 sliding-window and compressed-history models their real footprint — plus a
 fixed reservation for length-independent per-sequence state (GatedDeltaNet).
-Blocks are reference-counted; freed blocks keep their content hash and can
-be re-hit until they are recycled (least recently freed first, sequences
-tail first — or, with `hbm_evict_backed_first`, a nearby block a tier
-already holds). Recycling a block whose KV no tier holds writes it to the
+Blocks are held by reference; freed blocks keep their content and can be
+re-hit until they are recycled (least recently freed first, sequences tail
+first — or, with `hbm_evict_backed_first`, a nearby run a tier already
+holds). The blocks themselves are not tracked one by one: the topology's
+KV state is a radix tree over block hashes (`kv_cache::radix`), a node
+being a run of consecutive blocks no request diverges inside, and every
+worker's HBM residency, pinning, free runs (stamped for LRU / outlook
+order) and in-flight landings, and every store's holdings, are ranges of
+tree nodes with breakpoints where requests ending at different positions
+touched them. Because a request frees its whole prefix at once, free-time
+stamps are non-increasing along a chain and eviction never punches a hole
+in HBM; a chain forked at every session step compacts back into one run
+once the side branches are gone. Recycling a block whose KV no tier holds writes it to the
 worker's first tier under `write_back`; under `write_through` every fresh
 block was written when produced, under `selective` on its n-th hit. Tiers
 are stores of the topology's `MemoryGraph`, instantiated from the

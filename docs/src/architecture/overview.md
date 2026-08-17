@@ -15,7 +15,7 @@ config        TOML/JSON -> Config, ClusterSpec, DisaggTopology
   |  + layer classes (attention FLOPs, KV read / storage, per-sequence state)
   v
 compute       ComputeEngine: roofline step cost for a batch on a cluster
-kv_cache      KVCacheManager (blocks, prefix cache), MemoryGraph (stores, paths), Flows (edges, rates)
+kv_cache      Radix (KV state as ranges of a hash tree), KVCacheManager (a worker's view), MemoryGraph (stores, paths), Flows (edges, rates)
 scheduler     Scheduler: waiting/running sets, one schedule() per iteration
   |
   v
