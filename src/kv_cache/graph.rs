@@ -203,10 +203,7 @@ impl Store {
             return Vec::new();
         };
         let mut cancelled = Vec::new();
-        loop {
-            let Some((&seq, &hash)) = self.order.iter().next() else {
-                break;
-            };
+        while let Some((&seq, &hash)) = self.order.first_key_value() {
             let e = &self.entries[&hash];
             if now - e.touched <= seconds {
                 break;
