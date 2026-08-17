@@ -432,6 +432,63 @@ bandwidth = 1e12
     }
 
     #[test]
+    fn cluster_store_promotes_a_prefix_on_reentry_from_another_node() {
+        const MEM: &str = r#"
+gpus_per_node = 1
+[[stores]]
+name = "cluster_nvme"
+per = "cluster"
+capacity = 1e12
+bandwidth = 1e12
+stripe = 1
+latency = 1e-3
+[[links]]
+name = "nic"
+from = "gpu"
+to = "network"
+bandwidth = 1e12
+[[links]]
+name = "core"
+from = "network"
+to = "cluster_nvme"
+bandwidth = 1e12
+"#;
+        let (mut cluster, model, mut sched) = small_dense_parts();
+        cluster.hardware.memory = Some(toml::from_str(MEM).unwrap());
+        cluster.memory = toml::from_str("tiers = [\"cluster_nvme\"]").unwrap();
+        cluster.num_workers = 2;
+        // One GPU per node and eight HBM blocks per worker. Churn on worker
+        // 0 demotes session a; round-robin sends its re-entry to worker 1.
+        sched.kv_cache_capacity = 8 * model.kv_storage_bytes(sched.block_size);
+        let mut engine = Engine::new(
+            Topology::aggregated(cluster, model, sched)
+                .unwrap()
+                .with_router(&RouterConfig::RoundRobin {}),
+        );
+        let req = |id: &str, t: f64, hashes: Vec<u64>| {
+            let mut r = Request::new(id.into(), 0, t, hashes.len() as u32 * 16, 2);
+            r.prompt_block_hashes = hashes;
+            r
+        };
+        engine.submit(req("a", 0.0, (1..=4).collect())); // node 0
+        engine.submit(req("x", 0.5, (100..=103).collect())); // node 1
+        engine.submit(req("churn", 1.0, (200..=206).collect())); // node 0
+        engine.submit(req("a-reentry", 2.0, (1..=5).collect())); // node 1
+        run_until(&mut engine, 4);
+
+        assert_eq!(engine.router_stats().per_worker, vec![2, 2]);
+        let cache = engine.aggregate_prefix_cache();
+        assert_eq!(cache.hits, 1, "{cache:?}");
+        assert_eq!(cache.hit_size_sum, 64);
+        let memory = engine.memory_metrics().unwrap();
+        assert!(
+            memory.bytes_promoted > 0.0,
+            "re-entry used the cluster tier"
+        );
+        assert!(memory.stores[0].bytes_read > 0);
+    }
+
+    #[test]
     fn disagg_decode_pool_does_not_reprefill_handed_off_requests() {
         let (cluster, model, sched) = small_dense_parts();
         let topo = DisaggTopology {

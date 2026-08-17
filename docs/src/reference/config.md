@@ -127,17 +127,19 @@ own.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `gpus_per_node` | U32 | fabric's, else 1 | GPUs sharing a node's `per = "node"` stores |
-| `stores` | Array | `[]` | `{ name, per = "gpu" \| "node", capacity, bandwidth }` — bytes per instance; a `gpu` store is private to its GPU, a `node` store is one pool for the node's GPUs. `bandwidth` (optional) is the store's own throughput per instance, shared by every transfer in or out of it |
+| `stores` | Array | `[]` | `{ name, per = "gpu" \| "node" \| "cluster", capacity, bandwidth, stripe = 1, aggregate_bandwidth, latency = 0 }` — bytes per instance; a `gpu` store is private to its GPU, a `node` store is one pool for the node's GPUs, and a `cluster` store is one topology-wide pool behind the network. `bandwidth` is the store throughput per instance (per node for a cluster store). A cluster transfer can use `stripe × bandwidth`, while all its transfers share `aggregate_bandwidth` or, by default, `nodes × bandwidth`. `latency` is the fixed access cost in seconds on every fetch or write |
 | `junctions` | Array | `[]` | `{ name, per }` — a point with no capacity of its own, so that several links can share one (a GPU's PCIe port feeding host DRAM and NVMe) |
-| `links` | Array | `[]` | `{ name, from, to, bandwidth, latency = 0 }` — `from` is `"gpu"` (one port per GPU), a store or a junction; `to` is a store, a junction, `"switch"` (the node's scale-up fabric) or `"network"` (the scale-out core). One instance per instance of `from`, full duplex at `bandwidth` bytes/s each way |
+| `links` | Array | `[]` | `{ name, from, to, bandwidth, latency = 0 }` — `from` is `"gpu"` (one port per GPU), `"network"`, a store or a junction; `to` is a store, a junction, `"switch"` (the node's scale-up fabric) or `"network"` (the scale-out core). One instance per instance of `from`, full duplex at `bandwidth` bytes/s each way |
 
 Instances: a `tp`-GPU worker pools its GPUs' per-GPU stores, junctions and
 ports (capacity and bandwidth × `tp`); `gpus_per_node / tp` workers share a
-node's per-node instances. A transfer takes the shortest hop path between
-its ends and runs at its max-min fair share on every edge of it: the most
-contended edge fixes its transfers' rate first, the residual is shared
-among the rest. Tier promotions run store → GPU; hand-offs GPU → network →
-GPU (see `kv_link_bw`).
+node's per-node instances; every worker points at the same selected cluster
+store. A cluster access runs GPU → its NIC → network → store (and back), so
+the NIC remains the per-worker cap even when the store is striped. A transfer
+takes the shortest hop path between its ends and runs at its max-min fair
+share on every edge of it: the most contended edge fixes its transfers' rate
+first, the residual is shared among the rest. Tier promotions run store →
+GPU; hand-offs GPU → network → GPU (see `kv_link_bw`).
 
 Shipped presets, at datasheet figures: `b200` (192 GB / 8 TB/s), `b300`
 (288 GB / 8 TB/s), `gh200` (96 GB / 4 TB/s), `h100` (80 GB / 3.35 TB/s);
