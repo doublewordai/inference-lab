@@ -3,7 +3,7 @@ use crate::config::{PrefetchPolicy, SchedulerConfig, SourcePolicy};
 use crate::kv_cache::{KVCacheManager, PrefixCacheLookup};
 use crate::request::Request;
 use ordered_float::OrderedFloat;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 
 /// A prefix to pull back into HBM ahead of its announced re-entry.
 #[derive(Debug, Clone)]
@@ -621,6 +621,103 @@ impl Scheduler {
 
     fn tokens_to_schedule(&self, request: &Request, token_budget: u32) -> u32 {
         self.tokens_to_schedule_from(request, request.num_computed_tokens, token_budget)
+    }
+
+    /// Maximum number of plain-decode steps for which this scheduler's
+    /// batch membership cannot change. This deliberately excludes every
+    /// source of scheduler-local work: waiting/admission, transfers,
+    /// prefetch, rejection, prefill boundaries, and speculative widths.
+    pub(crate) fn decode_coalescing_limit(&self) -> u32 {
+        if !self.waiting.is_empty()
+            || !self.pending_transfers.is_empty()
+            || !self.prefetch_plans.is_empty()
+            || !self.prefetches.is_empty()
+            || !self.rejected.is_empty()
+            || self.config.max_num_batched_tokens < self.running.len() as u32
+        {
+            return 0;
+        }
+        if self.running.is_empty() {
+            // An entirely idle rank in a lockstep replica does not bound the
+            // active ranks' decode horizon.
+            return u32::MAX;
+        }
+        self.running
+            .iter()
+            .map(|r| {
+                if r.is_prefill()
+                    || r.is_finished()
+                    || r.pending_draft_len != 0
+                    || r.pending_round_commits.is_some()
+                {
+                    0
+                } else {
+                    r.planned_positions().saturating_sub(r.num_computed_tokens)
+                }
+            })
+            .min()
+            .unwrap_or(0)
+    }
+
+    /// Preflight `steps` decode allocations without mutating the radix.
+    /// Coalescing only uses never-used blocks and new, non-shared content
+    /// suffixes: recycling a cached block, hitting one, or failing capacity
+    /// would make the normal scheduler pass observably state-changing.
+    pub(crate) fn can_coalesce_decode_steps(&self, steps: u32) -> bool {
+        if steps == 0 || self.decode_coalescing_limit() < steps {
+            return false;
+        }
+        if self.running.is_empty() {
+            return true;
+        }
+        let needed: usize = self
+            .running
+            .iter()
+            .map(|r| self.kv_cache_manager.blocks_needed(r, steps))
+            .sum();
+        if needed > self.kv_cache_manager.num_unused_blocks() {
+            return false;
+        }
+
+        let mut new_hashes = HashSet::new();
+        self.running.iter().all(|r| {
+            let target_tokens = r.num_computed_tokens + steps;
+            if self
+                .kv_cache_manager
+                .growth_starts_write_through(r, target_tokens)
+            {
+                return false;
+            }
+            if !self
+                .kv_cache_manager
+                .growth_has_no_cached_suffix(r, target_tokens)
+            {
+                return false;
+            }
+            let target_blocks = self
+                .kv_cache_manager
+                .content_blocks_for_tokens(target_tokens)
+                .min(r.prompt_block_hashes.len());
+            let held_blocks = r.kv_blocks.len().min(target_blocks);
+            r.prompt_block_hashes[held_blocks..target_blocks]
+                .iter()
+                .all(|&hash| new_hashes.insert(hash))
+        })
+    }
+
+    /// Apply the allocation part of one already-preflighted decode pass.
+    /// Progress and timing remain engine-owned, exactly as in the normal
+    /// `schedule` -> `record_progress` path.
+    pub(crate) fn allocate_coalesced_decode_step(&mut self) {
+        for idx in 0..self.running.len() {
+            let needed = self.kv_cache_manager.blocks_needed(&self.running[idx], 1);
+            if needed == 0 {
+                continue;
+            }
+            self.kv_cache_manager
+                .allocate_blocks(&mut self.running[idx], 1)
+                .expect("coalesced decode growth was preflighted against unused blocks");
+        }
     }
 
     /// Whether admitting `request` keeps every running request able to grow

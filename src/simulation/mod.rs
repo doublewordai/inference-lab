@@ -16,8 +16,8 @@ pub mod simulator;
 pub mod spec;
 
 pub use engine::{
-    Engine, HandoffStats, IterationInfo, RequestProgress, RequestTiming, StepKind, StepOutcome,
-    Topology,
+    Engine, HandoffStats, IterationInfo, RequestProgress, RequestTiming, StepCoalescingStats,
+    StepKind, StepOutcome, Topology,
 };
 pub use roofline::{predict_decode_tpot, predict_prefill_time};
 pub use simulator::{ProgressInfo, Simulator, TimeSeriesPoint};
@@ -66,6 +66,9 @@ pub fn simulate_closed_loop(
         ..
     } = *workload;
     let mut engine = Engine::new(topology);
+    if std::env::var_os("INFERENCE_LAB_DISABLE_STEP_COALESCING").is_none() {
+        engine.set_step_coalescing(true);
+    }
     if let Some(s) = &workload.spec {
         engine.enable_speculative(s.clone(), seed)?;
     }
