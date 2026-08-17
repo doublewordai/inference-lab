@@ -58,6 +58,13 @@
 //! (a promotion of a block still arriving waits for it). A full store
 //! evicts into the next tier — a store → store transfer — or drops.
 //!
+//! `kind = "peer_hbm"` is the one virtual tier: it names KV already
+//! resident in a sibling worker's HBM on the same node. It has no capacity
+//! or write path; promotions traverse GPU → switch → GPU. A store's `pin`
+//! controls whether its source survives until a fetch drains (default true
+//! for peer HBM, false for capacity-bearing stores). An unpinned fetch
+//! rechecks its source on completion and lands only the surviving prefix.
+//!
 //! With no `[memory]` on the deployment there is no tiering (HBM only).
 
 use std::collections::BTreeMap;
@@ -76,6 +83,18 @@ pub enum Scope {
     Node,
     /// One for the whole topology, reachable through the scale-out network.
     Cluster,
+}
+
+/// What a hardware memory entry represents.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StoreKind {
+    /// A capacity-bearing store whose contents live in the radix tree.
+    #[default]
+    Store,
+    /// The HBM already resident on another worker in the same node. This is
+    /// a virtual, read-only tier: it has no capacity or contents of its own.
+    PeerHbm,
 }
 
 /// When a block's KV is written to the first tier below HBM.
@@ -331,7 +350,11 @@ impl MemoryPolicies {
 pub struct StoreTemplate {
     pub name: String,
     pub per: Scope,
+    /// Normal capacity-bearing store, or the virtual peer-HBM tier.
+    #[serde(default)]
+    pub kind: StoreKind,
     /// Bytes per instance.
+    #[serde(default)]
     pub capacity: f64,
     /// The store's own throughput per instance, bytes/s (an NVMe pool's
     /// aggregate drive rate). For a cluster store this is one node's rate;
@@ -351,6 +374,17 @@ pub struct StoreTemplate {
     /// Fixed access cost per fetch or write, seconds.
     #[serde(default)]
     pub latency: f64,
+    /// Keep a promotion's source resident until the transfer drains. The
+    /// virtual peer-HBM tier defaults to pinned; normal stores preserve the
+    /// historical unpinned behaviour.
+    #[serde(default)]
+    pub pin: Option<bool>,
+}
+
+impl StoreTemplate {
+    pub fn pins_fetches(&self) -> bool {
+        self.pin.unwrap_or(matches!(self.kind, StoreKind::PeerHbm))
+    }
 }
 
 fn default_stripe() -> u32 {
@@ -405,6 +439,11 @@ impl MemoryTemplate {
         self.stores.iter().find(|s| s.name == name)
     }
 
+    pub fn normal_store(&self, name: &str) -> Option<&StoreTemplate> {
+        self.store(name)
+            .filter(|s| matches!(s.kind, StoreKind::Store))
+    }
+
     pub fn junction(&self, name: &str) -> Option<&JunctionTemplate> {
         self.junctions.iter().find(|j| j.name == name)
     }
@@ -417,6 +456,15 @@ impl MemoryTemplate {
     /// Whether a GPU can reach `target` over the template's links (any
     /// number of hops, following links in their declared direction).
     pub fn gpu_reaches(&self, target: &str) -> bool {
+        if self
+            .store(target)
+            .is_some_and(|s| matches!(s.kind, StoreKind::PeerHbm))
+        {
+            return self
+                .links
+                .iter()
+                .any(|l| l.from == "gpu" && l.to == "switch");
+        }
         let mut frontier = vec!["gpu".to_string()];
         let mut seen = std::collections::HashSet::new();
         while let Some(v) = frontier.pop() {
@@ -439,11 +487,37 @@ impl MemoryTemplate {
             if !seen.insert(s.name.as_str()) {
                 return Err(format!("[memory] store `{}` declared twice", s.name));
             }
-            if s.capacity <= 0.0 {
-                return Err(format!("[memory] store `{}` needs capacity > 0", s.name));
-            }
-            if s.bandwidth.is_some_and(|b| b <= 0.0) {
-                return Err(format!("[memory] store `{}` needs bandwidth > 0", s.name));
+            match s.kind {
+                StoreKind::Store => {
+                    if s.name == "peer_hbm" {
+                        return Err(
+                            "[memory] `peer_hbm` is reserved for kind = \"peer_hbm\"".to_string()
+                        );
+                    }
+                    if s.capacity <= 0.0 {
+                        return Err(format!("[memory] store `{}` needs capacity > 0", s.name));
+                    }
+                    if s.bandwidth.is_some_and(|b| b <= 0.0) {
+                        return Err(format!("[memory] store `{}` needs bandwidth > 0", s.name));
+                    }
+                }
+                StoreKind::PeerHbm => {
+                    if s.name != "peer_hbm" {
+                        return Err(format!(
+                            "[memory] peer_hbm kind must use the reserved name `peer_hbm`, got `{}`",
+                            s.name
+                        ));
+                    }
+                    if s.per != Scope::Node {
+                        return Err("[memory] `peer_hbm` must be per = \"node\"".to_string());
+                    }
+                    if s.capacity != 0.0 || s.bandwidth.is_some() {
+                        return Err(
+                            "[memory] `peer_hbm` has no capacity or bandwidth of its own"
+                                .to_string(),
+                        );
+                    }
+                }
             }
             if s.stripe == 0 {
                 return Err(format!("[memory] store `{}` needs stripe > 0", s.name));
@@ -477,7 +551,7 @@ impl MemoryTemplate {
         for l in &self.links {
             let from_ok = l.from == "gpu"
                 || l.from == "network"
-                || self.store(&l.from).is_some()
+                || self.normal_store(&l.from).is_some()
                 || self.junction(&l.from).is_some();
             if !from_ok {
                 return Err(format!(
@@ -487,7 +561,7 @@ impl MemoryTemplate {
             }
             let to_ok = l.to == "switch"
                 || l.to == "network"
-                || self.store(&l.to).is_some()
+                || self.normal_store(&l.to).is_some()
                 || self.junction(&l.to).is_some();
             if !to_ok {
                 return Err(format!(
@@ -626,6 +700,12 @@ impl MemoryConfig {
             if *cap <= 0.0 {
                 return Err(format!("[memory] capacity for `{name}` must be > 0"));
             }
+            if template
+                .store(name)
+                .is_some_and(|s| matches!(s.kind, StoreKind::PeerHbm))
+            {
+                return Err("[memory] `peer_hbm` has no capacity to override".to_string());
+            }
         }
         Ok(())
     }
@@ -706,6 +786,30 @@ bandwidth = 1e12
         assert_eq!(pool.stripe, 1);
         assert_eq!(pool.aggregate_bandwidth, None);
         assert_eq!(pool.latency, 0.0);
+    }
+
+    #[test]
+    fn peer_hbm_is_virtual_node_scoped_and_pinned_by_default() {
+        let text = format!(
+            "{TEMPLATE}\n[[stores]]\nname = \"peer_hbm\"\nper = \"node\"\nkind = \"peer_hbm\"\n"
+        );
+        let t: MemoryTemplate = toml::from_str(&text).unwrap();
+        t.validate().unwrap();
+        let peer = t.store("peer_hbm").unwrap();
+        assert_eq!(peer.kind, StoreKind::PeerHbm);
+        assert!(peer.pins_fetches());
+        assert!(t.gpu_reaches("peer_hbm"));
+
+        let unpinned = text.replace("kind = \"peer_hbm\"", "kind = \"peer_hbm\"\npin = false");
+        let t: MemoryTemplate = toml::from_str(&unpinned).unwrap();
+        assert!(!t.store("peer_hbm").unwrap().pins_fetches());
+
+        let private = text.replace("per = \"node\"\nkind", "per = \"gpu\"\nkind");
+        assert!(toml::from_str::<MemoryTemplate>(&private)
+            .unwrap()
+            .validate()
+            .unwrap_err()
+            .contains("per = \"node\""));
     }
 
     #[test]

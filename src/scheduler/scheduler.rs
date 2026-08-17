@@ -248,15 +248,19 @@ impl Scheduler {
         let completed = self.kv_cache_manager.advance_transfers(current_time);
         let mut still_pending = Vec::with_capacity(self.pending_transfers.len());
         for mut req in self.pending_transfers.drain(..) {
-            if completed
+            if let Some(landed_blocks) = completed
                 .as_ref()
-                .is_some_and(|completed| completed.contains(&req.request_id))
+                .and_then(|completed| completed.get(&req.request_id))
+                .copied()
             {
                 // Publish the now-resident blocks to the HBM prefix cache so
                 // subsequent same-prefix requests get a clean HBM hit.
                 let cached_blocks = self
                     .kv_cache_manager
-                    .content_blocks_for_tokens(req.num_cached_tokens);
+                    .content_blocks_for_tokens(req.num_cached_tokens)
+                    .min(landed_blocks as usize);
+                req.num_cached_tokens =
+                    (cached_blocks as u32).saturating_mul(self.kv_cache_manager.block_size());
                 self.kv_cache_manager
                     .publish_transferred_blocks(&mut req, cached_blocks);
                 req.ready_at = None;
@@ -279,13 +283,17 @@ impl Scheduler {
         // outlook order); the rest wait on.
         let mut still_flying = Vec::with_capacity(self.prefetches.len());
         for mut req in self.prefetches.drain(..) {
-            if completed
+            if let Some(landed_blocks) = completed
                 .as_ref()
-                .is_some_and(|completed| completed.contains(&req.request_id))
+                .and_then(|completed| completed.get(&req.request_id))
+                .copied()
             {
                 let cached_blocks = self
                     .kv_cache_manager
-                    .content_blocks_for_tokens(req.num_cached_tokens);
+                    .content_blocks_for_tokens(req.num_cached_tokens)
+                    .min(landed_blocks as usize);
+                req.num_cached_tokens =
+                    (cached_blocks as u32).saturating_mul(self.kv_cache_manager.block_size());
                 self.kv_cache_manager
                     .publish_transferred_blocks(&mut req, cached_blocks);
                 self.kv_cache_manager.free_request(&mut req);

@@ -143,6 +143,10 @@ impl KvHold {
     pub fn extend(&mut self, n: u32) {
         self.blocks += n;
     }
+    /// Keep at most `n` blocks (a partial remote-KV landing).
+    pub(crate) fn truncate(&mut self, n: u32) {
+        self.blocks = self.blocks.min(n);
+    }
 }
 
 impl Request {

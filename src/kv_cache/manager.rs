@@ -1,9 +1,11 @@
 use super::flows::Owner;
 use super::graph::{promotion_request, MemoryGraph, SharedMemoryGraph, WorkerId};
-use super::radix::{HbmLookup, KvBytesFn, Path, Radix, SharedRadix, Span};
+use super::radix::{
+    HbmLookup, KvBytesFn, Path, Radix, SharedRadix, Span, TierSource, TierSourceRange, TierSpan,
+};
 use crate::config::{HbmEviction, ModelSpec};
 use crate::request::{KvLeaf, Outlook, Request};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 /// Result of looking up a request's prompt against the cache hierarchy.
@@ -32,7 +34,27 @@ pub struct PrefixCacheLookup {
     /// against the same leader rather than starting a redundant one.
     pub join_leader: Option<String>,
     /// The tier-held spans to promote, as `(tier, span)`, in prefix order.
-    pub(crate) tier_spans: Vec<(usize, Span)>,
+    pub(crate) tier_spans: Vec<TierSpan>,
+}
+
+#[derive(Debug, Clone)]
+struct PromotionSources {
+    /// HBM/in-flight blocks before the freshly promoted tier prefix.
+    base_blocks: u32,
+    /// Lookup-visible blocks, including a final block which may already be
+    /// held and therefore need no new landing reservation.
+    expected_blocks: u32,
+    /// Absolute end of the blocks actually reserved as a destination landing.
+    reserved_blocks: u32,
+    ranges: Vec<TierSourceRange>,
+    source_versions: Vec<(TierSource, u64)>,
+}
+
+struct PromotionGroup {
+    tier: usize,
+    source: TierSource,
+    spans: Vec<Span>,
+    ranges: Vec<TierSourceRange>,
 }
 
 impl PrefixCacheLookup {
@@ -149,6 +171,14 @@ pub struct KVCacheManager {
     /// hits zero across every tier.
     leader_active_tiers: HashMap<String, u32>,
 
+    /// Ordered concrete sources for each leader, rechecked when all of its
+    /// flows drain so an unpinned eviction becomes a partial landing.
+    leader_sources: HashMap<String, PromotionSources>,
+
+    /// Flow ids belonging to each leader (peer tiers may use more than one
+    /// sibling source under the same tier).
+    leader_transfer_ids: HashMap<String, Vec<String>>,
+
     /// Joiners piggybacking on each leader, keyed by leader id. Joiners
     /// contribute no bandwidth load and become ready when the leader does.
     /// Modelled after vLLM's block-ref-count sharing of in-flight prefixes.
@@ -209,6 +239,8 @@ impl KVCacheManager {
             enable_prefix_caching,
             memory: None,
             leader_active_tiers: HashMap::new(),
+            leader_sources: HashMap::new(),
+            leader_transfer_ids: HashMap::new(),
             leader_joiners: HashMap::new(),
             joiner_to_leader: HashMap::new(),
             per_seq_state_bytes,
@@ -293,8 +325,8 @@ impl KVCacheManager {
         {
             let mut r = radix.lock().unwrap();
             r.register_worker(worker, self.total_blocks, self.hbm_eviction, backed_first);
-            let tiers = graph.lock().unwrap().store_ids_of(worker);
-            r.set_worker_tiers(worker, tiers);
+            let tiers = graph.lock().unwrap().radix_tiers_of(worker);
+            r.set_worker_lookup_tiers(worker, tiers);
         }
         self.radix = radix;
         self.worker = worker;
@@ -450,7 +482,7 @@ impl KVCacheManager {
         let in_path_target = content_target.max(held_total).min(hashed);
         let anon_new = (content_target.max(held_total) - in_path_target).saturating_sub(anon_held);
         let aux_new = self.aux_blocks_needed(request, total_tokens) as u32;
-        let r = self.radix.lock().unwrap();
+        let mut r = self.radix.lock().unwrap();
         let path = if in_path_target > 0 {
             r.resolve(&request.prompt_block_hashes[..in_path_target as usize])
         } else {
@@ -459,7 +491,12 @@ impl KVCacheManager {
         // Path blocks not yet in the tree are fresh too.
         let missing = in_path_target.saturating_sub(path.blocks);
         let (fresh, hits_on_free) = r.acquire_cost(self.worker, &path, in_path_held, path.blocks);
-        r.free_blocks(self.worker) >= fresh + hits_on_free + missing + anon_new + aux_new
+        let needed = fresh + hits_on_free + missing + anon_new + aux_new;
+        let fits = r.free_blocks(self.worker) >= needed;
+        if !fits {
+            r.note_pin_stall(self.worker, needed);
+        }
+        fits
     }
 
     /// Allocate the blocks `request` needs to grow by `num_tokens` positions
@@ -582,18 +619,32 @@ impl KVCacheManager {
     /// blocks of `request`) landed in HBM: subsequent lookups see them as
     /// resident.
     pub fn publish_transferred_blocks(&mut self, request: &mut Request, cached_blocks: usize) {
-        if !self.enable_prefix_caching || cached_blocks == 0 {
+        if !self.enable_prefix_caching || request.kv_blocks.is_empty() {
             return;
         }
-        let n = cached_blocks.min(request.prompt_block_hashes.len());
-        let spans = {
-            let mut r = self.radix.lock().unwrap();
-            if !Self::rebuild_request_path(&r, request, n as u32) {
-                request.kv_path = r.resolve(&request.prompt_block_hashes[..n]);
-            }
-            r.landed(self.worker, &request.kv_path, n as u32);
-            path_spans(&request.kv_path, n as u32)
-        };
+        let reserved = request
+            .kv_blocks
+            .len()
+            .min(request.prompt_block_hashes.len());
+        let landed = cached_blocks.min(reserved);
+        let mut r = self.radix.lock().unwrap();
+        if !Self::rebuild_request_path(&r, request, reserved as u32) {
+            request.kv_path = r.resolve(&request.prompt_block_hashes[..reserved]);
+        }
+        r.landed_partial(
+            self.worker,
+            &request.kv_path,
+            &request.request_id,
+            reserved as u32,
+            landed as u32,
+        );
+        let spans = path_spans(&request.kv_path, landed as u32);
+        drop(r);
+        request.kv_blocks.truncate(landed as u32);
+        request.kv_leaf = spans.last().map(|span| KvLeaf {
+            node: span.node,
+            blocks: landed as u32,
+        });
         if let Some((g, w)) = &self.memory {
             g.lock().unwrap().promoted_batch(*w, &spans);
         }
@@ -747,6 +798,20 @@ impl KVCacheManager {
             };
         };
         let g = g.lock().unwrap();
+        if lookup
+            .tier_spans
+            .iter()
+            .any(|item| matches!(item.source, TierSource::PeerHbm(_)))
+        {
+            return lookup
+                .tier_spans
+                .iter()
+                .map(|item| {
+                    let bytes = self.radix.lock().unwrap().span_bytes(item.span);
+                    g.estimate_source_promotion(*w, item.tier, item.source, bytes)
+                })
+                .fold(0.0, f64::max);
+        }
         lookup
             .promote_bytes_per_tier
             .iter()
@@ -829,26 +894,105 @@ impl KVCacheManager {
         _hashes: &[u64],
         current_time: f64,
     ) {
-        let mut active_tiers = 0u32;
+        let mut active_transfers = 0u32;
+        let mut transfer_ids = Vec::new();
+        let base_blocks = (lookup.hbm_tokens + lookup.in_flight_tokens) / self.block_size;
+        let lookup_blocks = lookup.total_cached_tokens / self.block_size;
+        let (reserved_blocks, source_versions) = {
+            let radix = self.radix.lock().unwrap();
+            let reserved = radix
+                .landing_end(self.worker, &request_id)
+                .unwrap_or(base_blocks)
+                .min(lookup_blocks);
+            let mut versions = Vec::new();
+            for item in &lookup.tier_spans {
+                if versions.iter().all(|(source, _)| *source != item.source) {
+                    versions.push((item.source, radix.source_version(item.source)));
+                }
+            }
+            (reserved, versions)
+        };
         if let Some((g, w)) = &self.memory {
             let mut g = g.lock().unwrap();
-            for (i, &bytes) in lookup.promote_bytes_per_tier.iter().enumerate() {
+            let mut groups: Vec<PromotionGroup> = Vec::new();
+            let mut cursor = (lookup.hbm_tokens + lookup.in_flight_tokens) / self.block_size;
+            for item in &lookup.tier_spans {
+                let full_range = TierSourceRange {
+                    source: item.source,
+                    start: cursor,
+                    end: cursor + item.span.len(),
+                };
+                cursor = full_range.end;
+                let range = (full_range.start < reserved_blocks).then_some(TierSourceRange {
+                    end: full_range.end.min(reserved_blocks),
+                    ..full_range
+                });
+                if let Some(group) = groups
+                    .iter_mut()
+                    .find(|group| group.tier == item.tier && group.source == item.source)
+                {
+                    group.spans.push(item.span);
+                    group.ranges.extend(range);
+                } else {
+                    groups.push(PromotionGroup {
+                        tier: item.tier,
+                        source: item.source,
+                        spans: vec![item.span],
+                        ranges: range.into_iter().collect(),
+                    });
+                }
+            }
+            for group in groups {
+                let bytes = {
+                    let r = self.radix.lock().unwrap();
+                    group.spans.iter().map(|&span| r.span_bytes(span)).sum()
+                };
                 if bytes == 0 {
                     continue;
                 }
-                let spans: Vec<Span> = lookup
-                    .tier_spans
-                    .iter()
-                    .filter(|(t, _)| *t == i)
-                    .map(|(_, s)| *s)
-                    .collect();
-                g.submit_promotion(*w, i, &request_id, bytes, &spans, current_time);
-                active_tiers += 1;
+                let id = g.submit_source_promotion(
+                    *w,
+                    group.tier,
+                    &request_id,
+                    group.source,
+                    bytes,
+                    &group.spans,
+                    Some(&group.ranges),
+                    current_time,
+                );
+                transfer_ids.push(id);
+                active_transfers += 1;
             }
         }
-        if active_tiers > 0 {
+        if active_transfers > 0 {
+            let mut cursor = base_blocks;
+            let ranges = lookup
+                .tier_spans
+                .iter()
+                .filter_map(|item| {
+                    let start = cursor;
+                    cursor += item.span.len();
+                    (start < reserved_blocks).then_some(TierSourceRange {
+                        source: item.source,
+                        start,
+                        end: cursor.min(reserved_blocks),
+                    })
+                })
+                .collect();
             self.leader_active_tiers
-                .insert(request_id.clone(), active_tiers);
+                .insert(request_id.clone(), active_transfers);
+            self.leader_sources.insert(
+                request_id.clone(),
+                PromotionSources {
+                    base_blocks,
+                    expected_blocks: lookup_blocks,
+                    reserved_blocks,
+                    ranges,
+                    source_versions,
+                },
+            );
+            self.leader_transfer_ids
+                .insert(request_id.clone(), transfer_ids);
             self.leader_joiners.insert(request_id, Vec::new());
         }
     }
@@ -868,9 +1012,10 @@ impl KVCacheManager {
 
     /// Advance the memory graph's transfers to `current_time` and collect
     /// this worker's finished promotions. Returns request ids whose transfer
-    /// has completed (leaders plus their joiners), or `None` without
-    /// constructing a set when this worker has no completions.
-    pub fn advance_transfers(&mut self, current_time: f64) -> Option<HashSet<String>> {
+    /// has completed (leaders plus their joiners) and the number of prefix
+    /// blocks that actually landed, or `None` without constructing a map
+    /// when this worker has no completions.
+    pub fn advance_transfers(&mut self, current_time: f64) -> Option<HashMap<String, u32>> {
         let mine: Option<Vec<String>> = match &self.memory {
             Some((g, w)) => {
                 let mut g = g.lock().unwrap();
@@ -884,20 +1029,49 @@ impl KVCacheManager {
             None => None,
         };
         let mine = mine?;
-        let mut completed: HashSet<String> = HashSet::new();
+        let mut completed: HashMap<String, u32> = HashMap::new();
         for id in mine {
             let leader = promotion_request(&id).to_string();
             if let Some(active) = self.leader_active_tiers.get_mut(&leader) {
                 *active = active.saturating_sub(1);
                 if *active == 0 {
                     self.leader_active_tiers.remove(&leader);
+                    self.leader_transfer_ids.remove(&leader);
+                    let landed = self
+                        .leader_sources
+                        .remove(&leader)
+                        .map(|sources| {
+                            let source_blocks =
+                                sources.reserved_blocks.saturating_sub(sources.base_blocks);
+                            let survived = {
+                                let r = self.radix.lock().unwrap();
+                                if sources
+                                    .source_versions
+                                    .iter()
+                                    .all(|&(source, version)| r.source_version(source) == version)
+                                {
+                                    source_blocks
+                                } else {
+                                    r.source_landing_prefix(self.worker, &leader, &sources.ranges)
+                                }
+                            };
+                            let missing = source_blocks.saturating_sub(survived);
+                            let landed = sources.expected_blocks.saturating_sub(missing);
+                            let mut g = self.memory.as_ref().unwrap().0.lock().unwrap();
+                            g.settle_source_pins();
+                            if missing > 0 {
+                                g.record_partial_landing();
+                            }
+                            landed
+                        })
+                        .unwrap_or(0);
                     if let Some(joiners) = self.leader_joiners.remove(&leader) {
                         for joiner in joiners {
                             self.joiner_to_leader.remove(&joiner);
-                            completed.insert(joiner);
+                            completed.insert(joiner, landed);
                         }
                     }
-                    completed.insert(leader);
+                    completed.insert(leader, landed);
                 }
             }
         }
@@ -917,7 +1091,13 @@ impl KVCacheManager {
             return 0.0;
         }
         match &self.memory {
-            Some((g, w)) => g.lock().unwrap().estimate_promotion_remaining(*w, leader),
+            Some((g, w)) => {
+                let mut g = g.lock().unwrap();
+                match self.leader_transfer_ids.get(leader) {
+                    Some(ids) => ids.iter().map(|id| g.estimate_remaining(id)).sum(),
+                    None => g.estimate_promotion_remaining(*w, leader),
+                }
+            }
             None => 0.0,
         }
     }
@@ -1412,7 +1592,7 @@ mod landing_tests {
         assert_eq!(lj.join_leader.as_deref(), Some("r"));
         // Land it.
         let done = m.advance_transfers(10.0);
-        assert!(done.as_ref().is_some_and(|done| done.contains("r")));
+        assert!(done.as_ref().is_some_and(|done| done.contains_key("r")));
         m.publish_transferred_blocks(&mut r, 4);
         r.num_computed_tokens = 64;
         let lk2 = m.peek_prefix_cache(&r);

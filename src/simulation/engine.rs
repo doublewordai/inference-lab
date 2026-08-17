@@ -891,6 +891,9 @@ impl Engine {
             bytes_promoted: g.flows().bytes_submitted_worker,
             write_race_waits: g.write_race_waits,
             peak_transfers_in_flight: g.flows().peak_in_flight() as u64,
+            peer_hbm_bytes_promoted: g.peer_hbm_bytes_promoted,
+            pin_stalls: g.pin_stalls(),
+            partial_landings: g.partial_landings,
         })
     }
 

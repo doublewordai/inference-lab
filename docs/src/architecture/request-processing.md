@@ -63,6 +63,20 @@ contention point for all accesses; store access latency is paid before bytes
 flow. Writes, promotions, cascades between tiers and hand-offs are all
 transfers on the graph's edges.
 
+`peer_hbm` is a virtual node-local tier rather than another store. A lookup
+can source the next prefix span from a sibling worker's resident HBM and
+promote it GPU → switch → GPU over the hardware's NVLink edges. It has no
+capacity and receives no writes. Tier order still selects the closest
+available source first.
+
+A tier entry may pin fetch sources. While pinned, a peer's free HBM run or a
+normal store range cannot be recycled; an allocation with no other victim
+waits and records a pin stall. Peer HBM pins by default, while normal stores
+retain the historical unpinned default. If pinning is disabled and eviction
+removes a source suffix during the transfer, completion rechecks the ordered
+source spans, publishes only the surviving prefix, releases the unused
+landing reservation, and recomputes the rest. This records a partial landing.
+
 ## Preemption
 
 When a running request cannot get the block its next position needs, the

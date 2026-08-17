@@ -20,6 +20,12 @@
 //! hash sequences agree on a prefix exactly when they agree at its last
 //! position: comparisons are per node boundary, divergence points by binary
 //! search, never per block.
+//!
+//! A lookup tier may also be peer HBM. Unlike a store it owns no ranges:
+//! lookup reads sibling workers' resident prefixes directly and returns the
+//! concrete source worker with each span. Fetch-source references share the
+//! HBM pin boundary with live requests, so recycling cannot pass a span a
+//! promotion is reading.
 
 use crate::config::{EvictionPolicy, HbmEviction};
 use rustc_hash::FxHashMap;
@@ -97,6 +103,10 @@ struct HbmState {
     /// Live requests ending at each node offset (`end → count`); positions
     /// below the largest end are pinned.
     refs: BTreeMap<u32, u32>,
+    /// Promotion readers pinning another worker's HBM as a source. Like
+    /// request references these pin a prefix: HBM residency is contiguous,
+    /// so a protected middle span necessarily protects everything before it.
+    fetch_refs: BTreeMap<u32, u32>,
     /// Free portion `[pinned, resident)` as runs, ascending by position,
     /// stamps non-increasing.
     runs: Vec<Run>,
@@ -109,11 +119,19 @@ struct HbmState {
 
 impl HbmState {
     fn pinned(&self) -> u32 {
-        self.refs.keys().next_back().copied().unwrap_or(0)
+        self.refs
+            .keys()
+            .chain(self.fetch_refs.keys())
+            .next_back()
+            .copied()
+            .unwrap_or(0)
     }
 
     fn is_empty(&self) -> bool {
-        self.resident == 0 && self.refs.is_empty() && self.landing.is_empty()
+        self.resident == 0
+            && self.refs.is_empty()
+            && self.fetch_refs.is_empty()
+            && self.landing.is_empty()
     }
 
     /// The landing range starting exactly at `resident`, if any.
@@ -212,8 +230,13 @@ struct WorkerMeta {
     seq: u64,
     policy: HbmEviction,
     backed_first: bool,
-    /// The worker's stores, closest first (set by the memory graph).
-    tiers: Vec<StoreId>,
+    /// The worker's lookup tiers, closest first (set by the memory graph).
+    tiers: Vec<RadixTier>,
+    /// Changes whenever resident HBM is recycled, invalidating an unpinned
+    /// peer source's optimistic completion check.
+    source_version: u64,
+    /// Number of node spans currently pinned as peer-fetch sources.
+    fetch_pins: u32,
 }
 
 /// Order entry: `(key, seq, range id)`. The range's current tree position is
@@ -229,6 +252,44 @@ struct StoreMeta {
     locations: FxHashMap<TierRangeId, (NodeId, u32)>,
     seq: u64,
     eviction: EvictionPolicy,
+    /// Exact source spans protected by in-flight promotions. A pinned
+    /// store range is skipped wholesale by eviction; this can temporarily
+    /// leave the store over capacity until the reader drains.
+    pins: BTreeMap<(NodeId, u32, u32), u32>,
+    /// Changes whenever held content is removed or evicted.
+    source_version: u64,
+}
+
+/// A tier a worker can consult during a radix lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RadixTier {
+    Store(StoreId),
+    /// Candidate source workers on this worker's node, in stable order.
+    PeerHbm(Vec<WorkerId>),
+}
+
+/// The concrete source selected for a cached span.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TierSource {
+    Store(StoreId),
+    PeerHbm(WorkerId),
+}
+
+/// A contiguous cached span and the source that will serve it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TierSpan {
+    pub tier: usize,
+    pub span: Span,
+    pub source: TierSource,
+}
+
+/// One concrete source covering an absolute range of a request prefix.
+/// Absolute positions remain stable when radix nodes split or merge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TierSourceRange {
+    pub source: TierSource,
+    pub start: u32,
+    pub end: u32,
 }
 
 /// What a worker sees of a request's prefix.
@@ -245,8 +306,8 @@ pub struct HbmLookup {
     /// tier list) and their bytes.
     pub tier_blocks: Vec<u32>,
     pub tier_bytes: Vec<u64>,
-    /// Blocks reachable in tiers, in order, as `(tier, span)`.
-    pub tier_spans: Vec<(usize, Span)>,
+    /// Blocks reachable in tiers, in order, with their concrete source.
+    pub tier_spans: Vec<TierSpan>,
 }
 
 impl HbmLookup {
@@ -279,7 +340,7 @@ struct LookupParts {
     tier: u32,
     tier_blocks: Vec<u32>,
     tier_bytes: Vec<u64>,
-    tier_spans: Vec<(usize, Span)>,
+    tier_spans: Vec<TierSpan>,
 }
 
 /// A region a worker's HBM recycled.
@@ -326,6 +387,12 @@ pub struct Radix {
     kv_bytes_at: KvBytesFn,
     /// `kv_bytes_at(k × block_size)`, grown on demand.
     boundary_bytes: RefCell<Vec<u64>>,
+    /// Capacity/eviction attempts blocked by a pinned promotion source.
+    pin_stalls: u64,
+    /// Current radix nodes carrying each in-flight destination landing.
+    /// This keeps completion rechecks proportional to the landing path while
+    /// split/merge maintenance preserves stable identities.
+    landing_nodes: FxHashMap<(WorkerId, String), Vec<NodeId>>,
 }
 
 impl std::fmt::Debug for Radix {
@@ -360,6 +427,8 @@ impl Radix {
             block_size: block_size.max(1),
             kv_bytes_at,
             boundary_bytes: RefCell::new(vec![0]),
+            pin_stalls: 0,
+            landing_nodes: FxHashMap::default(),
         }
     }
 
@@ -418,6 +487,8 @@ impl Radix {
             policy,
             backed_first,
             tiers: Vec::new(),
+            source_version: 0,
+            fetch_pins: 0,
         });
     }
 
@@ -426,11 +497,28 @@ impl Radix {
     }
 
     pub fn set_worker_tiers(&mut self, w: WorkerId, tiers: Vec<StoreId>) {
+        self.wm(w).tiers = tiers.into_iter().map(RadixTier::Store).collect();
+    }
+
+    pub fn set_worker_lookup_tiers(&mut self, w: WorkerId, tiers: Vec<RadixTier>) {
         self.wm(w).tiers = tiers;
     }
 
-    pub fn worker_tiers(&self, w: WorkerId) -> &[StoreId] {
+    pub fn worker_tiers(&self, w: WorkerId) -> &[RadixTier] {
         &self.w(w).tiers
+    }
+
+    pub fn pin_stalls(&self) -> u64 {
+        self.pin_stalls
+    }
+
+    /// Generation of a promotion source. An unchanged generation proves no
+    /// source block could have disappeared while a transfer was in flight.
+    pub fn source_version(&self, source: TierSource) -> u64 {
+        match source {
+            TierSource::Store(store) => self.stores[store].source_version,
+            TierSource::PeerHbm(worker) => self.w(worker).source_version,
+        }
     }
 
     pub fn set_worker_hbm_policy(&mut self, w: WorkerId, policy: HbmEviction, backed_first: bool) {
@@ -448,6 +536,8 @@ impl Radix {
             locations: FxHashMap::default(),
             seq: 0,
             eviction,
+            pins: BTreeMap::new(),
+            source_version: 0,
         });
         self.stores.len() - 1
     }
@@ -549,6 +639,162 @@ impl Radix {
             cur = child;
         }
         path
+    }
+
+    /// Current radix spans reserved as `leader`'s landing in the absolute
+    /// request range `[from, upto)`. Landing tags move with their ranges when
+    /// radix nodes split or merge, so this is a stable alternative to keeping
+    /// either node ids or a copy of a potentially very long prompt.
+    fn landing_spans_between(
+        &self,
+        w: WorkerId,
+        leader: &str,
+        from: u32,
+        upto: u32,
+    ) -> Vec<(u32, Span)> {
+        let mut spans = Vec::new();
+        let key = (w, leader.to_string());
+        for &node_id in self.landing_nodes.get(&key).into_iter().flatten() {
+            let node = &self.nodes[node_id as usize];
+            let Some(hbm) = node.hbm.get(&w) else {
+                continue;
+            };
+            for landing in hbm.landing.iter().filter(|l| l.leader == leader) {
+                let start = landing.start.max(from.saturating_sub(node.depth));
+                let end = landing.end.min(upto.saturating_sub(node.depth));
+                if start < end {
+                    spans.push((
+                        node.depth + start,
+                        Span {
+                            node: node_id,
+                            start,
+                            end,
+                        },
+                    ));
+                }
+            }
+        }
+        spans.sort_unstable_by_key(|(start, _)| *start);
+        spans
+    }
+
+    /// Absolute end of the destination blocks actually reserved for a
+    /// leader. Lookup can expose the block containing the final usable token
+    /// even when an already-held block means no new landing was allocated.
+    pub fn landing_end(&self, w: WorkerId, leader: &str) -> Option<u32> {
+        let key = (w, leader.to_string());
+        self.landing_nodes
+            .get(&key)
+            .into_iter()
+            .flatten()
+            .flat_map(|&node_id| {
+                let node = &self.nodes[node_id as usize];
+                node.hbm.get(&w).into_iter().flat_map(move |hbm| {
+                    hbm.landing
+                        .iter()
+                        .filter(move |landing| landing.leader == leader)
+                        .map(move |landing| node.depth + landing.end)
+                })
+            })
+            .max()
+    }
+
+    /// Re-resolve source spans through the destination's stable landing tags.
+    /// Used to release pins after a tree split without retaining prompt hashes.
+    pub fn landing_source_spans(
+        &self,
+        w: WorkerId,
+        leader: &str,
+        ranges: &[TierSourceRange],
+    ) -> Vec<(TierSource, Span)> {
+        let Some((from, upto)) = ranges
+            .first()
+            .zip(ranges.last())
+            .map(|(first, last)| (first.start, last.end))
+        else {
+            return Vec::new();
+        };
+        let landings = self.landing_spans_between(w, leader, from, upto);
+        let mut landing_index = 0usize;
+        let mut out = Vec::new();
+        for range in ranges {
+            let mut cursor = range.start;
+            while cursor < range.end {
+                while landing_index < landings.len()
+                    && landings[landing_index].0 + landings[landing_index].1.len() <= cursor
+                {
+                    landing_index += 1;
+                }
+                let Some(&(absolute, span)) = landings.get(landing_index) else {
+                    break;
+                };
+                if absolute > cursor {
+                    break;
+                }
+                let offset = cursor - absolute;
+                let take = (span.len() - offset).min(range.end - cursor);
+                out.push((
+                    range.source,
+                    Span {
+                        start: span.start + offset,
+                        end: span.start + offset + take,
+                        ..span
+                    },
+                ));
+                cursor += take;
+            }
+        }
+        out
+    }
+
+    /// Surviving prefix of the ordered sources for one landing. The lookup
+    /// stops at the first missing source block even if a later range remains.
+    pub fn source_landing_prefix(
+        &self,
+        w: WorkerId,
+        leader: &str,
+        ranges: &[TierSourceRange],
+    ) -> u32 {
+        let Some((from, upto)) = ranges
+            .first()
+            .zip(ranges.last())
+            .map(|(first, last)| (first.start, last.end))
+        else {
+            return 0;
+        };
+        let landings = self.landing_spans_between(w, leader, from, upto);
+        let mut landing_index = 0usize;
+        let mut survived = 0u32;
+        for range in ranges {
+            let mut cursor = range.start;
+            while cursor < range.end {
+                while landing_index < landings.len()
+                    && landings[landing_index].0 + landings[landing_index].1.len() <= cursor
+                {
+                    landing_index += 1;
+                }
+                let Some(&(absolute, span)) = landings.get(landing_index) else {
+                    return survived;
+                };
+                if absolute > cursor {
+                    return survived;
+                }
+                let offset = cursor - absolute;
+                let take = (span.len() - offset).min(range.end - cursor);
+                let source_span = Span {
+                    start: span.start + offset,
+                    end: span.start + offset + take,
+                    ..span
+                };
+                let count = self.source_prefix(range.source, source_span);
+                survived += count;
+                cursor += count;
+                if count < take {
+                    return survived;
+                }
+            }
+        }
+        survived
     }
 
     /// The path for `hashes`, inserting what is missing (splitting a node
@@ -828,6 +1074,16 @@ impl Radix {
                 }
             }
             head.refs = head_refs;
+            let mut head_fetch_refs = BTreeMap::new();
+            for (&end, &c) in &head.fetch_refs {
+                if end > k {
+                    *head_fetch_refs.entry(k).or_insert(0) += c;
+                    *tail_state.fetch_refs.entry(end - k).or_insert(0) += c;
+                } else {
+                    *head_fetch_refs.entry(end).or_insert(0) += c;
+                }
+            }
+            head.fetch_refs = head_fetch_refs;
             let mut head_runs = Vec::new();
             for r in head.runs.drain(..) {
                 if r.end <= k {
@@ -954,6 +1210,49 @@ impl Radix {
             if !tail_state.ranges.is_empty() {
                 self.nodes[tail as usize].tiers.insert(s, tail_state);
             }
+            let pins: Vec<_> = self.stores[s]
+                .pins
+                .iter()
+                .filter(|&(&(n, _, _), _)| n == node)
+                .map(|(&key, &count)| (key, count))
+                .collect();
+            for ((_, start, end), count) in pins {
+                self.stores[s].pins.remove(&(node, start, end));
+                if start < k {
+                    *self.stores[s]
+                        .pins
+                        .entry((node, start, end.min(k)))
+                        .or_insert(0) += count;
+                }
+                if end > k {
+                    *self.stores[s]
+                        .pins
+                        .entry((tail, start.saturating_sub(k), end - k))
+                        .or_insert(0) += count;
+                }
+            }
+        }
+        for ((w, leader), nodes) in &mut self.landing_nodes {
+            if !nodes.contains(&node) {
+                continue;
+            }
+            let head_has = self.nodes[node as usize]
+                .hbm
+                .get(w)
+                .is_some_and(|h| h.landing.iter().any(|l| l.leader == *leader));
+            let tail_has = self.nodes[tail as usize]
+                .hbm
+                .get(w)
+                .is_some_and(|h| h.landing.iter().any(|l| l.leader == *leader));
+            nodes.retain(|&id| id != node);
+            if head_has {
+                nodes.push(node);
+            }
+            if tail_has {
+                nodes.push(tail);
+            }
+            nodes.sort_unstable();
+            nodes.dedup();
         }
         tail
     }
@@ -1015,15 +1314,20 @@ impl Radix {
         for &w in &workers_dedup {
             let hp = n.hbm.get(&w);
             let hc = c.hbm.get(&w);
-            let (rp, refs_at_k) = hp.map_or((0, 0), |h| {
-                (h.resident, h.refs.get(&k).copied().unwrap_or(0))
+            let (rp, refs_at_k, fetch_refs_at_k) = hp.map_or((0, 0, 0), |h| {
+                (
+                    h.resident,
+                    h.refs.get(&k).copied().unwrap_or(0),
+                    h.fetch_refs.get(&k).copied().unwrap_or(0),
+                )
             });
             if let Some(hc) = hc {
                 let child_refs: u32 = hc.refs.values().sum();
+                let child_fetch_refs: u32 = hc.fetch_refs.values().sum();
                 if (hc.resident > 0 || !hc.landing.is_empty()) && rp < k {
                     return;
                 }
-                if child_refs > refs_at_k {
+                if child_refs > refs_at_k || child_fetch_refs > fetch_refs_at_k {
                     return;
                 }
                 if !hc.landing.is_empty() && hp.is_some_and(|h| !h.landing.is_empty()) {
@@ -1080,6 +1384,17 @@ impl Radix {
             for (end, cnt) in hc.refs {
                 *hp.refs.entry(k + end).or_insert(0) += cnt;
             }
+            let child_fetch_refs: u32 = hc.fetch_refs.values().sum();
+            if child_fetch_refs > 0 {
+                let e = hp.fetch_refs.get_mut(&k).unwrap();
+                *e -= child_fetch_refs;
+                if *e == 0 {
+                    hp.fetch_refs.remove(&k);
+                }
+            }
+            for (end, cnt) in hc.fetch_refs {
+                *hp.fetch_refs.entry(k + end).or_insert(0) += cnt;
+            }
             for r in hc.runs {
                 hp.runs.push(Run {
                     start: k + r.start,
@@ -1120,9 +1435,30 @@ impl Radix {
                     .insert(moved.id, (node, moved.start));
                 tp.ranges.push(moved);
             }
+            let pins: Vec<_> = self.stores[s]
+                .pins
+                .iter()
+                .filter(|&(&(n, _, _), _)| n == child)
+                .map(|(&key, &count)| (key, count))
+                .collect();
+            for ((_, start, end), count) in pins {
+                self.stores[s].pins.remove(&(child, start, end));
+                *self.stores[s]
+                    .pins
+                    .entry((node, k + start, k + end))
+                    .or_insert(0) += count;
+            }
         }
         for &w in &workers_dedup {
             self.order_refresh(w, node);
+        }
+        for nodes in self.landing_nodes.values_mut() {
+            if nodes.contains(&child) {
+                nodes.retain(|&id| id != child);
+                nodes.push(node);
+                nodes.sort_unstable();
+                nodes.dedup();
+            }
         }
     }
 
@@ -1259,22 +1595,40 @@ impl Radix {
             let mut off = pos_total - acc;
             while off < seg.len {
                 // Nearest tier holding `off`.
-                let mut found: Option<(usize, u32)> = None;
-                for (ti, &s) in tiers.iter().enumerate() {
-                    if let Some(ts) = node.tiers.get(&s) {
-                        // Ranges are sorted and disjoint: the candidate is
-                        // the last one starting at or before `off`.
-                        let i = ts.ranges.partition_point(|r| r.start <= off);
-                        if i > 0 {
-                            let r = &ts.ranges[i - 1];
-                            if off < r.end {
-                                found = Some((ti, r.end.min(seg.len)));
-                                break;
+                let mut found: Option<(usize, u32, TierSource)> = None;
+                for (ti, tier) in tiers.iter().enumerate() {
+                    match tier {
+                        RadixTier::Store(s) => {
+                            if let Some(ts) = node.tiers.get(s) {
+                                // Ranges are sorted and disjoint: the
+                                // candidate is the last one starting at or
+                                // before `off`.
+                                let i = ts.ranges.partition_point(|r| r.start <= off);
+                                if i > 0 {
+                                    let r = &ts.ranges[i - 1];
+                                    if off < r.end {
+                                        found =
+                                            Some((ti, r.end.min(seg.len), TierSource::Store(*s)));
+                                    }
+                                }
+                            }
+                        }
+                        RadixTier::PeerHbm(peers) => {
+                            for &peer in peers {
+                                let resident =
+                                    node.hbm.get(&peer).map_or(0, |h| h.resident).min(seg.len);
+                                if off < resident {
+                                    found = Some((ti, resident, TierSource::PeerHbm(peer)));
+                                    break;
+                                }
                             }
                         }
                     }
+                    if found.is_some() {
+                        break;
+                    }
                 }
-                let Some((ti, end)) = found else {
+                let Some((ti, end, source)) = found else {
                     break 'outer;
                 };
                 let span = Span {
@@ -1286,7 +1640,11 @@ impl Radix {
                 if detailed {
                     lk.tier_blocks[ti] += span.len();
                     lk.tier_bytes[ti] += self.span_bytes(span);
-                    lk.tier_spans.push((ti, span));
+                    lk.tier_spans.push(TierSpan {
+                        tier: ti,
+                        span,
+                        source,
+                    });
                 }
                 off = end;
                 pos_total = acc + off;
@@ -1326,6 +1684,184 @@ impl Radix {
             }
         }
         n
+    }
+
+    /// How much of `span` is still present at `source`, starting at the
+    /// span's first block. Used when an unpinned promotion drains: only
+    /// this surviving prefix may become resident at the destination.
+    pub fn source_prefix(&self, source: TierSource, span: Span) -> u32 {
+        match source {
+            TierSource::PeerHbm(w) => self.nodes[span.node as usize]
+                .hbm
+                .get(&w)
+                .map_or(0, |h| h.resident.saturating_sub(span.start))
+                .min(span.len()),
+            TierSource::Store(s) => {
+                let Some(ts) = self.nodes[span.node as usize].tiers.get(&s) else {
+                    return 0;
+                };
+                let mut pos = span.start;
+                for r in &ts.ranges {
+                    if r.end <= pos {
+                        continue;
+                    }
+                    if r.start > pos || pos >= span.end {
+                        break;
+                    }
+                    pos = pos.max(r.end.min(span.end));
+                }
+                pos.saturating_sub(span.start)
+            }
+        }
+    }
+
+    /// Protect a promotion source until its flow drains.
+    pub fn pin_source(&mut self, source: TierSource, span: Span) {
+        match source {
+            TierSource::PeerHbm(w) => self.pin_hbm_source(w, span),
+            TierSource::Store(s) => {
+                *self.stores[s]
+                    .pins
+                    .entry((span.node, span.start, span.end))
+                    .or_insert(0) += 1;
+            }
+        }
+    }
+
+    /// Release a source pin. Store pins can have left their store
+    /// temporarily over capacity; return the evictions now unblocked.
+    pub fn unpin_source(&mut self, source: TierSource, span: Span) -> Vec<TierEvicted> {
+        match source {
+            TierSource::PeerHbm(w) => {
+                self.unpin_hbm_source(w, span);
+                Vec::new()
+            }
+            TierSource::Store(s) => {
+                let key = (span.node, span.start, span.end);
+                if let Some(n) = self.stores[s].pins.get_mut(&key) {
+                    *n -= 1;
+                    if *n == 0 {
+                        self.stores[s].pins.remove(&key);
+                    }
+                }
+                Vec::new()
+            }
+        }
+    }
+
+    pub fn trim_store_after_unpin(&mut self, store: StoreId) -> Vec<TierEvicted> {
+        self.store_trim_capacity(store)
+    }
+
+    fn pin_hbm_source(&mut self, w: WorkerId, span: Span) {
+        self.order_remove(w, span.node);
+        let old_pinned = self.nodes[span.node as usize]
+            .hbm
+            .get(&w)
+            .map_or(0, HbmState::pinned);
+        let mut consumed = 0u32;
+        {
+            let Some(h) = self.nodes[span.node as usize].hbm.get_mut(&w) else {
+                return;
+            };
+            *h.fetch_refs.entry(span.end).or_insert(0) += 1;
+            let new_pinned = h.pinned().min(h.resident);
+            if new_pinned > old_pinned {
+                let mut kept = Vec::with_capacity(h.runs.len());
+                for r in h.runs.drain(..) {
+                    let s = r.start.max(old_pinned);
+                    let e = r.end.min(new_pinned);
+                    if s < e {
+                        consumed += e - s;
+                    }
+                    if r.start < s {
+                        kept.push(Run { end: s, ..r });
+                    }
+                    if e < r.end {
+                        kept.push(Run { start: e, ..r });
+                    }
+                }
+                kept.sort_by_key(|r| r.start);
+                h.runs = kept;
+            }
+        }
+        self.wm(w).fetch_pins += 1;
+        self.wm(w).free_in_runs -= consumed;
+        self.order_refresh(w, span.node);
+    }
+
+    fn unpin_hbm_source(&mut self, w: WorkerId, span: Span) {
+        self.order_remove(w, span.node);
+        let old_pinned = self.nodes[span.node as usize]
+            .hbm
+            .get(&w)
+            .map_or(0, HbmState::pinned);
+        let seq = {
+            let m = self.wm(w);
+            m.seq += 1;
+            m.seq
+        };
+        let outlook_ordered = matches!(self.w(w).policy, HbmEviction::Outlook {});
+        let mut freed = 0u32;
+        let mut unpinned = false;
+        {
+            let node = &mut self.nodes[span.node as usize];
+            let boundary = outlook_ordered.then(|| node.outlook_boundary()).flatten();
+            let (key_lo, key_hi) = if outlook_ordered {
+                (node.outlook_key_at(0).0, node.outlook_key_at(u32::MAX).0)
+            } else {
+                (0, 0)
+            };
+            let Some(h) = node.hbm.get_mut(&w) else {
+                return;
+            };
+            if let Some(n) = h.fetch_refs.get_mut(&span.end) {
+                unpinned = true;
+                *n -= 1;
+                if *n == 0 {
+                    h.fetch_refs.remove(&span.end);
+                }
+            }
+            let new_pinned = h.pinned();
+            let free_end = old_pinned.min(h.resident);
+            if new_pinned < free_end {
+                let mut pieces = Vec::new();
+                match boundary {
+                    Some(u) if new_pinned < u && u < free_end => {
+                        pieces.push((new_pinned, u, key_lo));
+                        pieces.push((u, free_end, key_hi));
+                    }
+                    Some(u) if free_end <= u => pieces.push((new_pinned, free_end, key_lo)),
+                    _ => pieces.push((new_pinned, free_end, key_hi)),
+                }
+                for (start, end, key) in pieces {
+                    freed += end - start;
+                    h.runs.push(Run {
+                        start,
+                        end,
+                        seq,
+                        key,
+                    });
+                }
+                h.runs.sort_by_key(|r| r.start);
+            }
+        }
+        if unpinned {
+            self.wm(w).fetch_pins -= 1;
+        }
+        self.wm(w).free_in_runs += freed;
+        self.order_refresh(w, span.node);
+    }
+
+    /// Record an allocation attempt that could have recycled blocks but is
+    /// waiting for an in-flight peer-HBM reader to release them.
+    pub fn note_pin_stall(&mut self, w: WorkerId, needed: u32) {
+        if self.free_blocks(w) >= needed {
+            return;
+        }
+        if self.w(w).fetch_pins > 0 {
+            self.pin_stalls += 1;
+        }
     }
 
     // ------------------------------------------------------------------
@@ -1426,7 +1962,9 @@ impl Radix {
             }
             acc += seg.len;
         }
-        if self.free_blocks(w) < fresh + hits_on_free {
+        let needed = fresh + hits_on_free;
+        if self.free_blocks(w) < needed {
+            self.note_pin_stall(w, needed);
             return None;
         }
         let mut out = Acquired {
@@ -1434,6 +1972,7 @@ impl Radix {
             hits_on_free,
             ..Default::default()
         };
+        let mut landing_nodes = Vec::new();
 
         // Pass 2: pin refs, consume runs, record hits.
         acc = 0;
@@ -1574,10 +2113,20 @@ impl Radix {
                             end: b,
                             leader: leader.unwrap_or("").to_string(),
                         });
+                        landing_nodes.push(seg.node);
                     }
                 }
             }
             acc += seg.len;
+        }
+        if let Some(leader) = leader.filter(|_| !landing_nodes.is_empty()) {
+            let nodes = self
+                .landing_nodes
+                .entry((w, leader.to_string()))
+                .or_default();
+            nodes.extend(landing_nodes);
+            nodes.sort_unstable();
+            nodes.dedup();
         }
         Some(out)
     }
@@ -1596,7 +2145,15 @@ impl Radix {
         }
         while need > 0 {
             let backed_first = self.w(w).backed_first;
-            let tiers = self.w(w).tiers.clone();
+            let tiers: Vec<StoreId> = self
+                .w(w)
+                .tiers
+                .iter()
+                .filter_map(|t| match t {
+                    RadixTier::Store(s) => Some(*s),
+                    RadixTier::PeerHbm(_) => None,
+                })
+                .collect();
             // Candidate: front of the order, or a backed run within 16 blocks.
             let mut chosen: Option<(u64, u64, NodeId)> = None;
             if backed_first && !tiers.is_empty() {
@@ -1662,6 +2219,10 @@ impl Radix {
             if empty {
                 self.nodes[node_id as usize].hbm.remove(&w);
             }
+        }
+        if !out.is_empty() {
+            let version = self.w(w).source_version.wrapping_add(1);
+            self.wm(w).source_version = version;
         }
         out
     }
@@ -1788,6 +2349,57 @@ impl Radix {
             }
             acc += seg.len;
         }
+    }
+
+    /// Complete a promotion whose reservation covered `reserved` blocks but
+    /// whose source only survived through `upto`. The surviving prefix is
+    /// landed; the suffix reservation and this request's references to it
+    /// are released as blank capacity rather than publishing stale KV.
+    pub fn landed_partial(
+        &mut self,
+        w: WorkerId,
+        path: &Path,
+        leader: &str,
+        reserved: u32,
+        upto: u32,
+    ) {
+        let reserved = reserved.min(path.blocks);
+        let upto = upto.min(reserved);
+        self.landed(w, path, upto);
+        if upto == reserved {
+            self.landing_nodes.remove(&(w, leader.to_string()));
+            return;
+        }
+        let mut returned = 0u32;
+        let mut acc = 0u32;
+        for seg in &path.segs {
+            let old_end = reserved.saturating_sub(acc).min(seg.len);
+            let new_end = upto.saturating_sub(acc).min(seg.len);
+            acc += seg.len;
+            if new_end == old_end {
+                continue;
+            }
+            self.order_remove(w, seg.node);
+            if let Some(h) = self.nodes[seg.node as usize].hbm.get_mut(&w) {
+                if old_end > 0 {
+                    if let Some(n) = h.refs.get_mut(&old_end) {
+                        *n -= 1;
+                        if *n == 0 {
+                            h.refs.remove(&old_end);
+                        }
+                    }
+                }
+                if new_end > 0 {
+                    *h.refs.entry(new_end).or_insert(0) += 1;
+                }
+                h.landing
+                    .retain(|l| !(l.leader == leader && l.start >= new_end && l.start < old_end));
+                returned += old_end - new_end;
+            }
+            self.order_refresh(w, seg.node);
+        }
+        self.wm(w).unused += returned;
+        self.landing_nodes.remove(&(w, leader.to_string()));
     }
 
     /// Whether worker `w` has a landing range for `leader` on `path`.
@@ -2065,8 +2677,40 @@ impl Radix {
                 self.stores[s].held += piece.len();
             }
         }
+        evicted.extend(self.store_trim_capacity(s));
+        evicted
+    }
+
+    fn store_range_pinned(&self, s: StoreId, node: NodeId, start: u32, end: u32) -> bool {
+        self.stores[s]
+            .pins
+            .iter()
+            .any(|(&(n, a, b), &count)| count > 0 && n == node && a < end && start < b)
+    }
+
+    /// Evict until `s` meets its capacity, skipping every range protected by
+    /// an in-flight reader. If all candidates are pinned, the over-capacity
+    /// state is retained and completed when the last relevant pin releases.
+    fn store_trim_capacity(&mut self, s: StoreId) -> Vec<TierEvicted> {
+        let mut evicted = Vec::new();
         while self.stores[s].held > self.stores[s].capacity {
-            let Some(e) = self.stores[s].order.iter().next().copied() else {
+            let chosen = if self.stores[s].pins.is_empty() {
+                self.stores[s].order.iter().next().copied()
+            } else {
+                self.stores[s].order.iter().copied().find(|e| {
+                    let Some(&(node, start)) = self.stores[s].locations.get(&e.2) else {
+                        return true;
+                    };
+                    let end = self.nodes[node as usize]
+                        .tiers
+                        .get(&s)
+                        .and_then(|ts| ts.ranges.iter().find(|r| r.id == e.2))
+                        .map_or(start, |r| r.end);
+                    !self.store_range_pinned(s, node, start, end)
+                })
+            };
+            let Some(e) = chosen else {
+                self.pin_stalls += 1;
                 break;
             };
             let excess = self.stores[s].held - self.stores[s].capacity;
@@ -2125,6 +2769,7 @@ impl Radix {
             end: r.end,
         };
         self.stores[s].held -= take;
+        self.stores[s].source_version = self.stores[s].source_version.wrapping_add(1);
         let bytes = self.span_bytes(span);
         let dead_bytes = if dead_span.is_empty() {
             0
@@ -2425,6 +3070,9 @@ impl Radix {
         ts.ranges = kept;
         let empty = ts.ranges.is_empty();
         self.stores[s].held -= removed_blocks;
+        if removed_blocks > 0 {
+            self.stores[s].source_version = self.stores[s].source_version.wrapping_add(1);
+        }
         for e in order_rm {
             self.stores[s].order.remove(&e);
         }
