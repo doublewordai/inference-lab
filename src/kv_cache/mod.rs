@@ -11,4 +11,5 @@ pub use graph::{
     promotion_id, promotion_request, MemoryGraph, Path, SharedMemoryGraph, Store, StoreId, Tier,
     WorkerId,
 };
-pub use manager::{KVCacheManager, KvBytesFn, PrefixCacheLookup, PrefixCacheStats};
+pub use manager::{KVCacheManager, PrefixCacheLookup, PrefixCacheStats};
+pub use radix::{KvBytesFn, Radix, SharedRadix, Span};

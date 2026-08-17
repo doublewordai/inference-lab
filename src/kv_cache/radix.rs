@@ -31,7 +31,10 @@ pub type WorkerId = usize;
 pub type StoreId = usize;
 
 /// KV bytes of a `t`-token sequence, from the model.
-pub type KvBytesFn = Box<dyn Fn(u32) -> u64 + Send + Sync>;
+pub type KvBytesFn = std::sync::Arc<dyn Fn(u32) -> u64 + Send + Sync>;
+
+/// The tree shared by a topology's workers and its memory graph.
+pub type SharedRadix = std::sync::Arc<std::sync::Mutex<Radix>>;
 
 /// A range of one node's blocks, `[start, end)` in node-relative blocks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,8 +152,9 @@ struct Node {
     /// Blocks before this node along its path.
     depth: u32,
     hashes: Vec<u64>,
-    /// Children by their first hash.
-    children: FxHashMap<u64, NodeId>,
+    /// Children by their first hash (small fan-out: a linear scan beats
+    /// hashing).
+    children: Vec<(u64, NodeId)>,
     hbm: FxHashMap<WorkerId, HbmState>,
     tiers: FxHashMap<StoreId, TierState>,
     /// Announced re-entry: `(next_arrival, upto)` — positions `< upto`
@@ -165,6 +169,12 @@ impl Node {
     }
     fn first_hash(&self) -> Option<u64> {
         self.hashes.first().copied()
+    }
+    fn child(&self, first_hash: u64) -> Option<NodeId> {
+        self.children
+            .iter()
+            .find(|&&(h, _)| h == first_hash)
+            .map(|&(_, id)| id)
     }
     /// Outlook key for positions in `[start, end)`; a range straddling the
     /// outlook boundary is split by the caller.
@@ -294,12 +304,12 @@ impl std::fmt::Debug for Radix {
 }
 
 impl Radix {
-    pub fn new(block_size: u32, kv_bytes_at: impl Fn(u32) -> u64 + Send + Sync + 'static) -> Self {
+    pub fn new(block_size: u32, kv_bytes_at: KvBytesFn) -> Self {
         let root = Node {
             parent: None,
             depth: 0,
             hashes: Vec::new(),
-            children: FxHashMap::default(),
+            children: Vec::new(),
             hbm: FxHashMap::default(),
             tiers: FxHashMap::default(),
             outlook: None,
@@ -312,7 +322,7 @@ impl Radix {
             workers: Vec::new(),
             stores: Vec::new(),
             block_size: block_size.max(1),
-            kv_bytes_at: Box::new(kv_bytes_at),
+            kv_bytes_at,
             boundary_bytes: RefCell::new(vec![0]),
         }
     }
@@ -405,6 +415,10 @@ impl Radix {
         self.stores.len() - 1
     }
 
+    pub fn set_store_eviction(&mut self, s: StoreId, eviction: EvictionPolicy) {
+        self.stores[s].eviction = eviction;
+    }
+
     pub fn store_held_blocks(&self, s: StoreId) -> u32 {
         self.stores[s].held
     }
@@ -441,7 +455,7 @@ impl Radix {
         let mut cur = self.root;
         let mut pos = 0usize;
         while pos < hashes.len() {
-            let Some(&child) = self.nodes[cur as usize].children.get(&hashes[pos]) else {
+            let Some(child) = self.nodes[cur as usize].child(hashes[pos]) else {
                 break;
             };
             let node = &self.nodes[child as usize];
@@ -498,7 +512,7 @@ impl Radix {
         }
         let rest = &hashes[path.blocks as usize..];
         let leaf = self.new_node(Some(parent), rest.to_vec());
-        self.nodes[parent as usize].children.insert(rest[0], leaf);
+        self.nodes[parent as usize].children.push((rest[0], leaf));
         path.segs.push(Seg {
             node: leaf,
             len: rest.len() as u32,
@@ -516,7 +530,7 @@ impl Radix {
             parent,
             depth,
             hashes,
-            children: FxHashMap::default(),
+            children: Vec::new(),
             hbm: FxHashMap::default(),
             tiers: FxHashMap::default(),
             outlook: None,
@@ -543,7 +557,7 @@ impl Radix {
         }
         self.nodes[tail as usize].children = children;
         let first = self.nodes[tail as usize].first_hash().unwrap();
-        self.nodes[node as usize].children.insert(first, tail);
+        self.nodes[node as usize].children.push((first, tail));
 
         // Outlook.
         if let Some((t, upto)) = self.nodes[node as usize].outlook {
@@ -681,8 +695,9 @@ impl Radix {
     }
 
     /// Drop `node` and its ancestors while they hold no state and no
-    /// children.
-    fn prune(&mut self, mut node: NodeId) {
+    /// children. Callers run it after a batch that may have emptied a node
+    /// is fully processed (its evicted regions written on or dropped).
+    pub fn prune_if_empty(&mut self, mut node: NodeId) {
         while node != self.root
             && self.nodes[node as usize].alive
             && self.nodes[node as usize].prunable()
@@ -695,10 +710,176 @@ impl Radix {
             n.tiers.clear();
             n.hashes = Vec::new();
             if let Some(h) = first {
-                self.nodes[parent as usize].children.remove(&h);
+                self.nodes[parent as usize]
+                    .children
+                    .retain(|&(k, _)| k != h);
             }
             self.free_ids.push(node);
             node = parent;
+        }
+        // The last survivor may now be a node with a single child: compact.
+        if node != self.root && self.nodes[node as usize].alive {
+            self.try_merge_down(node);
+        }
+    }
+
+    /// Merge `node` with its only child when their state is a consistent
+    /// prefix (the child's HBM/store ranges continue the node's), so a chain
+    /// forked at every step compacts back into one run once the side
+    /// branches are gone.
+    fn try_merge_down(&mut self, node: NodeId) {
+        let n = &self.nodes[node as usize];
+        if n.children.len() != 1 {
+            return;
+        }
+        let child = n.children[0].1;
+        let k = n.len();
+        let c = &self.nodes[child as usize];
+        // Outlook compatibility.
+        let outlook = match (n.outlook, c.outlook) {
+            (None, None) => None,
+            (Some((t, u)), None) => Some((t, u)),
+            (Some((t, u)), Some((t2, u2))) if u == k && t == t2 => Some((t, k + u2)),
+            _ => return,
+        };
+        // HBM states must chain: the child's residency needs the node fully
+        // resident; the node's refs at k cover the child's refs.
+        let workers: Vec<WorkerId> = n.hbm.keys().chain(c.hbm.keys()).copied().collect();
+        let mut workers_dedup = workers.clone();
+        workers_dedup.sort_unstable();
+        workers_dedup.dedup();
+        for &w in &workers_dedup {
+            let hp = n.hbm.get(&w);
+            let hc = c.hbm.get(&w);
+            let (rp, refs_at_k) = hp.map_or((0, 0), |h| {
+                (h.resident, h.refs.get(&k).copied().unwrap_or(0))
+            });
+            if let Some(hc) = hc {
+                let child_refs: u32 = hc.refs.values().sum();
+                if (hc.resident > 0 || !hc.landing.is_empty()) && rp < k {
+                    return;
+                }
+                if child_refs > refs_at_k {
+                    return;
+                }
+                if !hc.landing.is_empty() && hp.is_some_and(|h| !h.landing.is_empty()) {
+                    return;
+                }
+            }
+        }
+        // Store states: only require the child's ranges to be shiftable
+        // (always true).
+        // Commit the merge.
+        let mut cn = std::mem::replace(
+            &mut self.nodes[child as usize],
+            Node {
+                parent: None,
+                depth: 0,
+                hashes: Vec::new(),
+                children: Vec::new(),
+                hbm: FxHashMap::default(),
+                tiers: FxHashMap::default(),
+                outlook: None,
+                alive: false,
+            },
+        );
+        self.free_ids.push(child);
+        for &(_, gc) in &cn.children {
+            self.nodes[gc as usize].parent = Some(node);
+        }
+        // Order entries of both nodes go, and come back for the merged one.
+        for &w in &workers_dedup {
+            self.order_remove(w, node);
+            if let Some(hc) = cn.hbm.get(&w) {
+                if let Some(tail) = hc.runs.last() {
+                    self.wm(w).order.remove(&(tail.key, tail.seq, child));
+                }
+            }
+        }
+        let stores: Vec<StoreId> = self.nodes[node as usize]
+            .tiers
+            .keys()
+            .chain(cn.tiers.keys())
+            .copied()
+            .collect();
+        for &s in &stores {
+            if let Some(ts) = self.nodes[node as usize].tiers.get(&s) {
+                for r in &ts.ranges {
+                    self.stores[s].order.remove(&(r.key, r.seq, node, r.start));
+                }
+            }
+            if let Some(ts) = cn.tiers.get(&s) {
+                for r in &ts.ranges {
+                    self.stores[s].order.remove(&(r.key, r.seq, child, r.start));
+                }
+            }
+        }
+        let n = &mut self.nodes[node as usize];
+        n.hashes.append(&mut cn.hashes);
+        n.children = std::mem::take(&mut cn.children);
+        n.outlook = outlook;
+        for (w, hc) in cn.hbm.drain() {
+            let hp = n.hbm.entry(w).or_default();
+            if hc.resident > 0 {
+                hp.resident = k + hc.resident;
+            }
+            let child_refs: u32 = hc.refs.values().sum();
+            if child_refs > 0 {
+                let e = hp.refs.get_mut(&k).unwrap();
+                *e -= child_refs;
+                if *e == 0 {
+                    hp.refs.remove(&k);
+                }
+            }
+            for (end, cnt) in hc.refs {
+                *hp.refs.entry(k + end).or_insert(0) += cnt;
+            }
+            for r in hc.runs {
+                hp.runs.push(Run {
+                    start: k + r.start,
+                    end: k + r.end,
+                    ..r
+                });
+            }
+            for l in hc.landing {
+                hp.landing.push(Landing {
+                    start: k + l.start,
+                    end: k + l.end,
+                    leader: l.leader,
+                });
+            }
+            for (end, cnt) in hc.hits {
+                if let Some(last) = hp.hits.last_mut() {
+                    if last.1 == cnt {
+                        last.0 = k + end;
+                        continue;
+                    }
+                }
+                hp.hits.push((k + end, cnt));
+            }
+        }
+        for (s, tc) in cn.tiers.drain() {
+            let tp = n.tiers.entry(s).or_default();
+            if tc.read_upto > 0 {
+                tp.read_upto = k + tc.read_upto;
+            }
+            for r in tc.ranges {
+                tp.ranges.push(TierRange {
+                    start: k + r.start,
+                    end: k + r.end,
+                    ..r
+                });
+            }
+        }
+        for &w in &workers_dedup {
+            self.order_refresh(w, node);
+        }
+        for &s in &stores {
+            if let Some(ts) = self.nodes[node as usize].tiers.get(&s) {
+                for r in &ts.ranges {
+                    self.stores[s].order.insert((r.key, r.seq, node, r.start));
+                }
+            }
         }
     }
 
@@ -807,9 +988,15 @@ impl Radix {
                 let mut found: Option<(usize, u32)> = None;
                 for (ti, &s) in tiers.iter().enumerate() {
                     if let Some(ts) = node.tiers.get(&s) {
-                        if let Some(r) = ts.ranges.iter().find(|r| r.start <= off && off < r.end) {
-                            found = Some((ti, r.end.min(seg.len)));
-                            break;
+                        // Ranges are sorted and disjoint: the candidate is
+                        // the last one starting at or before `off`.
+                        let i = ts.ranges.partition_point(|r| r.start <= off);
+                        if i > 0 {
+                            let r = &ts.ranges[i - 1];
+                            if off < r.end {
+                                found = Some((ti, r.end.min(seg.len)));
+                                break;
+                            }
                         }
                     }
                 }
@@ -1146,7 +1333,6 @@ impl Radix {
                 .is_some_and(|h| h.is_empty());
             if empty {
                 self.nodes[node_id as usize].hbm.remove(&w);
-                self.prune(node_id);
             }
         }
         out
@@ -1180,11 +1366,18 @@ impl Radix {
                 m.seq += 1;
                 m.seq
             };
+            let outlook_ordered = matches!(self.w(w).policy, HbmEviction::Outlook {});
             let node = &mut self.nodes[seg.node as usize];
-            let outlook_boundary = node.outlook_boundary();
-            let outlook_keys = |p: u32| node.outlook_key_at(p).0;
-            let key_lo = outlook_keys(0);
-            let key_hi = outlook_keys(u32::MAX);
+            let outlook_boundary = if outlook_ordered {
+                node.outlook_boundary()
+            } else {
+                None
+            };
+            let (key_lo, key_hi) = if outlook_ordered {
+                (node.outlook_key_at(0).0, node.outlook_key_at(u32::MAX).0)
+            } else {
+                (0, 0)
+            };
             let h = node.hbm.entry(w).or_default();
             let old_pinned = h.pinned();
             if let Some(c) = h.refs.get_mut(&end_here) {
@@ -1301,9 +1494,12 @@ impl Radix {
                 }
                 (None, _) => None,
             };
-            // Re-key HBM runs on every worker.
+            // Re-key HBM runs on every outlook-ordered worker.
             let workers: Vec<WorkerId> = self.nodes[node_id as usize].hbm.keys().copied().collect();
             for w in workers {
+                if !matches!(self.w(w).policy, HbmEviction::Outlook {}) {
+                    continue;
+                }
                 self.order_remove(w, node_id);
                 let node = &mut self.nodes[node_id as usize];
                 let boundary = node.outlook_boundary();
@@ -1569,7 +1765,6 @@ impl Radix {
             .is_some_and(|t| t.ranges.is_empty());
         if empty {
             self.nodes[node_id as usize].tiers.remove(&s);
-            self.prune(node_id);
         }
         Some(TierEvicted {
             span,
@@ -1626,14 +1821,15 @@ impl Radix {
             let mut ranges = Vec::with_capacity(ts.ranges.len() + 1);
             let mut removed = Vec::new();
             let mut added = Vec::new();
+            // One stamp per promotion: the touched ranges coalesce.
+            self.stores[s].seq += 1;
+            let seq = self.stores[s].seq;
             for r in ts.ranges.drain(..) {
                 if r.end <= sp.start || r.start >= sp.end {
                     ranges.push(r);
                     continue;
                 }
                 removed.push((r.key, r.seq, node_id, r.start));
-                self.stores[s].seq += 1;
-                let seq = self.stores[s].seq;
                 if r.start < sp.start {
                     let head = TierRange {
                         end: sp.start,
@@ -1736,8 +1932,8 @@ impl Radix {
         }
         if empty {
             self.nodes[node_id as usize].tiers.remove(&s);
-            self.prune(node_id);
         }
+        self.prune_if_empty(node_id);
         ids
     }
 
@@ -1806,6 +2002,57 @@ impl Radix {
         self.nodes.iter().filter(|n| n.alive).count()
     }
 
+    /// Whether the block of `hash` (wherever it sits on a path) is resident
+    /// in worker `w`'s HBM. Test helper: scans the tree.
+    pub fn hbm_contains(&self, w: WorkerId, hash: u64) -> bool {
+        self.nodes.iter().filter(|n| n.alive).any(|n| {
+            n.hashes
+                .iter()
+                .position(|&h| h == hash)
+                .is_some_and(|off| n.hbm.get(&w).is_some_and(|h| h.resident > off as u32))
+        })
+    }
+
+    /// Whether store `s` holds the block of `hash`. Test helper.
+    pub fn store_contains_hash(&self, s: StoreId, hash: u64) -> bool {
+        self.nodes.iter().filter(|n| n.alive).any(|n| {
+            n.hashes.iter().position(|&h| h == hash).is_some_and(|off| {
+                n.tiers.get(&s).is_some_and(|ts| {
+                    ts.ranges
+                        .iter()
+                        .any(|r| r.start <= off as u32 && (off as u32) < r.end)
+                })
+            })
+        })
+    }
+
+    /// Whether store `s` holds the block of `hash` with its write landed.
+    pub fn store_resident_hash(&self, s: StoreId, hash: u64) -> bool {
+        self.nodes.iter().filter(|n| n.alive).any(|n| {
+            n.hashes.iter().position(|&h| h == hash).is_some_and(|off| {
+                n.tiers.get(&s).is_some_and(|ts| {
+                    ts.ranges.iter().any(|r| {
+                        r.start <= off as u32 && (off as u32) < r.end && r.arriving.is_none()
+                    })
+                })
+            })
+        })
+    }
+
+    /// The span of the block of `hash`, if the tree has it. Test helper.
+    pub fn span_of_hash(&self, hash: u64) -> Option<Span> {
+        self.nodes.iter().enumerate().find_map(|(i, n)| {
+            if !n.alive {
+                return None;
+            }
+            n.hashes.iter().position(|&h| h == hash).map(|off| Span {
+                node: i as NodeId,
+                start: off as u32,
+                end: off as u32 + 1,
+            })
+        })
+    }
+
     /// Blocks resident in worker `w`'s HBM (all nodes), for utilisation.
     pub fn resident_blocks(&self, w: WorkerId) -> u32 {
         self.nodes
@@ -1823,7 +2070,7 @@ mod tests {
 
     fn radix() -> Radix {
         // 100 B per token, 16-token blocks: 1600 B per block.
-        Radix::new(16, |t| 100 * t as u64)
+        Radix::new(16, std::sync::Arc::new(|t| 100 * t as u64))
     }
 
     #[test]

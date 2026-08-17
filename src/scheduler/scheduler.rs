@@ -242,15 +242,8 @@ impl Scheduler {
                 let cached_blocks = self
                     .kv_cache_manager
                     .content_blocks_for_tokens(req.num_cached_tokens);
-                let hashes: Vec<u64> = req
-                    .prompt_block_hashes
-                    .iter()
-                    .copied()
-                    .take(cached_blocks)
-                    .collect();
-                let blocks: Vec<u32> = req.kv_blocks.iter().copied().take(cached_blocks).collect();
                 self.kv_cache_manager
-                    .publish_transferred_blocks(&hashes, &blocks);
+                    .publish_transferred_blocks(&req, cached_blocks);
                 req.ready_at = None;
                 req.num_computed_tokens = req.num_cached_tokens;
                 // Its prefix is hot and its landing blocks are held: admit
@@ -276,16 +269,9 @@ impl Scheduler {
                 let cached_blocks = self
                     .kv_cache_manager
                     .content_blocks_for_tokens(req.num_cached_tokens);
-                let hashes: Vec<u64> = req
-                    .prompt_block_hashes
-                    .iter()
-                    .copied()
-                    .take(cached_blocks)
-                    .collect();
-                let blocks: Vec<u32> = req.kv_blocks.iter().copied().take(cached_blocks).collect();
                 self.kv_cache_manager
-                    .publish_transferred_blocks(&hashes, &blocks);
-                self.kv_cache_manager.free_blocks(&req.kv_blocks);
+                    .publish_transferred_blocks(&req, cached_blocks);
+                self.kv_cache_manager.free_blocks(&req);
             } else {
                 still_flying.push(req);
             }
@@ -317,7 +303,7 @@ impl Scheduler {
                 self.kv_cache_manager
                     .set_outlook(&req.prompt_block_hashes, req.outlook_at(current_time));
                 self.plan_prefetch(&req, current_time);
-                self.kv_cache_manager.free_blocks(&req.kv_blocks);
+                self.kv_cache_manager.free_blocks(&req);
                 req.kv_blocks.clear();
                 decision.completed.push(req);
             } else {
@@ -587,7 +573,7 @@ impl Scheduler {
                 continue;
             }
             let r = &mut self.waiting[i];
-            self.kv_cache_manager.free_blocks(&r.kv_blocks);
+            self.kv_cache_manager.free_blocks(r);
             r.kv_blocks.clear();
             r.num_computed_tokens = 0;
             r.num_cached_tokens = 0;
@@ -709,7 +695,7 @@ impl Scheduler {
     /// Preempt a running request: free its KV; it recomputes on resume.
     fn preempt_request(&mut self, request: &mut Request) {
         self.num_preemptions += 1;
-        self.kv_cache_manager.free_blocks(&request.kv_blocks);
+        self.kv_cache_manager.free_blocks(request);
         request.kv_blocks.clear();
         request.preempt();
     }
@@ -760,7 +746,7 @@ impl Scheduler {
         let mut keep = Vec::with_capacity(self.running.len());
         for mut r in self.running.drain(..) {
             if !r.is_prefill() && !r.is_finished() {
-                self.kv_cache_manager.free_blocks(&r.kv_blocks);
+                self.kv_cache_manager.free_blocks(&r);
                 r.kv_blocks.clear();
                 handed.push(r);
             } else {
@@ -942,12 +928,14 @@ mod tests {
         let mgr = &mut scheduler.kv_cache_manager;
         let mut seed = create_test_request("seed", block_size, 1);
         seed.prompt_block_hashes = vec![prefix_hash];
-        let blocks = mgr.allocate_blocks(&seed, block_size).unwrap();
-        mgr.free_blocks(&blocks);
+        let n = mgr.allocate_blocks(&seed, block_size).unwrap();
+        seed.kv_blocks.extend(n);
+        mgr.free_blocks(&seed);
         let mut churn = create_test_request("churn", block_size * 4, 1);
         churn.prompt_block_hashes = vec![0xDEAD_u64, 0xDEAE, 0xDEAF, 0xDEB0];
-        let cb = mgr.allocate_blocks(&churn, block_size * 4).unwrap();
-        mgr.free_blocks(&cb);
+        let n = mgr.allocate_blocks(&churn, block_size * 4).unwrap();
+        churn.kv_blocks.extend(n);
+        mgr.free_blocks(&churn);
         assert!(mgr.num_tiers() == 1 && mgr.peek_prefix_cache(&seed).needs_promotion());
         (scheduler, prefix_hash)
     }
@@ -1010,7 +998,7 @@ mod tests {
         let d = s.schedule(3.0);
         assert_eq!(d.completed.len(), 1);
         let g = s.kv_cache_manager.memory().unwrap().0.clone();
-        assert!(g.lock().unwrap().holds(0, 0xA1) && g.lock().unwrap().holds(0, 0xA2));
+        assert!(g.lock().unwrap().holds_hash(0, 0xA1) && g.lock().unwrap().holds_hash(0, 0xA2));
         assert!(!s.kv_cache_manager.hbm_contains(0xA1));
         // Before 9 nothing starts; at 9 the prefetch goes out.
         s.schedule(8.0);
@@ -1107,13 +1095,15 @@ mod tests {
             let mgr = &mut s.kv_cache_manager;
             let mut seed = create_test_request("seed", bs, 1);
             seed.prompt_block_hashes = vec![a];
-            let blocks = mgr.allocate_blocks(&seed, bs).unwrap();
-            mgr.free_blocks(&blocks);
+            let n = mgr.allocate_blocks(&seed, bs).unwrap();
+            seed.kv_blocks.extend(n);
+            mgr.free_blocks(&seed);
             let mut churn = create_test_request("churn", bs * 3, 1);
             churn.prompt_block_hashes = vec![0xD1, 0xD2, 0xD3];
-            let cb = mgr.allocate_blocks(&churn, bs * 3).unwrap();
-            mgr.free_blocks(&cb);
-            assert!(mgr.memory().unwrap().0.lock().unwrap().holds(0, a));
+            let n = mgr.allocate_blocks(&churn, bs * 3).unwrap();
+            churn.kv_blocks.extend(n);
+            mgr.free_blocks(&churn);
+            assert!(mgr.memory().unwrap().0.lock().unwrap().holds_hash(0, a));
         }
         // A one-block request that keeps decoding holds a block throughout.
         s.add_request(create_test_request("hold", 1, bs - 1));
@@ -1125,7 +1115,7 @@ mod tests {
         assert_eq!(s.pending_transfers.len(), 1);
         assert_eq!(s.pending_transfers[0].num_cached_tokens, bs);
         // B lands in the tier while A is in flight.
-        s.kv_cache_manager.plant_in_tier(0, b);
+        s.kv_cache_manager.plant_in_tier_path(0, &[a, b]);
         // A lands: req is re-admitted, sees B in the tier, and parks again
         // — reserving one block for B (free: 3 − hold − A = 1).
         let ready = s.pending_transfers[0].ready_at.unwrap();
@@ -1230,7 +1220,7 @@ mod tests {
             .0
             .lock()
             .unwrap()
-            .holds(0, h));
+            .holds_hash(0, h));
 
         // Fast tier: 10× faster than recomputing → promote as before.
         let fast = per_block * 10.0 / (recompute * block_size as f64);
@@ -1274,12 +1264,14 @@ mod tests {
         let mgr = &mut scheduler.kv_cache_manager;
         let mut seed = create_test_request("seed", block_size, 1);
         seed.prompt_block_hashes = vec![prefix_hash];
-        let blocks = mgr.allocate_blocks(&seed, block_size).unwrap();
-        mgr.free_blocks(&blocks);
+        let n = mgr.allocate_blocks(&seed, block_size).unwrap();
+        seed.kv_blocks.extend(n);
+        mgr.free_blocks(&seed);
         let mut churn = create_test_request("churn", block_size * 4, 1);
         churn.prompt_block_hashes = vec![0xDEAD_u64, 0xDEAE, 0xDEAF, 0xDEB0];
-        let cb = mgr.allocate_blocks(&churn, block_size * 4).unwrap();
-        mgr.free_blocks(&cb);
+        let n = mgr.allocate_blocks(&churn, block_size * 4).unwrap();
+        churn.kv_blocks.extend(n);
+        mgr.free_blocks(&churn);
 
         // A request whose prompt starts with the prefix hash.
         let mut req = create_test_request("req", block_size * 2, 1);
@@ -1330,14 +1322,16 @@ mod tests {
             let mgr = &mut scheduler.kv_cache_manager;
             let mut seed = create_test_request("seed", block_size, 1);
             seed.prompt_block_hashes = vec![prefix_hash];
-            let blocks = mgr.allocate_blocks(&seed, block_size).unwrap();
-            mgr.free_blocks(&blocks);
+            let n = mgr.allocate_blocks(&seed, block_size).unwrap();
+            seed.kv_blocks.extend(n);
+            mgr.free_blocks(&seed);
             // Fill all four HBM blocks so the seed is evicted (LRU recycles
             // the oldest free block, so only a full HBM demotes).
             let mut churn = create_test_request("churn", block_size * 4, 1);
             churn.prompt_block_hashes = vec![0xDEAD, 0xBEEF, 0xF00D, 0xFACE];
-            let cb = mgr.allocate_blocks(&churn, block_size * 4).unwrap();
-            mgr.free_blocks(&cb);
+            let n = mgr.allocate_blocks(&churn, block_size * 4).unwrap();
+            churn.kv_blocks.extend(n);
+            mgr.free_blocks(&churn);
         }
 
         for i in 0..3 {
@@ -1350,27 +1344,18 @@ mod tests {
         // reference the same landing block.
         let _ = scheduler.schedule(0.0);
         assert_eq!(scheduler.pending_transfers.len(), 3);
-        let leader_block = scheduler.pending_transfers[0].kv_blocks[0];
+        // One landing block shared by reference: 4 − 1 = 3 free.
         for r in scheduler.pending_transfers.iter() {
-            assert_eq!(r.kv_blocks[0], leader_block);
+            assert_eq!(r.kv_blocks.len(), 1);
         }
-        assert_eq!(
-            scheduler.kv_cache_manager().block_ref_count(leader_block),
-            3
-        );
+        assert_eq!(scheduler.kv_cache_manager().num_free_blocks(), 3);
 
         let _ = scheduler.schedule(10.0);
         assert_eq!(scheduler.pending_transfers.len(), 0);
         assert_eq!(scheduler.num_running(), 3);
-        // Each request holds the shared prefix block plus its own second block.
-        let mut second: Vec<u32> = scheduler.running().iter().map(|r| r.kv_blocks[1]).collect();
-        second.sort();
-        second.dedup();
-        assert_eq!(second.len(), 3);
-        assert!(scheduler
-            .running()
-            .iter()
-            .all(|r| r.kv_blocks[0] == leader_block));
+        // Each request holds the shared prefix block plus its own second
+        // block: 1 shared + 3 private = all four.
+        assert!(scheduler.running().iter().all(|r| r.kv_blocks.len() == 2));
         assert_eq!(scheduler.kv_cache_manager().num_free_blocks(), 0);
     }
 

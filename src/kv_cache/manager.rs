@@ -1,21 +1,10 @@
-use super::block::Block;
 use super::flows::Owner;
-use super::free_queue::{FreeQueue, FreeSet, OutlookFree};
 use super::graph::{promotion_request, MemoryGraph, SharedMemoryGraph, WorkerId};
+use super::radix::{HbmLookup, KvBytesFn, Path, Radix, SharedRadix, Span};
 use crate::config::HbmEviction;
-use crate::request::{BlockId, Outlook, Request};
-use rustc_hash::FxHashMap;
+use crate::request::{Outlook, Request};
 use std::collections::{HashMap, HashSet};
-
-/// Bytes of KV a sequence of `t` tokens occupies. Supplied by the model
-/// (`ModelSpec::kv_storage_bytes`); the manager quantises it into blocks.
-pub type KvBytesFn = Box<dyn Fn(u32) -> u64 + Send + Sync>;
-
-#[derive(Debug, Clone)]
-struct InFlightEntry {
-    leader_id: String,
-    block_id: BlockId,
-}
+use std::sync::{Arc, Mutex};
 
 /// Result of looking up a request's prompt against the cache hierarchy.
 /// Each contiguous block of the prompt is classified as resident in HBM,
@@ -33,17 +22,17 @@ pub struct PrefixCacheLookup {
     /// that transfer at zero additional bandwidth cost.
     pub in_flight_tokens: u32,
     /// Per-spillover-tier tokens that need to be promoted. Indexed aligned
-    /// with `KVCacheManager::tiers`.
+    /// with the worker's tiers.
     pub promote_tokens_per_tier: Vec<u32>,
     /// Per-spillover-tier bytes that need to be promoted (the KV footprint of
     /// the promoted token ranges, from the model's KV curve).
     pub promote_bytes_per_tier: Vec<u64>,
     /// Identity of the leader transfer (if any) covering some portion of
     /// the in-flight region. The scheduler uses this to call `join_transfer`
-    /// against the same leader rather than starting a redundant one. If
-    /// multiple leaders covered different blocks, this is the latest of
-    /// them; in practice all in-flight blocks here share the same leader.
+    /// against the same leader rather than starting a redundant one.
     pub join_leader: Option<String>,
+    /// The tier-held spans to promote, as `(tier, span)`, in prefix order.
+    pub(crate) tier_spans: Vec<(usize, Span)>,
 }
 
 impl PrefixCacheLookup {
@@ -54,104 +43,6 @@ impl PrefixCacheLookup {
     pub fn needs_join(&self) -> bool {
         self.in_flight_tokens > 0
     }
-}
-
-/// Manages KV cache blocks for all requests on one worker.
-///
-/// Capacity and occupancy are counted in blocks. A block is the KV footprint
-/// of `block_size` tokens (`kv_bytes_at(block_size)`), and a sequence of `t`
-/// tokens occupies `ceil(kv_bytes_at(t) / bytes_per_block)` content blocks.
-/// For models whose KV is linear in position this is exactly
-/// `ceil(t / block_size)`; for models whose footprint is not (sliding window,
-/// DeepSeek-V4's window + compressed history) it charges the model's actual
-/// bytes. Sequences additionally hold `state_blocks` fixed blocks for
-/// length-independent per-sequence state (Mamba / GatedDeltaNet).
-pub struct KVCacheManager {
-    /// Block size in tokens.
-    block_size: u32,
-
-    /// KV bytes of a `t`-token sequence, from the model.
-    kv_bytes_at: KvBytesFn,
-
-    /// `kv_bytes_at(k × block_size)` for `k = 0..`, grown on demand: the
-    /// model's curve is a sum over layers, and per-block byte counts are
-    /// asked for on every allocation and lookup.
-    boundary_bytes: std::cell::RefCell<Vec<u64>>,
-
-    /// `kv_bytes_at(block_size)`: the unit of allocation.
-    bytes_per_block: u64,
-
-    /// Total number of blocks available.
-    total_blocks: u32,
-
-    /// All blocks.
-    blocks: Vec<Block>,
-
-    /// Free blocks in recycling order. A freed block keeps its hash and
-    /// stays hittable until it is recycled from the front, so recycling
-    /// order is the prefix cache's eviction order: LRU by free time, or
-    /// (under `hbm_eviction = outlook`) farthest announced re-entry first.
-    /// A hit on a free block pulls it back out.
-    free_blocks: FreeSet,
-
-    /// Announced re-entry per resident hash: `(next_arrival, position in
-    /// its sequence)`, set when the session step holding it completes.
-    /// Only the shared prefix of the next step is marked; everything else
-    /// is unmarked (no re-entry). Read by the outlook policies.
-    outlook: FxHashMap<u64, (f64, u32)>,
-
-    /// Enable prefix caching.
-    enable_prefix_caching: bool,
-
-    /// HBM tier: maps block hash -> block_id. The hashes are incremental
-    /// hashes of all the tokens up to a certain point, so a sequence with
-    /// blocks (1, 2, 3) reconstructs as cat(cache[1], cache[2], cache[3]).
-    prefix_cache: FxHashMap<u64, BlockId>,
-
-    /// The pool's KV memory beyond HBM and this worker's id in it, when the
-    /// deployment has tiers. Lookups, demotion and promotion transfers go
-    /// through it; `None` = HBM only.
-    memory: Option<(SharedMemoryGraph, WorkerId)>,
-
-    /// For each leader currently being promoted, the count of tiers that
-    /// still have bytes in flight for it. A leader is fully done when this
-    /// hits zero across every tier.
-    leader_active_tiers: HashMap<String, u32>,
-
-    /// Joiners piggybacking on each leader, keyed by leader id. Joiners
-    /// contribute no bandwidth load and become ready when the leader does.
-    /// Modelled after vLLM's block-ref-count sharing of in-flight prefixes.
-    leader_joiners: HashMap<String, Vec<String>>,
-
-    /// Hashes currently being promoted; maps each in-flight hash to the
-    /// leader request that owns the transfer and the HBM block reserved
-    /// to land it. Subsequent requests with the same prefix join the
-    /// existing transfer and ref-bump the same block, matching vLLM's
-    /// block-ref-count sharing.
-    in_flight_cache: FxHashMap<u64, InFlightEntry>,
-
-    /// Reverse index for joiners: maps a joiner request id to the leader
-    /// it's piggybacking on. Used by `estimate_remaining_time` so a joiner's
-    /// projected ready time stays in sync with its leader's.
-    joiner_to_leader: HashMap<String, String>,
-
-    /// Fixed blocks reserved per running sequence for length-independent state
-    /// (Mamba/GatedDeltaNet recurrent state). Zero for pure-attention models.
-    state_blocks: usize,
-
-    /// Prefix-cache lookup statistics, recorded via `record_prefix_lookup`.
-    stats: PrefixCacheStats,
-
-    /// HBM hits per resident hash (for the `selective` write policy);
-    /// cleared when the hash is recycled.
-    hit_counts: FxHashMap<u64, u32>,
-
-    /// Fresh block allocations so far, in bytes: KV written into HBM.
-    bytes_written: u64,
-    /// `bytes_written` plus every hit that pulled a free block back into
-    /// use: the content that moved to the recently-used end of the free
-    /// queue, so an upper bound on the LRU stack distance in bytes.
-    bytes_touched: u64,
 }
 
 /// Prefix-cache lookup counters. A lookup is a hit when any prefix tokens were
@@ -207,6 +98,79 @@ impl std::ops::AddAssign for PrefixCacheStats {
     }
 }
 
+/// Manages KV cache blocks for one worker.
+///
+/// Capacity and occupancy are counted in blocks. A block is the KV footprint
+/// of `block_size` tokens (`kv_bytes_at(block_size)`), and a sequence of `t`
+/// tokens occupies `ceil(kv_bytes_at(t) / bytes_per_block)` content blocks.
+/// For models whose KV is linear in position this is exactly
+/// `ceil(t / block_size)`; for models whose footprint is not (sliding window,
+/// DeepSeek-V4's window + compressed history) it charges the model's actual
+/// bytes. Sequences additionally hold `state_blocks` fixed blocks for
+/// length-independent per-sequence state (Mamba / GatedDeltaNet).
+///
+/// The blocks themselves live in the topology's [`Radix`] tree, shared with
+/// the memory graph: this manager is one worker's view of it. A request's
+/// KV is a path through the tree; what it holds is a count (`kv_blocks`),
+/// and every operation works on ranges of the path rather than on blocks.
+pub struct KVCacheManager {
+    /// Block size in tokens.
+    block_size: u32,
+
+    /// KV bytes of a `t`-token sequence, from the model.
+    kv_bytes_at: KvBytesFn,
+
+    /// `kv_bytes_at(block_size)`: the unit of allocation.
+    bytes_per_block: u64,
+
+    /// Total number of blocks available.
+    total_blocks: u32,
+
+    /// The topology's KV tree and this worker's id in it.
+    radix: SharedRadix,
+    worker: WorkerId,
+
+    /// Enable prefix caching.
+    enable_prefix_caching: bool,
+
+    /// The pool's KV memory beyond HBM and this worker's id in it, when the
+    /// deployment has tiers. Lookups, demotion and promotion transfers go
+    /// through it; `None` = HBM only.
+    memory: Option<(SharedMemoryGraph, WorkerId)>,
+
+    /// For each leader currently being promoted, the count of tiers that
+    /// still have bytes in flight for it. A leader is fully done when this
+    /// hits zero across every tier.
+    leader_active_tiers: HashMap<String, u32>,
+
+    /// Joiners piggybacking on each leader, keyed by leader id. Joiners
+    /// contribute no bandwidth load and become ready when the leader does.
+    /// Modelled after vLLM's block-ref-count sharing of in-flight prefixes.
+    leader_joiners: HashMap<String, Vec<String>>,
+
+    /// Reverse index for joiners: maps a joiner request id to the leader
+    /// it's piggybacking on. Used by `estimate_remaining_time` so a joiner's
+    /// projected ready time stays in sync with its leader's.
+    joiner_to_leader: HashMap<String, String>,
+
+    /// Fixed blocks reserved per running sequence for length-independent state
+    /// (Mamba/GatedDeltaNet recurrent state). Zero for pure-attention models.
+    state_blocks: usize,
+
+    /// Prefix-cache lookup statistics, recorded via `record_prefix_lookup`.
+    stats: PrefixCacheStats,
+
+    /// Fresh block allocations so far, in bytes: KV written into HBM.
+    bytes_written: u64,
+    /// `bytes_written` plus every hit that pulled a free block back into
+    /// use: the content that moved to the recently-used end of the free
+    /// order, so an upper bound on the LRU stack distance in bytes.
+    bytes_touched: u64,
+
+    hbm_eviction: HbmEviction,
+    backed_first: bool,
+}
+
 impl KVCacheManager {
     /// Create a manager over `kv_cache_capacity` bytes of HBM with no
     /// spillover hierarchy. `kv_bytes_at(t)` is the model's KV footprint of a
@@ -219,6 +183,7 @@ impl KVCacheManager {
         per_seq_state_bytes: u64,
         enable_prefix_caching: bool,
     ) -> Self {
+        let kv_bytes_at: KvBytesFn = Arc::new(kv_bytes_at);
         let bytes_per_block = kv_bytes_at(block_size);
         let total_blocks = kv_cache_capacity.checked_div(bytes_per_block).unwrap_or(0) as u32;
         // Fixed per-sequence state (Mamba/GDN) padded up to a whole number of
@@ -228,78 +193,368 @@ impl KVCacheManager {
         } else {
             per_seq_state_bytes.div_ceil(bytes_per_block) as usize
         };
-
-        let blocks = vec![Block::default(); total_blocks as usize];
-        let free_blocks = FreeSet::Lru(FreeQueue::new(total_blocks as usize));
-
+        let mut radix = Radix::new(block_size, kv_bytes_at.clone());
+        radix.register_worker(0, total_blocks, HbmEviction::Lru {}, false);
         Self {
             block_size,
-            kv_bytes_at: Box::new(kv_bytes_at),
-            boundary_bytes: std::cell::RefCell::new(vec![0]),
+            kv_bytes_at,
             bytes_per_block,
             total_blocks,
-            blocks,
-            free_blocks,
-            outlook: FxHashMap::default(),
+            radix: Arc::new(Mutex::new(radix)),
+            worker: 0,
             enable_prefix_caching,
-            prefix_cache: FxHashMap::default(),
             memory: None,
             leader_active_tiers: HashMap::new(),
             leader_joiners: HashMap::new(),
-            in_flight_cache: FxHashMap::default(),
             joiner_to_leader: HashMap::new(),
             state_blocks,
             stats: PrefixCacheStats::default(),
-            hit_counts: FxHashMap::default(),
             bytes_written: 0,
             bytes_touched: 0,
+            hbm_eviction: HbmEviction::Lru {},
+            backed_first: false,
         }
     }
 
-    /// Set the HBM eviction policy. Only meaningful before any allocation
-    /// (the free set is rebuilt in id order).
+    /// Set the HBM eviction policy. Only meaningful before any allocation.
     pub fn with_hbm_eviction(mut self, policy: HbmEviction) -> Self {
-        let n = self.total_blocks as usize;
-        self.free_blocks = match policy {
-            HbmEviction::Lru {} => FreeSet::Lru(FreeQueue::new(n)),
-            HbmEviction::Outlook {} => FreeSet::Outlook(OutlookFree::new(n)),
-        };
+        self.hbm_eviction = policy;
+        self.radix
+            .lock()
+            .unwrap()
+            .set_worker_hbm_policy(self.worker, policy, self.backed_first);
         self
     }
 
-    /// The session step holding `hashes` completed with `outlook`: mark the
-    /// hashes its next step re-enters with (the first `shared_tokens` worth)
-    /// and unmark the rest. Free blocks are re-ordered; tiers holding the
-    /// hashes learn the outlook too. `None` = the trajectory is over.
-    pub fn set_outlook(&mut self, hashes: &[u64], outlook: Option<Outlook>) {
-        let shared_blocks = outlook.map_or(0, |o| (o.shared_tokens / self.block_size) as usize);
-        for (pos, &hash) in hashes.iter().enumerate() {
-            let mark = outlook
-                .filter(|_| pos < shared_blocks)
-                .map(|o| (o.next_arrival, pos as u32));
-            match mark {
-                Some(m) => {
-                    self.outlook.insert(hash, m);
-                }
-                None => {
-                    self.outlook.remove(&hash);
-                }
-            }
-            if let Some(&id) = self.prefix_cache.get(&hash) {
-                self.free_blocks.rekey(id, mark);
-            }
+    /// Attach the pool's KV memory graph; this manager is `worker` in it.
+    /// The manager's blocks move into the graph's tree (call before any
+    /// allocation).
+    pub fn with_memory(mut self, graph: SharedMemoryGraph, worker: WorkerId) -> Self {
+        let (radix, backed_first) = {
+            let g = graph.lock().unwrap();
+            (g.radix(), g.evict_backed_first(worker))
+        };
+        self.backed_first = backed_first;
+        {
+            let mut r = radix.lock().unwrap();
+            r.register_worker(worker, self.total_blocks, self.hbm_eviction, backed_first);
+            let tiers = graph.lock().unwrap().store_ids_of(worker);
+            r.set_worker_tiers(worker, tiers);
         }
+        self.radix = radix;
+        self.worker = worker;
+        self.memory = Some((graph, worker));
+        self
+    }
+
+    /// Attach a private hierarchy for this worker alone: one tier per
+    /// `(name, capacity_bytes, bandwidth_to_hbm)`, closest first. What a
+    /// hardware `[memory]` of `per = "gpu"` stores gives a single worker.
+    pub fn with_private_tiers(self, tiers: &[(&str, u64, f64)]) -> Self {
+        let bpb = self.bytes_per_block.max(1);
+        let spec: Vec<(&str, u64, f64)> = tiers
+            .iter()
+            .map(|&(name, bytes, bw)| (name, bytes / bpb, bw))
+            .collect();
+        let graph = MemoryGraph::private_with(1, &spec, self.block_size, self.kv_bytes_at.clone())
+            .shared_handle();
+        self.with_memory(graph, 0)
+    }
+
+    /// The pool's memory graph and this worker's id in it, if tiered.
+    pub fn memory(&self) -> Option<(&SharedMemoryGraph, WorkerId)> {
+        self.memory.as_ref().map(|(g, w)| (g, *w))
+    }
+
+    /// The topology's KV tree.
+    pub fn radix(&self) -> &SharedRadix {
+        &self.radix
+    }
+
+    /// Number of tiers below this worker's HBM.
+    pub fn num_tiers(&self) -> usize {
+        self.radix.lock().unwrap().worker_tiers(self.worker).len()
+    }
+
+    /// Fixed blocks each running sequence holds for per-sequence state.
+    pub fn state_blocks(&self) -> usize {
+        self.state_blocks
+    }
+
+    /// Block size in tokens.
+    pub fn block_size(&self) -> u32 {
+        self.block_size
+    }
+
+    /// Bytes one block holds (`kv_bytes_at(block_size)`).
+    pub fn bytes_per_block(&self) -> u64 {
+        self.bytes_per_block
+    }
+
+    /// KV bytes of a `tokens`-token sequence, per the model's curve.
+    pub fn kv_bytes_for_tokens(&self, tokens: u32) -> u64 {
+        (self.kv_bytes_at)(tokens)
+    }
+
+    /// Content blocks a sequence of `tokens` tokens occupies (state blocks
+    /// excluded).
+    pub fn content_blocks_for_tokens(&self, tokens: u32) -> usize {
+        if self.bytes_per_block == 0 {
+            return 0;
+        }
+        (self.kv_bytes_at)(tokens).div_ceil(self.bytes_per_block) as usize
+    }
+
+    /// Blocks a sequence of `total_tokens` tokens needs: its fixed state
+    /// blocks plus the content blocks its bytes fill.
+    pub fn blocks_for_context(&self, total_tokens: u32) -> usize {
+        self.state_blocks + self.content_blocks_for_tokens(total_tokens)
+    }
+
+    /// New blocks `request` needs to grow its context by `num_new_tokens`
+    /// tokens beyond `num_computed_tokens`, given what it already holds.
+    pub fn blocks_needed(&self, request: &Request, num_new_tokens: u32) -> usize {
+        let total_tokens = request.num_computed_tokens + num_new_tokens;
+        self.blocks_for_context(total_tokens)
+            .saturating_sub(request.kv_blocks.len())
+    }
+
+    /// The path of `request`'s hashed content, and how the request's held
+    /// blocks split into (state, in-path content, anonymous tail).
+    fn hold_of(&self, request: &Request) -> (u32, u32, u32) {
+        let held = request.kv_blocks.len() as u32;
+        if held == 0 {
+            return (0, 0, 0);
+        }
+        let state = (self.state_blocks as u32).min(held);
+        let content = held - state;
+        let in_path = if self.enable_prefix_caching {
+            content.min(request.prompt_block_hashes.len() as u32)
+        } else {
+            0
+        };
+        (state, in_path, content - in_path)
+    }
+
+    /// Allocate the blocks `request` needs to grow by `num_tokens` positions.
+    /// `None` if there are not enough free blocks. Returns the blocks added.
+    pub fn allocate_blocks(&mut self, request: &Request, num_tokens: u32) -> Option<u32> {
+        self.allocate_inner(request, num_tokens, /*publish_to_hbm=*/ true, None)
+    }
+
+    /// Allocate blocks without publishing the request's hashes to the HBM
+    /// prefix cache. Used to reserve HBM landing space for an in-flight
+    /// promotion: until the transfer completes the data isn't really in HBM,
+    /// so other requests looking up the same prefix should not hit HBM.
+    pub fn reserve_blocks_for_transfer(
+        &mut self,
+        request: &Request,
+        num_tokens: u32,
+    ) -> Option<u32> {
+        self.allocate_inner(
+            request,
+            num_tokens,
+            /*publish_to_hbm=*/ false,
+            Some(&request.request_id),
+        )
+    }
+
+    fn allocate_inner(
+        &mut self,
+        request: &Request,
+        num_tokens: u32,
+        publish: bool,
+        leader: Option<&str>,
+    ) -> Option<u32> {
+        let target_total = self.blocks_for_context(request.num_computed_tokens + num_tokens) as u32;
+        let held_total = request.kv_blocks.len() as u32;
+        if target_total <= held_total {
+            return Some(0);
+        }
+        let (state_held, in_path_held, anon_held) = self.hold_of(request);
+        let state_new = (self.state_blocks as u32).saturating_sub(state_held);
+        let content_target = target_total - self.state_blocks as u32;
+        let hashed = if self.enable_prefix_caching {
+            request.prompt_block_hashes.len() as u32
+        } else {
+            0
+        };
+        let in_path_target = content_target.min(hashed);
+        let anon_target = content_target - in_path_target;
+        let anon_new = anon_target.saturating_sub(anon_held);
+
+        let mut r = self.radix.lock().unwrap();
+        let path = if in_path_target > 0 {
+            r.insert(&request.prompt_block_hashes[..in_path_target as usize])
+        } else {
+            Path::default()
+        };
+        let got = r.acquire(
+            self.worker,
+            &path,
+            in_path_held,
+            in_path_target,
+            anon_new + state_new,
+            publish,
+            leader,
+            false,
+        )?;
+        drop(r);
+        self.bytes_written += got.fresh_blocks as u64 * self.bytes_per_block;
+        self.bytes_touched += (got.fresh_blocks + got.hits_on_free) as u64 * self.bytes_per_block;
         if let Some((g, w)) = &self.memory {
             let mut g = g.lock().unwrap();
-            if g.outlook_ordered(*w) {
-                for (pos, &hash) in hashes.iter().enumerate() {
-                    let t = outlook
-                        .filter(|_| pos < shared_blocks)
-                        .map(|o| o.next_arrival);
-                    g.set_outlook(*w, hash, t);
-                }
+            g.demote_batch(*w, &got.evicted);
+            g.hit_batch(*w, &got.hits);
+            if publish {
+                g.produced_batch(*w, &got.produced);
             }
         }
+        if !got.evicted.is_empty() {
+            let mut r = self.radix.lock().unwrap();
+            for e in &got.evicted {
+                r.prune_if_empty(e.span.node);
+            }
+        }
+        Some(target_total - held_total)
+    }
+
+    /// A completed transfer's blocks (the first `cached_blocks` content
+    /// blocks of `request`) landed in HBM: subsequent lookups see them as
+    /// resident.
+    pub fn publish_transferred_blocks(&mut self, request: &Request, cached_blocks: usize) {
+        if !self.enable_prefix_caching || cached_blocks == 0 {
+            return;
+        }
+        let n = cached_blocks.min(request.prompt_block_hashes.len());
+        let spans = {
+            let mut r = self.radix.lock().unwrap();
+            let path = r.resolve(&request.prompt_block_hashes[..n]);
+            r.landed(self.worker, &path, n as u32);
+            path_spans(&path, n as u32)
+        };
+        if let Some((g, w)) = &self.memory {
+            g.lock().unwrap().promoted_batch(*w, &spans);
+        }
+    }
+
+    /// Free `request`'s blocks (due to preemption or completion). What the
+    /// request held is queued for recycling tail first, so the end of a
+    /// sequence is evicted before its beginning and what survives is always
+    /// a prefix.
+    pub fn free_blocks(&mut self, request: &Request) {
+        let (state, in_path, anon) = self.hold_of(request);
+        if state + in_path + anon == 0 {
+            return;
+        }
+        let mut r = self.radix.lock().unwrap();
+        let path = if in_path > 0 {
+            r.resolve(&request.prompt_block_hashes[..in_path as usize])
+        } else {
+            Path::default()
+        };
+        r.release(self.worker, &path, in_path, anon + state);
+    }
+
+    /// KV bytes written into HBM so far (every fresh block allocation).
+    pub fn bytes_written(&self) -> u64 {
+        self.bytes_written
+    }
+
+    /// Bytes written plus bytes of hits that pulled free blocks back into use.
+    pub fn bytes_touched(&self) -> u64 {
+        self.bytes_touched
+    }
+
+    pub fn num_free_blocks(&self) -> usize {
+        self.radix.lock().unwrap().free_blocks(self.worker) as usize
+    }
+
+    pub fn total_blocks(&self) -> usize {
+        self.total_blocks as usize
+    }
+
+    /// Fraction of blocks in use (referenced or reserved).
+    pub fn utilization(&self) -> f64 {
+        if self.total_blocks == 0 {
+            return 0.0;
+        }
+        1.0 - (self.num_free_blocks() as f64 / self.total_blocks as f64)
+    }
+
+    /// Look up `request`'s prompt: what is in HBM, in flight, in a tier.
+    pub fn peek_prefix_cache(&self, request: &Request) -> PrefixCacheLookup {
+        if !self.enable_prefix_caching {
+            return PrefixCacheLookup {
+                promote_tokens_per_tier: vec![0; self.num_tiers()],
+                promote_bytes_per_tier: vec![0; self.num_tiers()],
+                ..Default::default()
+            };
+        }
+        let lk = self
+            .radix
+            .lock()
+            .unwrap()
+            .lookup(self.worker, &request.prompt_block_hashes);
+        self.lookup_from(lk)
+    }
+
+    fn lookup_from(&self, lk: HbmLookup) -> PrefixCacheLookup {
+        let bs = self.block_size;
+        PrefixCacheLookup {
+            total_cached_tokens: lk.cached() * bs,
+            hbm_tokens: lk.hbm * bs,
+            in_flight_tokens: lk.landing * bs,
+            promote_tokens_per_tier: lk.tier_blocks.iter().map(|b| b * bs).collect(),
+            promote_bytes_per_tier: lk.tier_bytes.clone(),
+            join_leader: lk.leader.clone(),
+            tier_spans: lk.tier_spans.clone(),
+        }
+    }
+
+    /// Cached prefix length in tokens, for routing: HBM, in flight, or in
+    /// a tier — the longest prefix held anywhere on this worker.
+    pub fn cached_prefix_tokens_estimate(&self, hashes: &[u64]) -> u32 {
+        if !self.enable_prefix_caching || hashes.is_empty() {
+            return 0;
+        }
+        self.radix
+            .lock()
+            .unwrap()
+            .lookup(self.worker, hashes)
+            .cached()
+            * self.block_size
+    }
+
+    /// Contiguous prompt prefix already resident in HBM, in tokens: the part
+    /// of an incoming context a remote KV transfer (disaggregated hand-off)
+    /// can skip. Stops at the first block that is not in HBM (in flight or
+    /// in a spillover tier counts as not resident).
+    pub fn hbm_prefix_tokens(&self, hashes: &[u64]) -> u32 {
+        if !self.enable_prefix_caching {
+            return 0;
+        }
+        self.radix
+            .lock()
+            .unwrap()
+            .resident_prefix(self.worker, hashes)
+            * self.block_size
+    }
+
+    /// Record a prefix-cache lookup in the hit/miss statistics.
+    pub fn record_prefix_lookup(&mut self, lookup: &PrefixCacheLookup) {
+        let tokens = lookup.total_cached_tokens;
+        self.stats.lookups += 1;
+        self.stats.hit_size_sum += tokens as u64;
+        if tokens == 0 {
+            self.stats.misses += 1;
+        } else {
+            self.stats.hits += 1;
+        }
+    }
+
+    pub fn prefix_cache_stats(&self) -> PrefixCacheStats {
+        self.stats
     }
 
     /// Time the promotions a lookup needs would take if started now:
@@ -351,503 +606,35 @@ impl KVCacheManager {
         self.stats.recomputed_tokens += tokens as u64;
     }
 
-    /// `(blocks with references, total references, blocks free per the
-    /// free set)` — for stall diagnostics.
-    pub fn ref_summary(&self) -> (usize, u64, usize) {
-        let held = self.blocks.iter().filter(|b| b.ref_count > 0).count();
-        let refs: u64 = self.blocks.iter().map(|b| b.ref_count as u64).sum();
-        (held, refs, self.free_blocks.len())
-    }
-
-    /// The announced re-entry time of `hash`, if any.
-    pub fn outlook_of(&self, hash: u64) -> Option<f64> {
-        self.outlook.get(&hash).map(|m| m.0)
-    }
-
-    /// Attach the pool's KV memory graph; this manager is `worker` in it.
-    pub fn with_memory(mut self, graph: SharedMemoryGraph, worker: WorkerId) -> Self {
-        self.memory = Some((graph, worker));
-        self
-    }
-
-    /// Attach a private hierarchy for this worker alone: one tier per
-    /// `(name, capacity_bytes, bandwidth_to_hbm)`, closest first. What a
-    /// hardware `[memory]` of `per = "gpu"` stores gives a single worker.
-    pub fn with_private_tiers(self, tiers: &[(&str, u64, f64)]) -> Self {
-        let bpb = self.bytes_per_block.max(1);
-        let spec: Vec<(&str, u64, f64)> = tiers
-            .iter()
-            .map(|&(name, bytes, bw)| (name, bytes / bpb, bw))
-            .collect();
-        let graph = MemoryGraph::private(1, &spec).shared_handle();
-        self.with_memory(graph, 0)
-    }
-
-    /// The pool's memory graph and this worker's id in it, if tiered.
-    pub fn memory(&self) -> Option<(&SharedMemoryGraph, WorkerId)> {
-        self.memory.as_ref().map(|(g, w)| (g, *w))
-    }
-
-    /// Number of tiers below this worker's HBM.
-    pub fn num_tiers(&self) -> usize {
-        match &self.memory {
-            Some((g, w)) => g.lock().unwrap().num_tiers(*w),
-            None => 0,
-        }
-    }
-
-    /// Fixed blocks reserved per running sequence for length-independent state.
-    pub fn state_blocks(&self) -> usize {
-        self.state_blocks
-    }
-
-    /// Bytes per block: the KV footprint of a `block_size`-token sequence.
-    pub fn block_size(&self) -> u32 {
-        self.block_size
-    }
-
-    pub fn bytes_per_block(&self) -> u64 {
-        self.bytes_per_block
-    }
-
-    /// KV bytes held by content block `idx` (positions `idx × block_size ..
-    /// (idx + 1) × block_size`), from the memoised block boundaries.
-    fn content_bytes_of_block(&self, idx: usize) -> u64 {
-        let mut b = self.boundary_bytes.borrow_mut();
-        while b.len() <= idx + 1 {
-            let k = b.len() as u32;
-            let at = (self.kv_bytes_at)(k * self.block_size);
-            b.push(at);
-        }
-        b[idx + 1].saturating_sub(b[idx])
-    }
-
-    /// KV bytes of a `tokens`-token sequence, per the model's curve.
-    pub fn kv_bytes_for_tokens(&self, tokens: u32) -> u64 {
-        (self.kv_bytes_at)(tokens)
-    }
-
-    /// Content blocks a sequence of `tokens` tokens occupies (state blocks
-    /// excluded).
-    pub fn content_blocks_for_tokens(&self, tokens: u32) -> usize {
-        if self.bytes_per_block == 0 {
-            return 0;
-        }
-        (self.kv_bytes_at)(tokens).div_ceil(self.bytes_per_block) as usize
-    }
-
-    /// Blocks a request must hold once it has `total_tokens` tokens of context:
-    /// the fixed per-sequence state plus the content blocks.
-    pub fn blocks_for_context(&self, total_tokens: u32) -> usize {
-        self.state_blocks + self.content_blocks_for_tokens(total_tokens)
-    }
-
-    /// New blocks `request` needs to grow its context by `num_new_tokens`
-    /// tokens beyond `num_computed_tokens`, given what it already holds.
-    pub fn blocks_needed(&self, request: &Request, num_new_tokens: u32) -> usize {
-        let total_tokens = request.num_computed_tokens + num_new_tokens;
-        self.blocks_for_context(total_tokens)
-            .saturating_sub(request.kv_blocks.len())
-    }
-
-    /// The next block to recycle: the least recently freed, unless the
-    /// deployment prefers dropping a block a tier already holds — then the
-    /// first such block within `BACKED_LOOKAHEAD` of the queue's front.
-    fn pick_free_block(&mut self) -> BlockId {
-        const BACKED_LOOKAHEAD: usize = 16;
-        if let Some((g, w)) = &self.memory {
-            let g = g.lock().unwrap();
-            if g.evict_backed_first(*w) {
-                for id in self.free_blocks.front(BACKED_LOOKAHEAD) {
-                    match self.blocks[id as usize].content_hash {
-                        None => {
-                            // Never used: free to take.
-                            self.free_blocks.remove(id);
-                            return id;
-                        }
-                        Some(h) if g.is_backed(*w, h) => {
-                            self.free_blocks.remove(id);
-                            return id;
-                        }
-                        Some(_) => {}
-                    }
-                }
-            }
-        }
-        self.free_blocks.pop_front().unwrap()
-    }
-
-    /// Allocate the blocks `request` needs to grow by `num_tokens` positions.
-    /// `None` if there are not enough free blocks.
-    pub fn allocate_blocks(&mut self, request: &Request, num_tokens: u32) -> Option<Vec<BlockId>> {
-        self.allocate_blocks_inner(request, num_tokens, /*publish_to_hbm=*/ true)
-    }
-
-    /// Allocate blocks without publishing the request's hashes to the HBM
-    /// prefix cache or removing them from the spillover hierarchy. Used to
-    /// reserve HBM landing space for an in-flight promotion: until the
-    /// transfer completes the data isn't really in HBM, so other requests
-    /// looking up the same prefix should not hit HBM.
-    pub fn reserve_blocks_for_transfer(
-        &mut self,
-        request: &Request,
-        num_tokens: u32,
-    ) -> Option<Vec<BlockId>> {
-        self.allocate_blocks_inner(request, num_tokens, /*publish_to_hbm=*/ false)
-    }
-
-    /// Publish a completed transfer's blocks into the HBM prefix cache so
-    /// subsequent lookups see them as resident. Also clears in-flight
-    /// registrations for the involved hashes.
-    pub fn publish_transferred_blocks(&mut self, hashes: &[u64], blocks: &[BlockId]) {
-        if !self.enable_prefix_caching {
+    /// The session step holding `hashes` completed with `outlook`: mark the
+    /// prefix its next step re-enters with (the first `shared_tokens`
+    /// worth) and unmark the rest. Free runs and tier ranges are re-keyed.
+    /// `None` = the trajectory is over.
+    pub fn set_outlook(&mut self, hashes: &[u64], outlook: Option<Outlook>) {
+        if !self.enable_prefix_caching || hashes.is_empty() {
             return;
         }
-        let n = hashes.len().min(blocks.len());
-        for (&hash, &block_id) in hashes.iter().zip(blocks).take(n) {
-            self.prefix_cache.insert(hash, block_id);
-            self.in_flight_cache.remove(&hash);
-        }
-        if let Some((g, w)) = &self.memory {
-            g.lock().unwrap().promoted_batch(*w, &hashes[..n]);
-        }
+        let shared = outlook.map_or(0, |o| o.shared_tokens / self.block_size);
+        let mut r = self.radix.lock().unwrap();
+        let path = r.resolve(hashes);
+        r.set_outlook(&path, outlook.map(|o| o.next_arrival), shared);
     }
 
-    fn allocate_blocks_inner(
-        &mut self,
-        request: &Request,
-        num_tokens: u32,
-        publish_to_hbm: bool,
-    ) -> Option<Vec<BlockId>> {
-        let blocks_needed = self.blocks_needed(request, num_tokens);
-        let hashes = request.prompt_block_hashes.as_slice();
-
-        // The i-th block allocated in this call continues the request's
-        // existing allocation. Its index into the prompt hashes must skip the
-        // per-sequence state blocks and the content blocks already held —
-        // otherwise an incremental (decode-step) allocation looks up hash 0
-        // and aliases the request's own first prompt block.
-        let state_blocks = self.state_blocks;
-        let already_allocated = request.kv_blocks.len();
-        let hash_at = |i: usize| {
-            (already_allocated + i)
-                .checked_sub(state_blocks)
-                .and_then(|idx| hashes.get(idx))
-                .copied()
-        };
-
-        // Pass 1: decide for each requested block whether to ref an
-        // existing block (HBM-resident or already in-flight for someone
-        // else) or to allocate a fresh one. Bail early if there aren't
-        // enough fresh blocks for the misses.
-        enum Decision {
-            Fresh,
-            RefExisting(BlockId),
-        }
-        let mut decisions: Vec<Decision> = Vec::with_capacity(blocks_needed);
-        let mut fresh_needed = 0usize;
-        for i in 0..blocks_needed {
-            let dec = match hash_at(i) {
-                Some(h) if self.enable_prefix_caching => {
-                    if let Some(&block_id) = self.prefix_cache.get(&h) {
-                        Decision::RefExisting(block_id)
-                    } else if let Some(entry) = self.in_flight_cache.get(&h) {
-                        Decision::RefExisting(entry.block_id)
-                    } else {
-                        fresh_needed += 1;
-                        Decision::Fresh
-                    }
-                }
-                _ => {
-                    fresh_needed += 1;
-                    Decision::Fresh
-                }
-            };
-            decisions.push(dec);
-        }
-
-        // Hits on free-but-cached blocks leave the free queue when they are
-        // referenced below, so they are not available to the misses.
-        let hits_on_free = decisions
-            .iter()
-            .filter(|d| matches!(d, Decision::RefExisting(id) if self.free_blocks.contains(*id)))
-            .count();
-        if self.free_blocks.len() < fresh_needed + hits_on_free {
-            return None;
-        }
-        self.bytes_touched += (fresh_needed + hits_on_free) as u64 * self.bytes_per_block;
-
-        // KV bytes the i-th allocated block holds, from the model's curve
-        // at its position (content blocks after the state blocks).
-        let content_bytes_of: Vec<u64> = (0..blocks_needed)
-            .map(|i| {
-                let idx = (already_allocated + i).saturating_sub(state_blocks);
-                self.content_bytes_of_block(idx)
-            })
-            .collect();
-
-        // Pass 2: execute. Reference the hits first so a fresh pop can't
-        // recycle a block a later hit in this same call refers to. Track
-        // newly-allocated (hash, block_id) pairs so we can publish them to
-        // HBM or to in_flight_cache afterwards.
-        let mut allocated: Vec<Option<BlockId>> = vec![None; blocks_needed];
-        let mut hits: Vec<(u64, u64)> = Vec::new();
-        for (i, decision) in decisions.iter().enumerate() {
-            if let Decision::RefExisting(block_id) = decision {
-                self.free_blocks.remove(*block_id);
-                let b = &mut self.blocks[*block_id as usize];
-                b.reference();
-                if let Some(h) = b.content_hash {
-                    hits.push((h, b.content_bytes));
-                }
-                allocated[i] = Some(*block_id);
-            }
-        }
-        let mut evicted: Vec<(u64, u64)> = Vec::new();
-        let mut newly_allocated: Vec<(u64, BlockId, u64)> = Vec::new();
-        for (i, decision) in decisions.iter().enumerate() {
-            if let Decision::Fresh = decision {
-                let block_id = self.pick_free_block();
-                self.bytes_written += self.bytes_per_block;
-                let bytes = content_bytes_of[i];
-                let b = &mut self.blocks[block_id as usize];
-                let old_bytes = b.content_bytes;
-                let evicted_hash = b.allocate(hash_at(i));
-                b.content_bytes = bytes;
-                if let Some(h) = evicted_hash {
-                    evicted.push((h, old_bytes));
-                }
-                allocated[i] = Some(block_id);
-                if let Some(h) = hash_at(i) {
-                    newly_allocated.push((h, block_id, bytes));
-                }
-            }
-        }
-        let allocated: Vec<BlockId> = allocated.into_iter().map(|b| b.unwrap()).collect();
-
-        if self.enable_prefix_caching {
-            let mut demoted = Vec::with_capacity(evicted.len());
-            for (hash, bytes) in evicted {
-                self.prefix_cache.remove(&hash);
-                self.hit_counts.remove(&hash);
-                let outlook = self.outlook.remove(&hash).map(|m| m.0);
-                demoted.push((hash, bytes, outlook));
-            }
-            let mut hit_items = Vec::with_capacity(hits.len());
-            for (hash, bytes) in hits {
-                let n = self.hit_counts.entry(hash).or_insert(0);
-                *n += 1;
-                hit_items.push((hash, bytes, *n));
-            }
-            if let Some((g, w)) = &self.memory {
-                let mut g = g.lock().unwrap();
-                g.demote_batch(*w, &demoted);
-                g.hit_batch(*w, &hit_items);
-            }
-            if publish_to_hbm {
-                let mut produced = Vec::with_capacity(newly_allocated.len());
-                for &(hash, block_id, bytes) in &newly_allocated {
-                    self.prefix_cache.insert(hash, block_id);
-                    produced.push((hash, bytes));
-                }
-                if let Some((g, w)) = &self.memory {
-                    g.lock().unwrap().produced_batch(*w, &produced);
-                }
-            } else {
-                // Reservation for an in-flight transfer: register the
-                // freshly-allocated blocks in `in_flight_cache` so other
-                // requests with the same prefix can join.
-                for &(hash, block_id, _) in &newly_allocated {
-                    self.in_flight_cache.insert(
-                        hash,
-                        InFlightEntry {
-                            leader_id: request.request_id.clone(),
-                            block_id,
-                        },
-                    );
-                }
-            }
-        }
-
-        Some(allocated)
-    }
-
-    /// Free blocks from a request (due to preemption or completion). Blocks
-    /// are queued for recycling tail first, so the end of a sequence is
-    /// evicted before its beginning and what survives is always a prefix.
-    pub fn free_blocks(&mut self, block_ids: &[BlockId]) {
-        for &block_id in block_ids.iter().rev() {
-            if self.blocks[block_id as usize].release() {
-                let mark = self.blocks[block_id as usize]
-                    .content_hash
-                    .and_then(|h| self.outlook.get(&h).copied());
-                self.free_blocks.push_back(block_id, mark);
-            }
-        }
-    }
-
-    /// KV bytes written into HBM so far (every fresh block allocation).
-    pub fn bytes_written(&self) -> u64 {
-        self.bytes_written
-    }
-
-    /// `bytes_written` plus the bytes of free blocks that hits pulled back
-    /// into use.
-    pub fn bytes_touched(&self) -> u64 {
-        self.bytes_touched
-    }
-
-    pub fn num_free_blocks(&self) -> usize {
-        self.free_blocks.len()
-    }
-
-    pub fn total_blocks(&self) -> usize {
-        self.total_blocks as usize
-    }
-
-    /// Fraction of blocks in use; 0 when the cache has no blocks.
-    pub fn utilization(&self) -> f64 {
-        if self.total_blocks == 0 {
-            return 0.0;
-        }
-        1.0 - (self.free_blocks.len() as f64 / self.total_blocks as f64)
-    }
-
-    /// Look up a request's prompt against the prefix cache hierarchy.
-    /// Walks the request's incremental block hashes from the start; for each
-    /// block, records whether it lives in HBM, is currently in flight on
-    /// behalf of another request, or sits in a spillover tier. Stops at the
-    /// first block that's nowhere. Does not touch the lookup statistics; call
-    /// `record_prefix_lookup` when the lookup is acted on.
-    pub fn peek_prefix_cache(&self, request: &Request) -> PrefixCacheLookup {
-        let graph = self.memory.as_ref().map(|(g, w)| (g.lock().unwrap(), *w));
-        let n_tiers = graph.as_ref().map_or(0, |(g, w)| g.num_tiers(*w));
-        let mut lookup = PrefixCacheLookup {
-            total_cached_tokens: 0,
-            hbm_tokens: 0,
-            in_flight_tokens: 0,
-            promote_tokens_per_tier: vec![0u32; n_tiers],
-            promote_bytes_per_tier: vec![0u64; n_tiers],
-            join_leader: None,
-        };
-
-        if !self.enable_prefix_caching {
-            return lookup;
-        }
-
-        for (k, &hash) in request.prompt_block_hashes.iter().enumerate() {
-            if self.prefix_cache.contains_key(&hash) {
-                lookup.hbm_tokens += self.block_size;
-                lookup.total_cached_tokens += self.block_size;
-                continue;
-            }
-            if let Some(entry) = self.in_flight_cache.get(&hash) {
-                lookup.in_flight_tokens += self.block_size;
-                lookup.total_cached_tokens += self.block_size;
-                lookup.join_leader = Some(entry.leader_id.clone());
-                continue;
-            }
-            let held = graph.as_ref().and_then(|(g, w)| g.tier_holding(*w, hash));
-            match held {
-                Some(idx) => {
-                    lookup.promote_tokens_per_tier[idx] += self.block_size;
-                    lookup.promote_bytes_per_tier[idx] += self.content_bytes_of_block(k);
-                    lookup.total_cached_tokens += self.block_size;
-                }
-                None => break,
-            }
-        }
-
-        lookup
-    }
-
-    /// Whether `hash` is held anywhere on this worker: HBM, in flight from a
-    /// slower tier, or resident in a spillover tier.
-    fn holds_block(&self, hash: u64) -> bool {
-        self.prefix_cache.contains_key(&hash)
-            || self.in_flight_cache.contains_key(&hash)
-            || self
-                .memory
-                .as_ref()
-                .is_some_and(|(g, w)| g.lock().unwrap().holds(*w, hash))
-    }
-
-    /// Estimated cached prefix length in tokens, for routing. Finds the
-    /// longest held prefix of `hashes` by galloping then binary search on
-    /// block presence — O(log n) lookups instead of `peek_prefix_cache`'s
-    /// walk — assuming presence is prefix-closed (block k held ⇒ blocks
-    /// 0..k held), which is how blocks enter the cache and how they leave it
-    /// under LRU eviction of leaves. Where eviction has punched a hole the
-    /// estimate can overshoot; the scheduler's admission-time lookup is the
-    /// truth, and a router working from an approximate view of each
-    /// replica's prefix tree is what real KV-aware front ends do too.
-    pub fn cached_prefix_tokens_estimate(&self, hashes: &[u64]) -> u32 {
-        if !self.enable_prefix_caching || hashes.is_empty() {
-            return 0;
-        }
-        let n = hashes.len();
-        // `lo` blocks are known held; probe at lo + step.
-        let mut lo = 0usize;
-        let mut step = 1usize;
-        while lo + step <= n && self.holds_block(hashes[lo + step - 1]) {
-            lo += step;
-            step *= 2;
-        }
-        // Held count lies in [lo, min(lo + step, n)); binary search it.
-        let mut hi = (lo + step).min(n + 1); // exclusive upper bound on count
-        while lo + 1 < hi {
-            let mid = (lo + hi) / 2; // candidate count; block mid-1 must be held
-            if self.holds_block(hashes[mid - 1]) {
-                lo = mid;
-            } else {
-                hi = mid;
-            }
-        }
-        lo as u32 * self.block_size
-    }
-
-    /// Contiguous prompt prefix already resident in HBM, in tokens: the part
-    /// of an incoming context a remote KV transfer (disaggregated hand-off)
-    /// can skip. Stops at the first block that is not in HBM (in flight or
-    /// in a spillover tier counts as not resident).
-    pub fn hbm_prefix_tokens(&self, hashes: &[u64]) -> u32 {
-        if !self.enable_prefix_caching {
-            return 0;
-        }
-        let held = hashes
-            .iter()
-            .take_while(|h| self.prefix_cache.contains_key(h))
-            .count();
-        held as u32 * self.block_size
-    }
-
-    /// Record a prefix-cache lookup in the hit/miss statistics.
-    pub fn record_prefix_lookup(&mut self, lookup: &PrefixCacheLookup) {
-        let tokens = lookup.total_cached_tokens;
-        self.stats.lookups += 1;
-        self.stats.hit_size_sum += tokens as u64;
-        if tokens == 0 {
-            self.stats.misses += 1;
-        } else {
-            self.stats.hits += 1;
-        }
-    }
-
-    pub fn prefix_cache_stats(&self) -> PrefixCacheStats {
-        self.stats
+    /// The announced re-entry time of the sequence starting with `hash`.
+    pub fn outlook_of(&self, hash: u64) -> Option<f64> {
+        self.radix.lock().unwrap().outlook_of(&[hash])
     }
 
     /// Begin tracking an in-flight promotion for `request_id`: one transfer
     /// per tier with bytes to move (`lookup.promote_bytes_per_tier`), each
     /// along that tier's path in the memory graph, sharing every edge with
-    /// whatever else is in flight. The `in_flight_cache` entries are
-    /// populated at reservation time by `reserve_blocks_for_transfer`; this
-    /// method only kicks off the byte-pumping side.
+    /// whatever else is in flight. Landing blocks were reserved by
+    /// `reserve_blocks_for_transfer`; this only kicks off the byte pumping.
     pub fn start_transfer(
         &mut self,
         request_id: String,
         lookup: &PrefixCacheLookup,
-        hashes: &[u64],
+        _hashes: &[u64],
         current_time: f64,
     ) {
         let mut active_tiers = 0u32;
@@ -857,7 +644,13 @@ impl KVCacheManager {
                 if bytes == 0 {
                     continue;
                 }
-                g.submit_promotion(*w, i, &request_id, bytes, hashes, current_time);
+                let spans: Vec<Span> = lookup
+                    .tier_spans
+                    .iter()
+                    .filter(|(t, _)| *t == i)
+                    .map(|(_, s)| *s)
+                    .collect();
+                g.submit_promotion(*w, i, &request_id, bytes, &spans, current_time);
                 active_tiers += 1;
             }
         }
@@ -869,7 +662,7 @@ impl KVCacheManager {
     }
 
     /// Register `joiner_id` as piggybacking on the transfer that owns the
-    /// hashes covered by `lookup.in_flight_tokens`. The joiner contributes
+    /// blocks covered by `lookup.in_flight_tokens`. The joiner contributes
     /// no bandwidth load and becomes ready at the same time as the leader.
     pub fn join_transfer(&mut self, joiner_id: String, lookup: &PrefixCacheLookup) {
         let Some(leader) = lookup.join_leader.clone() else {
@@ -886,8 +679,6 @@ impl KVCacheManager {
     /// whose transfer has completed (leaders plus their joiners).
     pub fn advance_transfers(&mut self, current_time: f64) -> HashSet<String> {
         let mut completed: HashSet<String> = HashSet::new();
-        // Advance the whole graph (everyone's transfers move together) and
-        // collect this worker's finished promotions, one per (request, tier).
         let mine: Vec<String> = match &self.memory {
             Some((g, w)) => {
                 let mut g = g.lock().unwrap();
@@ -930,43 +721,91 @@ impl KVCacheManager {
         if !self.leader_active_tiers.contains_key(leader) {
             return 0.0;
         }
-        // Tiers are modelled as serial in the cost projection: the request
-        // must drain on each tier it has bytes on, and we sum those times.
         match &self.memory {
             Some((g, w)) => g.lock().unwrap().estimate_promotion_remaining(*w, leader),
             None => 0.0,
         }
     }
 
-    /// Put `hash` straight into this worker's tier `tier` (pre-warming).
+    /// Put the block of `hash` (as a one-block sequence) straight into this
+    /// worker's tier `tier` (pre-warming).
     pub fn plant_in_tier(&self, tier: usize, hash: u64) {
+        self.plant_in_tier_path(tier, &[hash]);
+    }
+
+    /// Put the last block of the sequence `hashes` straight into this
+    /// worker's tier `tier` (pre-warming a block at its position on a
+    /// chain).
+    pub fn plant_in_tier_path(&self, tier: usize, hashes: &[u64]) {
+        if hashes.is_empty() {
+            return;
+        }
+        let span = {
+            let mut r = self.radix.lock().unwrap();
+            let path = r.insert(hashes);
+            let last = *path.segs.last().unwrap();
+            Span {
+                node: last.node,
+                start: last.len - 1,
+                end: last.len,
+            }
+        };
         if let Some((g, w)) = &self.memory {
-            g.lock().unwrap().plant(*w, tier, hash);
+            g.lock().unwrap().plant(*w, tier, span);
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn block_ref_count(&self, block_id: BlockId) -> u32 {
-        self.blocks[block_id as usize].ref_count
+    /// `(blocks in use, references, blocks free)` — for stall diagnostics.
+    pub fn ref_summary(&self) -> (usize, u64, usize) {
+        let free = self.num_free_blocks();
+        let used = self.total_blocks as usize - free;
+        (used, used as u64, free)
     }
 
     #[cfg(test)]
     pub(crate) fn hbm_contains(&self, hash: u64) -> bool {
-        self.prefix_cache.contains_key(&hash)
+        self.radix.lock().unwrap().hbm_contains(self.worker, hash)
     }
+}
 
-    #[cfg(test)]
-    fn in_flight_contains(&self, hash: u64) -> bool {
-        self.in_flight_cache.contains_key(&hash)
+/// The spans of `path` covering its first `upto` blocks.
+pub(crate) fn path_spans(path: &Path, upto: u32) -> Vec<Span> {
+    let mut out = Vec::with_capacity(path.segs.len());
+    let mut acc = 0u32;
+    for seg in &path.segs {
+        if acc >= upto {
+            break;
+        }
+        let end = (upto - acc).min(seg.len);
+        out.push(Span {
+            node: seg.node,
+            start: 0,
+            end,
+        });
+        acc += seg.len;
     }
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{EvictionPolicy, WritePolicy};
 
     fn create_test_request(id: &str, prompt_tokens: u32) -> Request {
         Request::new(id.to_string(), 0, 0.0, prompt_tokens, 50)
+    }
+
+    /// Allocate `tokens` for `req` and account for them on the request.
+    fn alloc(m: &mut KVCacheManager, req: &mut Request, tokens: u32) -> u32 {
+        let n = m.allocate_blocks(req, tokens).unwrap();
+        req.kv_blocks.extend(n);
+        n
+    }
+
+    fn free(m: &mut KVCacheManager, req: &mut Request) {
+        m.free_blocks(req);
+        req.kv_blocks.clear();
     }
 
     #[test]
@@ -999,249 +838,142 @@ mod tests {
     }
 
     #[test]
-    fn incremental_allocation_does_not_alias_the_first_block() {
-        // Regression: a decode-step allocation must take a fresh block, not
-        // re-reference the request's own hash-0 block.
+    fn incremental_allocation_grows_the_hold_and_frees_it_whole() {
         let mut m = KVCacheManager::new(16 * 100 * 100, 16, |t| 100 * t as u64, 0, true);
         let mut req = create_test_request("a", 64);
         req.prompt_block_hashes = vec![1, 2, 3, 4];
-        let first = m.allocate_blocks(&req, 64).unwrap();
-        assert_eq!(first.len(), 4);
-        req.kv_blocks.extend(first.iter().copied());
+        assert_eq!(alloc(&mut m, &mut req, 64), 4);
         req.num_computed_tokens = 64;
-        let next = m.allocate_blocks(&req, 1).unwrap();
-        assert_eq!(next.len(), 1);
-        assert!(!first.contains(&next[0]));
-        assert_eq!(m.num_free_blocks(), 100 - 5);
+        // Decode into an unhashed fifth block.
+        assert_eq!(alloc(&mut m, &mut req, 1), 1);
+        assert_eq!(req.kv_blocks.len(), 5);
+        assert_eq!(m.num_free_blocks(), 95);
+        // Bytes: 5 fresh blocks written and touched.
+        assert_eq!(m.bytes_written(), 5 * 1600);
+        assert_eq!(m.bytes_touched(), 5 * 1600);
+        free(&mut m, &mut req);
+        assert_eq!(m.num_free_blocks(), 100);
+        // The hashed prefix is still hittable; the anonymous block is not.
+        let probe = {
+            let mut p = create_test_request("p", 64);
+            p.prompt_block_hashes = vec![1, 2, 3, 4];
+            p
+        };
+        assert_eq!(m.peek_prefix_cache(&probe).hbm_tokens, 64);
     }
 
     #[test]
-    fn test_block_allocation() {
-        let mut manager = KVCacheManager::new(16000, 16, |t| 100 * t as u64, 0, false);
-        let mut request = create_test_request("req-1", 32);
-
-        let allocated = manager.allocate_blocks(&request, 32);
-        assert!(allocated.is_some());
-
-        let blocks = allocated.unwrap();
-        assert_eq!(blocks.len(), 2);
-        assert_eq!(manager.num_free_blocks(), 8);
-
-        request.kv_blocks.extend(blocks);
-        request.num_computed_tokens = 32;
-
-        let more_blocks = manager.allocate_blocks(&request, 16);
-        assert!(more_blocks.is_some());
-        assert_eq!(more_blocks.unwrap().len(), 1);
-        assert_eq!(manager.num_free_blocks(), 7);
-    }
-
-    #[test]
-    fn test_block_allocation_failure() {
-        let mut manager = KVCacheManager::new(1600, 16, |t| 100 * t as u64, 0, false);
-        assert_eq!(manager.total_blocks, 1);
-
-        let request = create_test_request("req-1", 32);
-        let allocated = manager.allocate_blocks(&request, 32);
-        assert!(allocated.is_none());
-    }
-
-    #[test]
-    fn test_block_free() {
-        let mut manager = KVCacheManager::new(16000, 16, |t| 100 * t as u64, 0, false);
-        let request = create_test_request("req-1", 32);
-
-        let blocks = manager.allocate_blocks(&request, 32).unwrap();
-        assert_eq!(manager.num_free_blocks(), 8);
-
-        manager.free_blocks(&blocks);
-        assert_eq!(manager.num_free_blocks(), 10);
-        assert_eq!(manager.utilization(), 0.0);
-    }
-
-    #[test]
-    fn test_utilization() {
-        let mut manager = KVCacheManager::new(16000, 16, |t| 100 * t as u64, 0, false);
-        assert_eq!(manager.utilization(), 0.0);
-
-        let request = create_test_request("req-1", 32);
-        let blocks = manager.allocate_blocks(&request, 32).unwrap();
-
-        let util = manager.utilization();
-        assert!((util - 0.2).abs() < 1e-10);
-
-        manager.free_blocks(&blocks);
-        assert_eq!(manager.utilization(), 0.0);
-    }
-
-    #[test]
-    fn test_prefix_caching() {
-        let mut manager = KVCacheManager::new(16000, 16, |t| 100 * t as u64, 0, true);
-
-        let mut request1 = create_test_request("req-1", 16);
-        request1.prompt_block_hashes = vec![12345];
-
-        let lookup = manager.peek_prefix_cache(&request1);
-        manager.record_prefix_lookup(&lookup);
-        assert_eq!(lookup.total_cached_tokens, 0);
-        assert_eq!(manager.stats.misses, 1);
-
-        let blocks1 = manager.allocate_blocks(&request1, 16).unwrap();
-        request1.kv_blocks.extend(blocks1);
-
-        let mut request2 = create_test_request("req-2", 16);
-        request2.prompt_block_hashes = vec![12345];
-        let lookup = manager.peek_prefix_cache(&request2);
-        manager.record_prefix_lookup(&lookup);
-        assert_eq!(lookup.total_cached_tokens, 16);
-        assert_eq!(manager.stats.hits, 1);
-
-        let mut request3 = create_test_request("req-3", 16);
-        request3.prompt_block_hashes = vec![67890];
-        let lookup = manager.peek_prefix_cache(&request3);
-        manager.record_prefix_lookup(&lookup);
-        assert_eq!(lookup.total_cached_tokens, 0);
-        assert_eq!(manager.stats.misses, 2);
-    }
-
-    #[test]
-    fn prefix_estimate_matches_peek_on_a_prefix_closed_cache() {
-        let mut manager = KVCacheManager::new(64 * 16 * 100, 16, |t| 100 * t as u64, 0, true);
-        // Cache a 37-block prompt.
-        let mut held = create_test_request("held", 37 * 16);
-        held.prompt_block_hashes = (1..=37).collect();
-        let blocks = manager.allocate_blocks(&held, 37 * 16).unwrap();
-        held.kv_blocks.extend(blocks);
-
-        for (hashes, want) in [
-            ((1..=37).collect::<Vec<u64>>(), 37 * 16),      // exact
-            ((1..=50).collect(), 37 * 16),                  // longer prompt, same prefix
-            ((1..=5).collect(), 5 * 16),                    // shorter prompt
-            ((1..=1).collect(), 16),                        // one block
-            (vec![99, 100], 0),                             // cold
-            (vec![], 0),                                    // empty
-            ((1..=20).chain(200..=210).collect(), 20 * 16), // diverges at block 21
-        ] {
-            let mut probe = create_test_request("probe", hashes.len() as u32 * 16);
-            probe.prompt_block_hashes = hashes.clone();
-            let peek = manager.peek_prefix_cache(&probe).total_cached_tokens;
-            assert_eq!(peek, want, "peek for {} blocks", hashes.len());
-            assert_eq!(
-                manager.cached_prefix_tokens_estimate(&hashes),
-                want,
-                "estimate for {} blocks",
-                hashes.len()
-            );
-        }
-
-        let off = KVCacheManager::new(64 * 16 * 100, 16, |t| 100 * t as u64, 0, false);
-        assert_eq!(off.cached_prefix_tokens_estimate(&[1, 2, 3]), 0);
-    }
-
-    #[test]
-    fn freed_prefixes_survive_churn_and_are_recycled_lru_tail_first() {
-        // 8 blocks. Session A caches 3, completes; B allocates 2 in between;
-        // A's re-entry must still hit all 3 (LRU recycles the oldest free
-        // blocks, not the ones A just released).
-        let mut m = KVCacheManager::new(8 * 16 * 100, 16, |t| 100 * t as u64, 0, true);
+    fn prefix_hits_share_blocks_and_stop_at_the_first_miss() {
+        let mut m = KVCacheManager::new(10 * 1600, 16, |t| 100 * t as u64, 0, true);
         let mut a = create_test_request("a", 48);
         a.prompt_block_hashes = vec![1, 2, 3];
-        let a_blocks = m.allocate_blocks(&a, 48).unwrap();
-        m.free_blocks(&a_blocks);
-        assert_eq!(m.num_free_blocks(), 8);
-
-        let mut b = create_test_request("b", 32);
-        b.prompt_block_hashes = vec![10, 20];
-        let b_blocks = m.allocate_blocks(&b, 32).unwrap();
-        // B took the untouched blocks, not A's.
-        assert!(
-            b_blocks.iter().all(|id| !a_blocks.contains(id)),
-            "{b_blocks:?}"
+        alloc(&mut m, &mut a, 48);
+        // b shares [1, 2] then diverges: two hits, one fresh block.
+        let mut b = create_test_request("b", 48);
+        b.prompt_block_hashes = vec![1, 2, 9];
+        let lk = m.peek_prefix_cache(&b);
+        assert_eq!((lk.hbm_tokens, lk.total_cached_tokens), (32, 32));
+        assert!(!lk.needs_promotion());
+        assert_eq!(alloc(&mut m, &mut b, 48), 3);
+        assert_eq!(
+            m.num_free_blocks(),
+            10 - 4,
+            "one shared prefix, 4 distinct blocks"
         );
-
-        let mut a2 = create_test_request("a2", 64);
-        a2.prompt_block_hashes = vec![1, 2, 3, 4];
-        assert_eq!(m.peek_prefix_cache(&a2).total_cached_tokens, 48);
-        let a2_blocks = m.allocate_blocks(&a2, 64).unwrap();
-        // The three hits are A's physical blocks, now referenced and out of
-        // the free queue: 8 − 2 (B) − 3 (hits) − 1 (fresh) = 2 free.
-        assert_eq!(&a2_blocks[..3], &a_blocks[..]);
-        assert_eq!(m.num_free_blocks(), 2);
-        for id in &a2_blocks[..3] {
-            assert_eq!(m.block_ref_count(*id), 1);
-        }
-
-        // Fill the rest: the two remaining fresh blocks, then eviction has
-        // to recycle A's *tail* first (block for hash 4 was freed last of
-        // A2's, and B's are still held), i.e. what survives is a prefix.
-        m.free_blocks(&a2_blocks);
-        let mut c = create_test_request("c", 32);
-        c.prompt_block_hashes = vec![100, 200];
-        m.allocate_blocks(&c, 32).unwrap(); // takes the 2 never-used blocks
-        let mut d = create_test_request("d", 16);
-        d.prompt_block_hashes = vec![300];
-        m.allocate_blocks(&d, 16).unwrap(); // evicts hash 4 (A2's tail)
-        let mut probe = create_test_request("p", 64);
-        probe.prompt_block_hashes = vec![1, 2, 3, 4];
-        assert_eq!(m.peek_prefix_cache(&probe).total_cached_tokens, 48);
+        // Freeing a keeps its blocks hittable for b's siblings.
+        free(&mut m, &mut a);
+        let mut c = create_test_request("c", 48);
+        c.prompt_block_hashes = vec![1, 2, 3];
+        assert_eq!(m.peek_prefix_cache(&c).hbm_tokens, 48);
         assert_eq!(m.cached_prefix_tokens_estimate(&[1, 2, 3, 4]), 48);
-        let mut e = create_test_request("e", 16);
-        e.prompt_block_hashes = vec![400];
-        m.allocate_blocks(&e, 16).unwrap(); // evicts hash 3
-        assert_eq!(m.peek_prefix_cache(&probe).total_cached_tokens, 32);
+        assert_eq!(m.hbm_prefix_tokens(&[1, 2, 3, 4]), 48);
+        assert_eq!(m.hbm_prefix_tokens(&[7]), 0);
+    }
+
+    #[test]
+    fn lru_recycles_the_least_recently_freed_tail_first() {
+        // 6 blocks; three two-block sequences freed in order a, b, c.
+        let mut m = KVCacheManager::new(6 * 1600, 16, |t| 100 * t as u64, 0, true);
+        let mut seqs = Vec::new();
+        for (name, hashes) in [("a", vec![1u64, 2]), ("b", vec![3, 4]), ("c", vec![5, 6])] {
+            let mut r = create_test_request(name, 32);
+            r.prompt_block_hashes = hashes;
+            alloc(&mut m, &mut r, 32);
+            seqs.push(r);
+        }
+        for r in seqs.iter_mut() {
+            free(&mut m, r);
+        }
+        assert_eq!(m.num_free_blocks(), 6);
+        // A new 3-block sequence takes a whole and b's tail block.
+        let mut d = create_test_request("d", 48);
+        d.prompt_block_hashes = vec![7, 8, 9];
+        alloc(&mut m, &mut d, 48);
+        assert!(!m.hbm_contains(1) && !m.hbm_contains(2));
+        assert!(
+            m.hbm_contains(3) && !m.hbm_contains(4),
+            "b's tail went, its head survives"
+        );
+        assert!(m.hbm_contains(5) && m.hbm_contains(6));
+        assert_eq!(m.num_free_blocks(), 3);
     }
 
     #[test]
     fn a_hit_on_a_free_block_cannot_be_recycled_underneath_it() {
         // 2 blocks. A caches [1], frees. B hits hash 1 and needs one fresh
-        // block: the fresh pop must not return A's block (now B's).
+        // block: the fresh block must not recycle A's (now B's) block.
         let mut m = KVCacheManager::new(2 * 16 * 100, 16, |t| 100 * t as u64, 0, true);
         let mut a = create_test_request("a", 16);
         a.prompt_block_hashes = vec![1];
-        let a_blocks = m.allocate_blocks(&a, 16).unwrap();
-        m.free_blocks(&a_blocks);
+        alloc(&mut m, &mut a, 16);
+        free(&mut m, &mut a);
         let mut b = create_test_request("b", 32);
         b.prompt_block_hashes = vec![1, 2];
-        let b_blocks = m.allocate_blocks(&b, 32).unwrap();
-        assert_eq!(b_blocks[0], a_blocks[0]);
-        assert_ne!(b_blocks[0], b_blocks[1]);
+        assert_eq!(alloc(&mut m, &mut b, 32), 2);
+        assert!(m.hbm_contains(1) && m.hbm_contains(2));
         assert_eq!(m.num_free_blocks(), 0);
         // With both blocks held, a third request that hits nothing can't be
         // allocated: the hit did not leave a phantom free block behind.
         let mut c = create_test_request("c", 16);
         c.prompt_block_hashes = vec![9];
         assert!(m.allocate_blocks(&c, 16).is_none());
-        // And a request that hits [1] but needs one more block is also
-        // refused (the hit's block is not available to its own miss).
+        // A request that hits [1] but needs one more block is also refused
+        // (the hit's block is not available to its own miss).
         let mut d = create_test_request("d", 32);
         d.prompt_block_hashes = vec![1, 3];
-        m.free_blocks(&b_blocks[1..]);
-        assert_eq!(m.num_free_blocks(), 1);
+        assert!(m.allocate_blocks(&d, 32).is_none());
+        // Free b's second block worth by freeing b: d fits.
+        free(&mut m, &mut b);
+        assert_eq!(m.num_free_blocks(), 2);
         assert!(m.allocate_blocks(&d, 32).is_some());
     }
 
     #[test]
     fn hbm_prefers_recycling_a_backed_block_when_asked() {
-        use crate::config::{EvictionPolicy, WritePolicy};
         let build = |backed_first: bool| {
-            let graph = MemoryGraph::private(1, &[("host", 100, 1e9)])
-                .with_policies(WritePolicy::WriteBack {}, EvictionPolicy::Fifo {})
-                .with_hbm_evict_backed_first(backed_first)
-                .shared_handle();
+            let graph = MemoryGraph::private_with(
+                1,
+                &[("host", 100, 1e9)],
+                16,
+                Arc::new(|t| 100 * t as u64),
+            )
+            .with_policies(WritePolicy::WriteBack {}, EvictionPolicy::Fifo {})
+            .with_hbm_evict_backed_first(backed_first)
+            .shared_handle();
             let mut m = KVCacheManager::new(3 * 16 * 100, 16, |t| 100 * t as u64, 0, true)
                 .with_memory(graph.clone(), 0);
             // Three blocks with hashes 1, 2, 3, freed in that order.
             for h in [1u64, 2, 3] {
                 let mut r = create_test_request("r", 16);
                 r.prompt_block_hashes = vec![h];
-                let b = m.allocate_blocks(&r, 16).unwrap();
-                m.free_blocks(&b);
+                alloc(&mut m, &mut r, 16);
+                free(&mut m, &mut r);
             }
             // Only hash 2's KV sits in the tier.
-            graph.lock().unwrap().plant(0, 0, 2);
+            m.plant_in_tier(0, 2);
             let mut d = create_test_request("d", 16);
             d.prompt_block_hashes = vec![4];
-            m.allocate_blocks(&d, 16).unwrap();
+            alloc(&mut m, &mut d, 16);
             m
         };
         // Least recently freed (hash 1) goes by default...
@@ -1257,16 +989,13 @@ mod tests {
 
     #[test]
     fn hbm_outlook_recycles_dead_then_farthest_then_tail_first() {
-        use crate::config::HbmEviction;
         use crate::request::Outlook;
-        // 6 blocks. Three two-block sessions freed in order A, B, C:
-        // A announces a re-entry at t=100 over both blocks, B at t=10, C
-        // has none. Under LRU A's blocks go first; under outlook C's go
-        // first, then A's (farthest), tail block first, then B's.
+        // 6 blocks. Three two-block sessions A, B, C: A announces a re-entry
+        // at t=100 over both blocks, B at t=10, C has none. Under outlook
+        // C goes first, then A (farthest) tail-first, then B's tail.
         let build = |policy: HbmEviction| {
             let mut m = KVCacheManager::new(6 * 16 * 100, 16, |t| 100 * t as u64, 0, true)
                 .with_hbm_eviction(policy);
-            let mut ids = Vec::new();
             for (name, hashes, outlook) in [
                 (
                     "a",
@@ -1288,31 +1017,30 @@ mod tests {
             ] {
                 let mut r = create_test_request(name, 32);
                 r.prompt_block_hashes = hashes.clone();
-                let b = m.allocate_blocks(&r, 32).unwrap();
+                alloc(&mut m, &mut r, 32);
                 m.set_outlook(&hashes, outlook);
-                m.free_blocks(&b);
-                ids.push(b);
+                free(&mut m, &mut r);
             }
-            (m, ids)
+            m
         };
-        let recycle = |m: &mut KVCacheManager, k: usize| -> Vec<BlockId> {
-            let mut d = create_test_request("d", 16 * k as u32);
+        let recycle = |m: &mut KVCacheManager, k: u32| {
+            let mut d = create_test_request("d", 16 * k);
             d.prompt_block_hashes = (100..100 + k as u64).collect();
-            m.allocate_blocks(&d, 16 * k as u32).unwrap()
+            alloc(m, &mut d, 16 * k);
         };
-        let (mut lru, ids) = build(HbmEviction::Lru {});
-        // A freed first, tail (block index 1) queued before head.
-        assert_eq!(recycle(&mut lru, 2), vec![ids[0][1], ids[0][0]]);
-        let (mut o, ids) = build(HbmEviction::Outlook {});
-        let got = recycle(&mut o, 5);
-        assert_eq!(
-            got,
-            vec![ids[2][1], ids[2][0], ids[0][1], ids[0][0], ids[1][1]],
-            "dead C first, then far A tail-first, then B's tail"
+        let mut lru = build(HbmEviction::Lru {});
+        recycle(&mut lru, 2);
+        assert!(!lru.hbm_contains(1) && !lru.hbm_contains(2), "LRU: A first");
+        let mut o = build(HbmEviction::Outlook {});
+        recycle(&mut o, 5);
+        assert!(!o.hbm_contains(5) && !o.hbm_contains(6), "dead C first");
+        assert!(!o.hbm_contains(1) && !o.hbm_contains(2), "far A next");
+        assert!(
+            o.hbm_contains(3) && !o.hbm_contains(4),
+            "then B's tail; head survives"
         );
-        assert!(o.hbm_contains(3), "B's head survives: nearest re-entry");
-        // Announcing a nearer re-entry for a free block re-orders it.
-        let (mut o, ids) = build(HbmEviction::Outlook {});
+        // A nearer re-entry announced for A re-orders it behind B.
+        let mut o = build(HbmEviction::Outlook {});
         o.set_outlook(
             &[1, 2],
             Some(Outlook {
@@ -1320,12 +1048,11 @@ mod tests {
                 shared_tokens: 32,
             }),
         );
-        assert_eq!(
-            recycle(&mut o, 4),
-            vec![ids[2][1], ids[2][0], ids[1][1], ids[1][0]]
-        );
+        recycle(&mut o, 4);
+        assert!(o.hbm_contains(1) && o.hbm_contains(2));
+        assert!(!o.hbm_contains(3) && !o.hbm_contains(4));
         // A partial outlook marks only the shared prefix: A's tail is dead.
-        let (mut o, ids) = build(HbmEviction::Outlook {});
+        let mut o = build(HbmEviction::Outlook {});
         o.set_outlook(
             &[1, 2],
             Some(Outlook {
@@ -1333,273 +1060,92 @@ mod tests {
                 shared_tokens: 16,
             }),
         );
-        assert_eq!(recycle(&mut o, 3), vec![ids[2][1], ids[2][0], ids[0][1]]);
+        recycle(&mut o, 3);
+        assert!(!o.hbm_contains(5) && !o.hbm_contains(6));
+        assert!(!o.hbm_contains(2) && o.hbm_contains(1));
     }
 
     #[test]
     fn write_through_writes_every_hashed_fresh_block() {
-        use crate::config::{EvictionPolicy, WritePolicy};
-        let graph = MemoryGraph::private(1, &[("host", 100, 1e9)])
-            .with_policies(WritePolicy::WriteThrough {}, EvictionPolicy::Fifo {})
-            .shared_handle();
+        let graph =
+            MemoryGraph::private_with(1, &[("host", 100, 1e9)], 16, Arc::new(|t| 100 * t as u64))
+                .with_policies(WritePolicy::WriteThrough {}, EvictionPolicy::Fifo {})
+                .shared_handle();
         let mut m = KVCacheManager::new(16 * 16 * 100, 16, |t| 100 * t as u64, 0, true)
             .with_memory(graph.clone(), 0);
         // 48-token prompt (3 hashed blocks) plus 16 tokens of output (one
         // unhashed block): 3 × 1600 bytes are written through.
         let mut r = create_test_request("r", 48);
         r.prompt_block_hashes = vec![1, 2, 3];
-        let b = m.allocate_blocks(&r, 48).unwrap();
-        r.kv_blocks.extend(b);
+        alloc(&mut m, &mut r, 48);
         r.num_computed_tokens = 48;
-        m.allocate_blocks(&r, 16).unwrap();
+        alloc(&mut m, &mut r, 16);
         let g = graph.lock().unwrap();
-        assert!((g.flows().bytes_submitted_write - 4800.0).abs() < 1e-9);
-        assert!(g.holds(0, 1) && g.holds(0, 2) && g.holds(0, 3));
-        // A hit on a resident block does not write again.
+        assert!((g.flows().bytes_submitted_write - 3.0 * 1600.0).abs() < 1e-9);
+        assert!(g.holds_hash(0, 1) && g.holds_hash(0, 3));
         drop(g);
-        let mut r2 = create_test_request("r2", 32);
-        r2.prompt_block_hashes = vec![1, 2];
-        m.allocate_blocks(&r2, 32).unwrap();
-        assert!((graph.lock().unwrap().flows().bytes_submitted_write - 4800.0).abs() < 1e-9);
+        // A hit writes nothing more.
+        let mut s = create_test_request("s", 48);
+        s.prompt_block_hashes = vec![1, 2, 3];
+        alloc(&mut m, &mut s, 48);
+        assert!((graph.lock().unwrap().flows().bytes_submitted_write - 3.0 * 1600.0).abs() < 1e-9);
     }
 
     #[test]
-    fn test_spillover_demotion_on_eviction() {
-        // 2 HBM blocks, 1 host-RAM tier of 2 blocks.
-        let mut manager = KVCacheManager::new(2 * 16 * 100, 16, |t| 100 * t as u64, 0, true)
-            .with_private_tiers(&[("host_ram", 2 * 16 * 100, 64e9)]);
-
-        // Fill HBM with two requests' hashes.
-        let mut req_a = create_test_request("a", 16);
-        req_a.prompt_block_hashes = vec![1];
-        let blocks_a = manager.allocate_blocks(&req_a, 16).unwrap();
-        req_a.kv_blocks.extend(blocks_a.clone());
-
-        let mut req_b = create_test_request("b", 16);
-        req_b.prompt_block_hashes = vec![2];
-        let blocks_b = manager.allocate_blocks(&req_b, 16).unwrap();
-        req_b.kv_blocks.extend(blocks_b.clone());
-
-        // HBM full. Free both so blocks are reusable but hashes still in HBM index.
-        manager.free_blocks(&blocks_a);
-        manager.free_blocks(&blocks_b);
-
-        // New request with new hashes evicts both from HBM; they demote to host RAM.
-        let mut req_c = create_test_request("c", 32);
-        req_c.prompt_block_hashes = vec![3, 4];
-        manager.allocate_blocks(&req_c, 32).unwrap();
-
-        // Now lookup of hash 1 should hit host_ram, not HBM.
-        let mut probe = create_test_request("probe", 16);
-        probe.prompt_block_hashes = vec![1];
-        let lookup = manager.peek_prefix_cache(&probe);
-        assert_eq!(lookup.hbm_tokens, 0);
-        assert_eq!(lookup.promote_tokens_per_tier[0], 16);
-        assert_eq!(lookup.total_cached_tokens, 16);
-        assert!(lookup.needs_promotion());
-    }
-
-    #[test]
-    fn test_peek_reports_promotion_bytes_from_kv_curve() {
-        // Two spillover tiers; a nonlinear KV curve (bytes = 100 * t^2 / 16 so
-        // block k costs more than block k-1) checks that promotion bytes are
-        // charged from the curve, not from a per-token constant.
-        let curve = |t: u32| (100.0 * (t as f64).powi(2) / 16.0) as u64;
-        let manager = KVCacheManager::new(curve(1024), 16, curve, 0, true)
-            .with_private_tiers(&[("host_ram", 1_000_000, 1e10), ("nvme", 10_000_000, 1e9)]);
-        // Hash 1 (tokens 0..16) in tier 0, hash 2 (tokens 16..32) in tier 1.
-        manager.plant_in_tier(0, 1);
-        manager.plant_in_tier(1, 2);
-        let mut req = create_test_request("a", 32);
-        req.prompt_block_hashes = vec![1, 2];
-        let lookup = manager.peek_prefix_cache(&req);
-        assert_eq!(lookup.total_cached_tokens, 32);
-        assert_eq!(lookup.promote_tokens_per_tier, vec![16, 16]);
-        assert_eq!(
-            lookup.promote_bytes_per_tier,
-            vec![curve(16) - curve(0), curve(32) - curve(16)]
-        );
-    }
-
-    #[test]
-    fn test_concurrent_transfers_share_bandwidth() {
-        // 1 GB/s tier; one transfer of 1 GB should take 1.0s alone, but two
-        // concurrent equal-size transfers should each take ~2.0s.
-        let mut manager = KVCacheManager::new(16_000, 16, |t| 100 * t as u64, 0, true)
-            .with_private_tiers(&[("host_ram", 10_000_000_000, 1e9)]);
-        let one_gb_in_tokens = 1_000_000_000 / 100; // 10 million tokens at 100 bytes/token
-        let lookup = PrefixCacheLookup {
-            total_cached_tokens: one_gb_in_tokens,
-            hbm_tokens: 0,
-            in_flight_tokens: 0,
-            promote_tokens_per_tier: vec![one_gb_in_tokens],
-            promote_bytes_per_tier: vec![1_000_000_000],
-            join_leader: None,
+    fn selective_writes_on_the_nth_hit_and_live_only_announced_evictions() {
+        use crate::request::Outlook;
+        let build = |write: WritePolicy| {
+            let graph = MemoryGraph::private_with(
+                1,
+                &[("host", 100, 1e9)],
+                16,
+                Arc::new(|t| 100 * t as u64),
+            )
+            .with_policies(write, EvictionPolicy::Fifo {})
+            .shared_handle();
+            let m = KVCacheManager::new(4 * 16 * 100, 16, |t| 100 * t as u64, 0, true)
+                .with_memory(graph.clone(), 0);
+            (m, graph)
         };
-
-        // First transfer alone: 1 GB / 1 GB/s = 1.0s
-        manager.start_transfer("a".into(), &lookup, &[], 0.0);
-        let est_a_alone = manager.estimate_remaining_time("a");
-        assert!((est_a_alone - 1.0).abs() < 1e-3);
-
-        // Second transfer admitted at the same instant: each gets half
-        // bandwidth, so each individually projects 2.0s remaining.
-        manager.start_transfer("b".into(), &lookup, &[], 0.0);
-        let est_a_shared = manager.estimate_remaining_time("a");
-        let est_b_shared = manager.estimate_remaining_time("b");
-        assert!((est_a_shared - 2.0).abs() < 1e-3);
-        assert!((est_b_shared - 2.0).abs() < 1e-3);
-
-        // Advance halfway. Each transfer has had 0.5 GB of progress at
-        // 0.5 GB/s, so 0.5 GB remains in each. With contention still 2x,
-        // each projects 1.0s more.
-        let completed = manager.advance_transfers(1.0);
-        assert!(completed.is_empty());
-        let est_a_mid = manager.estimate_remaining_time("a");
-        assert!((est_a_mid - 1.0).abs() < 1e-3);
-
-        // Advance to t=2.0; both should now be done.
-        let completed = manager.advance_transfers(2.0);
-        assert!(completed.contains("a"));
-        assert!(completed.contains("b"));
-        assert_eq!(manager.leader_active_tiers.len(), 0);
-    }
-
-    #[test]
-    fn test_hbm_hit_ref_bumps_existing_block() {
-        // Two requests with the same prefix. The second should ref-bump
-        // the first one's blocks rather than allocating fresh ones.
-        let mut manager = KVCacheManager::new(16_000, 16, |t| 100 * t as u64, 0, true);
+        // Selective: the second HBM hit on [1, 2] writes those two blocks.
+        let (mut m, graph) = build(WritePolicy::Selective { min_hits: 2 });
         let mut a = create_test_request("a", 32);
         a.prompt_block_hashes = vec![1, 2];
-        let blocks_a = manager.allocate_blocks(&a, 32).unwrap();
-        a.kv_blocks.extend(blocks_a.clone());
-        let free_after_a = manager.num_free_blocks();
-        assert_eq!(manager.block_ref_count(blocks_a[0]), 1);
-        assert_eq!(manager.block_ref_count(blocks_a[1]), 1);
-
-        // B has the same first two hashes; allocate_blocks should ref the
-        // same physical blocks, not consume two more from the free list.
-        let mut b = create_test_request("b", 32);
-        b.prompt_block_hashes = vec![1, 2];
-        let blocks_b = manager.allocate_blocks(&b, 32).unwrap();
-        assert_eq!(blocks_b, blocks_a);
-        assert_eq!(manager.num_free_blocks(), free_after_a);
-        assert_eq!(manager.block_ref_count(blocks_a[0]), 2);
-        assert_eq!(manager.block_ref_count(blocks_a[1]), 2);
-    }
-
-    #[test]
-    fn test_shared_blocks_outlive_first_releaser() {
-        let mut manager = KVCacheManager::new(16_000, 16, |t| 100 * t as u64, 0, true);
-        let mut a = create_test_request("a", 16);
-        a.prompt_block_hashes = vec![42];
-        let blocks_a = manager.allocate_blocks(&a, 16).unwrap();
-        a.kv_blocks.extend(blocks_a.clone());
-
-        let mut b = create_test_request("b", 16);
-        b.prompt_block_hashes = vec![42];
-        let blocks_b = manager.allocate_blocks(&b, 16).unwrap();
-        assert_eq!(blocks_b, blocks_a);
-        assert_eq!(manager.block_ref_count(blocks_a[0]), 2);
-
-        let free_before = manager.num_free_blocks();
-        // A finishes and frees its blocks; ref_count goes to 1, block stays
-        // out of the free list.
-        manager.free_blocks(&blocks_a);
-        assert_eq!(manager.num_free_blocks(), free_before);
-        assert_eq!(manager.block_ref_count(blocks_a[0]), 1);
-        // HBM index still holds the hash because the block is still alive.
-        assert!(manager.hbm_contains(42));
-
-        // B finishes and frees; now ref_count = 0 and block returns.
-        manager.free_blocks(&blocks_b);
-        assert_eq!(manager.num_free_blocks(), free_before + 1);
-        assert_eq!(manager.block_ref_count(blocks_a[0]), 0);
-    }
-
-    #[test]
-    fn test_in_flight_join_refs_leader_block() {
-        // Set up a host-RAM tier and seed a prefix into it.
-        let mut manager = KVCacheManager::new(2 * 16 * 100, 16, |t| 100 * t as u64, 0, true)
-            .with_private_tiers(&[("host_ram", 8 * 16 * 100, 1e9)]);
-        let prefix_hash = 0x1234u64;
-        // Get prefix_hash into host_ram by allocating then evicting.
-        let mut seed = create_test_request("seed", 16);
-        seed.prompt_block_hashes = vec![prefix_hash];
-        let seed_blocks = manager.allocate_blocks(&seed, 16).unwrap();
-        manager.free_blocks(&seed_blocks);
-        // Evict by churning HBM, then free the churn blocks so we have
-        // room for the leader to reserve.
-        let mut churn = create_test_request("churn", 32);
-        churn.prompt_block_hashes = vec![0xFFFE, 0xFFFF];
-        let churn_blocks = manager.allocate_blocks(&churn, 32).unwrap();
-        assert!(!manager.hbm_contains(prefix_hash));
-        manager.free_blocks(&churn_blocks);
-
-        // Leader reserves blocks for transfer.
-        let mut leader = create_test_request("leader", 16);
-        leader.prompt_block_hashes = vec![prefix_hash];
-        let lookup_l = manager.peek_prefix_cache(&leader);
-        assert!(lookup_l.needs_promotion());
-        let leader_blocks = manager.reserve_blocks_for_transfer(&leader, 16).unwrap();
-        manager.start_transfer("leader".into(), &lookup_l, &[], 0.0);
-        let free_after_leader = manager.num_free_blocks();
-        assert_eq!(manager.block_ref_count(leader_blocks[0]), 1);
-        assert!(manager.in_flight_contains(prefix_hash));
-
-        // Joiner sees the prefix in flight; its peek should return needs_join.
-        let mut joiner = create_test_request("joiner", 16);
-        joiner.prompt_block_hashes = vec![prefix_hash];
-        let lookup_j = manager.peek_prefix_cache(&joiner);
-        assert!(lookup_j.needs_join());
-        assert!(!lookup_j.needs_promotion());
-        assert_eq!(lookup_j.join_leader.as_deref(), Some("leader"));
-
-        // Reserving for joiner: ref-bumps the leader's block, no new blocks
-        // taken from the free list.
-        let joiner_blocks = manager.reserve_blocks_for_transfer(&joiner, 16).unwrap();
-        assert_eq!(joiner_blocks, leader_blocks);
-        assert_eq!(manager.num_free_blocks(), free_after_leader);
-        assert_eq!(manager.block_ref_count(leader_blocks[0]), 2);
-    }
-
-    #[test]
-    fn test_publish_after_transfer_makes_prefix_hbm_resident() {
-        let mut manager = KVCacheManager::new(16_000, 16, |t| 100 * t as u64, 0, true)
-            .with_private_tiers(&[("host_ram", 16_000, 1e9)]);
-        let mut req = create_test_request("a", 16);
-        req.prompt_block_hashes = vec![0xC0FFE];
-        // Manually plant the hash in spillover to simulate a prior eviction.
-        manager.plant_in_tier(0, 0xC0FFE);
-
-        let lookup = manager.peek_prefix_cache(&req);
-        assert!(lookup.needs_promotion());
-        let blocks = manager.reserve_blocks_for_transfer(&req, 16).unwrap();
-        manager.start_transfer("a".into(), &lookup, &[], 0.0);
-        assert!(manager.in_flight_contains(0xC0FFE));
-        assert!(!manager.hbm_contains(0xC0FFE));
-
-        let completed = manager.advance_transfers(10.0);
-        assert!(completed.contains("a"));
-        manager.publish_transferred_blocks(&[0xC0FFE], &blocks);
-        assert!(manager.hbm_contains(0xC0FFE));
-        assert!(!manager.in_flight_contains(0xC0FFE));
-    }
-
-    #[test]
-    fn test_lookup_hbm_only_when_no_tiers() {
-        let mut manager = KVCacheManager::new(16000, 16, |t| 100 * t as u64, 0, true);
-        let mut req = create_test_request("a", 16);
-        req.prompt_block_hashes = vec![100];
-        let blocks = manager.allocate_blocks(&req, 16).unwrap();
-        req.kv_blocks.extend(blocks);
-
-        let mut probe = create_test_request("probe", 16);
-        probe.prompt_block_hashes = vec![100];
-        let lookup = manager.peek_prefix_cache(&probe);
-        assert_eq!(lookup.hbm_tokens, 16);
-        assert!(lookup.promote_tokens_per_tier.is_empty());
-        assert!(!lookup.needs_promotion());
+        alloc(&mut m, &mut a, 32);
+        free(&mut m, &mut a);
+        for _ in 0..2 {
+            let mut b = create_test_request("b", 32);
+            b.prompt_block_hashes = vec![1, 2];
+            alloc(&mut m, &mut b, 32);
+            free(&mut m, &mut b);
+        }
+        assert!((graph.lock().unwrap().flows().bytes_submitted_write - 2.0 * 1600.0).abs() < 1e-9);
+        // Live: eviction writes only blocks whose session announced a
+        // re-entry. Fill HBM (4) with a (2, announced) and c (2, not);
+        // then d (2 fresh) evicts LRU order a first? a freed first → a is
+        // evicted → written (announced); c stays.
+        let (mut m, graph) = build(WritePolicy::Live {});
+        let mut a = create_test_request("a", 32);
+        a.prompt_block_hashes = vec![1, 2];
+        alloc(&mut m, &mut a, 32);
+        m.set_outlook(
+            &[1, 2],
+            Some(Outlook {
+                next_arrival: 50.0,
+                shared_tokens: 32,
+            }),
+        );
+        free(&mut m, &mut a);
+        let mut c = create_test_request("c", 32);
+        c.prompt_block_hashes = vec![5, 6];
+        alloc(&mut m, &mut c, 32);
+        free(&mut m, &mut c);
+        let mut d = create_test_request("d", 64);
+        d.prompt_block_hashes = vec![7, 8, 9, 10];
+        alloc(&mut m, &mut d, 64);
+        let g = graph.lock().unwrap();
+        assert!((g.flows().bytes_submitted_write - 2.0 * 1600.0).abs() < 1e-9);
+        assert!(g.holds_hash(0, 1) && g.holds_hash(0, 2));
+        assert!(!g.holds_hash(0, 5) && !g.holds_hash(0, 6));
     }
 }

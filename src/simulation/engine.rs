@@ -6,6 +6,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
+use std::sync::Arc;
 
 use super::spec::{DepthSample, PlanCosts, SpecPlanner};
 use crate::compute::ComputeEngine;
@@ -270,8 +271,14 @@ impl Topology {
         model: ModelSpec,
         scheduler_config: SchedulerConfig,
     ) -> Result<Self, String> {
-        let bytes_per_block = model.kv_storage_bytes(scheduler_config.block_size);
-        let memory = MemoryGraph::build(&[&cluster], bytes_per_block, None)?.shared_handle();
+        let kv_model = model.clone();
+        let memory = MemoryGraph::build(
+            &[&cluster],
+            scheduler_config.block_size,
+            Arc::new(move |t| kv_model.kv_storage_bytes(t)),
+            None,
+        )?
+        .shared_handle();
         let workers = Self::build_pool(&cluster, &model, &scheduler_config, &memory, 0)?;
         Ok(Self {
             pools: vec![WorkerPool::new(workers)],
@@ -313,10 +320,11 @@ impl Topology {
         model: ModelSpec,
         scheduler_config: SchedulerConfig,
     ) -> Result<Self, String> {
-        let bytes_per_block = model.kv_storage_bytes(scheduler_config.block_size);
+        let kv_model = model.clone();
         let memory = MemoryGraph::build(
             &[&topology.prefill, &topology.decode],
-            bytes_per_block,
+            scheduler_config.block_size,
+            Arc::new(move |t| kv_model.kv_storage_bytes(t)),
             topology.kv_link_bw,
         )?
         .shared_handle();

@@ -57,7 +57,10 @@ pub struct Request {
     pub session: Option<Box<SessionStep>>,
 
     /// KV cache blocks allocated to this request.
-    pub kv_blocks: Vec<BlockId>,
+    /// KV blocks the request holds on its worker (a count: the blocks
+    /// themselves are ranges of the worker's KV tree, identified by the
+    /// request's block hashes).
+    pub kv_blocks: KvHold,
 
     /// Number of times this request has been preempted.
     pub num_preemptions: u32,
@@ -98,6 +101,30 @@ pub struct Request {
     pub pending_round_commits: Option<u32>,
 }
 
+/// What a request holds of its worker's KV: a block count. Blocks are
+/// ranges of the worker's KV tree keyed by the request's hashes, so no
+/// per-block identity is kept here.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KvHold {
+    blocks: u32,
+}
+
+impl KvHold {
+    pub fn len(&self) -> usize {
+        self.blocks as usize
+    }
+    pub fn is_empty(&self) -> bool {
+        self.blocks == 0
+    }
+    pub fn clear(&mut self) {
+        self.blocks = 0;
+    }
+    /// Account for `n` more blocks.
+    pub fn extend(&mut self, n: u32) {
+        self.blocks += n;
+    }
+}
+
 impl Request {
     /// The re-entry this request's session announces, if it is a session
     /// step with a successor: arrival at `completion_time` plus the harness
@@ -132,7 +159,7 @@ impl Request {
             num_cached_tokens: 0,
             prompt_block_hashes: Vec::new(),
             session: None,
-            kv_blocks: Vec::new(),
+            kv_blocks: KvHold::default(),
             num_preemptions: 0,
             rejected: false,
             first_token_time: None,

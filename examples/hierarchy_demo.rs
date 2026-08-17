@@ -72,20 +72,22 @@ fn run_for_batch(num_concurrent: usize, share_prefix: bool) -> Vec<f64> {
         for hashes in &prefix_hashes_per_req {
             let mut seed = Request::new("seed".into(), 0, 0.0, prefix_blocks * block_size, 1);
             seed.prompt_block_hashes = hashes.clone();
-            let blocks = mgr
+            let n = mgr
                 .allocate_blocks(&seed, prefix_blocks * block_size)
                 .unwrap();
-            mgr.free_blocks(&blocks);
+            seed.kv_blocks.extend(n);
+            mgr.free_blocks(&seed);
         }
         let churn_blocks = mgr.total_blocks() as u32;
         let mut churn = Request::new("churn".into(), 0, 0.0, churn_blocks * block_size, 1);
         churn.prompt_block_hashes = (0..churn_blocks as u64)
             .map(|i| 9_000_000_000 + i)
             .collect();
-        mgr.allocate_blocks(&churn, churn_blocks * block_size)
+        let n = mgr
+            .allocate_blocks(&churn, churn_blocks * block_size)
             .unwrap();
-        let churn_blocks_alloc: Vec<u32> = (0..churn_blocks).collect();
-        mgr.free_blocks(&churn_blocks_alloc);
+        churn.kv_blocks.extend(n);
+        mgr.free_blocks(&churn);
     }
 
     let mut scheduler = Scheduler::new(config_scheduler, kv_cache_manager);
