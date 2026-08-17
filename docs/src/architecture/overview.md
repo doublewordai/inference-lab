@@ -15,7 +15,7 @@ config        TOML/JSON -> Config, ClusterSpec, DisaggTopology
   |  + layer classes (attention FLOPs, KV read / storage, per-sequence state)
   v
 compute       ComputeEngine: roofline step cost for a batch on a cluster
-kv_cache      KVCacheManager (blocks, prefix cache), MemoryGraph (stores, tiers), Link
+kv_cache      KVCacheManager (blocks, prefix cache), MemoryGraph (stores, paths), Flows (edges, rates)
 scheduler     Scheduler: waiting/running sets, one schedule() per iteration
   |
   v
@@ -52,8 +52,10 @@ worker's `KVCacheManager`. Each iteration:
 `Topology::aggregated` is one pool of identical workers; a `Router`
 (round-robin by default; least-loaded, prefix-affinity or KV-aware by
 config) picks the worker each arrival enters. `Topology::from_disagg` is a
-prefill pool and a decode pool joined by a KV hand-off `Link` whose
-bandwidth is shared by every hand-off in flight (processor sharing,
+prefill pool and a decode pool; a hand-off moves over the topology's
+`MemoryGraph` from the prefill worker's GPU through its hardware's NIC to
+the network core (`kv_link_bw`, optional) and into the decode worker,
+sharing every edge with the other transfers in flight (max-min fair,
 event-driven); `[router]` fronts the prefill pool and `[decode_router]`
 the decode pool.
 

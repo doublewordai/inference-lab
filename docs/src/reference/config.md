@@ -117,19 +117,26 @@ nodes, its in-node and cross-node shares concurrently on their own links.
 #### `[memory]` on the hardware
 
 The stores a node offers for KV beyond HBM and the links that reach them,
-templated per GPU or per node. Presets ship one (host DRAM over PCIe and a
-node NVMe pool on the HGX parts; Grace LPDDR5X behind NVLink-C2C on
-`gh200`); an inline hardware table can declare its own.
+templated per GPU or per node: a graph. Presets ship one (host DRAM and a
+node NVMe pool behind each GPU's PCIe port on the HGX parts; Grace LPDDR5X
+behind NVLink-C2C on `gh200`; NVLink ports into the node switch and one NIC
+per GPU to the network on all); an inline hardware table can declare its
+own.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `gpus_per_node` | U32 | fabric's, else 1 | GPUs sharing a node's `per = "node"` stores |
-| `stores` | Array | `[]` | `{ name, per = "gpu" \| "node", capacity, eviction = "fifo" }` — bytes per instance; a `gpu` store is private to its GPU, a `node` store is one pool for the node's GPUs |
-| `links` | Array | `[]` | `{ name, from, to, bandwidth, latency = 0 }` — `from` is `"gpu"` (one port per GPU) or `"node"`; `to` is a store name, `"switch"` (scale-up fabric) or `"network"` (NIC); bytes/s per direction per instance |
+| `stores` | Array | `[]` | `{ name, per = "gpu" \| "node", capacity, bandwidth, eviction = "fifo" }` — bytes per instance; a `gpu` store is private to its GPU, a `node` store is one pool for the node's GPUs. `bandwidth` (optional) is the store's own throughput per instance, shared by every transfer in or out of it |
+| `junctions` | Array | `[]` | `{ name, per }` — a point with no capacity of its own, so that several links can share one (a GPU's PCIe port feeding host DRAM and NVMe) |
+| `links` | Array | `[]` | `{ name, from, to, bandwidth, latency = 0 }` — `from` is `"gpu"` (one port per GPU), a store or a junction; `to` is a store, a junction, `"switch"` (the node's scale-up fabric) or `"network"` (the scale-out core). One instance per instance of `from`, full duplex at `bandwidth` bytes/s each way |
 
-Only direct `gpu → store` links carry transfers today; `switch` and
-`network` links are declared for the multi-hop paths (peer HBM, cross-node
-fetch) that are next.
+Instances: a `tp`-GPU worker pools its GPUs' per-GPU stores, junctions and
+ports (capacity and bandwidth × `tp`); `gpus_per_node / tp` workers share a
+node's per-node instances. A transfer takes the shortest hop path between
+its ends and runs at its max-min fair share on every edge of it: the most
+contended edge fixes its transfers' rate first, the residual is shared
+among the rest. Tier promotions run store → GPU; hand-offs GPU → network →
+GPU (see `kv_link_bw`).
 
 Shipped presets, at datasheet figures: `b200` (192 GB / 8 TB/s), `b300`
 (288 GB / 8 TB/s), `gh200` (96 GB / 4 TB/s), `h100` (80 GB / 3.35 TB/s);
@@ -271,9 +278,10 @@ host_dram = 1.0e12          # bytes per instance given to KV
 
 Blocks recycled out of HBM fall into the first tier; a full tier evicts its
 oldest into the next; hashes falling off the last are gone. A prompt whose
-blocks sit in a tier is promoted back over the worker's link (bandwidth
-shared with that worker's other promotions on the same tier) while the
-request waits with its landing blocks reserved.
+blocks sit in a tier is promoted back along the path from that store to the
+worker's GPU — sharing every edge on it (its PCIe port, the NVMe pool's
+drives, …) with whatever else is in flight — while the request waits with
+its landing blocks reserved.
 
 ## [router] and [decode_router]
 

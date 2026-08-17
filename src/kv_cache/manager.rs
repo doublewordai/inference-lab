@@ -1,6 +1,7 @@
 use super::block::Block;
+use super::flows::Owner;
 use super::free_queue::FreeQueue;
-use super::graph::{MemoryGraph, SharedMemoryGraph, WorkerId};
+use super::graph::{promotion_request, MemoryGraph, SharedMemoryGraph, WorkerId};
 use crate::request::{BlockId, Request};
 use std::collections::{HashMap, HashSet};
 
@@ -634,12 +635,12 @@ impl KVCacheManager {
         self.stats
     }
 
-    /// Begin tracking an in-flight transfer for `request_id`. Per-tier byte
-    /// counts come from `lookup.promote_bytes_per_tier`; each non-zero tier
-    /// gets a submission on its `Link` (which divides bandwidth across all
-    /// its in-flight transfers). The `in_flight_cache` entries are populated
-    /// at reservation time by `reserve_blocks_for_transfer`; this method only
-    /// kicks off the byte-pumping side.
+    /// Begin tracking an in-flight promotion for `request_id`: one transfer
+    /// per tier with bytes to move (`lookup.promote_bytes_per_tier`), each
+    /// along that tier's path in the memory graph, sharing every edge with
+    /// whatever else is in flight. The `in_flight_cache` entries are
+    /// populated at reservation time by `reserve_blocks_for_transfer`; this
+    /// method only kicks off the byte-pumping side.
     pub fn start_transfer(
         &mut self,
         request_id: String,
@@ -653,7 +654,7 @@ impl KVCacheManager {
                 if bytes == 0 {
                     continue;
                 }
-                g.submit(*w, i, request_id.clone(), bytes, current_time);
+                g.submit_promotion(*w, i, &request_id, bytes, current_time);
                 active_tiers += 1;
             }
         }
@@ -677,30 +678,37 @@ impl KVCacheManager {
         self.joiner_to_leader.insert(joiner_id, leader);
     }
 
-    /// Advance all in-flight transfers to `current_time`, with each tier's
-    /// `Link` charging its bandwidth share appropriate to its contention.
-    /// Returns the set of request ids whose transfer has completed (leaders
-    /// plus their joiners).
+    /// Advance the memory graph's transfers to `current_time` and collect
+    /// this worker's finished promotions. Returns the set of request ids
+    /// whose transfer has completed (leaders plus their joiners).
     pub fn advance_transfers(&mut self, current_time: f64) -> HashSet<String> {
         let mut completed: HashSet<String> = HashSet::new();
-        let per_tier: Vec<HashSet<String>> = match &self.memory {
-            Some((g, w)) => g.lock().unwrap().advance(*w, current_time),
+        // Advance the whole graph (everyone's transfers move together) and
+        // collect this worker's finished promotions, one per (request, tier).
+        let mine: Vec<String> = match &self.memory {
+            Some((g, w)) => {
+                let mut g = g.lock().unwrap();
+                g.advance(current_time);
+                let mut ids: Vec<String> =
+                    g.take_completed(Owner::Worker(*w)).into_iter().collect();
+                ids.sort();
+                ids
+            }
             None => Vec::new(),
         };
-        for done_on_tier in per_tier {
-            for leader in done_on_tier {
-                if let Some(active) = self.leader_active_tiers.get_mut(&leader) {
-                    *active = active.saturating_sub(1);
-                    if *active == 0 {
-                        self.leader_active_tiers.remove(&leader);
-                        if let Some(joiners) = self.leader_joiners.remove(&leader) {
-                            for joiner in joiners {
-                                self.joiner_to_leader.remove(&joiner);
-                                completed.insert(joiner);
-                            }
+        for id in mine {
+            let leader = promotion_request(&id).to_string();
+            if let Some(active) = self.leader_active_tiers.get_mut(&leader) {
+                *active = active.saturating_sub(1);
+                if *active == 0 {
+                    self.leader_active_tiers.remove(&leader);
+                    if let Some(joiners) = self.leader_joiners.remove(&leader) {
+                        for joiner in joiners {
+                            self.joiner_to_leader.remove(&joiner);
+                            completed.insert(joiner);
                         }
-                        completed.insert(leader);
                     }
+                    completed.insert(leader);
                 }
             }
         }
@@ -722,7 +730,7 @@ impl KVCacheManager {
         // Tiers are modelled as serial in the cost projection: the request
         // must drain on each tier it has bytes on, and we sum those times.
         match &self.memory {
-            Some((g, w)) => g.lock().unwrap().estimate_remaining(*w, leader),
+            Some((g, w)) => g.lock().unwrap().estimate_promotion_remaining(*w, leader),
             None => 0.0,
         }
     }

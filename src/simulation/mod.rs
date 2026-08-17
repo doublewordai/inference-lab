@@ -437,7 +437,7 @@ bandwidth = 1e12
         let topo = DisaggTopology {
             prefill: cluster.clone(),
             decode: cluster,
-            kv_link_bw: 1e12,
+            kv_link_bw: Some(1e12),
         };
         let mut engine = Engine::new(Topology::from_disagg(&topo, model, sched).unwrap());
         engine.submit(Request::new("a".into(), 0, 0.0, 640, 4));
@@ -466,7 +466,7 @@ bandwidth = 1e12
         let topo = DisaggTopology {
             prefill: cluster.clone(),
             decode: cluster,
-            kv_link_bw: kv16,
+            kv_link_bw: Some(kv16),
         };
         let mut engine = Engine::new(Topology::from_disagg(&topo, model, sched).unwrap());
         // Round 1: 64-token prompt, blocks 1..4. Round 2 arrives well after
@@ -526,7 +526,7 @@ bandwidth = 1e12
             let topo = DisaggTopology {
                 prefill: cluster.clone(),
                 decode: cluster,
-                kv_link_bw: 1e12,
+                kv_link_bw: Some(1e12),
             };
             let mut engine = Engine::new(
                 Topology::from_disagg(&topo, model, sched)
@@ -565,7 +565,7 @@ bandwidth = 1e12
             let topo = DisaggTopology {
                 prefill: cluster.clone(),
                 decode: cluster,
-                kv_link_bw: 1e12,
+                kv_link_bw: Some(1e12),
             };
             Engine::new(
                 Topology::from_disagg(&topo, model, sched)
@@ -624,6 +624,90 @@ bandwidth = 1e12
         assert_eq!(h.bytes, 32 * 33 * per_block);
     }
 
+    /// Prefill and decode pools on the b200 preset with no `kv_link_bw`:
+    /// the hand-off runs over the hardware's NIC links (one 50 GB/s port
+    /// per GPU into the network and one out), so a prompt's KV takes
+    /// `bytes / 5e10` seconds alone and twice that when two hand-offs
+    /// share the same ports.
+    #[test]
+    fn disagg_handoff_runs_over_the_preset_nics_when_no_core_is_given() {
+        let (mut cluster, model, sched) = small_dense_parts();
+        cluster.hardware = crate::catalog::hardware("b200").unwrap();
+        let topo = DisaggTopology {
+            prefill: cluster.clone(),
+            decode: cluster,
+            kv_link_bw: None,
+        };
+        let bytes = model.kv_storage_bytes(512) as f64;
+        let mut engine = Engine::new(Topology::from_disagg(&topo, model, sched).unwrap());
+        engine.submit(Request::new("a".into(), 0, 0.0, 512, 2));
+        let t = run_until(&mut engine, 1);
+        let handoff = t[0].handoff_done_time - t[0].prefill_done_time;
+        assert!((handoff - bytes / 5e10).abs() < 1e-9, "{handoff}");
+        // Two at once, same P and D ports: each takes twice as long.
+        let (mut cluster, model, sched) = small_dense_parts();
+        cluster.hardware = crate::catalog::hardware("b200").unwrap();
+        let topo = DisaggTopology {
+            prefill: cluster.clone(),
+            decode: cluster,
+            kv_link_bw: None,
+        };
+        let mut engine = Engine::new(Topology::from_disagg(&topo, model, sched).unwrap());
+        engine.submit(Request::new("a".into(), 0, 0.0, 512, 2));
+        engine.submit(Request::new("b".into(), 0, 0.0, 512, 2));
+        let t = run_until(&mut engine, 2);
+        for r in &t {
+            let handoff = r.handoff_done_time - r.prefill_done_time;
+            assert!((handoff - 2.0 * bytes / 5e10).abs() < 1e-9, "{handoff}");
+        }
+        // Hardware without network links and no core: a config error.
+        let (cluster, model, sched) = small_dense_parts();
+        let topo = DisaggTopology {
+            prefill: cluster.clone(),
+            decode: cluster,
+            kv_link_bw: None,
+        };
+        assert!(Topology::from_disagg(&topo, model, sched).is_err());
+    }
+
+    /// Two tp=1 workers on one b200 node with host_dram and nvme as tiers:
+    /// a promotion from host DRAM and one from NVMe on the same worker share
+    /// its PCIe port (64 GB/s), and two NVMe promotions from different
+    /// workers share the drives (56 GB/s per node).
+    #[test]
+    fn preset_promotions_share_the_pcie_port_and_the_nvme_pool() {
+        let (mut cluster, model, sched) = small_dense_parts();
+        cluster.hardware = crate::catalog::hardware("b200").unwrap();
+        cluster.memory = toml::from_str("tiers = [\"host_dram\", \"nvme\"]").unwrap();
+        cluster.num_workers = 2;
+        let topo = Topology::aggregated(cluster, model, sched).unwrap();
+        let mut g = topo.memory().lock().unwrap();
+        assert_eq!(g.num_tiers(0), 2);
+        // Paths: host_dram → pcie junction → gpu (2 edges); nvme: drive
+        // edge, nvme → pcie, pcie → gpu (3 edges), sharing the last edge.
+        assert_eq!(g.tiers(0)[0].fetch_path.edges.len(), 2);
+        assert_eq!(g.tiers(0)[1].fetch_path.edges.len(), 3);
+        assert_eq!(
+            g.tiers(0)[0].fetch_path.edges[1],
+            g.tiers(0)[1].fetch_path.edges[2]
+        );
+        // Worker 0: host alone at 64 GB/s.
+        g.submit_promotion(0, 0, "h", 64_000_000_000, 0.0);
+        assert!((g.estimate_promotion_remaining(0, "h") - 1.0).abs() < 1e-9);
+        // Add an nvme promotion on worker 0: the port splits 32/32 (the
+        // drives at 56 are not binding for one transfer).
+        g.submit_promotion(0, 1, "n0", 32_000_000_000, 0.0);
+        assert!((g.estimate_promotion_remaining(0, "h") - 2.0).abs() < 1e-9);
+        assert!((g.estimate_promotion_remaining(0, "n0") - 1.0).abs() < 1e-9);
+        // Worker 1 pulls from nvme too: the drives (56) are now the most
+        // contended edge, so both nvme promotions get 28 and worker 0's
+        // port hands its remaining 36 to the host promotion.
+        g.submit_promotion(1, 1, "n1", 28_000_000_000, 0.0);
+        assert!((g.estimate_promotion_remaining(1, "n1") - 1.0).abs() < 1e-9);
+        assert!((g.estimate_promotion_remaining(0, "n0") - 32.0 / 28.0).abs() < 1e-9);
+        assert!((g.estimate_promotion_remaining(0, "h") - 64.0 / 36.0).abs() < 1e-9);
+    }
+
     #[test]
     fn disagg_handoffs_share_the_link_bandwidth() {
         let (cluster, model, sched) = small_dense_parts();
@@ -632,7 +716,7 @@ bandwidth = 1e12
         let topo = DisaggTopology {
             prefill: cluster.clone(),
             decode: cluster,
-            kv_link_bw: kv_bytes,
+            kv_link_bw: Some(kv_bytes),
         };
         let topology = Topology::from_disagg(&topo, model, sched).unwrap();
         let mut engine = Engine::new(topology);
@@ -692,7 +776,7 @@ bandwidth = 1e12
         DisaggTopology {
             prefill: cluster.clone(),
             decode: cluster,
-            kv_link_bw: model.kv_storage_bytes(prompt) as f64,
+            kv_link_bw: Some(model.kv_storage_bytes(prompt) as f64),
         }
     }
     fn model_of() -> ModelSpec {

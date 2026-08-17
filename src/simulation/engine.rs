@@ -12,13 +12,12 @@ use crate::compute::ComputeEngine;
 use crate::config::{
     ClusterSpec, DisaggTopology, ModelSpec, RouterConfig, SchedulerConfig, SpeculativeConfig,
 };
-use crate::kv_cache::{KVCacheManager, Link, MemoryGraph, PrefixCacheStats, SharedMemoryGraph};
+use crate::kv_cache::{KVCacheManager, MemoryGraph, Owner, PrefixCacheStats, SharedMemoryGraph};
 use crate::request::{Request, SessionStep};
 use crate::router::{build_router, PrefixSignal, Router, RouterStats, WorkerSignal};
 use crate::scheduler::Scheduler;
 
 pub type PoolId = usize;
-pub type LinkId = usize;
 
 /// Per-request timing breakdown produced when a request completes.
 #[derive(Debug, Clone)]
@@ -67,16 +66,21 @@ impl RequestTiming {
 pub(crate) struct Worker {
     pub scheduler: Scheduler,
     pub compute_engine: ComputeEngine,
+    /// This worker's id in the topology's memory graph (pools numbered in
+    /// order: prefill workers, then decode workers).
+    pub global_id: usize,
 }
 
 impl Worker {
-    /// `memory` is the pool's KV memory graph (shared by its workers) and
-    /// this worker's index in it; `None` = HBM only.
+    /// `graph` is the topology's KV memory graph and `global_id` this
+    /// worker's id in it; the manager is attached to the graph only when
+    /// the worker has tiers there.
     pub fn new(
         cluster: &ClusterSpec,
         model: ModelSpec,
         scheduler_config: SchedulerConfig,
-        memory: Option<(SharedMemoryGraph, usize)>,
+        graph: &SharedMemoryGraph,
+        global_id: usize,
     ) -> Result<Self, String> {
         let kv_capacity =
             cluster.kv_cache_capacity(&scheduler_config, cluster.resident_weight_bytes(&model));
@@ -93,8 +97,8 @@ impl Worker {
             model.per_sequence_state_bytes(),
             true,
         );
-        if let Some((graph, worker)) = memory {
-            kv_cache_manager = kv_cache_manager.with_memory(graph, worker);
+        if graph.lock().unwrap().num_tiers(global_id) > 0 {
+            kv_cache_manager = kv_cache_manager.with_memory(graph.clone(), global_id);
         }
         if kv_cache_manager.total_blocks() == 0 {
             return Err(format!(
@@ -114,6 +118,7 @@ impl Worker {
         Ok(Self {
             scheduler,
             compute_engine,
+            global_id,
         })
     }
 }
@@ -180,20 +185,16 @@ enum PoolRole {
 }
 
 pub(crate) enum Roles {
-    Aggregated {
-        pool: PoolId,
-    },
-    Disagg {
-        prefill: PoolId,
-        decode: PoolId,
-        handoff: LinkId,
-    },
+    Aggregated { pool: PoolId },
+    Disagg { prefill: PoolId, decode: PoolId },
 }
 
 pub struct Topology {
     pub(crate) pools: Vec<WorkerPool>,
-    pub(crate) links: Vec<Link>,
     pub(crate) roles: Roles,
+    /// The KV memory graph every worker's tiers and every hand-off move
+    /// over.
+    pub(crate) memory: SharedMemoryGraph,
     model: ModelSpec,
 }
 
@@ -203,33 +204,34 @@ impl Topology {
         model: ModelSpec,
         scheduler_config: SchedulerConfig,
     ) -> Result<Self, String> {
-        let workers = Self::build_pool(&cluster, &model, &scheduler_config)?;
+        let bytes_per_block = model.kv_storage_bytes(scheduler_config.block_size);
+        let memory = MemoryGraph::build(&[&cluster], bytes_per_block, None)?.shared_handle();
+        let workers = Self::build_pool(&cluster, &model, &scheduler_config, &memory, 0)?;
         Ok(Self {
             pools: vec![WorkerPool::new(workers)],
-            links: vec![],
             roles: Roles::Aggregated { pool: 0 },
+            memory,
             model,
         })
     }
 
-    /// The workers of one pool, sharing one KV memory graph built from the
-    /// cluster's hardware `[memory]` template and `[memory]` selection.
+    /// The workers of one pool, numbered `first_id..` in the memory graph.
     fn build_pool(
         cluster: &ClusterSpec,
         model: &ModelSpec,
         scheduler_config: &SchedulerConfig,
+        memory: &SharedMemoryGraph,
+        first_id: usize,
     ) -> Result<Vec<Worker>, String> {
         let n = cluster.num_workers.max(1) as usize;
-        let bytes_per_block = model.kv_storage_bytes(scheduler_config.block_size);
-        let graph: Option<SharedMemoryGraph> =
-            MemoryGraph::build(cluster, bytes_per_block)?.map(MemoryGraph::shared_handle);
         let mut workers = Vec::with_capacity(n);
         for w in 0..n {
             workers.push(Worker::new(
                 cluster,
                 model.clone(),
                 scheduler_config.clone(),
-                graph.as_ref().map(|g| (g.clone(), w)),
+                memory,
+                first_id + w,
             )?);
         }
         Ok(workers)
@@ -240,18 +242,47 @@ impl Topology {
         model: ModelSpec,
         scheduler_config: SchedulerConfig,
     ) -> Result<Self, String> {
-        let p_workers = Self::build_pool(&topology.prefill, &model, &scheduler_config)?;
-        let d_workers = Self::build_pool(&topology.decode, &model, &scheduler_config)?;
+        let bytes_per_block = model.kv_storage_bytes(scheduler_config.block_size);
+        let memory = MemoryGraph::build(
+            &[&topology.prefill, &topology.decode],
+            bytes_per_block,
+            topology.kv_link_bw,
+        )?
+        .shared_handle();
+        let p_count = topology.prefill.num_workers.max(1) as usize;
+        let p_workers = Self::build_pool(&topology.prefill, &model, &scheduler_config, &memory, 0)?;
+        let d_workers = Self::build_pool(
+            &topology.decode,
+            &model,
+            &scheduler_config,
+            &memory,
+            p_count,
+        )?;
+        // Every hand-off route must exist up front (a missing NIC template
+        // and no `kv_link_bw` is a config error, not a run-time one).
+        {
+            let mut g = memory.lock().unwrap();
+            let d_count = topology.decode.num_workers.max(1) as usize;
+            for p in 0..p_count {
+                for d in 0..d_count {
+                    g.handoff_path(p, p_count + d)?;
+                }
+            }
+        }
         Ok(Self {
             pools: vec![WorkerPool::new(p_workers), WorkerPool::new(d_workers)],
-            links: vec![Link::new(topology.kv_link_bw)],
             roles: Roles::Disagg {
                 prefill: 0,
                 decode: 1,
-                handoff: 0,
             },
+            memory,
             model,
         })
+    }
+
+    /// The topology's memory graph.
+    pub fn memory(&self) -> &SharedMemoryGraph {
+        &self.memory
     }
 
     /// Front every pool with the router `cfg` names. On a disaggregated
@@ -306,11 +337,11 @@ enum EventKind {
         pool: PoolId,
         worker: usize,
     },
-    /// The next hand-off on `link` is due to complete (under the contention
-    /// in force when it was scheduled). `generation` invalidates events made
-    /// stale by a later change to the link's in-flight set.
-    LinkDrain {
-        link: LinkId,
+    /// The next transfer on the memory graph (a hand-off or a tier
+    /// promotion) is due to complete under the rates in force when it was
+    /// scheduled. `generation` invalidates events made stale by a later
+    /// change to the in-flight set.
+    FlowDrain {
         generation: u64,
     },
     /// A request's prefill finishes at this instant on the P pool: pick its
@@ -403,9 +434,12 @@ pub struct Engine {
     /// the link, with the decode worker each was routed to when the transfer
     /// began.
     parked: HashMap<String, (Request, usize)>,
-    /// Per-link generation of the scheduled `LinkDrain` event; only the
-    /// event carrying the current generation is acted on.
-    link_generation: Vec<u64>,
+    /// Memory-graph id of the prefill worker each in-flight hand-off left.
+    handoff_source: HashMap<String, usize>,
+    /// Generation of the scheduled `FlowDrain` event and the time it is
+    /// due; only the event carrying the current generation is acted on.
+    flow_generation: u64,
+    flow_due: Option<f64>,
     /// `worker_busy[pool][worker]` is true iff a `WorkerReady` for that
     /// worker is currently scheduled in the queue.
     worker_busy: Vec<Vec<bool>>,
@@ -429,12 +463,13 @@ impl Engine {
             worker_busy.push(vec![false; pool.workers.len()]);
         }
         let pool_batch_acc = vec![(0.0_f64, 0.0_f64); topology.pools.len()];
-        let link_generation = vec![0u64; topology.links.len()];
         Self {
             topology,
             events: BinaryHeap::new(),
             parked: HashMap::new(),
-            link_generation,
+            handoff_source: HashMap::new(),
+            flow_generation: 0,
+            flow_due: None,
             worker_busy,
             handoff_stats: HandoffStats::default(),
             pool_batch_acc,
@@ -685,7 +720,7 @@ impl Engine {
         }
         self.current_time = ev.time;
 
-        match ev.kind {
+        let outcome = match ev.kind {
             EventKind::Arrival(mut req) => {
                 if let Some(step) = &mut req.session {
                     if let Some(at_parent) = step.parent_bytes_written {
@@ -714,8 +749,10 @@ impl Engine {
                     completions,
                 })
             }
-            EventKind::LinkDrain { link, generation } => {
-                self.handle_link_drain(link, generation)?;
+            EventKind::FlowDrain { generation } => {
+                if generation == self.flow_generation {
+                    self.flow_due = None;
+                }
                 Ok(StepOutcome {
                     time: self.current_time,
                     kind: StepKind::LinkComplete,
@@ -732,7 +769,74 @@ impl Engine {
                     completions: Vec::new(),
                 })
             }
+        };
+        // Whatever the event was, move the memory graph's transfers to now,
+        // hand finished hand-offs to their decode workers, wake workers with
+        // finished promotions, and re-arm the drain event.
+        self.pump_flows()?;
+        outcome
+    }
+
+    /// Bring the memory graph to `now`; deliver completed hand-offs; wake
+    /// workers whose promotions completed (their next `schedule()` collects
+    /// them); (re)schedule the `FlowDrain` for the next completion.
+    fn pump_flows(&mut self) -> Result<(), String> {
+        let now = self.current_time;
+        let (owners, next) = {
+            let mut g = self.topology.memory.lock().unwrap();
+            g.advance(now);
+            (g.owners_with_completions(), g.next_completion_delay())
+        };
+        for owner in owners {
+            match owner {
+                Owner::Handoff => {
+                    let done = self
+                        .topology
+                        .memory
+                        .lock()
+                        .unwrap()
+                        .take_completed(Owner::Handoff);
+                    self.deliver_drained(done, now)?;
+                }
+                Owner::Worker(w) => {
+                    if let Some((pool, idx)) = self.locate_worker(w) {
+                        self.maybe_wake_worker(pool, idx, now);
+                    }
+                }
+            }
         }
+        match next {
+            Some(delay) => {
+                let due = now + delay;
+                if self.flow_due.is_none_or(|t| (t - due).abs() > 1e-12) {
+                    self.flow_generation += 1;
+                    self.flow_due = Some(due);
+                    self.push(
+                        due,
+                        EventKind::FlowDrain {
+                            generation: self.flow_generation,
+                        },
+                    );
+                }
+            }
+            None => {
+                if self.flow_due.is_some() {
+                    self.flow_generation += 1;
+                    self.flow_due = None;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `(pool, index)` of the worker with memory-graph id `global`.
+    fn locate_worker(&self, global: usize) -> Option<(PoolId, usize)> {
+        for (p, pool) in self.topology.pools.iter().enumerate() {
+            if let Some(i) = pool.workers.iter().position(|w| w.global_id == global) {
+                return Some((p, i));
+            }
+        }
+        None
     }
 
     fn handle_arrival(&mut self, req: Request) {
@@ -785,7 +889,9 @@ impl Engine {
             .as_ref()
             .map(|i| i.end_time)
             .unwrap_or(now);
+        let source = self.topology.pools[pool].workers[worker].global_id;
         for req in outcome.handed_off {
+            self.handoff_source.insert(req.request_id.clone(), source);
             self.push(handoff_time, EventKind::HandoffStart(req));
         }
         if let Some(end) = outcome.iteration.as_ref().map(|i| i.end_time) {
@@ -808,9 +914,13 @@ impl Engine {
             .earliest_pending_ready()
         {
             // Nothing ran, but a request is parked on a KV tier promotion.
-            // Re-arm at its completion time so the engine doesn't stall
-            // waiting for an arrival.
-            self.maybe_wake_worker(pool, worker, ready.max(now));
+            // Its `ready_at` is the estimate made when it parked; the
+            // memory graph's `FlowDrain` wakes this worker when the
+            // promotion actually completes, so a stale estimate that has
+            // already passed is left to that (re-arming at `now` would spin).
+            if ready > now {
+                self.maybe_wake_worker(pool, worker, ready);
+            }
         }
         (outcome.iteration, timings)
     }
@@ -1081,10 +1191,8 @@ impl Engine {
     fn start_handoff(&mut self, mut req: Request) -> Result<(), String> {
         let prefill_done_at = self.current_time;
         req.prefill_done_time = Some(prefill_done_at);
-        let (link, decode) = match self.topology.roles {
-            Roles::Disagg {
-                handoff, decode, ..
-            } => (handoff, decode),
+        let decode = match self.topology.roles {
+            Roles::Disagg { decode, .. } => decode,
             _ => return Err("hand-off on an aggregated topology".to_string()),
         };
         let worker_idx = self.topology.pools[decode].pick(&req);
@@ -1102,15 +1210,20 @@ impl Engine {
         self.handoff_stats.bytes += kv_bytes;
         self.handoff_stats.bytes_skipped += full_bytes - kv_bytes;
         let id = req.request_id.clone();
-        // Bring the link up to date under the old contention (delivering
-        // anything that completes exactly now, whose own drain event may be
-        // queued behind this one and is superseded below), then add the new
-        // transfer and re-plan the next completion under the new one.
-        let done = self.topology.links[link].advance(prefill_done_at);
-        self.deliver_drained(decode, done, prefill_done_at)?;
-        self.topology.links[link].submit(id.clone(), kv_bytes, prefill_done_at);
+        let from = self
+            .handoff_source
+            .get(&id)
+            .copied()
+            .ok_or_else(|| format!("hand-off of {id} has no source worker"))?;
+        let to = self.topology.pools[decode].workers[worker_idx].global_id;
+        self.topology.memory.lock().unwrap().submit_handoff(
+            &id,
+            from,
+            to,
+            kv_bytes,
+            prefill_done_at,
+        )?;
         self.parked.insert(id, (req, worker_idx));
-        self.schedule_link_drain(link, prefill_done_at);
         Ok(())
     }
 
@@ -1118,45 +1231,24 @@ impl Engine {
     /// decode worker chosen when its transfer began.
     fn deliver_drained(
         &mut self,
-        decode_pool: PoolId,
         done: std::collections::HashSet<String>,
         now: f64,
     ) -> Result<(), String> {
+        let decode_pool = match self.topology.roles {
+            Roles::Disagg { decode, .. } => decode,
+            _ => return Err("hand-off drain on an aggregated topology".to_string()),
+        };
         let mut done: Vec<String> = done.into_iter().collect();
         done.sort();
         for request_id in done {
             let (mut req, worker_idx) = self
                 .parked
                 .remove(&request_id)
-                .ok_or_else(|| format!("link complete for unknown request {request_id}"))?;
+                .ok_or_else(|| format!("hand-off complete for unknown request {request_id}"))?;
+            self.handoff_source.remove(&request_id);
             req.handoff_done_time = Some(now);
             self.deliver_to_worker(decode_pool, worker_idx, req);
         }
-        Ok(())
-    }
-
-    /// Schedule the next completion on `link` under its current contention,
-    /// invalidating any previously scheduled drain event.
-    fn schedule_link_drain(&mut self, link: LinkId, now: f64) {
-        self.link_generation[link] += 1;
-        let generation = self.link_generation[link];
-        if let Some(delay) = self.topology.links[link].next_completion_delay() {
-            self.push(now + delay, EventKind::LinkDrain { link, generation });
-        }
-    }
-
-    fn handle_link_drain(&mut self, link: LinkId, generation: u64) -> Result<(), String> {
-        if generation != self.link_generation[link] {
-            return Ok(()); // superseded by a later submit / completion
-        }
-        let now = self.current_time;
-        let done = self.topology.links[link].advance(now);
-        let decode_pool = match self.topology.roles {
-            Roles::Disagg { decode, .. } => decode,
-            _ => return Err("link drain on an aggregated topology".to_string()),
-        };
-        self.deliver_drained(decode_pool, done, now)?;
-        self.schedule_link_drain(link, now);
         Ok(())
     }
 

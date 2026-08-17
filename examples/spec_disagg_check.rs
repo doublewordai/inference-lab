@@ -123,7 +123,7 @@ fn run(
             ..cluster(p_workers)
         },
         decode: cluster(1),
-        kv_link_bw: 9.0e11,
+        kv_link_bw: Some(9.0e11),
     };
     let topology =
         Topology::from_disagg(&topo, common::deepseek_v4_flash(), scheduler()).expect("topo");

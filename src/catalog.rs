@@ -77,16 +77,17 @@ mod tests {
         assert!(!model_names().is_empty());
         for n in hardware_names() {
             let hw = hardware(n).unwrap_or_else(|e| panic!("{e}"));
-            // Every shipped preset offers at least one store reachable
-            // from a GPU by a direct link.
+            // Every shipped preset offers at least one store a GPU can
+            // reach, and a route to the network for hand-offs.
             let m = hw
                 .memory
                 .as_ref()
                 .unwrap_or_else(|| panic!("{n}: no [memory]"));
             assert!(
-                m.stores.iter().any(|s| m.gpu_link_to(&s.name).is_some()),
-                "{n}: no store with a gpu link"
+                m.stores.iter().any(|s| m.gpu_reaches(&s.name)),
+                "{n}: no store reachable from a gpu"
             );
+            assert!(m.gpu_reaches("network"), "{n}: no route to the network");
         }
         for n in model_names() {
             model(n).unwrap_or_else(|e| panic!("{e}"));
