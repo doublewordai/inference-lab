@@ -13,7 +13,7 @@ use crate::config::{
     ClusterSpec, DisaggTopology, ModelSpec, RouterConfig, SchedulerConfig, SpeculativeConfig,
 };
 use crate::kv_cache::{KVCacheManager, Link, PrefixCacheStats};
-use crate::request::Request;
+use crate::request::{Request, SessionStep};
 use crate::router::{build_router, PrefixSignal, Router, RouterStats, WorkerSignal};
 use crate::scheduler::Scheduler;
 
@@ -36,6 +36,10 @@ pub struct RequestTiming {
     pub completion_time: f64,
     pub num_prompt_tokens: u32,
     pub num_output_tokens: u32,
+    /// Prompt tokens served from the prefix cache at admission.
+    pub num_cached_tokens: u32,
+    /// Session workloads: which step of which session this was.
+    pub session: Option<Box<SessionStep>>,
     /// Times the request was preempted (and recomputed) before completing.
     pub num_preemptions: u32,
 }
@@ -603,6 +607,32 @@ impl Engine {
 
     /// Aggregate KV cache utilisation across pools, weighted by capacity.
     /// Returns 0.0 if no KV cache is configured anywhere.
+    /// KV bytes written into HBM so far, summed over workers: every fresh
+    /// block allocation, whether for computed or promoted content. Monotone;
+    /// the difference between two readings is the distinct content that
+    /// entered the caches in between (a reuse distance, in bytes).
+    pub fn kv_bytes_written(&self) -> u64 {
+        self.topology
+            .pools
+            .iter()
+            .flat_map(|p| p.workers.iter())
+            .map(|w| w.scheduler.kv_cache_manager().bytes_written())
+            .sum()
+    }
+
+    /// `kv_bytes_written` plus the bytes of free (evictable) blocks that
+    /// prefix hits pulled back into use, summed over workers. Fresh writes
+    /// alone undercount the LRU stack distance: a hit moves its content to
+    /// the recently-used end too. The two readings bracket it.
+    pub fn kv_bytes_touched(&self) -> u64 {
+        self.topology
+            .pools
+            .iter()
+            .flat_map(|p| p.workers.iter())
+            .map(|w| w.scheduler.kv_cache_manager().bytes_touched())
+            .sum()
+    }
+
     pub fn kv_cache_util(&self) -> f64 {
         let mut used = 0.0_f64;
         let mut total = 0.0_f64;
@@ -652,7 +682,17 @@ impl Engine {
         self.current_time = ev.time;
 
         match ev.kind {
-            EventKind::Arrival(req) => {
+            EventKind::Arrival(mut req) => {
+                if let Some(step) = &mut req.session {
+                    if let Some(at_parent) = step.parent_bytes_written {
+                        step.reuse_distance_bytes =
+                            Some(self.kv_bytes_written().saturating_sub(at_parent));
+                    }
+                    if let Some(at_parent) = step.parent_bytes_touched {
+                        step.reuse_touched_bytes =
+                            Some(self.kv_bytes_touched().saturating_sub(at_parent));
+                    }
+                }
                 self.handle_arrival(req);
                 Ok(StepOutcome {
                     time: self.current_time,
@@ -1131,6 +1171,8 @@ impl Engine {
             completion_time,
             num_prompt_tokens: req.num_prompt_tokens,
             num_output_tokens: req.num_output_tokens,
+            num_cached_tokens: req.num_cached_tokens,
+            session: req.session,
             num_preemptions: req.num_preemptions,
         }
     }

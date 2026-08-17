@@ -188,6 +188,13 @@ pub struct KVCacheManager {
 
     /// Prefix-cache lookup statistics, recorded via `record_prefix_lookup`.
     stats: PrefixCacheStats,
+
+    /// Fresh block allocations so far, in bytes: KV written into HBM.
+    bytes_written: u64,
+    /// `bytes_written` plus every hit that pulled a free block back into
+    /// use: the content that moved to the recently-used end of the free
+    /// queue, so an upper bound on the LRU stack distance in bytes.
+    bytes_touched: u64,
 }
 
 /// Prefix-cache lookup counters. A lookup is a hit when any prefix tokens were
@@ -272,6 +279,8 @@ impl KVCacheManager {
             joiner_to_leader: HashMap::new(),
             state_blocks,
             stats: PrefixCacheStats::default(),
+            bytes_written: 0,
+            bytes_touched: 0,
         }
     }
 
@@ -451,6 +460,7 @@ impl KVCacheManager {
         if self.free_blocks.len() < fresh_needed + hits_on_free {
             return None;
         }
+        self.bytes_touched += (fresh_needed + hits_on_free) as u64 * self.bytes_per_block;
 
         // Pass 2: execute. Reference the hits first so a fresh pop can't
         // recycle a block a later hit in this same call refers to. Track
@@ -469,6 +479,7 @@ impl KVCacheManager {
         for (i, decision) in decisions.iter().enumerate() {
             if let Decision::Fresh = decision {
                 let block_id = self.free_blocks.pop_front().unwrap();
+                self.bytes_written += self.bytes_per_block;
                 let evicted_hash = self.blocks[block_id as usize].allocate(hash_at(i));
                 evicted_hashes.extend(evicted_hash);
                 allocated[i] = Some(block_id);
@@ -518,6 +529,17 @@ impl KVCacheManager {
                 self.free_blocks.push_back(block_id);
             }
         }
+    }
+
+    /// KV bytes written into HBM so far (every fresh block allocation).
+    pub fn bytes_written(&self) -> u64 {
+        self.bytes_written
+    }
+
+    /// `bytes_written` plus the bytes of free blocks that hits pulled back
+    /// into use.
+    pub fn bytes_touched(&self) -> u64 {
+        self.bytes_touched
     }
 
     pub fn num_free_blocks(&self) -> usize {

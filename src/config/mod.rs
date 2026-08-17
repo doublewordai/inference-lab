@@ -231,6 +231,8 @@ impl Config {
 
         let workload = WorkloadConfig {
             dataset_path: None,
+            sessions_path: None,
+            num_sessions: None,
             arrival_pattern: ArrivalPattern::Poisson,
             arrival_rate: 1.0,
             rate_schedule: None,

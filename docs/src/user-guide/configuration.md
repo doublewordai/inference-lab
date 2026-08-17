@@ -291,6 +291,62 @@ inference-lab -c configs/llama-3-70b.toml -w workloads/dataset-poisson.toml \
   --chat-template None
 ```
 
+### Sessions
+
+Agentic traffic: chains of requests where each step re-enters with its
+parent's whole context as prefix (prompt *and* the parent's output) plus some
+novel tokens, after the gap the harness spent between the parent's completion
+and this arrival (a tool call running, a user typing).
+
+```toml
+sessions_path = "data/sessions/tracelab.jsonl"
+arrival_pattern = "poisson"   # governs session starts
+arrival_rate = 0.05           # sessions/s
+num_sessions = 200            # stop starting sessions after this many
+seed = 42
+
+input_len_dist = { type = "fixed", value = 1 }   # ignored in session mode
+output_len_dist = { type = "fixed", value = 1 }  # ignored in session mode
+```
+
+The arrival pattern decides when sessions **start**: `poisson` / `uniform` /
+`burst` at `arrival_rate` sessions per second, `closed_loop` keeps
+`num_concurrent_users` sessions in flight (a slot starts a fresh session when
+its session's last step completes), `batched` starts every session at t=0.
+Every later step of a session arrives at its parent's completion plus the
+step's `gap`, so the simulated latency feeds back into the arrival process
+and long gaps are preserved. Sessions are taken from the file in order and
+the file is cycled; stop with `num_sessions` or `num_requests` (steps).
+
+**Session file:** JSONL, one session per line:
+
+```json
+{"id": "claude:000adcd5", "steps": [
+  {"input": 15524, "new": 15524, "output": 111, "gap": 0.0, "kind": "user"},
+  {"input": 17079, "new": 1444, "output": 96, "gap": 0.104, "kind": "tool"}
+]}
+```
+
+`input` is the step's prompt length, `new` the tokens of it that are not the
+parent's context (`input − new` is the reusable prefix, capped at what the
+parent actually had), `output` the tokens generated, `gap` the seconds from
+the parent's completion to this arrival (ignored on the first step), `kind`
+free-form. Prefix identity is built from block hashes: the parent's hashes
+over the shared prefix, fresh ones for the novel tail and the step's own
+output, so a re-entry hits the parent's generated tokens too. Whole blocks
+only: a partial block continued with new tokens is new content.
+
+`examples/sessions/tracelab_export.py` exports TraceLab's
+`per_step_stats.parquet` into this format.
+
+**Per-request CSV** (`--request-csv`) carries, for session steps, `session`,
+`step`, `gap`, `shared_toks` (the most the prefix cache could serve),
+`cached_toks` (what it did), and two reuse distances: `reuse_distance_bytes`
+(KV bytes written into the caches between the parent's completion and this
+arrival) and `reuse_touched_bytes` (the same plus the free blocks that hits
+pulled back into use in between). Fresh writes undercount the LRU stack
+distance and the touched count overcounts it, so the pair brackets it.
+
 ### Closed-Loop Workload
 
 Simulate a fixed number of concurrent users:
