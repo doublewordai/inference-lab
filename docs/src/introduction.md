@@ -18,12 +18,16 @@ Within each simulation step, the simulator:
 
 Caveats:
 
-- This assumes perfectly optimized GPU execution, ignoring kernel launch overheads, poorly optimized kernels, application overhead, thermals, etc.
-- We simulate tensor parallel execution, but don't model multi-GPU communication overheads.
+- Step times are a datasheet roofline: peak FLOP rate and HBM bandwidth
+  per precision stream, collectives on the fabric preset added serially,
+  and no kernel-efficiency or fixed per-step overhead term. Every
+  latency and throughput is an upper bound; the optional
+  `time_correction = { alpha, beta }` on a hardware entry calibrates
+  the step (`alpha × roofline + beta`) against a measured engine.
 
 ## Features
 
-- Accurate Performance Modeling: Models compute (FLOPS) and memory bandwidth constraints
+- Roofline Performance Modeling: compute (FLOPS) and memory bandwidth constraints per precision stream
 - Multiple Scheduling Policies: FCFS, Priority, SJF, and more
 - Chunked Prefill: Simulates realistic request interleaving
 - KV Cache Management: Models GPU memory and KV cache utilization

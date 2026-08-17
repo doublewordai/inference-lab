@@ -10,7 +10,7 @@ pub mod topology;
 pub mod workload;
 
 pub use deployment::{Deployment, DeploymentError, ModelConfig};
-pub use hardware::{FabricConfig, FabricLink, HardwareConfig, Precision};
+pub use hardware::{FabricConfig, FabricLink, HardwareConfig, Precision, TimeCorrection};
 pub use memory::{
     EvictionPolicy, HbmEviction, JunctionTemplate, LinkTemplate, MemoryConfig, MemoryPolicies,
     MemoryPreset, MemoryTemplate, PrefetchPolicy, Scope, SourcePolicy, StoreTemplate, WritePolicy,
@@ -92,6 +92,10 @@ pub struct Config {
     /// KV tiers beyond HBM, chosen from the hardware's `[memory]` stores.
     #[serde(default)]
     pub memory: MemoryConfig,
+    /// Optional step-time calibration against a measured engine
+    /// (`t = alpha × t_roofline + beta`); absent = pure roofline.
+    #[serde(default)]
+    pub time_correction: Option<TimeCorrection>,
     pub workload: WorkloadConfig,
     /// Optional speculative decoding. When set, decode steps verify `gamma + 1`
     /// tokens and advance by `accepted + 1` per the acceptance model.
@@ -140,6 +144,7 @@ impl Config {
             router,
             decode_router,
             memory,
+            time_correction,
             speculative,
             fault,
         } = deployment;
@@ -152,6 +157,7 @@ impl Config {
             router,
             decode_router,
             memory,
+            time_correction,
             workload,
             speculative,
             fault,
@@ -269,6 +275,7 @@ impl Config {
             router: RouterConfig::default(),
             decode_router: None,
             memory: MemoryConfig::default(),
+            time_correction: None,
             workload,
             speculative: None,
             fault: None,

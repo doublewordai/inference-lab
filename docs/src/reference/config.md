@@ -69,6 +69,7 @@ hardware preset unless `spec` says otherwise.
 | `router` | Table | shared `[router]` | Replaces the shared block for this entry |
 | `decode_router` | Table | shared `[decode_router]` | Replaces the shared block for this entry |
 | `memory` | Table | shared `[memory]` | Replaces the shared block for this entry |
+| `time_correction` | Table | unset | Step-time calibration against a measured engine: `{ alpha = 1.0, beta = 0.0 }` prices every roofline step at `alpha × t + beta` seconds (`alpha` = kernel-efficiency gap, `beta` = fixed per-iteration cost). Unset = pure roofline. Never applied on top of a measured step-cost table |
 
 Collectives are priced on the hardware's `[fabric]` (below) and added
 serially to the step; an entry with `tp > 1` or `ep > 1` on hardware without

@@ -492,6 +492,16 @@ bandwidth = 1e12
             "{}",
             handoff(get("r2"))
         );
+        // The first token travels with the KV: TTFT includes the hand-off.
+        for t in &timings {
+            assert!(
+                (t.first_token_time - t.handoff_done_time).abs() < 1e-9,
+                "{t:?}"
+            );
+        }
+        // The prefill pool held the blocks through each transfer and freed
+        // them after: nothing is left allocated anywhere once both are done.
+        assert_eq!(engine.kv_cache_util(), 0.0);
         // And the prefill pool only computed the new block of round 2 (its
         // own cache held blocks 1..4 from round 1).
         let r2_prefill: Vec<_> = progress

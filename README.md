@@ -3,8 +3,15 @@
 **[Documentation](https://doublewordai.github.io/inference-lab/)**
 
 LLM inference simulator for analyzing serving systems.
-Simulates GPU clusters serving LLM inference workloads with realistic
-performance modeling.
+Simulates GPU clusters serving LLM inference workloads with a vLLM-style
+scheduler and KV cache over a datasheet roofline: every step is priced at
+peak FLOP rate and HBM bandwidth with collectives added serially, and
+nothing else. Simulated latencies and throughputs are therefore upper
+bounds — the numbers a perfect engine on the datasheet hardware would
+reach — and the deltas between configurations are what the simulator is
+for. `[hardware.<name>] time_correction = { alpha, beta }` calibrates the
+step time (`alpha × roofline + beta`) against a measured engine when
+absolute figures are needed.
 
 ## Features
 
@@ -13,7 +20,8 @@ performance modeling.
   TP / EP collectives
 - **vLLM-style scheduling**: chunked prefill, preemption with recompute,
   FCFS / priority / length-based policies, preemption-free admission
-- **KV cache**: block allocation from each model's exact KV footprint,
+- **KV cache**: block allocation from each model's KV footprint (content
+  blocks per token block, sliding windows and recurrent state per request),
   prefix caching with block sharing, cascade attention
 - **Memory graph**: KV tiers beyond HBM as a graph of stores and links per
   hardware preset (host DRAM / NVMe behind PCIe, Grace memory behind

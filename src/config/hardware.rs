@@ -49,6 +49,46 @@ impl Precision {
     }
 }
 
+/// Calibration of a deployment's step time against a measured engine:
+/// `t = alpha × t_roofline + beta`. `alpha` is the kernel-efficiency gap to
+/// the roofline (dominant at large batch), `beta` the fixed per-iteration
+/// cost — scheduler, CPU, kernel launch — (dominant at small batch). Off by
+/// default: without it every step is the datasheet roofline. Applied to the
+/// executed step only, never to speculative policy candidate pricing, and
+/// never on top of a measured step-cost table.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct TimeCorrection {
+    /// Multiplier on the roofline step time. Defaults to 1.
+    #[serde(default = "one")]
+    pub alpha: f64,
+    /// Seconds added to every step. Defaults to 0.
+    #[serde(default)]
+    pub beta: f64,
+}
+
+fn one() -> f64 {
+    1.0
+}
+
+impl TimeCorrection {
+    pub fn validate(&self) -> Result<(), String> {
+        if !(self.alpha.is_finite() && self.alpha > 0.0) {
+            return Err(format!(
+                "time_correction.alpha must be > 0 (got {})",
+                self.alpha
+            ));
+        }
+        if !(self.beta.is_finite() && self.beta >= 0.0) {
+            return Err(format!(
+                "time_correction.beta must be >= 0 (got {})",
+                self.beta
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// One tier of the collective fabric: what a GPU can inject into it and
 /// what a collective call costs before any byte moves.
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq)]

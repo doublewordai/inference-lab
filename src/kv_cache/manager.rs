@@ -1,7 +1,7 @@
 use super::flows::Owner;
 use super::graph::{promotion_request, MemoryGraph, SharedMemoryGraph, WorkerId};
 use super::radix::{HbmLookup, KvBytesFn, Path, Radix, SharedRadix, Span};
-use crate::config::HbmEviction;
+use crate::config::{HbmEviction, ModelSpec};
 use crate::request::{Outlook, Request};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -100,14 +100,18 @@ impl std::ops::AddAssign for PrefixCacheStats {
 
 /// Manages KV cache blocks for one worker.
 ///
-/// Capacity and occupancy are counted in blocks. A block is the KV footprint
-/// of `block_size` tokens (`kv_bytes_at(block_size)`), and a sequence of `t`
-/// tokens occupies `ceil(kv_bytes_at(t) / bytes_per_block)` content blocks.
-/// For models whose KV is linear in position this is exactly
-/// `ceil(t / block_size)`; for models whose footprint is not (sliding window,
-/// DeepSeek-V4's window + compressed history) it charges the model's actual
-/// bytes. Sequences additionally hold `state_blocks` fixed blocks for
-/// length-independent per-sequence state (Mamba / GatedDeltaNet).
+/// Capacity and occupancy are counted in blocks. A block is the content KV
+/// of `block_size` tokens (`kv_bytes_at(block_size)`) — the part of the
+/// footprint that grows with position for the sequence's whole life
+/// (full-context layers, compressed history, indexer entries), which is
+/// linear in position, so a sequence of `t` tokens holds
+/// `ceil(t / block_size)` content blocks and content block `i` is prompt
+/// block `i`: the prefix-hashed, shareable unit, as vLLM's full-attention
+/// KV group. Sequences additionally hold auxiliary blocks, unshared and
+/// released with the request: fixed per-sequence state (Mamba /
+/// GatedDeltaNet) plus the sliding windows' last `min(t, window)` positions
+/// (`window_bytes_at`), which vLLM's sliding-window group frees as the
+/// sequence slides past them.
 ///
 /// The blocks themselves live in the topology's [`Radix`] tree, shared with
 /// the memory graph: this manager is one worker's view of it. A request's
@@ -153,9 +157,14 @@ pub struct KVCacheManager {
     /// projected ready time stays in sync with its leader's.
     joiner_to_leader: HashMap<String, String>,
 
-    /// Fixed blocks reserved per running sequence for length-independent state
-    /// (Mamba/GatedDeltaNet recurrent state). Zero for pure-attention models.
-    state_blocks: usize,
+    /// Fixed per-sequence bytes for length-independent state
+    /// (Mamba/GatedDeltaNet recurrent state), held in auxiliary blocks.
+    /// Zero for pure-attention models.
+    per_seq_state_bytes: u64,
+
+    /// Sliding-window KV bytes of a `t`-token sequence, from the model:
+    /// held per request in auxiliary blocks.
+    window_bytes_at: KvBytesFn,
 
     /// Prefix-cache lookup statistics, recorded via `record_prefix_lookup`.
     stats: PrefixCacheStats,
@@ -186,13 +195,6 @@ impl KVCacheManager {
         let kv_bytes_at: KvBytesFn = Arc::new(kv_bytes_at);
         let bytes_per_block = kv_bytes_at(block_size);
         let total_blocks = kv_cache_capacity.checked_div(bytes_per_block).unwrap_or(0) as u32;
-        // Fixed per-sequence state (Mamba/GDN) padded up to a whole number of
-        // blocks, vLLM-style. Held for the sequence's lifetime.
-        let state_blocks = if bytes_per_block == 0 {
-            0
-        } else {
-            per_seq_state_bytes.div_ceil(bytes_per_block) as usize
-        };
         let mut radix = Radix::new(block_size, kv_bytes_at.clone());
         radix.register_worker(0, total_blocks, HbmEviction::Lru {}, false);
         Self {
@@ -207,13 +209,64 @@ impl KVCacheManager {
             leader_active_tiers: HashMap::new(),
             leader_joiners: HashMap::new(),
             joiner_to_leader: HashMap::new(),
-            state_blocks,
+            per_seq_state_bytes,
+            window_bytes_at: Arc::new(|_| 0),
             stats: PrefixCacheStats::default(),
             bytes_written: 0,
             bytes_touched: 0,
             hbm_eviction: HbmEviction::Lru {},
             backed_first: false,
         }
+    }
+
+    /// The content KV curve of `model` at `block_size`: content is linear
+    /// in position, so a sequence's last, partial block is charged whole
+    /// (as its pages are) and content block `i` is exactly prompt block
+    /// `i`. A model whose KV is all sliding window (no content that grows
+    /// for life) has no linear stream to quantise and is charged its exact
+    /// footprint instead (its blocks stop growing past the window, so only
+    /// the first window's blocks are hashed). Shared by the manager and the
+    /// memory graph, which count in the same blocks.
+    pub fn content_curve(model: &ModelSpec, block_size: u32) -> KvBytesFn {
+        let m = model.clone();
+        if model.kv_content_bytes(block_size) == 0 {
+            return Arc::new(move |t| m.kv_storage_bytes(t));
+        }
+        let bytes_per_block = model.kv_content_bytes(block_size);
+        Arc::new(move |t| t.div_ceil(block_size) as u64 * bytes_per_block)
+    }
+
+    /// A manager for `model`: content blocks from `kv_content_bytes`,
+    /// sliding windows and per-sequence state in auxiliary blocks (see
+    /// [`Self::content_curve`]).
+    pub fn for_model(
+        kv_cache_capacity: u64,
+        block_size: u32,
+        model: &ModelSpec,
+        enable_prefix_caching: bool,
+    ) -> Self {
+        let state = model.per_sequence_state_bytes();
+        let curve = Self::content_curve(model, block_size);
+        let curve2 = curve.clone();
+        let m = Self::new(
+            kv_cache_capacity,
+            block_size,
+            move |t| curve2(t),
+            state,
+            enable_prefix_caching,
+        );
+        if model.kv_content_bytes(block_size) == 0 {
+            return m;
+        }
+        let window = model.clone();
+        m.with_window_bytes(move |t| window.kv_window_bytes(t))
+    }
+
+    /// Sliding-window KV bytes of a `t`-token sequence, held per request in
+    /// auxiliary blocks on top of the content curve.
+    pub fn with_window_bytes(mut self, f: impl Fn(u32) -> u64 + Send + Sync + 'static) -> Self {
+        self.window_bytes_at = Arc::new(f);
+        self
     }
 
     /// Set the HBM eviction policy. Only meaningful before any allocation.
@@ -276,9 +329,15 @@ impl KVCacheManager {
         self.radix.lock().unwrap().worker_tiers(self.worker).len()
     }
 
-    /// Fixed blocks each running sequence holds for per-sequence state.
-    pub fn state_blocks(&self) -> usize {
-        self.state_blocks
+    /// Auxiliary blocks a `tokens`-token sequence holds: fixed per-sequence
+    /// state plus its sliding windows, padded up to whole blocks. Unshared;
+    /// released with the request.
+    pub fn aux_blocks_for_tokens(&self, tokens: u32) -> usize {
+        if self.bytes_per_block == 0 {
+            return 0;
+        }
+        (self.per_seq_state_bytes + (self.window_bytes_at)(tokens)).div_ceil(self.bytes_per_block)
+            as usize
     }
 
     /// Block size in tokens.
@@ -291,13 +350,13 @@ impl KVCacheManager {
         self.bytes_per_block
     }
 
-    /// KV bytes of a `tokens`-token sequence, per the model's curve.
+    /// Content KV bytes of a `tokens`-token sequence, per the model's curve.
     pub fn kv_bytes_for_tokens(&self, tokens: u32) -> u64 {
         (self.kv_bytes_at)(tokens)
     }
 
-    /// Content blocks a sequence of `tokens` tokens occupies (state blocks
-    /// excluded).
+    /// Content blocks a sequence of `tokens` tokens occupies (auxiliary
+    /// blocks excluded): prompt block `i` lives in content block `i`.
     pub fn content_blocks_for_tokens(&self, tokens: u32) -> usize {
         if self.bytes_per_block == 0 {
             return 0;
@@ -305,83 +364,126 @@ impl KVCacheManager {
         (self.kv_bytes_at)(tokens).div_ceil(self.bytes_per_block) as usize
     }
 
-    /// Blocks a sequence of `total_tokens` tokens needs: its fixed state
-    /// blocks plus the content blocks its bytes fill.
+    /// Blocks a request must hold once it has `total_tokens` tokens of
+    /// context: content plus auxiliary.
     pub fn blocks_for_context(&self, total_tokens: u32) -> usize {
-        self.state_blocks + self.content_blocks_for_tokens(total_tokens)
+        self.content_blocks_for_tokens(total_tokens) + self.aux_blocks_for_tokens(total_tokens)
     }
 
     /// New blocks `request` needs to grow its context by `num_new_tokens`
     /// tokens beyond `num_computed_tokens`, given what it already holds.
     pub fn blocks_needed(&self, request: &Request, num_new_tokens: u32) -> usize {
         let total_tokens = request.num_computed_tokens + num_new_tokens;
-        self.blocks_for_context(total_tokens)
+        self.content_blocks_needed(request, total_tokens)
+            + self.aux_blocks_needed(request, total_tokens)
+    }
+
+    /// Content blocks `request` lacks for `total_tokens` of context.
+    fn content_blocks_needed(&self, request: &Request, total_tokens: u32) -> usize {
+        self.content_blocks_for_tokens(total_tokens)
             .saturating_sub(request.kv_blocks.len())
     }
 
-    /// The path of `request`'s hashed content, and how the request's held
-    /// blocks split into (state, in-path content, anonymous tail).
-    fn hold_of(&self, request: &Request) -> (u32, u32, u32) {
+    /// Auxiliary blocks `request` lacks for `total_tokens` of context.
+    fn aux_blocks_needed(&self, request: &Request, total_tokens: u32) -> usize {
+        self.aux_blocks_for_tokens(total_tokens)
+            .saturating_sub(request.aux_blocks.len())
+    }
+
+    /// How the request's held content blocks split into (in-path, i.e.
+    /// hashed and in the tree, and anonymous decode tail).
+    fn content_hold_of(&self, request: &Request) -> (u32, u32) {
         let held = request.kv_blocks.len() as u32;
-        if held == 0 {
-            return (0, 0, 0);
-        }
-        let state = (self.state_blocks as u32).min(held);
-        let content = held - state;
         let in_path = if self.enable_prefix_caching {
-            content.min(request.prompt_block_hashes.len() as u32)
+            held.min(request.prompt_block_hashes.len() as u32)
         } else {
             0
         };
-        (state, in_path, content - in_path)
+        (in_path, held - in_path)
     }
 
-    /// Allocate the blocks `request` needs to grow by `num_tokens` positions.
-    /// `None` if there are not enough free blocks. Returns the blocks added.
-    pub fn allocate_blocks(&mut self, request: &Request, num_tokens: u32) -> Option<u32> {
-        self.allocate_inner(request, num_tokens, /*publish_to_hbm=*/ true, None)
-    }
-
-    /// Allocate blocks without publishing the request's hashes to the HBM
-    /// prefix cache. Used to reserve HBM landing space for an in-flight
-    /// promotion: until the transfer completes the data isn't really in HBM,
-    /// so other requests looking up the same prefix should not hit HBM.
-    pub fn reserve_blocks_for_transfer(
-        &mut self,
-        request: &Request,
-        num_tokens: u32,
-    ) -> Option<u32> {
-        self.allocate_inner(
-            request,
-            num_tokens,
-            /*publish_to_hbm=*/ false,
-            Some(&request.request_id),
-        )
-    }
-
-    fn allocate_inner(
-        &mut self,
-        request: &Request,
-        num_tokens: u32,
-        publish: bool,
-        leader: Option<&str>,
-    ) -> Option<u32> {
-        let target_total = self.blocks_for_context(request.num_computed_tokens + num_tokens) as u32;
-        let held_total = request.kv_blocks.len() as u32;
-        if target_total <= held_total {
-            return Some(0);
-        }
-        let (state_held, in_path_held, anon_held) = self.hold_of(request);
-        let state_new = (self.state_blocks as u32).saturating_sub(state_held);
-        let content_target = target_total - self.state_blocks as u32;
+    /// Whether `request` can grow to `total_tokens` of context: the free
+    /// blocks cover its content misses and hits on free-but-cached blocks
+    /// (hits held by other requests are shared) plus its auxiliary blocks.
+    /// This is the check `allocate_blocks` applies; the scheduler uses it
+    /// before admitting a request without mutating anything.
+    pub fn can_grow_to(&self, request: &Request, total_tokens: u32) -> bool {
+        let content_target = self.content_blocks_for_tokens(total_tokens) as u32;
+        let (in_path_held, anon_held) = self.content_hold_of(request);
         let hashed = if self.enable_prefix_caching {
             request.prompt_block_hashes.len() as u32
         } else {
             0
         };
-        let in_path_target = content_target.min(hashed);
-        let anon_target = content_target - in_path_target;
+        let held_total = request.kv_blocks.len() as u32;
+        let in_path_target = content_target.max(held_total).min(hashed);
+        let anon_new = (content_target.max(held_total) - in_path_target).saturating_sub(anon_held);
+        let aux_new = self.aux_blocks_needed(request, total_tokens) as u32;
+        let r = self.radix.lock().unwrap();
+        let path = if in_path_target > 0 {
+            r.resolve(&request.prompt_block_hashes[..in_path_target as usize])
+        } else {
+            Path::default()
+        };
+        // Path blocks not yet in the tree are fresh too.
+        let missing = in_path_target.saturating_sub(path.blocks);
+        let (fresh, hits_on_free) = r.acquire_cost(self.worker, &path, in_path_held, path.blocks);
+        r.free_blocks(self.worker) >= fresh + hits_on_free + missing + anon_new + aux_new
+    }
+
+    /// Allocate the blocks `request` needs to grow by `num_tokens` positions
+    /// and hand them to it (`kv_blocks` for content, `aux_blocks` for state
+    /// and windows). Returns the content blocks allocated by this call;
+    /// `None` (and nothing allocated) if the free blocks can't cover it.
+    pub fn allocate_blocks(&mut self, request: &mut Request, num_tokens: u32) -> Option<u32> {
+        self.allocate_inner(request, num_tokens, /*publish_to_hbm=*/ true, false)
+    }
+
+    /// Allocate content blocks without publishing the request's hashes to
+    /// the HBM prefix cache. Used to reserve HBM landing space for an
+    /// in-flight promotion: until the transfer completes the data isn't
+    /// really in HBM, so other requests looking up the same prefix should
+    /// not hit HBM. Auxiliary blocks come with admission.
+    pub fn reserve_blocks_for_transfer(
+        &mut self,
+        request: &mut Request,
+        num_tokens: u32,
+    ) -> Option<u32> {
+        self.allocate_inner(request, num_tokens, /*publish_to_hbm=*/ false, true)
+    }
+
+    fn allocate_inner(
+        &mut self,
+        request: &mut Request,
+        num_tokens: u32,
+        publish: bool,
+        reserve: bool,
+    ) -> Option<u32> {
+        let total_tokens = request.num_computed_tokens + num_tokens;
+        let content_target = self.content_blocks_for_tokens(total_tokens) as u32;
+        let (in_path_held, anon_held) = self.content_hold_of(request);
+        let held_total = request.kv_blocks.len() as u32;
+        let hashed = if self.enable_prefix_caching {
+            request.prompt_block_hashes.len() as u32
+        } else {
+            0
+        };
+        let in_path_target = content_target.max(held_total).min(hashed);
+        let anon_target = content_target.max(held_total) - in_path_target;
         let anon_new = anon_target.saturating_sub(anon_held);
+        let aux_new = if reserve {
+            0
+        } else {
+            self.aux_blocks_needed(request, total_tokens) as u32
+        };
+        if content_target <= held_total && aux_new == 0 {
+            return Some(0);
+        }
+        let leader = if reserve {
+            Some(request.request_id.clone())
+        } else {
+            None
+        };
 
         let mut r = self.radix.lock().unwrap();
         let path = if in_path_target > 0 {
@@ -394,12 +496,15 @@ impl KVCacheManager {
             &path,
             in_path_held,
             in_path_target,
-            anon_new + state_new,
+            anon_new + aux_new,
             publish,
-            leader,
+            leader.as_deref(),
             false,
         )?;
         drop(r);
+        let content_added = content_target.saturating_sub(held_total);
+        request.kv_blocks.extend(content_added);
+        request.aux_blocks.extend(aux_new);
         self.bytes_written += got.fresh_blocks as u64 * self.bytes_per_block;
         self.bytes_touched += (got.fresh_blocks + got.hits_on_free) as u64 * self.bytes_per_block;
         if let Some((g, w)) = &self.memory {
@@ -416,7 +521,7 @@ impl KVCacheManager {
                 r.prune_if_empty(e.span.node);
             }
         }
-        Some(target_total - held_total)
+        Some(content_added)
     }
 
     /// A completed transfer's blocks (the first `cached_blocks` content
@@ -438,13 +543,17 @@ impl KVCacheManager {
         }
     }
 
-    /// Free `request`'s blocks (due to preemption or completion). What the
-    /// request held is queued for recycling tail first, so the end of a
-    /// sequence is evicted before its beginning and what survives is always
-    /// a prefix.
-    pub fn free_blocks(&mut self, request: &Request) {
-        let (state, in_path, anon) = self.hold_of(request);
-        if state + in_path + anon == 0 {
+    /// Release everything `request` holds (preemption, completion or a
+    /// disaggregated hand-off): auxiliary blocks and the anonymous decode
+    /// tail carry no hash and are simply free again; the content path is
+    /// queued for recycling tail first, so the end of a sequence is evicted
+    /// before its beginning and what survives is always a prefix.
+    pub fn free_request(&mut self, request: &mut Request) {
+        let (in_path, anon) = self.content_hold_of(request);
+        let aux = request.aux_blocks.len() as u32;
+        request.kv_blocks.clear();
+        request.aux_blocks.clear();
+        if in_path + anon + aux == 0 {
             return;
         }
         let mut r = self.radix.lock().unwrap();
@@ -453,7 +562,7 @@ impl KVCacheManager {
         } else {
             Path::default()
         };
-        r.release(self.worker, &path, in_path, anon + state);
+        r.release(self.worker, &path, in_path, anon + aux);
     }
 
     /// KV bytes written into HBM so far (every fresh block allocation).
@@ -803,16 +912,13 @@ mod tests {
         Request::new(id.to_string(), 0, 0.0, prompt_tokens, 50)
     }
 
-    /// Allocate `tokens` for `req` and account for them on the request.
+    /// Allocate `tokens` for `req` (content blocks added).
     fn alloc(m: &mut KVCacheManager, req: &mut Request, tokens: u32) -> u32 {
-        let n = m.allocate_blocks(req, tokens).unwrap();
-        req.kv_blocks.extend(n);
-        n
+        m.allocate_blocks(req, tokens).unwrap()
     }
 
     fn free(m: &mut KVCacheManager, req: &mut Request) {
-        m.free_blocks(req);
-        req.kv_blocks.clear();
+        m.free_request(req);
     }
 
     #[test]
@@ -840,7 +946,7 @@ mod tests {
         assert_eq!(m.content_blocks_for_tokens(1000), 2);
         // Per-sequence state is padded to whole blocks and added on top.
         let m = KVCacheManager::new(16000, 16, |t| 100 * t as u64, 1700, false);
-        assert_eq!(m.state_blocks(), 2);
+        assert_eq!(m.aux_blocks_for_tokens(16), 2);
         assert_eq!(m.blocks_for_context(16), 3);
     }
 
@@ -945,16 +1051,16 @@ mod tests {
         // allocated: the hit did not leave a phantom free block behind.
         let mut c = create_test_request("c", 16);
         c.prompt_block_hashes = vec![9];
-        assert!(m.allocate_blocks(&c, 16).is_none());
+        assert!(m.allocate_blocks(&mut c, 16).is_none());
         // A request that hits [1] but needs one more block is also refused
         // (the hit's block is not available to its own miss).
         let mut d = create_test_request("d", 32);
         d.prompt_block_hashes = vec![1, 3];
-        assert!(m.allocate_blocks(&d, 32).is_none());
+        assert!(m.allocate_blocks(&mut d, 32).is_none());
         // Free b's second block worth by freeing b: d fits.
         free(&mut m, &mut b);
         assert_eq!(m.num_free_blocks(), 2);
-        assert!(m.allocate_blocks(&d, 32).is_some());
+        assert!(m.allocate_blocks(&mut d, 32).is_some());
     }
 
     #[test]
@@ -1187,8 +1293,7 @@ mod landing_tests {
         assert_eq!(lk.promote_tokens_per_tier, vec![64]);
         // Park: reserve 4 landing blocks, start the transfer.
         r.num_cached_tokens = 64;
-        let n = m.reserve_blocks_for_transfer(&r, 64).unwrap();
-        r.kv_blocks.extend(n);
+        m.reserve_blocks_for_transfer(&mut r, 64).unwrap();
         assert_eq!(r.kv_blocks.len(), 4);
         m.start_transfer("r".into(), &lk, &r.prompt_block_hashes, 0.0);
         // Another request sees it in flight and would join.
@@ -1210,10 +1315,9 @@ mod landing_tests {
         );
         assert!(!lk2.needs_promotion());
         // It now allocates its fifth block and runs.
-        let n = m.allocate_blocks(&r, 16).unwrap();
+        let n = m.allocate_blocks(&mut r, 16).unwrap();
         assert_eq!(n, 1);
-        r.kv_blocks.extend(n);
-        m.free_blocks(&r);
+        m.free_request(&mut r);
         assert_eq!(m.num_free_blocks(), 16);
     }
 }

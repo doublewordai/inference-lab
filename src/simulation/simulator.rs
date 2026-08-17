@@ -133,6 +133,9 @@ impl Simulator {
         };
 
         let mut engine = Engine::new(topology);
+        if let Some(tc) = &config.time_correction {
+            engine.set_time_correction(tc.alpha, tc.beta);
+        }
         if let Some(spec) = &config.speculative {
             engine.enable_speculative(spec.clone(), config.workload.seed)?;
         }

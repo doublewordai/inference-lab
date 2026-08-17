@@ -48,7 +48,8 @@ use toml::{Table, Value};
 
 use super::{
     hardware_ref, model_ref, ClusterSpec, Config, FaultConfig, HardwareConfig, MemoryConfig,
-    ModelSpec, ParallelConfig, RouterConfig, SchedulerConfig, SpeculativeConfig, WorkloadConfig,
+    ModelSpec, ParallelConfig, RouterConfig, SchedulerConfig, SpeculativeConfig, TimeCorrection,
+    WorkloadConfig,
 };
 
 /// A model on one hardware: everything a simulation needs except the
@@ -75,6 +76,10 @@ pub struct Deployment {
     /// KV tiers beyond HBM, chosen from the hardware's `[memory]` stores.
     #[serde(default)]
     pub memory: MemoryConfig,
+    /// Optional step-time calibration against a measured engine
+    /// (`t = alpha × t_roofline + beta`); absent = pure roofline.
+    #[serde(default)]
+    pub time_correction: Option<TimeCorrection>,
     #[serde(default)]
     pub speculative: Option<SpeculativeConfig>,
     #[serde(default)]
@@ -152,6 +157,9 @@ struct HardwareEntry {
     /// Replaces the shared `[memory]` block for this hardware.
     #[serde(default)]
     memory: Option<Table>,
+    /// Step-time calibration for this hardware (`{ alpha, beta }`).
+    #[serde(default)]
+    time_correction: Option<Table>,
 }
 
 /// A parsed model config file. Resolve a hardware entry with
@@ -254,6 +262,9 @@ impl ModelConfig {
         if let Some(memory) = entry.memory.as_ref().or(self.memory.as_ref()) {
             merged.insert("memory".into(), Value::Table(memory.clone()));
         }
+        if let Some(tc) = &entry.time_correction {
+            merged.insert("time_correction".into(), Value::Table(tc.clone()));
+        }
         if let Some(fault) = &self.fault {
             merged.insert("fault".into(), Value::Table(fault.clone()));
         }
@@ -263,6 +274,10 @@ impl ModelConfig {
             .cluster()
             .validate()
             .map_err(|e| DeploymentError(format!("[hardware.{name}]: {e}")))?;
+        if let Some(tc) = &deployment.time_correction {
+            tc.validate()
+                .map_err(|e| DeploymentError(format!("[hardware.{name}]: {e}")))?;
+        }
         Ok(deployment)
     }
 }
@@ -302,6 +317,7 @@ replicas = 4
 tp = 4
 scheduler = { max_num_batched_tokens = 4096 }
 router = { policy = "prefix_affinity", max_load_ratio = 1.5 }
+time_correction = { alpha = 1.5, beta = 0.002 }
 [hardware.gh200.speculative]
 gamma = 2
 policy = "goodput_budget"
@@ -328,9 +344,17 @@ alpha = 0.5
             RouterConfig::KvAwareDecode { load_weight: 64.0 }
         );
         assert_eq!(b200.cluster().num_workers, 4);
+        assert_eq!(b200.time_correction, None);
 
         let gh = cfg.deployment(Some("gh200")).unwrap();
         assert_eq!(gh.replicas, 1);
+        assert_eq!(
+            gh.time_correction,
+            Some(TimeCorrection {
+                alpha: 1.5,
+                beta: 0.002
+            })
+        );
         assert_eq!(
             gh.router,
             RouterConfig::PrefixAffinity {

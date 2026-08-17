@@ -1045,6 +1045,46 @@ impl Radix {
     // ------------------------------------------------------------------
     // Acquire / release
 
+    /// What taking `[held, upto)` of `path` on worker `w` would cost:
+    /// `(fresh blocks, hits on free-but-cached blocks)` — the blocks the
+    /// free set must supply. The dry run of [`Self::acquire`]'s first pass.
+    pub fn acquire_cost(&self, w: WorkerId, path: &Path, held: u32, upto: u32) -> (u32, u32) {
+        let upto = upto.min(path.blocks);
+        let mut fresh = 0u32;
+        let mut hits_on_free = 0u32;
+        let mut acc = 0u32;
+        for seg in &path.segs {
+            let (a, b) = (
+                held.saturating_sub(acc).min(seg.len),
+                upto.saturating_sub(acc).min(seg.len),
+            );
+            if a < b {
+                let node = &self.nodes[seg.node as usize];
+                let h = node.hbm.get(&w);
+                let resident = h.map_or(0, |h| h.resident);
+                let landing_end = h
+                    .and_then(|h| h.landing_at(resident.max(a)).map(|l| l.end))
+                    .unwrap_or(resident);
+                let covered = resident.max(landing_end).min(b);
+                if b > covered.max(a) {
+                    fresh += b - covered.max(a);
+                }
+                if let Some(h) = h {
+                    let hb = b.min(resident);
+                    for r in &h.runs {
+                        let s = r.start.max(a);
+                        let e = r.end.min(hb);
+                        if s < e {
+                            hits_on_free += e - s;
+                        }
+                    }
+                }
+            }
+            acc += seg.len;
+        }
+        (fresh, hits_on_free)
+    }
+
     /// Take blocks `[held, upto)` of `path` for a request on worker `w`
     /// (which already holds `[0, held)`), pinning hits and allocating fresh
     /// or landing blocks. `publish`: fresh blocks are content this request
