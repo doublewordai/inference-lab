@@ -76,6 +76,9 @@ pub struct MemoryMetrics {
     pub bytes_promoted: f64,
     /// Promotions that had to wait for a write still arriving.
     pub write_race_waits: u64,
+    /// Most transfers (promotions, writes, hand-offs) in flight at once.
+    #[serde(default)]
+    pub peak_transfers_in_flight: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize)]

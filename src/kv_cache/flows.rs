@@ -88,6 +88,7 @@ struct Transfer {
 pub struct Flows {
     edges: Vec<Edge>,
     in_flight: HashMap<String, Transfer>,
+    peak_in_flight: usize,
     /// Completed transfers not yet collected, per owner.
     completed: HashMap<Owner, HashSet<String>>,
     /// Bytes submitted, by owner kind, for reporting.
@@ -117,6 +118,11 @@ impl Flows {
 
     pub fn num_in_flight(&self) -> usize {
         self.in_flight.len()
+    }
+
+    /// Most transfers ever in flight at once.
+    pub fn peak_in_flight(&self) -> usize {
+        self.peak_in_flight
     }
 
     pub fn contains(&self, id: &str) -> bool {
@@ -160,6 +166,7 @@ impl Flows {
                 last_update: now,
             },
         );
+        self.peak_in_flight = self.peak_in_flight.max(self.in_flight.len());
         self.recompute_rates();
     }
 

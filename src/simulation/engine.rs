@@ -838,6 +838,7 @@ impl Engine {
             bytes_written: g.flows().bytes_submitted_write,
             bytes_promoted: g.flows().bytes_submitted_worker,
             write_race_waits: g.write_race_waits,
+            peak_transfers_in_flight: g.flows().peak_in_flight() as u64,
         })
     }
 

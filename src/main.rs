@@ -823,12 +823,13 @@ fn print_final_metrics(
     if let Some(m) = &summary.memory {
         println!("\n{}", "MEMORY".yellow().bold());
         println!(
-            "  • Write: {}; eviction: {}; written {:.2} GB; promoted {:.2} GB; promotions waiting on a write: {}",
+            "  • Write: {}; eviction: {}; written {:.2} GB; promoted {:.2} GB; promotions waiting on a write: {}; peak transfers in flight: {}",
             m.write_policy,
             m.eviction_policy,
             m.bytes_written / 1e9,
             m.bytes_promoted / 1e9,
-            m.write_race_waits
+            m.write_race_waits,
+            m.peak_transfers_in_flight
         );
         for st in &m.stores {
             println!(
