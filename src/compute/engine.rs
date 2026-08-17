@@ -87,12 +87,17 @@ impl ComputeEngine {
     ///
     /// * attention: one all-reduce of the hidden-wide activation, unless
     ///   `dp_attention` (each rank owns its sequences' attention outright);
-    /// * dense FFN, or MoE with `ep = 1` (experts TP-sharded): one
-    ///   all-reduce, or under `dp_attention` an all-gather in and a
-    ///   reduce-scatter out (the ranks' tokens meet the sharded FFN);
-    /// * MoE with `ep > 1`: dispatch and combine all-to-alls over the `ep`
-    ///   group, each rank moving its `tokens / ep` share of the routed
-    ///   activations (`experts_per_tok` copies of the hidden vector).
+    /// * dense FFN, or MoE without `dp_attention`: one all-reduce, whatever
+    ///   `ep` is — with TP attention every rank already holds every token,
+    ///   so EP only decides which expert GEMMs a rank runs; its partial
+    ///   outputs are summed by the same all-reduce (vLLM's TP + EP path);
+    /// * under `dp_attention`, dense FFN or MoE with `ep = 1`: an all-gather
+    ///   in and a reduce-scatter out (the ranks' tokens meet the sharded
+    ///   FFN);
+    /// * under `dp_attention`, MoE with `ep > 1`: each token lives on one
+    ///   rank, so dispatch and combine all-to-alls over the `ep` group, each
+    ///   rank moving its `tokens / ep` share of the routed activations
+    ///   (`experts_per_tok` copies of the hidden vector).
     fn collective_time(&self, total_tokens: u32) -> f64 {
         let Some(fabric) = &self.hardware.fabric else {
             return 0.0;
@@ -119,7 +124,7 @@ impl ComputeEngine {
             total += self.model.num_layers() as f64 * fabric.allreduce_time(tp, hidden);
         }
         total += ffn_exchange(self.model.dense_ffn_layers());
-        if ep > 1 {
+        if ep > 1 && dpa {
             for r in self.model.weights.iter().filter_map(|w| w.routing) {
                 let per_rank = tokens / ep as f64 * r.experts_per_tok as f64 * hidden / tokens;
                 total += 2.0 * r.moe_layers as f64 * fabric.alltoall_time(ep, per_rank);
@@ -344,8 +349,10 @@ mod tests {
         assert_eq!(extra, base.model.attention_weight_bytes() as f64);
     }
 
-    /// EP replaces the MoE layers' FFN all-reduce with dispatch + combine
-    /// all-to-alls over the ep group; dense layers keep the all-reduce.
+    /// Under DP-attention, EP replaces the MoE layers' FFN exchange with
+    /// dispatch + combine all-to-alls over the ep group; dense layers keep
+    /// the all-gather + reduce-scatter. With TP attention, tokens are
+    /// replicated and EP prices exactly like ep = 1.
     #[test]
     fn ep_prices_alltoalls_on_moe_layers() {
         use crate::config::{FabricConfig, FabricLink, Routing, WeightStream};
@@ -374,16 +381,27 @@ mod tests {
         let mut par = base.parallel.clone();
         par.tp = 4;
         par.ep = 4;
-        let eng = ComputeEngine::new(hw, par, model);
+        par.dp_attention = true;
+        let eng = ComputeEngine::new(hw.clone(), par.clone(), model.clone());
         let tokens = 1024.0;
         let hidden = tokens * 4096.0 * 2.0;
-        let allreduce = 1e-6 + 2.0 * 3.0 / 4.0 * hidden / 1e12;
+        // Dense layers: all-gather + reduce-scatter, ring bytes, two calls.
+        let ag_rs = 2e-6 + 2.0 * 3.0 / 4.0 * hidden / 1e12;
         // Each rank dispatches 1024/4 tokens × 4 experts × hidden bytes,
         // 3/4 of it to other ranks.
         let per_rank = tokens / 4.0 * 4.0 * 4096.0 * 2.0;
         let a2a = 1e-6 + 3.0 / 4.0 * per_rank / 1e12;
-        let expected = 32.0 * allreduce + 8.0 * allreduce + 2.0 * 24.0 * a2a;
+        let expected = 8.0 * ag_rs + 2.0 * 24.0 * a2a;
         assert!((eng.collective_time(1024) - expected).abs() < 1e-12);
+
+        // TP attention: no dispatch — ep = 4 costs what ep = 1 costs.
+        par.dp_attention = false;
+        let ep4 = ComputeEngine::new(hw.clone(), par.clone(), model.clone());
+        par.ep = 1;
+        let ep1 = ComputeEngine::new(hw, par, model);
+        let allreduce = 1e-6 + 2.0 * 3.0 / 4.0 * hidden / 1e12;
+        assert_eq!(ep4.collective_time(1024), ep1.collective_time(1024));
+        assert!((ep4.collective_time(1024) - 64.0 * allreduce).abs() < 1e-12);
     }
 
     fn create_test_request(id: &str, computed: u32, prompt: u32) -> Request {

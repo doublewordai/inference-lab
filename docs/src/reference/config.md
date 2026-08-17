@@ -55,8 +55,8 @@ hardware preset unless `spec` says otherwise.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `tp` | U32 | 1 | Replica world size: its GPUs pool FLOP rate, HBM bandwidth and memory; weights are sharded across them; each layer's output is all-reduced twice (after attention, after the FFN) |
-| `ep` | U32 | 1 | Experts sharded across `ep` of the ranks (divides `tp`); MoE layers exchange tokens with dispatch + combine all-to-alls over the `ep` group instead of the FFN all-reduce |
-| `dp_attention` | Bool | false | Attention runs data-parallel over the `tp` ranks (sglang `--enable-dp-attention`): the attention projections are replicated (`tp×` resident and read per step), a sequence's KV lives on one rank, no attention all-reduce; the TP-sharded FFN gathers the ranks' tokens with an all-gather and returns them with a reduce-scatter (all-to-alls when `ep > 1`) |
+| `ep` | U32 | 1 | Experts sharded across `ep` of the ranks (divides `tp`). With TP attention every rank holds every token, so the MoE output is still combined by the FFN all-reduce (vLLM `--enable-expert-parallel`); under `dp_attention` the MoE layers dispatch + combine with all-to-alls over the `ep` group instead |
+| `dp_attention` | Bool | false | Attention runs data-parallel over the `tp` ranks (sglang `--enable-dp-attention`): the attention projections are replicated (`tp×` resident and read per step), a sequence's KV lives on one rank, no attention all-reduce; the TP-sharded FFN gathers the ranks' tokens with an all-gather and returns them with a reduce-scatter (with `ep > 1`, DeepEP-style dispatch + combine all-to-alls) |
 | `spec` | String or Table | the entry name | Another catalog preset, or an inline hardware table (fields below) |
 | `scheduler` | Table | `{}` | Keys merged over the shared `[scheduler]` for this entry |
 | `speculative` | Table | shared `[speculative]` | Replaces the shared block for this entry |
@@ -64,10 +64,11 @@ hardware preset unless `spec` says otherwise.
 Collectives are priced on the hardware's `[fabric]` (below) and added
 serially to the step; an entry with `tp > 1` or `ep > 1` on hardware without
 one is rejected. Per layer: attention → one all-reduce over `tp` (none under
-`dp_attention`); dense FFN, or MoE with `ep = 1` → one all-reduce (under
-`dp_attention` an all-gather + reduce-scatter); MoE with `ep > 1` → dispatch
-and combine all-to-alls over `ep`, each rank moving its `tokens / ep` share
-of `experts_per_tok` hidden vectors. Expert reads and FLOPs are taken as
+`dp_attention`); dense FFN, or MoE without `dp_attention` (any `ep`) → one
+all-reduce; under `dp_attention`, dense FFN or MoE with `ep = 1` → an
+all-gather + reduce-scatter, MoE with `ep > 1` → dispatch and combine
+all-to-alls over `ep`, each rank moving its `tokens / ep` share of
+`experts_per_tok` hidden vectors. Expert reads and FLOPs are taken as
 balanced across ranks; there is no overlap of collectives with compute.
 
 ### Hardware spec
@@ -134,7 +135,7 @@ simulator serves is a composition of the pieces below.
 | `precision` | `"fp4"`,`"fp8"`,`"bf16"`,`"fp16"`,`"fp32"` | — | |
 | `active_params` | U64 | — | Parameters touched per token (FLOPs = 2×) |
 | `resident_params` | U64 | — | Parameters resident in HBM |
-| `routing` | Table | unset | MoE routing: `{ routed_experts, experts_per_tok, moe_layers }`. The per-step read then follows coupon-collector growth with the step's tokens (per-expert and shared params are recovered from the active/resident split); EP all-to-alls = 2 × `moe_layers` |
+| `routing` | Table | unset | MoE routing: `{ routed_experts, experts_per_tok, moe_layers }`. The per-step read then follows coupon-collector growth with the step's tokens (per-expert and shared params are recovered from the active/resident split); EP all-to-alls (under `dp_attention`) = 2 × `moe_layers` |
 
 A dense fp8 model is one stream; DeepSeek-V4 is an fp4 expert stream with
 routing plus an fp8 non-expert stream; gpt-oss is fp4 experts + bf16 rest.

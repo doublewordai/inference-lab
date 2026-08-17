@@ -40,9 +40,10 @@ scheduler = { max_num_batched_tokens = 8192 }   # per-entry override
   name is a hardware preset (`b200`, `b300`, `gh200-120`, `gh200-96`,
   `b200-datasheet`, `h100`) unless the entry sets `spec`. Each entry gives
   the parallel layout — `tp` (replica world size, weights sharded, per-layer
-  all-reduces), `ep` (experts sharded over `ep` ranks, all-to-alls instead of
-  the FFN all-reduce), `dp_attention` (data-parallel attention: replicated
-  attention weights, all-gather/reduce-scatter around the FFN) — and may
+  all-reduces), `ep` (experts sharded over `ep` ranks), `dp_attention`
+  (data-parallel attention: replicated attention weights,
+  all-gather/reduce-scatter around the FFN, or dispatch/combine all-to-alls
+  when `ep > 1`) — and may
   override `scheduler` keys or carry its own `speculative` block. The
   shipped configs carry the layouts production runs (`tp8 + dp_attention`
   for DeepSeek-V4-Pro / Kimi / GLM-5, `tp = ep` for the Qwen3.5/VL MoEs and
