@@ -13,7 +13,9 @@ use crate::config::{
     ClusterSpec, DisaggTopology, ModelSpec, RouterConfig, SchedulerConfig, SourcePolicy,
     SpeculativeConfig,
 };
-use crate::kv_cache::{KVCacheManager, MemoryGraph, Owner, PrefixCacheStats, SharedMemoryGraph};
+use crate::kv_cache::{
+    KVCacheManager, MemoryGraph, Owner, PrefixCacheStats, SharedMemoryGraph, SharedRadix,
+};
 use crate::request::{Request, SessionStep};
 use crate::router::{build_router, PrefixSignal, Router, RouterStats, WorkerSignal};
 use crate::scheduler::{RecomputeFn, Scheduler};
@@ -166,6 +168,12 @@ pub(crate) struct WorkerPool {
     /// worker, so on a DP-attention pool it places requests on ranks.
     router: Box<dyn Router>,
     router_stats: RouterStats,
+    /// Tier-attached managers in a pool share one radix. Keep that handle
+    /// and its radix-local worker ids so a KV-aware routing decision resolves
+    /// the prompt path once, then reads each worker's view. Multi-worker
+    /// HBM-only pools retain private trees and use the per-manager fallback.
+    routing_radix: Option<SharedRadix>,
+    worker_ids: Vec<usize>,
     /// Lockstep groups: the ranks of one replica, stepped together as one
     /// iteration (they meet at every layer's FFN collective). Each group
     /// lists its members' worker indices; the first is the leader that
@@ -177,6 +185,18 @@ pub(crate) struct WorkerPool {
 impl WorkerPool {
     pub fn new(workers: Vec<Worker>) -> Self {
         let n = workers.len();
+        let worker_ids: Vec<usize> = workers
+            .iter()
+            .map(|w| w.scheduler.kv_cache_manager().radix_worker())
+            .collect();
+        let routing_radix = workers
+            .first()
+            .map(|w| w.scheduler.kv_cache_manager().radix().clone())
+            .filter(|radix| {
+                workers
+                    .iter()
+                    .all(|w| std::sync::Arc::ptr_eq(radix, w.scheduler.kv_cache_manager().radix()))
+            });
         let mut groups: Vec<Vec<usize>> = Vec::new();
         let mut group_of = Vec::with_capacity(n);
         for (i, w) in workers.iter().enumerate() {
@@ -190,6 +210,8 @@ impl WorkerPool {
             workers,
             router: build_router(&RouterConfig::RoundRobin {}),
             router_stats: RouterStats::new(n),
+            routing_radix,
+            worker_ids,
             groups,
             group_of,
         }
@@ -219,24 +241,52 @@ impl WorkerPool {
     /// per-worker prefix estimate is only computed for routers that ask.
     fn pick(&mut self, req: &Request) -> usize {
         let prefix = self.router.prefix_signal();
+        let hashes = &req.prompt_block_hashes;
+        let shared_prefix_tokens: Option<Vec<u32>> = match prefix {
+            PrefixSignal::None => None,
+            _ if hashes.is_empty() => Some(vec![0; self.workers.len()]),
+            PrefixSignal::Cached => self.routing_radix.as_ref().map(|radix| {
+                radix
+                    .lock()
+                    .unwrap()
+                    .lookup_workers(&self.worker_ids, hashes)
+                    .into_iter()
+                    .zip(&self.workers)
+                    .map(|(lk, w)| lk.cached() * w.scheduler.kv_cache_manager().block_size())
+                    .collect()
+            }),
+            PrefixSignal::Resident => self.routing_radix.as_ref().map(|radix| {
+                radix
+                    .lock()
+                    .unwrap()
+                    .resident_prefix_workers(&self.worker_ids, hashes)
+                    .into_iter()
+                    .zip(&self.workers)
+                    .map(|(blocks, w)| blocks * w.scheduler.kv_cache_manager().block_size())
+                    .collect()
+            }),
+        };
         let signals: Vec<WorkerSignal> = self
             .workers
             .iter()
-            .map(|w| {
+            .enumerate()
+            .map(|(i, w)| {
                 let sched = &w.scheduler;
                 let mgr = sched.kv_cache_manager();
-                let hashes = &req.prompt_block_hashes;
                 WorkerSignal {
                     running: sched.num_running(),
                     waiting: sched.num_waiting(),
                     queued_prefill_tokens: sched.queued_prefill_tokens(),
                     kv_util: mgr.utilization(),
                     free_kv_tokens: mgr.num_free_blocks() as u64 * mgr.block_size() as u64,
-                    cached_prefix_tokens: match prefix {
-                        PrefixSignal::None => None,
-                        PrefixSignal::Cached => Some(mgr.cached_prefix_tokens_estimate(hashes)),
-                        PrefixSignal::Resident => Some(mgr.hbm_prefix_tokens(hashes)),
-                    },
+                    cached_prefix_tokens: shared_prefix_tokens.as_ref().map_or_else(
+                        || match prefix {
+                            PrefixSignal::None => None,
+                            PrefixSignal::Cached => Some(mgr.cached_prefix_tokens_estimate(hashes)),
+                            PrefixSignal::Resident => Some(mgr.hbm_prefix_tokens(hashes)),
+                        },
+                        |tokens| Some(tokens[i]),
+                    ),
                 }
             })
             .collect();
@@ -1018,7 +1068,9 @@ impl Engine {
                         .lock()
                         .unwrap()
                         .take_completed(Owner::Handoff);
-                    self.deliver_drained(done, now)?;
+                    if let Some(done) = done {
+                        self.deliver_drained(done, now)?;
+                    }
                 }
                 Owner::Worker(w) => {
                     if let Some((pool, idx)) = self.locate_worker(w) {

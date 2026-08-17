@@ -248,7 +248,10 @@ impl Scheduler {
         let completed = self.kv_cache_manager.advance_transfers(current_time);
         let mut still_pending = Vec::with_capacity(self.pending_transfers.len());
         for mut req in self.pending_transfers.drain(..) {
-            if completed.contains(&req.request_id) {
+            if completed
+                .as_ref()
+                .is_some_and(|completed| completed.contains(&req.request_id))
+            {
                 // Publish the now-resident blocks to the HBM prefix cache so
                 // subsequent same-prefix requests get a clean HBM hit.
                 let cached_blocks = self
@@ -276,7 +279,10 @@ impl Scheduler {
         // outlook order); the rest wait on.
         let mut still_flying = Vec::with_capacity(self.prefetches.len());
         for req in self.prefetches.drain(..) {
-            if completed.contains(&req.request_id) {
+            if completed
+                .as_ref()
+                .is_some_and(|completed| completed.contains(&req.request_id))
+            {
                 let cached_blocks = self
                     .kv_cache_manager
                     .content_blocks_for_tokens(req.num_cached_tokens);

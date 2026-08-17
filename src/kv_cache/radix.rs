@@ -255,6 +255,33 @@ impl HbmLookup {
     }
 }
 
+/// Allocation-light prefix view used when one routing decision probes many
+/// workers. The matched [`Path`] is shared by the whole batch of lookups, and
+/// routing only needs the aggregate tier prefix rather than promotion spans.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WorkerLookup {
+    pub hbm: u32,
+    pub landing: u32,
+    pub tier: u32,
+}
+
+impl WorkerLookup {
+    pub fn cached(&self) -> u32 {
+        self.hbm + self.landing + self.tier
+    }
+}
+
+#[derive(Default)]
+struct LookupParts {
+    hbm: u32,
+    landing: u32,
+    leader: Option<String>,
+    tier: u32,
+    tier_blocks: Vec<u32>,
+    tier_bytes: Vec<u64>,
+    tier_spans: Vec<(usize, Span)>,
+}
+
 /// A region a worker's HBM recycled.
 #[derive(Debug, Clone)]
 pub struct HbmEvicted {
@@ -928,17 +955,46 @@ impl Radix {
     /// prefix, a landing range to join, and tier-held blocks beyond.
     pub fn lookup(&self, w: WorkerId, hashes: &[u64]) -> HbmLookup {
         let path = self.resolve(hashes);
-        let mut lk = HbmLookup {
+        let lk = self.lookup_resolved(w, &path, true);
+        HbmLookup {
             path,
-            ..Default::default()
-        };
-        let tiers = self.w(w).tiers.clone();
-        lk.tier_blocks = vec![0; tiers.len()];
-        lk.tier_bytes = vec![0; tiers.len()];
+            hbm: lk.hbm,
+            landing: lk.landing,
+            leader: lk.leader,
+            tier_blocks: lk.tier_blocks,
+            tier_bytes: lk.tier_bytes,
+            tier_spans: lk.tier_spans,
+        }
+    }
+
+    /// Resolve `hashes` once and read every worker's HBM, landing, and
+    /// aggregate tier prefix from that path. Router probes do not need an
+    /// owned path or per-tier promotion details for each worker.
+    pub fn lookup_workers(&self, workers: &[WorkerId], hashes: &[u64]) -> Vec<WorkerLookup> {
+        let path = self.resolve(hashes);
+        let mut lookups = Vec::with_capacity(workers.len());
+        for &w in workers {
+            let lk = self.lookup_resolved(w, &path, false);
+            lookups.push(WorkerLookup {
+                hbm: lk.hbm,
+                landing: lk.landing,
+                tier: lk.tier,
+            });
+        }
+        lookups
+    }
+
+    fn lookup_resolved(&self, w: WorkerId, path: &Path, detailed: bool) -> LookupParts {
+        let tiers = &self.w(w).tiers;
+        let mut lk = LookupParts::default();
+        if detailed {
+            lk.tier_blocks.resize(tiers.len(), 0);
+            lk.tier_bytes.resize(tiers.len(), 0);
+        }
         // Resident prefix, then landing.
         let mut i = 0usize;
-        while i < lk.path.segs.len() {
-            let seg = lk.path.segs[i];
+        while i < path.segs.len() {
+            let seg = path.segs[i];
             let node = &self.nodes[seg.node as usize];
             let h = node.hbm.get(&w);
             let resident = h.map_or(0, |h| h.resident).min(seg.len);
@@ -948,15 +1004,17 @@ impl Radix {
                     if let Some(l) = h.landing_at(resident) {
                         let take = l.end.min(seg.len) - resident;
                         lk.landing += take;
-                        lk.leader = Some(l.leader.clone());
+                        if detailed {
+                            lk.leader = Some(l.leader.clone());
+                        }
                         // A landing range may continue in the next segment
                         // only if it reaches this node's end.
                         if l.end >= seg.len && take + resident == seg.len {
                             i += 1;
                             // Continue landing through following segments
                             // owned by the same leader.
-                            while i < lk.path.segs.len() {
-                                let s2 = lk.path.segs[i];
+                            while i < path.segs.len() {
+                                let s2 = path.segs[i];
                                 let n2 = &self.nodes[s2.node as usize];
                                 let Some(h2) = n2.hbm.get(&w) else { break };
                                 if h2.resident > 0 {
@@ -989,12 +1047,12 @@ impl Radix {
         // Locate the segment/offset of pos_total.
         let mut acc = 0u32;
         let mut si = 0usize;
-        while si < lk.path.segs.len() && acc + lk.path.segs[si].len <= pos_total {
-            acc += lk.path.segs[si].len;
+        while si < path.segs.len() && acc + path.segs[si].len <= pos_total {
+            acc += path.segs[si].len;
             si += 1;
         }
-        'outer: while si < lk.path.segs.len() {
-            let seg = lk.path.segs[si];
+        'outer: while si < path.segs.len() {
+            let seg = path.segs[si];
             let node = &self.nodes[seg.node as usize];
             let mut off = pos_total - acc;
             while off < seg.len {
@@ -1022,9 +1080,12 @@ impl Radix {
                     start: off,
                     end,
                 };
-                lk.tier_blocks[ti] += span.len();
-                lk.tier_bytes[ti] += self.span_bytes(span);
-                lk.tier_spans.push((ti, span));
+                lk.tier += span.len();
+                if detailed {
+                    lk.tier_blocks[ti] += span.len();
+                    lk.tier_bytes[ti] += self.span_bytes(span);
+                    lk.tier_spans.push((ti, span));
+                }
                 off = end;
                 pos_total = acc + off;
             }
@@ -1037,6 +1098,19 @@ impl Radix {
     /// Blocks of `hashes` resident in worker `w`'s HBM (prefix).
     pub fn resident_prefix(&self, w: WorkerId, hashes: &[u64]) -> u32 {
         let path = self.resolve(hashes);
+        self.resident_prefix_resolved(w, &path)
+    }
+
+    /// Resolve once and read the HBM-resident prefix for several workers.
+    pub fn resident_prefix_workers(&self, workers: &[WorkerId], hashes: &[u64]) -> Vec<u32> {
+        let path = self.resolve(hashes);
+        workers
+            .iter()
+            .map(|&w| self.resident_prefix_resolved(w, &path))
+            .collect()
+    }
+
+    fn resident_prefix_resolved(&self, w: WorkerId, path: &Path) -> u32 {
         let mut n = 0;
         for seg in &path.segs {
             let r = self.nodes[seg.node as usize]
@@ -2575,6 +2649,48 @@ mod tests {
         assert_eq!(r.resident_prefix(0, &[1, 2, 3, 4]), 4);
         r.release(0, &p, 4, 0);
         assert_eq!(r.free_blocks(0), 8);
+    }
+
+    #[test]
+    fn multi_worker_lookup_matches_individual_views() {
+        let mut r = radix();
+        for w in 0..3 {
+            r.register_worker(w, 8, HbmEviction::Lru {}, false);
+        }
+        let store = r.add_store(8, EvictionPolicy::Fifo {});
+        for w in 0..3 {
+            r.set_worker_tiers(w, vec![store]);
+        }
+        let path = r.insert(&[1, 2, 3, 4]);
+        r.acquire(0, &path, 0, 4, 0, true, None, false).unwrap();
+        r.acquire(1, &path, 0, 2, 0, true, None, false).unwrap();
+        r.acquire(2, &path, 0, 3, 0, false, Some("landing"), false)
+            .unwrap();
+        r.store_insert(
+            store,
+            Span {
+                node: path.segs[0].node,
+                start: 0,
+                end: 4,
+            },
+            None,
+            0.0,
+        );
+
+        let workers = [0, 1, 2];
+        let batched = r.lookup_workers(&workers, &[1, 2, 3, 4]);
+        let resident = r.resident_prefix_workers(&workers, &[1, 2, 3, 4]);
+        for ((&worker, summary), hbm) in workers.iter().zip(&batched).zip(resident) {
+            let individual = r.lookup(worker, &[1, 2, 3, 4]);
+            assert_eq!(summary.hbm, individual.hbm);
+            assert_eq!(summary.landing, individual.landing);
+            assert_eq!(
+                summary.tier,
+                individual.tier_blocks.iter().copied().sum::<u32>()
+            );
+            assert_eq!(summary.cached(), individual.cached());
+            assert_eq!(hbm, individual.hbm);
+        }
     }
 
     #[test]
