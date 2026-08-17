@@ -65,7 +65,11 @@ pub struct Simulator {
     config: Config,
     time_series: Vec<TimeSeriesPoint>,
 
-    sample_interval: f64,
+    /// Sim-time spacing of `time_series` samples; `None` collects nothing.
+    /// Off by default: a sample every 0.1 s over a months-long session
+    /// replay is gigabytes of points, and only interactive front-ends read
+    /// them.
+    sample_interval: Option<f64>,
     next_sample_time: f64,
 
     // Counters for accumulating tokens within a sample window.
@@ -146,13 +150,21 @@ impl Simulator {
             metrics: MetricsCollector::new(0.0),
             config,
             time_series: Vec::new(),
-            sample_interval: 0.1,
+            sample_interval: None,
             next_sample_time: 0.0,
             window_prefill_tokens: 0,
             window_decode_tokens: 0,
             sent: SampleCursor::default(),
             bytes_at_completion: HashMap::new(),
         })
+    }
+
+    /// Collect a [`TimeSeriesPoint`] every `interval` seconds of sim time,
+    /// readable through [`Simulator::time_series`] and the progress callback.
+    pub fn with_time_series(mut self, interval: f64) -> Self {
+        assert!(interval > 0.0, "sample interval must be positive");
+        self.sample_interval = Some(interval);
+        self
     }
 
     /// The configuration in force, including any fields filled in at
@@ -237,7 +249,11 @@ impl Simulator {
             }
 
             // Sample the time series at fixed sim-time intervals.
-            while self.engine.current_time() >= self.next_sample_time {
+            while self
+                .sample_interval
+                .is_some_and(|_| self.engine.current_time() >= self.next_sample_time)
+            {
+                let interval = self.sample_interval.unwrap();
                 let prefilling = self.engine.aggregate_prefilling();
                 let decoding = self.engine.aggregate_running() - prefilling;
 
@@ -255,14 +271,14 @@ impl Simulator {
                     num_decoding: decoding,
                     prefill_tokens,
                     decode_tokens,
-                    input_throughput: prefill_tokens as f64 / self.sample_interval,
-                    output_throughput: decode_tokens as f64 / self.sample_interval,
+                    input_throughput: prefill_tokens as f64 / interval,
+                    output_throughput: decode_tokens as f64 / interval,
                     ttft_interval_mean_ms: ttft_mean,
                     tpot_interval_mean_ms: tpot_mean,
                 });
                 self.window_prefill_tokens = 0;
                 self.window_decode_tokens = 0;
-                self.next_sample_time += self.sample_interval;
+                self.next_sample_time += interval;
             }
 
             // Progress callback every callback_interval of sim time.
@@ -464,7 +480,7 @@ mod tests {
     #[test]
     fn test_simulation_time_series_collected() {
         let config = create_minimal_test_config();
-        let mut simulator = Simulator::new(config, None).unwrap();
+        let mut simulator = Simulator::new(config, None).unwrap().with_time_series(0.1);
         simulator.run_with_callback(|_| {}).unwrap();
         let ts = simulator.time_series();
         assert!(!ts.is_empty());
