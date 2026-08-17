@@ -372,6 +372,13 @@ enum EventKind {
     /// done inside the iteration that produced it) so the link is advanced
     /// to a time no later than any transfer's pending drain event.
     HandoffStart(Request),
+    /// A worker's next prefetch plan is due: wake it if idle. Its own
+    /// event (not a `WorkerReady` armed ahead of time) so an idle worker
+    /// still wakes for arrivals in between.
+    PrefetchDue {
+        pool: PoolId,
+        worker: usize,
+    },
 }
 
 #[derive(Debug)]
@@ -440,6 +447,7 @@ pub enum StepKind {
     Iteration,
     LinkComplete,
     HandoffStart,
+    PrefetchDue,
 }
 
 #[derive(Debug)]
@@ -466,6 +474,8 @@ pub struct Engine {
     /// `worker_busy[pool][worker]` is true iff a `WorkerReady` for that
     /// worker is currently scheduled in the queue.
     worker_busy: Vec<Vec<bool>>,
+    /// Per worker: the time of its armed `PrefetchDue` event, if any.
+    prefetch_armed: Vec<Vec<Option<f64>>>,
     /// Hand-off transfers started, bytes moved, and bytes skipped because
     /// the chosen decoder already held the prompt prefix.
     handoff_stats: HandoffStats,
@@ -482,8 +492,10 @@ pub struct Engine {
 impl Engine {
     pub fn new(topology: Topology) -> Self {
         let mut worker_busy = Vec::with_capacity(topology.pools.len());
+        let mut prefetch_armed = Vec::with_capacity(topology.pools.len());
         for pool in &topology.pools {
             worker_busy.push(vec![false; pool.workers.len()]);
+            prefetch_armed.push(vec![None; pool.workers.len()]);
         }
         let pool_batch_acc = vec![(0.0_f64, 0.0_f64); topology.pools.len()];
         Self {
@@ -494,6 +506,7 @@ impl Engine {
             flow_generation: 0,
             flow_due: None,
             worker_busy,
+            prefetch_armed,
             handoff_stats: HandoffStats::default(),
             pool_batch_acc,
             current_time: 0.0,
@@ -840,6 +853,17 @@ impl Engine {
                     completions: Vec::new(),
                 })
             }
+            EventKind::PrefetchDue { pool, worker } => {
+                self.prefetch_armed[pool][worker] = None;
+                let now = self.current_time;
+                self.maybe_wake_worker(pool, worker, now);
+                Ok(StepOutcome {
+                    time: self.current_time,
+                    kind: StepKind::PrefetchDue,
+                    iteration: None,
+                    completions: Vec::new(),
+                })
+            }
             EventKind::HandoffStart(req) => {
                 self.start_handoff(req)?;
                 Ok(StepOutcome {
@@ -991,13 +1015,10 @@ impl Engine {
             if w.scheduler.num_running() > 0 || w.scheduler.num_waiting() > 0 {
                 self.maybe_wake_worker(pool, worker, now);
             }
-        } else if let Some(ready) = {
-            let s = &self.topology.pools[pool].workers[worker].scheduler;
-            match (s.earliest_pending_ready(), s.next_prefetch_at()) {
-                (Some(a), Some(b)) => Some(a.min(b)),
-                (a, b) => a.or(b),
-            }
-        } {
+        } else if let Some(ready) = self.topology.pools[pool].workers[worker]
+            .scheduler
+            .earliest_pending_ready()
+        {
             // Nothing ran, but a request is parked on a KV tier promotion.
             // Its `ready_at` is the estimate made when it parked; the
             // memory graph's `FlowDrain` wakes this worker when the
@@ -1005,6 +1026,17 @@ impl Engine {
             // already passed is left to that (re-arming at `now` would spin).
             if ready > now {
                 self.maybe_wake_worker(pool, worker, ready);
+            }
+        }
+        // Arm the worker's next prefetch plan as its own event, so it fires
+        // whether or not the worker is busy then.
+        if let Some(t) = self.topology.pools[pool].workers[worker]
+            .scheduler
+            .next_prefetch_at()
+        {
+            if t > now && self.prefetch_armed[pool][worker] != Some(t) {
+                self.prefetch_armed[pool][worker] = Some(t);
+                self.push(t, EventKind::PrefetchDue { pool, worker });
             }
         }
         (outcome.iteration, timings)
