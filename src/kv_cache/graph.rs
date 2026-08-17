@@ -4,7 +4,7 @@
 //! network.
 //!
 //! *Vertices*: each worker's GPU (a `tp`-GPU replica, its ports pooled),
-//! each node's switch, the network core, every store instance and every
+//! each node's switch, the network core, every capacity-bearing store instance and every
 //! junction instance. *Edges*: directed, one each way per template link
 //! instance, with a capacity in bytes/s; a store with its own throughput
 //! adds an edge every transfer in or out of it crosses. Rates are max-min
@@ -21,6 +21,10 @@
 //! worker's GPU; a prefill → decode hand-off along the shortest path from one
 //! GPU to the other (through the network when they are on different nodes,
 //! with an optional core capacity).
+//! A `peer_hbm` tier is virtual: radix lookup selects a same-node sibling
+//! whose HBM holds the next span, then the graph moves it GPU → switch → GPU
+//! over the existing scale-up links. Source pins are held here for the
+//! lifetime of the flow and released before the destination worker wakes.
 //!
 //! The graph is shared by the topology's workers behind a mutex; the
 //! engine is single-threaded, so the lock only serialises.
@@ -29,8 +33,11 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use super::flows::{EdgeId, Flows, Owner};
-use super::radix::{HbmEvicted, KvBytesFn, NodeId, Radix, SharedRadix, Span, TierEvicted};
-use crate::config::{ClusterSpec, EvictionPolicy, MemoryTemplate, Scope, WritePolicy};
+use super::radix::{
+    HbmEvicted, KvBytesFn, NodeId, Radix, RadixTier, SharedRadix, Span, TierEvicted, TierSource,
+    TierSourceRange,
+};
+use crate::config::{ClusterSpec, EvictionPolicy, MemoryTemplate, Scope, StoreKind, WritePolicy};
 
 pub type StoreId = usize;
 pub type WorkerId = usize;
@@ -83,9 +90,29 @@ pub struct Path {
 /// from it takes into the worker's HBM, and the path a write takes out.
 #[derive(Debug, Clone)]
 pub struct Tier {
+    /// `usize::MAX` for the virtual peer-HBM tier, which has no store.
     pub store: StoreId,
+    pub kind: StoreKind,
+    pub pin: bool,
     pub fetch_path: Path,
     pub write_path: Path,
+}
+
+impl Tier {
+    pub fn is_peer_hbm(&self) -> bool {
+        matches!(self.kind, StoreKind::PeerHbm)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PendingPin {
+    source: TierSource,
+    /// Original spans for direct graph/test submissions without a request
+    /// path; manager submissions use the stable landing/range form below.
+    spans: Vec<Span>,
+    worker: WorkerId,
+    leader: String,
+    ranges: Option<Vec<TierSourceRange>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -134,9 +161,20 @@ pub struct MemoryGraph {
     /// ranges it carries that have not landed or been dropped. A batch of
     /// blocks written together moves as one transfer.
     pending_writes: HashMap<String, Vec<(StoreId, Span)>>,
+    /// Source ranges held resident until their promotion flow drains.
+    pending_pins: HashMap<String, PendingPin>,
+    /// Workers whose free HBM changed when a peer-source pin released.
+    wake_workers: HashSet<WorkerId>,
+    /// Stores left temporarily over capacity until the completed reader has
+    /// rechecked and accounted its source.
+    deferred_store_trims: HashSet<StoreId>,
     next_write_seq: u64,
     /// Promotions that had to wait for a write still arriving.
     pub write_race_waits: u64,
+    /// Bytes fetched directly from a sibling worker's HBM.
+    pub peer_hbm_bytes_promoted: u64,
+    /// Promotions whose source no longer covered their whole landing.
+    pub partial_landings: u64,
 }
 
 /// A graph shared by the topology's workers.
@@ -171,8 +209,13 @@ impl MemoryGraph {
             write_of: Vec::new(),
             evict_backed_first: Vec::new(),
             pending_writes: HashMap::new(),
+            pending_pins: HashMap::new(),
+            wake_workers: HashSet::new(),
+            deferred_store_trims: HashSet::new(),
             next_write_seq: 0,
             write_race_waits: 0,
+            peer_hbm_bytes_promoted: 0,
+            partial_landings: 0,
         }
     }
 
@@ -390,7 +433,9 @@ impl MemoryGraph {
             // A shipped cluster store is an opt-in example. Leaving it out
             // of `tiers` must not add zero-use stores or edges to existing
             // simulations and their summaries.
-            if st.per == Scope::Cluster && !tiers.iter().any(|name| name == &st.name) {
+            if matches!(st.kind, StoreKind::PeerHbm)
+                || (st.per == Scope::Cluster && !tiers.iter().any(|name| name == &st.name))
+            {
                 continue;
             }
             let cap_bytes = capacity.get(&st.name).copied().unwrap_or(st.capacity);
@@ -435,6 +480,19 @@ impl MemoryGraph {
         // write path into each; each store's `next` is its successor.
         let mut prev: Option<StoreId> = None;
         for name in tiers {
+            let template_store = t
+                .store(name)
+                .ok_or_else(|| format!("[memory] tier `{name}` has no template entry"))?;
+            if matches!(template_store.kind, StoreKind::PeerHbm) {
+                self.tiers[w].push(Tier {
+                    store: StoreId::MAX,
+                    kind: StoreKind::PeerHbm,
+                    pin: template_store.pins_fetches(),
+                    fetch_path: Path::default(),
+                    write_path: Path::default(),
+                });
+                continue;
+            }
             let (sv, _) = resolve(self, name)?;
             let store = self
                 .stores
@@ -461,6 +519,8 @@ impl MemoryGraph {
             prev = Some(store);
             self.tiers[w].push(Tier {
                 store,
+                kind: StoreKind::Store,
+                pin: template_store.pins_fetches(),
                 fetch_path: fetch,
                 write_path: write,
             });
@@ -525,6 +585,8 @@ impl MemoryGraph {
                 prev[w] = Some(store);
                 g.tiers[w].push(Tier {
                     store,
+                    kind: StoreKind::Store,
+                    pin: false,
                     fetch_path: fetch,
                     write_path: write,
                 });
@@ -601,8 +663,35 @@ impl MemoryGraph {
     pub fn store_ids_of(&self, worker: WorkerId) -> Vec<StoreId> {
         self.tiers
             .get(worker)
-            .map(|ts| ts.iter().map(|t| t.store).collect())
+            .map(|ts| {
+                ts.iter()
+                    .filter(|t| !t.is_peer_hbm())
+                    .map(|t| t.store)
+                    .collect()
+            })
             .unwrap_or_default()
+    }
+
+    /// The radix lookup tiers of `worker`, including the sibling workers
+    /// visible through a node-local peer-HBM entry.
+    pub fn radix_tiers_of(&self, worker: WorkerId) -> Vec<RadixTier> {
+        self.tiers[worker]
+            .iter()
+            .map(|t| {
+                if t.is_peer_hbm() {
+                    RadixTier::PeerHbm(
+                        self.node_of
+                            .iter()
+                            .enumerate()
+                            .filter(|&(w, &node)| w != worker && node == self.node_of[worker])
+                            .map(|(w, _)| w)
+                            .collect(),
+                    )
+                } else {
+                    RadixTier::Store(t.store)
+                }
+            })
+            .collect()
     }
 
     /// Node-shared tiers (see `simple`).
@@ -646,9 +735,17 @@ impl MemoryGraph {
     /// `tiers(worker)`), the closest first.
     pub fn tier_holding(&self, worker: WorkerId, span: Span) -> Option<usize> {
         let r = self.radix.lock().unwrap();
-        self.tiers[worker]
-            .iter()
-            .position(|t| r.store_holds(t.store, span))
+        self.tiers[worker].iter().position(|t| {
+            if t.is_peer_hbm() {
+                self.node_of.iter().enumerate().any(|(w, &node)| {
+                    w != worker
+                        && node == self.node_of[worker]
+                        && r.source_prefix(TierSource::PeerHbm(w), span) > 0
+                })
+            } else {
+                r.store_holds(t.store, span)
+            }
+        })
     }
 
     /// Whether any of `worker`'s tiers holds any of `span`.
@@ -726,11 +823,13 @@ impl MemoryGraph {
     /// one transfer, skipping what any tier already holds. Every range is
     /// arriving until the transfer lands.
     pub fn write_batch(&mut self, worker: WorkerId, items: &[(Span, Option<f64>)]) {
-        if self.tiers[worker].is_empty() || items.is_empty() {
+        if items.is_empty() {
             return;
         }
         let now = self.flows.now();
-        let tier = &self.tiers[worker][0];
+        let Some(tier) = self.tiers[worker].iter().find(|t| !t.is_peer_hbm()) else {
+            return;
+        };
         let (store, path) = (tier.store, tier.write_path.clone());
         let transfer_bandwidth = self.stores[store].transfer_bandwidth;
         let id = format!("w:{worker}:{store}:{}", self.next_write_seq);
@@ -740,7 +839,11 @@ impl MemoryGraph {
         let mut evicted = Vec::new();
         {
             let mut r = self.radix.lock().unwrap();
-            let all_tiers: Vec<StoreId> = self.tiers[worker].iter().map(|t| t.store).collect();
+            let all_tiers: Vec<StoreId> = self.tiers[worker]
+                .iter()
+                .filter(|t| !t.is_peer_hbm())
+                .map(|t| t.store)
+                .collect();
             for &(span, _) in items {
                 // Skip what any tier already holds; write the rest.
                 let mut missing = vec![span];
@@ -900,7 +1003,11 @@ impl MemoryGraph {
     /// used under LRU / TTL).
     pub fn promoted_batch(&mut self, worker: WorkerId, spans: &[Span]) {
         let now = self.flows.now();
-        let stores: Vec<StoreId> = self.tiers[worker].iter().map(|t| t.store).collect();
+        let stores: Vec<StoreId> = self.tiers[worker]
+            .iter()
+            .filter(|t| !t.is_peer_hbm())
+            .map(|t| t.store)
+            .collect();
         let mut r = self.radix.lock().unwrap();
         for s in stores {
             let read = r.store_promoted(s, spans, now);
@@ -910,7 +1017,11 @@ impl MemoryGraph {
 
     /// Remove `span` from whichever of `worker`'s tiers hold it.
     pub fn remove(&mut self, worker: WorkerId, span: Span) {
-        let stores: Vec<StoreId> = self.tiers[worker].iter().map(|t| t.store).collect();
+        let stores: Vec<StoreId> = self.tiers[worker]
+            .iter()
+            .filter(|t| !t.is_peer_hbm())
+            .map(|t| t.store)
+            .collect();
         for s in stores {
             let ids = self.radix.lock().unwrap().store_remove(s, span);
             for id in ids {
@@ -955,13 +1066,69 @@ impl MemoryGraph {
     /// would take if started now, at the fetch path's current fair share
     /// (see [`Flows::estimate_new`]).
     pub fn estimate_promotion(&self, worker: WorkerId, tier: usize, bytes: u64) -> f64 {
-        let path = &self.tiers[worker][tier].fetch_path;
+        let t = &self.tiers[worker][tier];
+        if t.is_peer_hbm() {
+            let Some(source) = self
+                .node_of
+                .iter()
+                .enumerate()
+                .find(|&(w, &node)| w != worker && node == self.node_of[worker])
+                .map(|(w, _)| w)
+            else {
+                return f64::INFINITY;
+            };
+            let Some(path) = self.peer_path(source, worker) else {
+                return f64::INFINITY;
+            };
+            return self
+                .flows
+                .estimate_new(&path.edges, bytes as f64, path.latency);
+        }
         self.flows.estimate_new_capped(
-            &path.edges,
+            &t.fetch_path.edges,
             bytes as f64,
-            path.latency,
-            self.stores[self.tiers[worker][tier].store].transfer_bandwidth,
+            t.fetch_path.latency,
+            self.stores[t.store].transfer_bandwidth,
         )
+    }
+
+    /// Price a promotion from the concrete source selected by the radix.
+    pub fn estimate_source_promotion(
+        &self,
+        worker: WorkerId,
+        tier: usize,
+        source: TierSource,
+        bytes: u64,
+    ) -> f64 {
+        let (path, transfer_bandwidth) = match source {
+            TierSource::Store(store) => (
+                self.tiers[worker][tier].fetch_path.clone(),
+                self.stores[store].transfer_bandwidth,
+            ),
+            TierSource::PeerHbm(source) => match self.peer_path(source, worker) {
+                Some(p) => (p, None),
+                None => return f64::INFINITY,
+            },
+        };
+        self.flows
+            .estimate_new_capped(&path.edges, bytes as f64, path.latency, transfer_bandwidth)
+    }
+
+    /// GPU source → node switch → destination GPU. Keeping the switch
+    /// explicit prevents a same-node peer fetch from accidentally choosing
+    /// a scale-out route with the same hop count.
+    fn peer_path(&self, source: WorkerId, worker: WorkerId) -> Option<Path> {
+        if source == worker || self.node_of[source] != self.node_of[worker] {
+            return None;
+        }
+        let switch = *self
+            .vertex_index
+            .get(&VertexKey::Switch(self.node_of[worker]))?;
+        let mut a = self.shortest_path(self.gpu_vertex[source], switch)?;
+        let b = self.shortest_path(switch, self.gpu_vertex[worker])?;
+        a.edges.extend(b.edges);
+        a.latency += b.latency;
+        Some(a)
     }
 
     /// Start moving `bytes` for `request` from `worker`'s tier `tier` into
@@ -977,10 +1144,38 @@ impl MemoryGraph {
         spans: &[Span],
         now: f64,
     ) {
-        let path = self.tiers[worker][tier].fetch_path.clone();
-        let store = self.tiers[worker][tier].store;
+        let source = TierSource::Store(self.tiers[worker][tier].store);
+        self.submit_source_promotion(worker, tier, request, source, bytes, spans, None, now);
+    }
+
+    /// Start a promotion from the concrete store or peer worker selected by
+    /// lookup. Returns the flow id; peer-HBM ids include their source so
+    /// disjoint spans from different siblings can move concurrently.
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_source_promotion(
+        &mut self,
+        worker: WorkerId,
+        tier: usize,
+        request: &str,
+        source: TierSource,
+        bytes: u64,
+        spans: &[Span],
+        ranges: Option<&[TierSourceRange]>,
+        now: f64,
+    ) -> String {
+        let (path, transfer_bandwidth) = match source {
+            TierSource::Store(store) => (
+                self.tiers[worker][tier].fetch_path.clone(),
+                self.stores[store].transfer_bandwidth,
+            ),
+            TierSource::PeerHbm(source_worker) => (
+                self.peer_path(source_worker, worker)
+                    .expect("radix only exposes peer workers on the same switched node"),
+                None,
+            ),
+        };
         let mut wait = 0.0_f64;
-        {
+        if let TierSource::Store(store) = source {
             let r = self.radix.lock().unwrap();
             for &sp in spans {
                 for id in r.store_arriving(store, sp) {
@@ -991,15 +1186,49 @@ impl MemoryGraph {
         if wait > 0.0 {
             self.write_race_waits += 1;
         }
+        let id = match source {
+            TierSource::Store(_) => promotion_id(request, tier),
+            TierSource::PeerHbm(source_worker) => {
+                format!("{}@{}", promotion_id(request, tier), source_worker)
+            }
+        };
+        if self.tiers[worker][tier].pin {
+            let mut r = self.radix.lock().unwrap();
+            let pin_spans: Vec<Span> = match ranges {
+                Some(ranges) => r
+                    .landing_source_spans(worker, request, ranges)
+                    .into_iter()
+                    .filter_map(|(span_source, span)| (span_source == source).then_some(span))
+                    .collect(),
+                None => spans.to_vec(),
+            };
+            for &span in &pin_spans {
+                r.pin_source(source, span);
+            }
+            self.pending_pins.insert(
+                id.clone(),
+                PendingPin {
+                    source,
+                    spans: pin_spans,
+                    worker,
+                    leader: request.to_string(),
+                    ranges: ranges.map(|ranges| ranges.to_vec()),
+                },
+            );
+        }
+        if matches!(source, TierSource::PeerHbm(_)) {
+            self.peer_hbm_bytes_promoted = self.peer_hbm_bytes_promoted.saturating_add(bytes);
+        }
         self.flows.submit_capped(
-            promotion_id(request, tier),
+            id.clone(),
             Owner::Worker(worker),
             path.edges,
             bytes,
             path.latency + wait,
-            self.stores[store].transfer_bandwidth,
+            transfer_bandwidth,
             now,
         );
+        id
     }
 
     /// The path a hand-off from `from` (prefill worker) to `to` (decode
@@ -1081,16 +1310,60 @@ impl MemoryGraph {
     /// Writes that landed become resident; TTL-expired entries are dropped.
     pub fn advance(&mut self, now: f64) -> Vec<(Owner, String)> {
         let done = self.flows.advance(now);
+        for (_, id) in &done {
+            let Some(pin) = self.pending_pins.remove(id) else {
+                continue;
+            };
+            let evicted = {
+                let mut r = self.radix.lock().unwrap();
+                let mut evicted = Vec::new();
+                let spans = if let Some(ranges) = pin.ranges {
+                    r.landing_source_spans(pin.worker, &pin.leader, &ranges)
+                } else {
+                    pin.spans
+                        .into_iter()
+                        .map(|span| (pin.source, span))
+                        .collect()
+                };
+                for (source, span) in spans {
+                    evicted.extend(r.unpin_source(source, span));
+                }
+                evicted
+            };
+            match pin.source {
+                TierSource::PeerHbm(source) => {
+                    self.wake_workers.insert(source);
+                }
+                TierSource::Store(store) => {
+                    debug_assert!(evicted.is_empty());
+                    self.deferred_store_trims.insert(store);
+                }
+            }
+        }
         self.settle_writes(now);
         done
     }
 
     pub fn take_completed(&mut self, owner: Owner) -> Option<HashSet<String>> {
-        self.flows.take_completed(owner)
+        let mut completed = self.flows.take_completed(owner);
+        if let Owner::Worker(worker) = owner {
+            if self.wake_workers.remove(&worker) {
+                completed.get_or_insert_with(HashSet::new);
+            }
+        }
+        completed
     }
 
     pub fn owners_with_completions(&self) -> Vec<Owner> {
-        self.flows.owners_with_completions()
+        let mut owners = self.flows.owners_with_completions();
+        owners.extend(self.wake_workers.iter().copied().map(Owner::Worker));
+        owners.sort_by_key(|owner| match owner {
+            Owner::Worker(w) => (0, *w),
+            Owner::Handoff => (1, 0),
+            Owner::Write => (2, 0),
+        });
+        owners.dedup();
+        owners
     }
 
     pub fn next_completion_delay(&mut self) -> Option<f64> {
@@ -1108,6 +1381,24 @@ impl MemoryGraph {
 
     pub fn estimate_remaining(&mut self, id: &str) -> f64 {
         self.flows.estimate_remaining(id)
+    }
+
+    /// Apply store-capacity evictions deferred until a completed pinned
+    /// reader has rechecked its source.
+    pub fn settle_source_pins(&mut self) {
+        let stores: Vec<_> = self.deferred_store_trims.drain().collect();
+        for store in stores {
+            let evicted = self.radix.lock().unwrap().trim_store_after_unpin(store);
+            self.cascade_batch(store, evicted);
+        }
+    }
+
+    pub fn record_partial_landing(&mut self) {
+        self.partial_landings += 1;
+    }
+
+    pub fn pin_stalls(&self) -> u64 {
+        self.radix.lock().unwrap().pin_stalls()
     }
 
     /// Per-store occupancy in blocks, by store name (summed over instances).
@@ -1191,6 +1482,8 @@ pub struct EdgeTotals {
 mod tests {
     use super::*;
     use crate::config::{HardwareConfig, MemoryConfig, MemoryTemplate, ParallelConfig};
+    use crate::kv_cache::KVCacheManager;
+    use crate::request::Request;
 
     fn hardware(memory: &str, gpus_per_node: u32) -> HardwareConfig {
         let mut m: MemoryTemplate = toml::from_str(memory).unwrap();
@@ -1339,6 +1632,171 @@ latency = 0.25
         let mut r = g.radix.lock().unwrap();
         let path = r.insert(&[hash]);
         r.set_outlook(&path, t, 1);
+    }
+
+    const PEER_MEM: &str = r#"
+[[stores]]
+name = "peer_hbm"
+per = "node"
+kind = "peer_hbm"
+[[links]]
+name = "nvlink"
+from = "gpu"
+to = "switch"
+bandwidth = 900
+"#;
+
+    fn peer_managers(
+        workers: u32,
+        gpus_per_node: u32,
+        hbm_blocks: u64,
+        pin: bool,
+    ) -> (SharedMemoryGraph, Vec<KVCacheManager>) {
+        let memory = if pin {
+            PEER_MEM.to_string()
+        } else {
+            PEER_MEM.replace("kind = \"peer_hbm\"", "kind = \"peer_hbm\"\npin = false")
+        };
+        let mut cluster = cluster(&[], workers, 1, gpus_per_node);
+        cluster.hardware = hardware(&memory, gpus_per_node);
+        cluster.memory = toml::from_str("tiers = [\"peer_hbm\"]").unwrap();
+        let graph = MemoryGraph::build(&[&cluster], 1, Arc::new(|t| 10 * t as u64), None)
+            .unwrap()
+            .shared_handle();
+        let managers = (0..workers as usize)
+            .map(|worker| {
+                KVCacheManager::new(hbm_blocks * 10, 1, |t| 10 * t as u64, 0, true)
+                    .with_memory(graph.clone(), worker)
+            })
+            .collect();
+        (graph, managers)
+    }
+
+    fn request(id: &str, hashes: &[u64]) -> Request {
+        let mut request = Request::new(id.to_string(), 0, 0.0, hashes.len() as u32 + 1, 1);
+        request.prompt_block_hashes = hashes.to_vec();
+        request
+    }
+
+    #[test]
+    fn peer_lookup_finds_only_a_same_node_siblings_hbm() {
+        let (_graph, mut managers) = peer_managers(3, 2, 2, true);
+        let mut source = request("source", &[7]);
+        managers[0].allocate_blocks(&mut source, 1).unwrap();
+        managers[0].free_request(&mut source);
+
+        let probe = request("probe", &[7]);
+        let same_node = managers[1].peek_prefix_cache(&probe);
+        assert_eq!(same_node.total_cached_tokens, 1);
+        assert_eq!(same_node.tier_spans.len(), 1);
+        assert_eq!(same_node.tier_spans[0].source, TierSource::PeerHbm(0));
+        assert_eq!(same_node.tier_spans[0].tier, 0);
+
+        let other_node = managers[2].peek_prefix_cache(&probe);
+        assert_eq!(other_node.total_cached_tokens, 0);
+        assert!(other_node.tier_spans.is_empty());
+    }
+
+    #[test]
+    fn peer_promotions_use_and_contend_on_the_source_nvlink_port() {
+        let (graph, mut managers) = peer_managers(3, 4, 2, true);
+        let mut source = request("source", &[1]);
+        managers[0].allocate_blocks(&mut source, 1).unwrap();
+        managers[0].free_request(&mut source);
+
+        for (worker, id) in [(1usize, "a"), (2, "b")] {
+            let mut req = request(id, &[1]);
+            let lookup = managers[worker].peek_prefix_cache(&req);
+            if worker == 1 {
+                assert!(close(
+                    managers[worker].estimate_fetch(&lookup),
+                    10.0 / 900.0
+                ));
+            }
+            req.num_cached_tokens = 1;
+            managers[worker]
+                .reserve_blocks_for_transfer(&mut req, 1)
+                .unwrap();
+            managers[worker].start_transfer(id.to_string(), &lookup, &[1], 0.0);
+        }
+        assert!(close(
+            managers[1].estimate_remaining_time("a"),
+            20.0 / 900.0
+        ));
+        assert!(close(
+            managers[2].estimate_remaining_time("b"),
+            20.0 / 900.0
+        ));
+        let g = graph.lock().unwrap();
+        assert_eq!(g.peer_hbm_bytes_promoted, 20);
+        let nvlink = g
+            .edge_totals()
+            .into_iter()
+            .find(|(n, _)| n == "nvlink")
+            .unwrap();
+        assert_eq!(nvlink.1.capacity, 900.0);
+    }
+
+    #[test]
+    fn a_pinned_peer_fetch_blocks_source_eviction_until_it_drains() {
+        let (graph, mut managers) = peer_managers(2, 2, 1, true);
+        let mut source = request("source", &[1]);
+        managers[0].allocate_blocks(&mut source, 1).unwrap();
+        managers[0].free_request(&mut source);
+
+        let mut fetch = request("fetch", &[1]);
+        let lookup = managers[1].peek_prefix_cache(&fetch);
+        fetch.num_cached_tokens = 1;
+        managers[1]
+            .reserve_blocks_for_transfer(&mut fetch, 1)
+            .unwrap();
+        managers[1].start_transfer("fetch".into(), &lookup, &[1], 0.0);
+
+        let mut replacement = request("replacement", &[9]);
+        assert!(managers[0].allocate_blocks(&mut replacement, 1).is_none());
+        assert!(graph.lock().unwrap().pin_stalls() > 0);
+
+        let done = managers[1].advance_transfers(1.0).unwrap();
+        assert_eq!(done.get("fetch"), Some(&1));
+        assert!(managers[0].allocate_blocks(&mut replacement, 1).is_some());
+    }
+
+    #[test]
+    fn an_unpinned_evicted_source_partially_lands_and_recomputes() {
+        let (graph, mut managers) = peer_managers(2, 2, 2, false);
+        let mut source = request("source", &[1, 2]);
+        managers[0].allocate_blocks(&mut source, 2).unwrap();
+        managers[0].free_request(&mut source);
+
+        let mut fetch = request("fetch", &[1, 2]);
+        let lookup = managers[1].peek_prefix_cache(&fetch);
+        assert_eq!(lookup.total_cached_tokens, 2);
+        fetch.num_cached_tokens = 2;
+        managers[1]
+            .reserve_blocks_for_transfer(&mut fetch, 2)
+            .unwrap();
+        managers[1].start_transfer("fetch".into(), &lookup, &[1, 2], 0.0);
+
+        // Reusing the first block splits the in-flight source's radix node;
+        // allocating the divergent tail then evicts only its second block.
+        let mut replacement = request("replacement", &[1, 9]);
+        managers[0]
+            .allocate_blocks(&mut replacement, 2)
+            .expect("unpinned source is evictable while the fetch is in flight");
+
+        let done = managers[1].advance_transfers(1.0).unwrap();
+        assert_eq!(done.get("fetch"), Some(&1));
+        managers[1].publish_transferred_blocks(&mut fetch, 1);
+        fetch.num_cached_tokens = 1;
+        fetch.num_computed_tokens = 1;
+        assert_eq!(fetch.kv_blocks.len(), 1);
+        assert_eq!(graph.lock().unwrap().partial_landings, 1);
+        assert_eq!(managers[1].peek_prefix_cache(&fetch).hbm_tokens, 1);
+        assert_eq!(
+            managers[1].allocate_blocks(&mut fetch, 1),
+            Some(1),
+            "the missing suffix is recomputed"
+        );
     }
 
     #[test]
@@ -1564,6 +2022,22 @@ latency = 0.25
         let before = g.flows().bytes_submitted_write;
         g.demote(0, s1, None);
         assert_eq!(g.flows().bytes_submitted_write, before);
+    }
+
+    #[test]
+    fn a_pinned_store_source_is_skipped_by_eviction() {
+        let mut g = two_tier_private(WritePolicy::WriteBack {}, EvictionPolicy::Fifo {});
+        g.tiers[0][0].pin = true;
+        let (s1, s2, s3) = (sp(&g, 1), sp(&g, 2), sp(&g, 3));
+        g.plant(0, 0, s1);
+        g.plant(0, 0, s2);
+        g.submit_promotion(0, 0, "read", 100, &[s1], 0.0);
+
+        // FIFO would choose s1; its source pin makes s2 the victim instead.
+        g.plant(0, 0, s3);
+        assert!(store_contains(&g, 0, 1));
+        assert!(!store_contains(&g, 0, 2));
+        assert!(store_contains(&g, 0, 3));
     }
 
     #[test]

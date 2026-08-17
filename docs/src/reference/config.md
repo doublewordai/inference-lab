@@ -127,7 +127,7 @@ own.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `gpus_per_node` | U32 | fabric's, else 1 | GPUs sharing a node's `per = "node"` stores |
-| `stores` | Array | `[]` | `{ name, per = "gpu" \| "node" \| "cluster", capacity, bandwidth, stripe = 1, aggregate_bandwidth, latency = 0 }` — bytes per instance; a `gpu` store is private to its GPU, a `node` store is one pool for the node's GPUs, and a `cluster` store is one topology-wide pool behind the network. `bandwidth` is the store throughput per instance (per node for a cluster store). A cluster transfer can use `stripe × bandwidth`, while all its transfers share `aggregate_bandwidth` or, by default, `nodes × bandwidth`. `latency` is the fixed access cost in seconds on every fetch or write |
+| `stores` | Array | `[]` | `{ name, per = "gpu" \| "node" \| "cluster", kind = "store", capacity, bandwidth, stripe = 1, aggregate_bandwidth, latency = 0, pin = false }` — bytes per instance; a `gpu` store is private to its GPU, a `node` store is one pool for the node's GPUs, and a `cluster` store is one topology-wide pool behind the network. `bandwidth` is the store throughput per instance (per node for a cluster store). A cluster transfer can use `stripe × bandwidth`, while all its transfers share `aggregate_bandwidth` or, by default, `nodes × bandwidth`. `latency` is the fixed access cost in seconds on every fetch or write. The reserved `{ name = "peer_hbm", per = "node", kind = "peer_hbm" }` entry is virtual: no `capacity`/`bandwidth`, read-only, and `pin` defaults to true |
 | `junctions` | Array | `[]` | `{ name, per }` — a point with no capacity of its own, so that several links can share one (a GPU's PCIe port feeding host DRAM and NVMe) |
 | `links` | Array | `[]` | `{ name, from, to, bandwidth, latency = 0 }` — `from` is `"gpu"` (one port per GPU), `"network"`, a store or a junction; `to` is a store, a junction, `"switch"` (the node's scale-up fabric) or `"network"` (the scale-out core). One instance per instance of `from`, full duplex at `bandwidth` bytes/s each way |
 
@@ -139,7 +139,9 @@ the NIC remains the per-worker cap even when the store is striped. A transfer
 takes the shortest hop path between its ends and runs at its max-min fair
 share on every edge of it: the most contended edge fixes its transfers' rate
 first, the residual is shared among the rest. Tier promotions run store →
-GPU; hand-offs GPU → network → GPU (see `kv_link_bw`).
+GPU; `peer_hbm` promotions run
+from the selected sibling GPU through the node switch to the destination
+GPU; hand-offs run GPU → network → GPU (see `kv_link_bw`).
 
 Shipped presets, at datasheet figures: `b200` (192 GB / 8 TB/s), `b300`
 (288 GB / 8 TB/s), `gh200` (96 GB / 4 TB/s), `h100` (80 GB / 3.35 TB/s);
@@ -269,7 +271,7 @@ can promote. A worker wider than a node pools the node stores it spans.
 
 ```toml
 [memory]
-tiers = ["host_dram", "nvme"]
+tiers = ["peer_hbm", "host_dram", "nvme"] # peer_hbm is declared by b200
 preset = "reactive"                            # reactive | oracle (optional bundle)
 source = { policy = "promote" }                # promote | min_time
 hbm_eviction = { policy = "lru" }              # lru | outlook
@@ -283,7 +285,7 @@ host_dram = 1.0e12          # bytes per instance given to KV
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `tiers` | Array | `[]` | Store names from the hardware's `[memory]`, closest first. Each must be reachable from a GPU over the hardware's links |
+| `tiers` | Array | `[]` | Tier names from the hardware's `[memory]`, closest first. Each must be reachable from a GPU over the hardware's links. `peer_hbm` consults same-node sibling HBM and has no capacity or write step |
 | `capacity` | Table | full | Per-store cap on bytes per instance |
 | `preset` | String | unset | A named bundle of the five policies below plus `hbm_evict_backed_first`; any field set explicitly overrides the preset's choice. `reactive`: `promote` / `lru` / `selective` (`min_hits` 1) / `lru` / `none` / backed-first — decides only from what has already happened, as shipped stacks do. `oracle`: `min_time` / `outlook` / `live` / `outlook` / `outlook` / backed-first — reads every session's announced re-entry. The preset covers KV movement only: on a pool with several workers or DP-attention ranks, pair it with a `[router]` that sends a re-entry to the worker holding (or prefetching) its prefix — `kv_aware` or `prefix_affinity` — or its evictions and prefetches serve arrivals that land elsewhere |
 | `source` | Table | `promote` | Where a re-entry's tier-held prefix comes from: `promote` — fetch it (a hit is a hit); `min_time` — fetch it only if the transfer, at the fetch path's current fair share, beats recomputing those tokens at the worker's roofline; otherwise recompute (the tier keeps its copy) |
@@ -315,10 +317,18 @@ whose blocks sit in a tier is promoted along the path from that store to
 the worker's GPU — sharing every edge on it with whatever else is in
 flight — while the request waits with its landing blocks reserved.
 
+`pin` is set on each hardware store entry. While true, its source range
+cannot be recycled until the promotion drains; an allocation with no other
+HBM victim records a pin stall and waits. With `pin = false`, completion
+rechecks the ordered source spans, lands only the prefix still present,
+releases the unused landing reservation, and recomputes the suffix. Peer HBM
+defaults to pinned; normal stores preserve the unpinned default.
+
 The summary's `memory` section reports, per store name, blocks held, bytes
 written / read / dead, evictions and expiries; per link name, bytes moved
-and utilisation; and totals of bytes written, bytes promoted, and
-promotions that waited on a write. The `prefix_cache` section counts
+and utilisation; and totals of bytes written, bytes promoted, peer-HBM bytes
+promoted, pin stalls, partial landings, and promotions that waited on a
+write. The `prefix_cache` section counts
 lookups recomputed instead of fetched (`min_time`) and prefetches started
 (`prefetch = outlook`), with their tokens.
 

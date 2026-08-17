@@ -79,6 +79,19 @@ pub struct MemoryMetrics {
     /// Most transfers (promotions, writes, hand-offs) in flight at once.
     #[serde(default)]
     pub peak_transfers_in_flight: u64,
+    /// Bytes promoted directly from a sibling worker's HBM.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub peer_hbm_bytes_promoted: u64,
+    /// Allocation/store-eviction attempts waiting on a pinned source.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub pin_stalls: u64,
+    /// Completed promotions whose unpinned source lost a suffix in flight.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub partial_landings: u64,
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize)]

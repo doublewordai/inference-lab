@@ -831,6 +831,14 @@ fn print_final_metrics(
             m.write_race_waits,
             m.peak_transfers_in_flight
         );
+        if m.peer_hbm_bytes_promoted > 0 || m.pin_stalls > 0 || m.partial_landings > 0 {
+            println!(
+                "  • Peer HBM promoted {:.2} GB; pin stalls: {}; partial landings: {}",
+                m.peer_hbm_bytes_promoted as f64 / 1e9,
+                m.pin_stalls,
+                m.partial_landings
+            );
+        }
         for st in &m.stores {
             println!(
                 "  • {}: {} × {} blocks, {} held; written {:.2} GB, read {:.2} GB, dead {:.2} GB; evictions {}, expired {}",

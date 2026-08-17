@@ -22,8 +22,14 @@ scale_out = { bandwidth = 5.0e10, latency = 2e-5 }
 # throughput (eight U.2 drives, ~7 GB/s each) bounds every transfer in or
 # out of it. `nvlink` and `nic` restate the fabric for the memory graph:
 # NVLink per-GPU ports into the node's switch, one NIC per GPU to the
-# network core.
+# network core. `peer_hbm` exposes sibling GPUs' already-resident KV as a
+# read-only tier over those NVLink ports; it has no capacity of its own.
 [memory]
+[[memory.stores]]
+name = "peer_hbm"
+per = "node"
+kind = "peer_hbm"
+
 [[memory.stores]]
 name = "host_dram"
 per = "node"
