@@ -843,12 +843,14 @@ impl MemoryGraph {
 
     /// Land finished writes and drop TTL-expired ranges.
     fn settle_writes(&mut self, now: f64) {
-        for id in self.flows.take_completed(Owner::Write) {
-            if let Some(entries) = self.pending_writes.remove(&id) {
-                let mut r = self.radix.lock().unwrap();
-                for (store, span) in entries {
-                    r.store_landed(store, &[span]);
-                    self.stores[store].bytes_written += r.span_bytes(span);
+        if let Some(completed) = self.flows.take_completed(Owner::Write) {
+            for id in completed {
+                if let Some(entries) = self.pending_writes.remove(&id) {
+                    let mut r = self.radix.lock().unwrap();
+                    for (store, span) in entries {
+                        r.store_landed(store, &[span]);
+                        self.stores[store].bytes_written += r.span_bytes(span);
+                    }
                 }
             }
         }
@@ -1000,7 +1002,7 @@ impl MemoryGraph {
         done
     }
 
-    pub fn take_completed(&mut self, owner: Owner) -> HashSet<String> {
+    pub fn take_completed(&mut self, owner: Owner) -> Option<HashSet<String>> {
         self.flows.take_completed(owner)
     }
 
@@ -1324,7 +1326,7 @@ bandwidth = 3
         assert!(close(g.estimate_remaining(&promotion_id("b", 1)), 5.0));
         let done = g.advance(5.0);
         assert_eq!(done.len(), 1);
-        assert_eq!(g.take_completed(Owner::Worker(0)).len(), 1);
+        assert_eq!(g.take_completed(Owner::Worker(0)).unwrap().len(), 1);
         // a: 75 left at 10 → 7.5 s.
         assert!(close(g.estimate_promotion_remaining(0, "a"), 7.5));
         // Two nvme promotions: the 5-wide drive binds them at 2.5 each.
@@ -1374,7 +1376,7 @@ bandwidth = 3
         // fetch path (different edges, same link).
         let done = g.advance(20.0);
         assert_eq!(done.len(), 1);
-        assert_eq!(g.take_completed(Owner::Worker(0)).len(), 1);
+        assert_eq!(g.take_completed(Owner::Worker(0)).unwrap().len(), 1);
         // Promotion marks the range read; the tier keeps its copy.
         g.promoted_batch(0, &[s1]);
         assert!(holds(&g, 0, 1));

@@ -247,9 +247,10 @@ impl Flows {
         }
     }
 
-    /// Completed transfers of `owner`, drained.
-    pub fn take_completed(&mut self, owner: Owner) -> HashSet<String> {
-        self.completed.remove(&owner).unwrap_or_default()
+    /// Completed transfers of `owner`, drained. `None` is the common case
+    /// and avoids constructing a fresh hash set for every worker poll.
+    pub fn take_completed(&mut self, owner: Owner) -> Option<HashSet<String>> {
+        self.completed.remove(&owner)
     }
 
     /// Owners with completions waiting to be collected.
@@ -493,9 +494,15 @@ mod tests {
         assert!(approx(f.estimate_remaining("a"), 5.0));
         let done = f.advance(10.0);
         assert_eq!(done, vec![(Owner::Handoff, "a".to_string())]);
-        assert_eq!(f.take_completed(Owner::Handoff).len(), 1);
+        assert_eq!(f.take_completed(Owner::Handoff).unwrap().len(), 1);
         assert!(approx(f.edges()[slow].bytes_moved, 100.0));
         assert!(approx(f.edges()[fast].bytes_moved, 100.0));
+    }
+
+    #[test]
+    fn empty_completion_poll_returns_none() {
+        let mut f = Flows::new();
+        assert!(f.take_completed(Owner::Worker(0)).is_none());
     }
 
     #[test]
@@ -515,11 +522,11 @@ mod tests {
         assert_eq!(done.len(), 2);
         assert_eq!(
             f.take_completed(Owner::Worker(0)),
-            HashSet::from(["a".to_string()])
+            Some(HashSet::from(["a".to_string()]))
         );
         assert_eq!(
             f.take_completed(Owner::Worker(1)),
-            HashSet::from(["b".to_string()])
+            Some(HashSet::from(["b".to_string()]))
         );
     }
 
@@ -571,7 +578,7 @@ mod tests {
         assert!(approx(f.next_completion_delay().unwrap(), 5.0));
         let done = f.advance(15.0);
         assert_eq!(done, vec![(Owner::Worker(0), "b".to_string())]);
-        assert_eq!(f.take_completed(Owner::Worker(0)).len(), 2);
+        assert_eq!(f.take_completed(Owner::Worker(0)).unwrap().len(), 2);
         // Mean load on e over 15 s: (2 × 10 + 1 × 5) / 15.
         assert!(approx(f.edges()[e].mean_in_flight(15.0), 25.0 / 15.0));
     }

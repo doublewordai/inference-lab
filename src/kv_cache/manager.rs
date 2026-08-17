@@ -324,6 +324,13 @@ impl KVCacheManager {
         &self.radix
     }
 
+    /// This manager's worker id inside [`Self::radix`]. Private HBM-only
+    /// managers use 0 even when the engine gives their worker a nonzero
+    /// topology-global id.
+    pub fn radix_worker(&self) -> WorkerId {
+        self.worker
+    }
+
     /// Number of tiers below this worker's HBM.
     pub fn num_tiers(&self) -> usize {
         self.radix.lock().unwrap().worker_tiers(self.worker).len()
@@ -791,21 +798,24 @@ impl KVCacheManager {
     }
 
     /// Advance the memory graph's transfers to `current_time` and collect
-    /// this worker's finished promotions. Returns the set of request ids
-    /// whose transfer has completed (leaders plus their joiners).
-    pub fn advance_transfers(&mut self, current_time: f64) -> HashSet<String> {
-        let mut completed: HashSet<String> = HashSet::new();
-        let mine: Vec<String> = match &self.memory {
+    /// this worker's finished promotions. Returns request ids whose transfer
+    /// has completed (leaders plus their joiners), or `None` without
+    /// constructing a set when this worker has no completions.
+    pub fn advance_transfers(&mut self, current_time: f64) -> Option<HashSet<String>> {
+        let mine: Option<Vec<String>> = match &self.memory {
             Some((g, w)) => {
                 let mut g = g.lock().unwrap();
                 g.advance(current_time);
-                let mut ids: Vec<String> =
-                    g.take_completed(Owner::Worker(*w)).into_iter().collect();
-                ids.sort();
-                ids
+                g.take_completed(Owner::Worker(*w)).map(|ids| {
+                    let mut ids: Vec<String> = ids.into_iter().collect();
+                    ids.sort();
+                    ids
+                })
             }
-            None => Vec::new(),
+            None => None,
         };
+        let mine = mine?;
+        let mut completed: HashSet<String> = HashSet::new();
         for id in mine {
             let leader = promotion_request(&id).to_string();
             if let Some(active) = self.leader_active_tiers.get_mut(&leader) {
@@ -822,7 +832,7 @@ impl KVCacheManager {
                 }
             }
         }
-        completed
+        (!completed.is_empty()).then_some(completed)
     }
 
     /// Project the remaining time for an in-flight transfer at `current_time`,
@@ -1304,7 +1314,7 @@ mod landing_tests {
         assert_eq!(lj.join_leader.as_deref(), Some("r"));
         // Land it.
         let done = m.advance_transfers(10.0);
-        assert!(done.contains("r"));
+        assert!(done.as_ref().is_some_and(|done| done.contains("r")));
         m.publish_transferred_blocks(&r, 4);
         r.num_computed_tokens = 64;
         let lk2 = m.peek_prefix_cache(&r);
