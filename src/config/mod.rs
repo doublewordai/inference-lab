@@ -1,5 +1,6 @@
 pub mod deployment;
 pub mod hardware;
+pub mod memory;
 pub mod model;
 pub mod parallel;
 pub mod router;
@@ -9,7 +10,11 @@ pub mod topology;
 pub mod workload;
 
 pub use deployment::{Deployment, DeploymentError, ModelConfig};
-pub use hardware::{FabricConfig, FabricLink, HardwareConfig, KVTier, Precision};
+pub use hardware::{FabricConfig, FabricLink, HardwareConfig, Precision};
+pub use memory::{
+    EvictionPolicy, JunctionTemplate, LinkTemplate, MemoryConfig, MemoryTemplate, Scope,
+    StoreTemplate,
+};
 pub use model::{
     expected_distinct_experts, History, Indexer, LayerClass, ModelSpec, Routing, WeightStream,
 };
@@ -38,10 +43,14 @@ enum NameOrInline<T> {
 
 /// Deserialise a hardware spec given as a catalog name or an inline table.
 pub(crate) fn hardware_ref<'de, D: Deserializer<'de>>(d: D) -> Result<HardwareConfig, D::Error> {
-    match NameOrInline::<HardwareConfig>::deserialize(d)? {
-        NameOrInline::Name(n) => crate::catalog::hardware(&n).map_err(de::Error::custom),
-        NameOrInline::Inline(h) => Ok(h),
+    let hw = match NameOrInline::<HardwareConfig>::deserialize(d)? {
+        NameOrInline::Name(n) => crate::catalog::hardware(&n).map_err(de::Error::custom)?,
+        NameOrInline::Inline(h) => h,
+    };
+    if let Some(m) = &hw.memory {
+        m.validate().map_err(de::Error::custom)?;
     }
+    Ok(hw)
 }
 
 /// Deserialise a model spec given as a catalog name or an inline table.
@@ -80,6 +89,9 @@ pub struct Config {
     /// pool. Defaults to `router`.
     #[serde(default)]
     pub decode_router: Option<RouterConfig>,
+    /// KV tiers beyond HBM, chosen from the hardware's `[memory]` stores.
+    #[serde(default)]
+    pub memory: MemoryConfig,
     pub workload: WorkloadConfig,
     /// Optional speculative decoding. When set, decode steps verify `gamma + 1`
     /// tokens and advance by `accepted + 1` per the acceptance model.
@@ -127,6 +139,7 @@ impl Config {
             replicas,
             router,
             decode_router,
+            memory,
             speculative,
             fault,
         } = deployment;
@@ -138,6 +151,7 @@ impl Config {
             replicas,
             router,
             decode_router,
+            memory,
             workload,
             speculative,
             fault,
@@ -169,6 +183,7 @@ impl Config {
             hardware: self.hardware.clone(),
             parallel: self.parallel.clone(),
             num_workers: self.replicas.max(1),
+            memory: self.memory.clone(),
         }
     }
 
@@ -185,7 +200,7 @@ impl Config {
             flops_fp16: Some(1e15),
             memory_bandwidth: 1e12,
             memory_capacity: 80_000_000_000,
-            kv_tiers: Vec::new(),
+            memory: None,
             fabric: None,
         };
         let parallel = ParallelConfig::default();
@@ -253,6 +268,7 @@ impl Config {
             replicas: 1,
             router: RouterConfig::default(),
             decode_router: None,
+            memory: MemoryConfig::default(),
             workload,
             speculative: None,
             fault: None,

@@ -14,10 +14,15 @@ performance modeling.
 - **vLLM-style scheduling**: chunked prefill, preemption with recompute,
   FCFS / priority / length-based policies, preemption-free admission
 - **KV cache**: block allocation from each model's exact KV footprint,
-  prefix caching with block sharing, spillover tiers, cascade attention
+  prefix caching with block sharing, cascade attention
+- **Memory graph**: KV tiers beyond HBM as a graph of stores and links per
+  hardware preset (host DRAM / NVMe behind PCIe, Grace memory behind
+  NVLink-C2C, NVLink, NICs); per-GPU or node-shared stores; transfers at
+  max-min fair share over every edge of their path
 - **Replicas and routing**: N identical workers behind a pluggable router —
   round-robin, least-loaded, prefix-affinity, KV-aware
-- **Disaggregated serving**: prefill and decode pools with a shared hand-off link
+- **Disaggregated serving**: prefill and decode pools; hand-offs ride the
+  memory graph's NICs and network core
 - **Speculative decoding**: analytic or trace-replayed acceptance, fixed and
   goodput-adaptive draft policies, measured step-cost tables
 - **Workloads**: Poisson / uniform / burst / batched / closed-loop arrivals,

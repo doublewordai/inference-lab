@@ -50,6 +50,11 @@ scheduler = { max_num_batched_tokens = 8192 }   # per-entry override
 - **[speculative]** — speculative decoding, optional; a shared default that
   an entry's `speculative` replaces (acceptance traces and measured step
   costs are per hardware).
+- **[memory]** — KV tiers beyond HBM, picked from the stores the hardware
+  offers (host DRAM over PCIe, Grace memory over NVLink-C2C, NVMe): evicted
+  blocks fall through them and are promoted back instead of recomputed. A
+  `per = "node"` store is shared by the workers on a node (see the
+  reference).
 - **replicas / [router] / [decode_router]** — an entry's `replicas`
   (default 1) runs that many identical workers, each with its own scheduler
   and KV cache; the shared `[router]` (or an entry's `router`) picks which
@@ -74,7 +79,7 @@ tp = 2
 
 or point an entry at another preset, or at an inline per-GPU spec (a FLOP
 rate for every precision the model uses, bandwidth, capacity, optional
-spillover `kv_tiers`):
+`[fabric]` and `[memory]`):
 
 ```toml
 [hardware.isambard]

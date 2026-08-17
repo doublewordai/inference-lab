@@ -6,7 +6,7 @@
 
 use serde::Deserialize;
 
-use super::{HardwareConfig, ModelSpec, ParallelConfig, SchedulerConfig};
+use super::{HardwareConfig, MemoryConfig, ModelSpec, ParallelConfig, SchedulerConfig};
 use crate::compute::ComputeEngine;
 
 /// A worker pool: one or more identically-shaped workers running the same
@@ -24,6 +24,9 @@ pub struct ClusterSpec {
     /// Number of identical workers in this pool. Defaults to 1.
     #[serde(default = "default_num_workers")]
     pub num_workers: u32,
+    /// KV tiers beyond HBM, chosen from the hardware's `[memory]` stores.
+    #[serde(default)]
+    pub memory: MemoryConfig,
 }
 
 fn default_num_workers() -> u32 {
@@ -87,6 +90,7 @@ impl ClusterSpec {
                 Some(_) => {}
             }
         }
+        self.memory.validate(self.hardware.memory.as_ref())?;
         Ok(())
     }
 
@@ -111,10 +115,15 @@ impl ClusterSpec {
 pub struct DisaggTopology {
     pub prefill: ClusterSpec,
     pub decode: ClusterSpec,
-    /// Bandwidth of the KV cache hand-off path from prefill workers to decode
-    /// workers, in bytes/sec. Modelled as one link shared (bandwidth divided
-    /// equally) by every hand-off in flight.
-    pub kv_link_bw: f64,
+    /// Capacity of the network core between the prefill and decode pools,
+    /// bytes/s, shared by every hand-off in flight. A hand-off's route runs
+    /// from the prefill worker's GPU through its hardware's `[memory]`
+    /// links to the network, over this core, and into the decode worker;
+    /// with no network links on either side the core alone is the route.
+    /// Unset: unbounded core (the NICs bound the transfer); an error if the
+    /// hardware has no network links either.
+    #[serde(default)]
+    pub kv_link_bw: Option<f64>,
 }
 
 #[cfg(test)]

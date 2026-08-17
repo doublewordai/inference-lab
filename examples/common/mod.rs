@@ -61,6 +61,7 @@ pub fn closed_loop_config(
         replicas: 1,
         router: Default::default(),
         decode_router: None,
+        memory: Default::default(),
         workload: WorkloadConfig {
             dataset_path: None,
             sessions_path: None,

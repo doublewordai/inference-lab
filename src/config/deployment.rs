@@ -31,7 +31,8 @@
 //! run behind the router; `[router]` picks the policy that spreads requests
 //! across them, and `[decode_router]` (default: `[router]`) the policy that
 //! spreads hand-offs across a disaggregated decode pool (see
-//! [`super::router`]).
+//! [`super::router`]). `[memory]` (shared, or per entry) picks which of the
+//! hardware's stores hold evicted KV (see [`super::memory`]).
 //!
 //! [`ModelConfig::deployment`] resolves one entry into a [`Deployment`]: the
 //! model on that hardware, with no workload. A [`Deployment`] plus a
@@ -46,8 +47,8 @@ use serde::Deserialize;
 use toml::{Table, Value};
 
 use super::{
-    hardware_ref, model_ref, ClusterSpec, Config, FaultConfig, HardwareConfig, ModelSpec,
-    ParallelConfig, RouterConfig, SchedulerConfig, SpeculativeConfig, WorkloadConfig,
+    hardware_ref, model_ref, ClusterSpec, Config, FaultConfig, HardwareConfig, MemoryConfig,
+    ModelSpec, ParallelConfig, RouterConfig, SchedulerConfig, SpeculativeConfig, WorkloadConfig,
 };
 
 /// A model on one hardware: everything a simulation needs except the
@@ -71,6 +72,9 @@ pub struct Deployment {
     /// `router`.
     #[serde(default)]
     pub decode_router: Option<RouterConfig>,
+    /// KV tiers beyond HBM, chosen from the hardware's `[memory]` stores.
+    #[serde(default)]
+    pub memory: MemoryConfig,
     #[serde(default)]
     pub speculative: Option<SpeculativeConfig>,
     #[serde(default)]
@@ -95,6 +99,7 @@ impl Deployment {
             hardware: self.hardware.clone(),
             parallel: self.parallel.clone(),
             num_workers: self.replicas.max(1),
+            memory: self.memory.clone(),
         }
     }
 
@@ -144,6 +149,9 @@ struct HardwareEntry {
     /// Replaces the shared `[decode_router]` block for this hardware.
     #[serde(default)]
     decode_router: Option<Table>,
+    /// Replaces the shared `[memory]` block for this hardware.
+    #[serde(default)]
+    memory: Option<Table>,
 }
 
 /// A parsed model config file. Resolve a hardware entry with
@@ -159,6 +167,8 @@ pub struct ModelConfig {
     router: Option<Table>,
     #[serde(default)]
     decode_router: Option<Table>,
+    #[serde(default)]
+    memory: Option<Table>,
     #[serde(default)]
     fault: Option<Table>,
     hardware: BTreeMap<String, HardwareEntry>,
@@ -240,6 +250,9 @@ impl ModelConfig {
         }
         if let Some(router) = entry.decode_router.as_ref().or(self.decode_router.as_ref()) {
             merged.insert("decode_router".into(), Value::Table(router.clone()));
+        }
+        if let Some(memory) = entry.memory.as_ref().or(self.memory.as_ref()) {
+            merged.insert("memory".into(), Value::Table(memory.clone()));
         }
         if let Some(fault) = &self.fault {
             merged.insert("fault".into(), Value::Table(fault.clone()));

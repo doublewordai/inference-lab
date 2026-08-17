@@ -8,30 +8,13 @@
 //! Run with: `cargo run --example hierarchy_demo --no-default-features`
 
 use inference_lab::catalog;
-use inference_lab::config::{HardwareConfig, KVTier, SchedulerConfig};
+use inference_lab::config::SchedulerConfig;
 use inference_lab::kv_cache::KVCacheManager;
 use inference_lab::request::Request;
 use inference_lab::scheduler::Scheduler;
 use inference_lab::scheduler::SchedulingPolicy;
 
 fn run_for_batch(num_concurrent: usize, share_prefix: bool) -> Vec<f64> {
-    let hardware = HardwareConfig {
-        name: "demo".into(),
-        flops_fp4: None,
-        flops_fp8: None,
-        flops_bf16: Some(1e15),
-        flops_fp16: Some(1e15),
-        memory_bandwidth: 3e12,
-        memory_capacity: 80_000_000_000,
-        // Single host-RAM tier, plenty of capacity, 1 GB/s PCIe so wait
-        // time is observable.
-        kv_tiers: vec![KVTier {
-            name: "host_ram".into(),
-            capacity_bytes: 100_000_000_000,
-            bandwidth_to_hbm: 1e9,
-        }],
-        fabric: None,
-    };
     // A dense 70B-class model from the catalog; only its KV footprint matters here.
     let model = catalog::model("llama-3-70b").expect("catalog preset");
     let scheduler_cfg = SchedulerConfig {
@@ -48,7 +31,6 @@ fn run_for_batch(num_concurrent: usize, share_prefix: bool) -> Vec<f64> {
         enable_preemption_free: false,
         enable_cascade_attention: false,
     };
-    let config_hardware = hardware.clone();
     let config_model = model.clone();
     let config_scheduler = scheduler_cfg.clone();
     let block_size = scheduler_cfg.block_size;
@@ -61,7 +43,9 @@ fn run_for_batch(num_concurrent: usize, share_prefix: bool) -> Vec<f64> {
         config_model.per_sequence_state_bytes(),
         true,
     )
-    .with_tiers(&config_hardware.kv_tiers);
+    // Single host-RAM tier, plenty of capacity, 1 GB/s PCIe so wait time
+    // is observable.
+    .with_private_tiers(&[("host_ram", 100_000_000_000, 1e9)]);
 
     // Pre-warm: pretend a long prefix lives in host RAM. We do this by
     // hand-poking the manager before handing it to the scheduler: allocate
