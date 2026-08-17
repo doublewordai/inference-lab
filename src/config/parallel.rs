@@ -10,16 +10,19 @@ fn default_dim() -> u32 {
 ///   and memory; weights are sharded across them (each expert's matrices
 ///   included, unless `ep` says otherwise). Every layer's sharded output is
 ///   all-reduced: once after attention, once after the FFN.
-/// * `ep` — experts sharded across `ep` of the ranks (must divide `tp`).
-///   MoE layers then exchange tokens with dispatch and combine all-to-alls
-///   over the `ep` group instead of the FFN all-reduce; expert reads and
-///   FLOPs are taken as balanced across the ranks.
+/// * `ep` — experts sharded across `ep` of the ranks (must divide `tp`);
+///   expert reads and FLOPs are taken as balanced across the ranks. With TP
+///   attention every rank holds every token, so the MoE output is still
+///   combined by the FFN all-reduce (vLLM `--enable-expert-parallel`); the
+///   traffic changes only under `dp_attention`.
 /// * `dp_attention` — attention runs data-parallel over the `tp` ranks
 ///   (sglang `--enable-dp-attention`): each rank holds the full attention
 ///   projections (replicated: `tp×` resident, `tp×` read per step) and its
 ///   own sequences' KV, and needs no attention all-reduce; the FFN, still
 ///   TP-sharded, gathers the ranks' tokens with an all-gather and returns
-///   them with a reduce-scatter (or, with `ep > 1`, the all-to-alls do it).
+///   them with a reduce-scatter; with `ep > 1` the MoE layers instead
+///   dispatch each rank's tokens to the expert-owning ranks and combine
+///   them back with all-to-alls over the `ep` group (DeepEP-style).
 ///
 /// Collectives are priced on the hardware's [`super::FabricConfig`].
 #[derive(Debug, Clone, Deserialize)]
