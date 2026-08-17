@@ -194,7 +194,9 @@ fn build_simulator(config_json: &str) -> Result<Simulator, JsValue> {
     let mut config: Config = serde_json::from_str(config_json)
         .map_err(|e| JsValue::from_str(&format!("Config parse error: {e}")))?;
     config.finalize();
-    Simulator::new(config, None).map_err(|e| JsValue::from_str(&format!("Simulator error: {e}")))
+    Simulator::new(config, None)
+        .map(|s| s.with_time_series(0.1))
+        .map_err(|e| JsValue::from_str(&format!("Simulator error: {e}")))
 }
 
 fn final_result(simulator: &mut Simulator) -> Result<JsValue, JsValue> {
