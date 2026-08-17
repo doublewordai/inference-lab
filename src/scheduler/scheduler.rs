@@ -339,6 +339,12 @@ impl Scheduler {
                 .kv_cache_manager
                 .blocks_needed(&self.running[idx], tokens_to_schedule);
 
+            // A running request outranks the prefixes waiting requests hold
+            // from earlier promotions (their tier copies stay): give those
+            // up before preempting anything that has computed state.
+            if blocks_needed > 0 && self.kv_cache_manager.num_free_blocks() < blocks_needed {
+                self.release_waiting_kv(usize::MAX, blocks_needed);
+            }
             if blocks_needed > 0 && self.kv_cache_manager.num_free_blocks() < blocks_needed {
                 if self.config.enable_preemption_free {
                     // Admission control guarantees every admitted request can
@@ -469,7 +475,14 @@ impl Scheduler {
                     // already in flight for a leader are shared by
                     // reference. Bytes/PCIe cost is only paid for the
                     // spillover portion; the in-flight portion is joined.
-                    if !self.kv_cache_manager.can_grow_to(request, cached_tokens) {
+                    // Promote only what can then run: a landing that fits
+                    // but leaves no room for the rest of the prompt would
+                    // sit on the KV while running requests starve (and be
+                    // released and re-promoted every time one grows).
+                    if !self
+                        .kv_cache_manager
+                        .can_grow_to(request, request.num_prompt_tokens)
+                    {
                         break;
                     }
                     let mut request = self.waiting.remove(selected_idx).unwrap();
@@ -1122,15 +1135,15 @@ mod tests {
 
     #[test]
     fn a_second_promotion_reserves_only_beyond_the_prefix_already_held() {
-        // HBM of 3 blocks, one private tier. A request whose prompt is
+        // HBM of 4 blocks, one private tier. A request whose prompt is
         // [A, B, C] finds A in the tier, promotes it, and by the time it is
         // re-admitted B has been backed too (a sibling wrote it): the second
         // reservation must cover B only, not A again — with one other block
-        // held there is room for exactly one more.
+        // held, A's block plus B's landing block leave exactly one free.
         let config = Config::test_default();
         let bs = config.scheduler.block_size;
         let per_block = config.model.kv_storage_bytes(bs);
-        let kv = kv_manager(&config, 3 * per_block, true).with_private_tiers(&[(
+        let kv = kv_manager(&config, 4 * per_block, true).with_private_tiers(&[(
             "host_ram",
             10 * 1024 * 1024 * 1024,
             per_block as f64, // one block per second
@@ -1143,9 +1156,9 @@ mod tests {
             seed.prompt_block_hashes = vec![a];
             mgr.allocate_blocks(&mut seed, bs).unwrap();
             mgr.free_request(&mut seed);
-            let mut churn = create_test_request("churn", bs * 3, 1);
-            churn.prompt_block_hashes = vec![0xD1, 0xD2, 0xD3];
-            mgr.allocate_blocks(&mut churn, bs * 3).unwrap();
+            let mut churn = create_test_request("churn", bs * 4, 1);
+            churn.prompt_block_hashes = vec![0xD1, 0xD2, 0xD3, 0xD4];
+            mgr.allocate_blocks(&mut churn, bs * 4).unwrap();
             mgr.free_request(&mut churn);
             assert!(mgr.memory().unwrap().0.lock().unwrap().holds_hash(0, a));
         }
@@ -1161,7 +1174,7 @@ mod tests {
         // B lands in the tier while A is in flight.
         s.kv_cache_manager.plant_in_tier_path(0, &[a, b]);
         // A lands: req is re-admitted, sees B in the tier, and parks again
-        // — reserving one block for B (free: 3 − hold − A = 1).
+        // — reserving one block for B (free: 4 − hold − A − B = 1).
         let ready = s.earliest_pending_ready(0.0).unwrap();
         apply(&mut s, &d, ready / 2.0);
         let d = s.schedule(ready + 1e-9);
@@ -1170,17 +1183,16 @@ mod tests {
         assert_eq!(r.request_id, "req");
         assert_eq!(r.num_cached_tokens, 2 * bs);
         assert_eq!(r.kv_blocks.len(), 2, "A's block plus B's landing block");
-        assert_eq!(s.kv_cache_manager.num_free_blocks(), 0);
+        assert_eq!(s.kv_cache_manager.num_free_blocks(), 1);
         assert_eq!(d.batch.len(), 1);
     }
 
     #[test]
-    fn landed_promotions_admit_first_and_held_kv_is_released_to_break_a_deadlock() {
+    fn a_promotion_starts_only_when_the_whole_prompt_would_fit() {
         // HBM of 3 blocks; two 3-block requests each find their first block
-        // in the tier and park holding one landing block. When both land,
-        // neither can take the two more blocks it needs (one free): nothing
-        // runs, nothing is in flight — the scheduler gives up the other's
-        // held prefix so one proceeds, instead of waiting forever.
+        // in the tier. Promoting both would park two landings that can
+        // never both run; the second waits (no landing block held) until
+        // the first has run.
         let config = Config::test_default();
         let bs = config.scheduler.block_size;
         let per_block = config.model.kv_storage_bytes(bs);
@@ -1200,30 +1212,92 @@ mod tests {
         s.add_request(x2);
         let d = s.schedule(0.0);
         assert!(d.batch.is_empty());
-        assert_eq!(s.pending_transfers.len(), 2);
-        assert_eq!(s.kv_cache_manager.num_free_blocks(), 1);
-        let ready = s
-            .pending_transfers
-            .iter()
-            .map(|r| s.kv_cache_manager.estimate_remaining_time(&r.request_id))
-            .fold(0.0, f64::max);
+        assert_eq!(
+            s.pending_transfers.len(),
+            1,
+            "x1 promotes; x2 would not fit"
+        );
+        assert_eq!(s.pending_transfers[0].request_id, "x1");
+        assert_eq!(s.waiting().len(), 1);
+        assert!(s.waiting()[0].kv_blocks.is_empty());
+        assert_eq!(s.kv_cache_manager.num_free_blocks(), 2);
+        let ready = s.earliest_pending_ready(0.0).unwrap();
         let d = s.schedule(ready + 1e-9);
-        // Both landed and re-entered at the front; one runs, the other's
-        // held block was released for it (counted as a preemption).
         assert_eq!(d.batch.len(), 1);
-        assert_eq!(s.num_running(), 1);
-        assert_eq!(s.num_preemptions(), 1);
-        let waiting = s.waiting();
-        assert_eq!(waiting.len(), 1);
-        assert!(waiting[0].kv_blocks.is_empty());
-        assert_eq!(waiting[0].num_computed_tokens, 0);
-        assert_eq!(s.kv_cache_manager.num_free_blocks(), 0);
-        // The runner finishes; the other re-promotes its first block (still
-        // in the tier) and completes too.
+        assert_eq!(running_ids(&s), vec!["x1"]);
+        assert_eq!(s.num_preemptions(), 0);
+        // x1 finishes; x2 promotes its first block and runs in turn.
         apply(&mut s, &d, ready + 1.0);
         let d = s.schedule(ready + 1.5);
         assert_eq!(d.completed.len(), 1);
-        assert_eq!(s.pending_transfers.len(), 1, "re-promoting from the tier");
+        assert_eq!(s.pending_transfers.len(), 1);
+        assert_eq!(s.pending_transfers[0].request_id, "x2");
+    }
+
+    #[test]
+    fn a_growing_request_takes_back_kv_held_by_waiting_promotions() {
+        // HBM of 4 blocks. `run` (1-block prompt, long output) is running.
+        // `held` (prompt [A, B, C], A in the tier) promotes A while the
+        // whole prompt still fits, then `run` grows into the free blocks;
+        // when `held` lands it cannot get B and C and waits holding A's
+        // block. `run` needs one more block with none free: it takes back
+        // `held`'s landing block (the tier copy stays) and is not preempted.
+        let config = Config::test_default();
+        let bs = config.scheduler.block_size;
+        let per_block = config.model.kv_storage_bytes(bs);
+        let kv = kv_manager(&config, 4 * per_block, true).with_private_tiers(&[(
+            "host_ram",
+            10 * 1024 * 1024 * 1024,
+            per_block as f64,
+        )]);
+        let mut s = scheduler_from(config, kv);
+        s.kv_cache_manager.plant_in_tier(0, 0xA);
+        s.add_request(create_test_request("run", 1, 4 * bs));
+        let d = s.schedule(0.0);
+        assert_eq!(running_ids(&s), vec!["run"]);
+        apply(&mut s, &d, 0.5);
+        let mut held = create_test_request("held", bs * 3, 1);
+        held.prompt_block_hashes = vec![0xA, 0xB, 0xC];
+        s.add_request(held);
+        let d = s.schedule(1.0);
+        assert_eq!(
+            s.pending_transfers.len(),
+            1,
+            "3 free ≥ 3-block prompt: promote"
+        );
+        assert_eq!(s.kv_cache_manager.num_free_blocks(), 2);
+        // `run` decodes across two block boundaries before A lands.
+        let ready = s.earliest_pending_ready(1.0).unwrap();
+        let mut t = 1.0;
+        let mut d = d;
+        while s.kv_cache_manager.num_free_blocks() > 0 {
+            apply(&mut s, &d, t);
+            t += 1e-3;
+            d = s.schedule(t);
+            assert!(t < ready, "run fills the free blocks before A lands");
+        }
+        assert_eq!(s.pending_transfers.len(), 1);
+        // A lands: `held` cannot take B and C; it waits holding A's block.
+        apply(&mut s, &d, ready);
+        let mut d = s.schedule(ready + 1e-9);
+        assert_eq!(s.waiting().len(), 1);
+        assert_eq!(s.waiting()[0].kv_blocks.len(), 1);
+        assert_eq!(s.kv_cache_manager.num_free_blocks(), 0);
+        // `run` keeps decoding until it needs another block: it takes it
+        // from `held` rather than preempting itself.
+        let mut t = ready + 1e-9;
+        for _ in 0..(bs + 1) {
+            apply(&mut s, &d, t);
+            t += 1e-3;
+            d = s.schedule(t);
+            assert_eq!(running_ids(&s), vec!["run"], "run is never preempted");
+        }
+        assert!(
+            s.waiting()[0].kv_blocks.is_empty(),
+            "held gave up its landing block"
+        );
+        assert_eq!(s.waiting()[0].num_computed_tokens, 0);
+        assert!(s.running()[0].kv_blocks.len() >= 4);
     }
 
     #[test]

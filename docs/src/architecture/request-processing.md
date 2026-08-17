@@ -22,8 +22,10 @@ compute is skipped (block-aligned, and never the whole prompt — the last
 block is always computed, as in vLLM); blocks in a memory tier (a store of
 the pool's memory graph the worker can reach) or already in flight for
 another request are promoted / joined asynchronously while the request waits
-with its landing blocks reserved. Synthetic workloads carry no
-prompt content and never hit.
+with its landing blocks reserved — started only when the whole prompt would
+fit the worker's KV, and given back (the tier copy stays) whenever a running
+request needs the blocks. Synthetic workloads carry no prompt content and
+never hit.
 
 ## KV blocks
 
