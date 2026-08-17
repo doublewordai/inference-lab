@@ -9,7 +9,7 @@
 #   layer (not modeled). NOTE: the archive/task label "GQA MoE" does not match
 #   the HF config — this is an MLA+DSA model, hence the deepseek_v4 variant.
 #
-# Param split (computed, FP8 weights incl. shared expert; KV bf16):
+# Param split (computed, FP8 weights incl. shared expert; KV fp8):
 #   per expert = 3*6144*2048 = 37_748_736
 #   active expert  = (8+1 shared) * per * 75 = 25_480_396_800
 #   resident expert= (256+1)      * per * 75 = 727_606_886_400
@@ -46,9 +46,9 @@ count = 21
 latent_dim = 512
 q_latent_dim = 2048
 rope_dim = 64
-kv_precision = "bf16"
+kv_precision = "fp8"
 window = 0
-history = { compress_ratio = 1, index_topk = 2048, indexer = { heads = 32, head_dim = 128, kv_precision = "bf16" } }
+history = { compress_ratio = 1, index_topk = 2048, indexer = { heads = 32, head_dim = 128, kv_precision = "fp8" } }
 heads = 64
 qk_head_dim = 256
 v_head_dim = 256
@@ -59,7 +59,7 @@ count = 57
 latent_dim = 512
 q_latent_dim = 2048
 rope_dim = 64
-kv_precision = "bf16"
+kv_precision = "fp8"
 window = 0
 history = { compress_ratio = 1, index_topk = 2048 }
 heads = 64
