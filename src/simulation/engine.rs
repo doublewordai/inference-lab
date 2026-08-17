@@ -30,7 +30,9 @@ pub struct RequestTiming {
     /// Time the KV hand-off transfer completed and the request entered the
     /// decode worker. Equal to `prefill_done_time` for aggregated mode.
     pub handoff_done_time: f64,
-    /// Time the first output token was produced (= TTFT relative to arrival).
+    /// Time the first output token reached the client (= TTFT relative to
+    /// arrival): the end of the pass that completed the prompt, or on a
+    /// disaggregated topology the end of the KV hand-off, which carries it.
     pub first_token_time: f64,
     pub completion_time: f64,
     pub num_prompt_tokens: u32,
@@ -85,18 +87,11 @@ impl Worker {
         let kv_capacity =
             cluster.kv_cache_capacity(&scheduler_config, cluster.resident_weight_bytes(&model));
 
-        // Blocks are charged from the model's exact KV curve: linear-KV
-        // models get ceil(t / block_size), models whose footprint is
-        // nonlinear in position (sliding window, DeepSeek-V4's window +
-        // compressed history) get their real bytes.
-        let kv_model = model.clone();
-        let mut kv_cache_manager = KVCacheManager::new(
-            kv_capacity,
-            scheduler_config.block_size,
-            move |t| kv_model.kv_storage_bytes(t),
-            model.per_sequence_state_bytes(),
-            true,
-        );
+        // Blocks are the model's content KV per block of tokens (the part
+        // that grows for life: full-context layers, compressed history);
+        // sliding windows and per-sequence state ride in auxiliary blocks.
+        let mut kv_cache_manager =
+            KVCacheManager::for_model(kv_capacity, scheduler_config.block_size, &model, true);
         if graph.lock().unwrap().num_tiers(global_id) > 0 {
             kv_cache_manager = kv_cache_manager.with_memory(graph.clone(), global_id);
         }
@@ -204,7 +199,7 @@ impl Topology {
         model: ModelSpec,
         scheduler_config: SchedulerConfig,
     ) -> Result<Self, String> {
-        let bytes_per_block = model.kv_storage_bytes(scheduler_config.block_size);
+        let bytes_per_block = model.kv_block_bytes(scheduler_config.block_size);
         let memory = MemoryGraph::build(&[&cluster], bytes_per_block, None)?.shared_handle();
         let workers = Self::build_pool(&cluster, &model, &scheduler_config, &memory, 0)?;
         Ok(Self {
@@ -242,7 +237,7 @@ impl Topology {
         model: ModelSpec,
         scheduler_config: SchedulerConfig,
     ) -> Result<Self, String> {
-        let bytes_per_block = model.kv_storage_bytes(scheduler_config.block_size);
+        let bytes_per_block = model.kv_block_bytes(scheduler_config.block_size);
         let memory = MemoryGraph::build(
             &[&topology.prefill, &topology.decode],
             bytes_per_block,
@@ -480,12 +475,14 @@ impl Engine {
         }
     }
 
-    /// Apply an affine empirical correction to every executed iteration time:
-    /// `t = alpha * t_model + beta`. `alpha` captures the kernel-efficiency
-    /// gap to the roofline (dominant at large batch); `beta` captures fixed
-    /// per-iteration overhead — scheduler, CPU, launch latency (dominant at
-    /// small batch). Applied to the actual step time only, never to policy
-    /// candidate pricing, so speculative width choices stay model-relative.
+    /// Apply an affine empirical correction to every roofline-priced
+    /// iteration time: `t = alpha * t_model + beta`. `alpha` captures the
+    /// kernel-efficiency gap to the roofline (dominant at large batch);
+    /// `beta` captures fixed per-iteration overhead — scheduler, CPU, launch
+    /// latency (dominant at small batch). Applied to the actual step time
+    /// only, never to policy candidate pricing (so speculative width choices
+    /// stay model-relative) and never on top of a measured step-cost table.
+    /// Config: `[hardware.<name>] time_correction = { alpha, beta }`.
     pub fn set_time_correction(&mut self, alpha: f64, beta: f64) {
         self.time_correction = Some((alpha, beta));
     }
@@ -1097,7 +1094,8 @@ impl Engine {
 
         let handed_off = if matches!(role, PoolRole::DisaggPrefill) {
             // Anything whose prefill is now complete leaves this worker via
-            // the link; the scheduler frees its KV on the way out.
+            // the link; its KV stays allocated here until the transfer
+            // drains (`deliver_drained`).
             w.scheduler.take_prefill_complete()
         } else {
             Vec::new()
@@ -1231,10 +1229,12 @@ impl Engine {
             Some(t_dec + t_pre)
         });
         let cost = ce.step_cost(batch_refs, cost_tokens);
-        let iter_time = measured_time.unwrap_or(cost.time);
-        let iter_time = match correction {
-            Some((alpha, beta)) => alpha * iter_time + beta,
-            None => iter_time,
+        // A measured table already embodies the engine's overheads; the
+        // correction calibrates roofline-priced steps only.
+        let iter_time = match (measured_time, correction) {
+            (Some(t), _) => t,
+            (None, Some((alpha, beta))) => alpha * cost.time + beta,
+            (None, None) => cost.time,
         };
         let bw = ce.bandwidth_utilization(&cost, iter_time);
         let flops = ce.flops_utilization(&cost, iter_time);
@@ -1304,8 +1304,23 @@ impl Engine {
                 .parked
                 .remove(&request_id)
                 .ok_or_else(|| format!("hand-off complete for unknown request {request_id}"))?;
-            self.handoff_source.remove(&request_id);
+            // The prefill worker held the request's KV for the transfer;
+            // release it there now (hashes stay hittable).
+            let source = self
+                .handoff_source
+                .remove(&request_id)
+                .ok_or_else(|| format!("hand-off of {request_id} has no source worker"))?;
+            let (sp, si) = self
+                .locate_worker(source)
+                .ok_or_else(|| format!("hand-off source worker {source} not found"))?;
+            self.topology.pools[sp].workers[si]
+                .scheduler
+                .release_handed_off(&mut req);
             req.handoff_done_time = Some(now);
+            // The first token travels with the KV: the decode side emits it
+            // on receipt (Dynamo / sglang PD), so that is when the client
+            // sees it. Decode-side TPOT then runs from here.
+            req.first_token_time = Some(now);
             self.deliver_to_worker(decode_pool, worker_idx, req);
         }
         Ok(())

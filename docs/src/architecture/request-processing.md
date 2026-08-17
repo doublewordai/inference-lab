@@ -27,11 +27,16 @@ prompt content and never hit.
 
 ## KV blocks
 
-The `KVCacheManager` charges a sequence of `t` tokens
-`ceil(kv_storage_bytes(t) / kv_storage_bytes(block_size))` content blocks
-from the model's own KV curve — linear models get `ceil(t / block_size)`,
-sliding-window and compressed-history models their real footprint — plus a
-fixed reservation for length-independent per-sequence state (GatedDeltaNet).
+A block is the model's *content* KV of `block_size` tokens
+(`kv_content_bytes(block_size)`): the part of the footprint that grows with
+position for the sequence's whole life — full-context layers, compressed
+history, indexer entries — which is linear in position, so a sequence of
+`t` tokens holds `ceil(t / block_size)` content blocks and content block
+`i` is prompt block `i`, the prefix-hashed unit (vLLM's full-attention KV
+group). On top a sequence holds *auxiliary* blocks, unshared and released
+with it: length-independent per-sequence state (GatedDeltaNet) plus each
+sliding window's last `min(t, window)` positions (`kv_window_bytes`),
+which vLLM's sliding-window group frees as the sequence slides past them.
 Blocks are reference-counted; freed blocks keep their content hash and can
 be re-hit until they are recycled (least recently freed first, sequences
 tail first — or, with `hbm_evict_backed_first`, a nearby block a tier

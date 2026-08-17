@@ -104,8 +104,7 @@ impl Scheduler {
         while idx < self.running.len() {
             if self.running[idx].is_finished() {
                 let mut req = self.running.remove(idx);
-                self.kv_cache_manager.free_blocks(&req.kv_blocks);
-                req.kv_blocks.clear();
+                self.kv_cache_manager.free_request(&mut req);
                 decision.completed.push(req);
             } else {
                 idx += 1;
@@ -155,11 +154,9 @@ impl Scheduler {
             }
 
             if blocks_needed > 0 {
-                let blocks = self
-                    .kv_cache_manager
-                    .allocate_blocks(&self.running[idx], tokens_to_schedule)
+                self.kv_cache_manager
+                    .allocate_blocks(&mut self.running[idx], tokens_to_schedule)
                     .expect("free-block check above guarantees allocation");
-                self.running[idx].kv_blocks.extend(blocks);
             }
 
             decision.batch.push(ScheduledSeq {
@@ -198,10 +195,10 @@ impl Scheduler {
                     if tokens_to_schedule == 0 {
                         break;
                     }
-                    let blocks_needed = self
+                    if !self
                         .kv_cache_manager
-                        .blocks_needed(request, tokens_to_schedule);
-                    if self.kv_cache_manager.num_free_blocks() < blocks_needed {
+                        .can_grow_to(request, request.num_computed_tokens + tokens_to_schedule)
+                    {
                         break;
                     }
                     let mut request = self.waiting.remove(selected_idx).unwrap();
@@ -209,11 +206,9 @@ impl Scheduler {
                     // Prompt blocks this worker already holds are shared by
                     // reference (they were skipped by the transfer); the
                     // rest are fresh and publish the prompt's hashes here.
-                    let blocks = self
-                        .kv_cache_manager
-                        .allocate_blocks(&request, tokens_to_schedule)
+                    self.kv_cache_manager
+                        .allocate_blocks(&mut request, tokens_to_schedule)
                         .expect("free-block check above guarantees allocation");
-                    request.kv_blocks.extend(blocks);
                     decision.batch.push(ScheduledSeq {
                         idx: self.running.len(),
                         num_tokens: tokens_to_schedule,
@@ -237,21 +232,15 @@ impl Scheduler {
                     // already in flight for a leader are shared by
                     // reference. Bytes/PCIe cost is only paid for the
                     // spillover portion; the in-flight portion is joined.
-                    let blocks_needed = self
-                        .kv_cache_manager
-                        .blocks_for_context(cached_tokens)
-                        .saturating_sub(request.kv_blocks.len());
-                    if self.kv_cache_manager.num_free_blocks() < blocks_needed {
+                    if !self.kv_cache_manager.can_grow_to(request, cached_tokens) {
                         break;
                     }
                     let mut request = self.waiting.remove(selected_idx).unwrap();
                     self.kv_cache_manager.record_prefix_lookup(&lookup);
                     request.num_cached_tokens = cached_tokens;
-                    let allocated = self
-                        .kv_cache_manager
-                        .reserve_blocks_for_transfer(&request, cached_tokens)
+                    self.kv_cache_manager
+                        .reserve_blocks_for_transfer(&mut request, cached_tokens)
                         .expect("blocks_needed already verified against capacity");
-                    request.kv_blocks.extend(allocated);
 
                     // Two paths, possibly both: start a transfer for the
                     // spillover portion, and/or join an existing one for
@@ -291,12 +280,13 @@ impl Scheduler {
                 if tokens_to_schedule == 0 {
                     break;
                 }
-                // A promoted request already holds its cached-prefix blocks.
-                let blocks_needed = self
+                // Cached-prefix blocks held by running requests are shared by
+                // reference and cost no free blocks; a promoted request already
+                // holds its own. Same rule as the allocation below.
+                if !self
                     .kv_cache_manager
-                    .blocks_for_context(cached_tokens + tokens_to_schedule)
-                    .saturating_sub(request.kv_blocks.len());
-                if self.kv_cache_manager.num_free_blocks() < blocks_needed {
+                    .can_grow_to(request, cached_tokens + tokens_to_schedule)
+                {
                     break; // Can't fit, stop scheduling new requests
                 }
 
@@ -308,11 +298,9 @@ impl Scheduler {
                 }
                 request.num_cached_tokens = cached_tokens;
                 request.num_computed_tokens = cached_tokens;
-                let blocks = self
-                    .kv_cache_manager
-                    .allocate_blocks(&request, tokens_to_schedule)
+                self.kv_cache_manager
+                    .allocate_blocks(&mut request, tokens_to_schedule)
                     .expect("free-block check above guarantees allocation");
-                request.kv_blocks.extend(blocks);
 
                 decision.batch.push(ScheduledSeq {
                     idx: self.running.len(),
@@ -439,8 +427,7 @@ impl Scheduler {
     /// Preempt a running request: free its KV; it recomputes on resume.
     fn preempt_request(&mut self, request: &mut Request) {
         self.num_preemptions += 1;
-        self.kv_cache_manager.free_blocks(&request.kv_blocks);
-        request.kv_blocks.clear();
+        self.kv_cache_manager.free_request(request);
         request.preempt();
     }
 
@@ -473,15 +460,16 @@ impl Scheduler {
     }
 
     /// Remove and return every running request whose prefill is complete and
-    /// which still has output to generate, freeing its KV here. Used by a
-    /// disaggregated prefill worker to hand requests to the decode pool.
+    /// which still has output to generate. Used by a disaggregated prefill
+    /// worker to hand requests to the decode pool. The requests keep their
+    /// KV blocks here: the transfer reads them, and the engine releases
+    /// them with `release_handed_off` when it drains (as a P worker holds
+    /// its blocks until the connector is done with them).
     pub fn take_prefill_complete(&mut self) -> Vec<Request> {
         let mut handed = Vec::new();
         let mut keep = Vec::with_capacity(self.running.len());
-        for mut r in self.running.drain(..) {
+        for r in self.running.drain(..) {
             if !r.is_prefill() && !r.is_finished() {
-                self.kv_cache_manager.free_blocks(&r.kv_blocks);
-                r.kv_blocks.clear();
                 handed.push(r);
             } else {
                 keep.push(r);
@@ -489,6 +477,12 @@ impl Scheduler {
         }
         self.running = keep;
         handed
+    }
+
+    /// A handed-off request's transfer has drained: release the KV it held
+    /// on this worker (its hashes stay hittable until recycled).
+    pub fn release_handed_off(&mut self, request: &mut Request) {
+        self.kv_cache_manager.free_request(request);
     }
 
     pub fn num_running(&self) -> usize {
@@ -642,11 +636,11 @@ mod tests {
         let mgr = &mut scheduler.kv_cache_manager;
         let mut seed = create_test_request("seed", block_size, 1);
         seed.prompt_block_hashes = vec![prefix_hash];
-        let blocks = mgr.allocate_blocks(&seed, block_size).unwrap();
+        let blocks = mgr.allocate_blocks(&mut seed, block_size).unwrap();
         mgr.free_blocks(&blocks);
         let mut churn = create_test_request("churn", block_size * 4, 1);
         churn.prompt_block_hashes = vec![0xDEAD_u64, 0xDEAE, 0xDEAF, 0xDEB0];
-        let cb = mgr.allocate_blocks(&churn, block_size * 4).unwrap();
+        let cb = mgr.allocate_blocks(&mut churn, block_size * 4).unwrap();
         mgr.free_blocks(&cb);
 
         // A request whose prompt starts with the prefix hash.
@@ -698,13 +692,13 @@ mod tests {
             let mgr = &mut scheduler.kv_cache_manager;
             let mut seed = create_test_request("seed", block_size, 1);
             seed.prompt_block_hashes = vec![prefix_hash];
-            let blocks = mgr.allocate_blocks(&seed, block_size).unwrap();
+            let blocks = mgr.allocate_blocks(&mut seed, block_size).unwrap();
             mgr.free_blocks(&blocks);
             // Fill all four HBM blocks so the seed is evicted (LRU recycles
             // the oldest free block, so only a full HBM demotes).
             let mut churn = create_test_request("churn", block_size * 4, 1);
             churn.prompt_block_hashes = vec![0xDEAD, 0xBEEF, 0xF00D, 0xFACE];
-            let cb = mgr.allocate_blocks(&churn, block_size * 4).unwrap();
+            let cb = mgr.allocate_blocks(&mut churn, block_size * 4).unwrap();
             mgr.free_blocks(&cb);
         }
 
@@ -777,6 +771,35 @@ mod tests {
         let c_entry = d.batch.iter().find(|s| s.idx == 2).unwrap();
         assert_eq!(c_entry.num_tokens, bs);
         assert_eq!(scheduler.running()[2].num_computed_tokens, 3 * bs);
+    }
+
+    #[test]
+    fn test_admission_shares_held_prefix_blocks() {
+        // KV holds exactly 6 blocks. `a` (4 prompt blocks + 1 for its first
+        // decode step) is running; `b` shares a's first three blocks and
+        // needs one fresh block. vLLM admits it: hits on blocks a holds cost
+        // nothing, and one block is free.
+        let config = Config::test_default();
+        let bs = config.scheduler.block_size;
+        let per_block = config.model.kv_storage_bytes(bs);
+        let kv = kv_manager(&config, 6 * per_block, true);
+        let mut scheduler = scheduler_from(config, kv);
+
+        let mut a = create_test_request("a", 4 * bs, 10);
+        a.prompt_block_hashes = vec![1, 2, 3, 4];
+        scheduler.add_request(a);
+        let d = scheduler.schedule(0.0);
+        apply(&mut scheduler, &d, 1.0);
+        assert_eq!(scheduler.kv_cache_manager().num_free_blocks(), 2);
+
+        let mut b = create_test_request("b", 4 * bs, 10);
+        b.prompt_block_hashes = vec![1, 2, 3, 9];
+        scheduler.add_request(b);
+        let d = scheduler.schedule(1.0);
+        assert_eq!(running_ids(&scheduler), vec!["a", "b"]);
+        let b_entry = d.batch.iter().find(|s| s.idx == 1).unwrap();
+        assert_eq!(b_entry.num_tokens, bs);
+        assert_eq!(scheduler.kv_cache_manager().num_free_blocks(), 0);
     }
 
     #[test]
@@ -1116,7 +1139,7 @@ mod tests {
     }
 
     #[test]
-    fn test_take_prefill_complete_hands_off_and_frees_kv() {
+    fn test_take_prefill_complete_hands_off_and_holds_kv_until_released() {
         let mut scheduler = create_test_scheduler();
         scheduler.add_request(create_test_request("done", 16, 5));
         scheduler.add_request(create_test_request("mid", 64, 5));
@@ -1133,8 +1156,14 @@ mod tests {
         // `done` finished prefill with output left; `one` is finished (stays
         // to be reaped); `mid` is still prefilling.
         assert_eq!(ids, vec!["done"]);
-        assert!(handed[0].kv_blocks.is_empty());
-        assert!(scheduler.kv_cache_manager().num_free_blocks() > free_before);
+        // The blocks stay allocated (the transfer reads them) until the
+        // engine releases them.
+        assert!(!handed[0].kv_blocks.is_empty());
+        assert_eq!(scheduler.kv_cache_manager().num_free_blocks(), free_before);
         assert_eq!(running_ids(&scheduler), vec!["mid", "one"]);
+        let mut done = handed.into_iter().next().unwrap();
+        scheduler.release_handed_off(&mut done);
+        assert!(done.kv_blocks.is_empty());
+        assert!(scheduler.kv_cache_manager().num_free_blocks() > free_before);
     }
 }

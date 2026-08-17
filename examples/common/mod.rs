@@ -62,6 +62,7 @@ pub fn closed_loop_config(
         router: Default::default(),
         decode_router: None,
         memory: Default::default(),
+        time_correction: None,
         workload: WorkloadConfig {
             dataset_path: None,
             sessions_path: None,
