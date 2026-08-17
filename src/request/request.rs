@@ -71,6 +71,9 @@ pub struct Request {
     /// counted apart from served requests.
     pub rejected: bool,
 
+    /// Debug: times parked on a promotion.
+    pub debug_parks: u32,
+
     /// Time the first output token was produced (end of the prefill pass).
     pub first_token_time: Option<f64>,
 
@@ -162,6 +165,7 @@ impl Request {
             kv_blocks: KvHold::default(),
             num_preemptions: 0,
             rejected: false,
+            debug_parks: 0,
             first_token_time: None,
             prefill_done_time: None,
             handoff_done_time: None,

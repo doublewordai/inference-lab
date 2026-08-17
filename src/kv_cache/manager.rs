@@ -491,11 +491,18 @@ impl KVCacheManager {
                 ..Default::default()
             };
         }
+        // Only the prompt (short of its last token, which is always
+        // computed) can be served from the cache at admission: blocks
+        // beyond it — a session's future output — must not be looked up,
+        // or a request could park to promote what it can never use.
+        let usable = ((request.num_prompt_tokens.saturating_sub(1) / self.block_size.max(1))
+            as usize)
+            .min(request.prompt_block_hashes.len());
         let lk = self
             .radix
             .lock()
             .unwrap()
-            .lookup(self.worker, &request.prompt_block_hashes);
+            .lookup(self.worker, &request.prompt_block_hashes[..usable]);
         self.lookup_from(lk)
     }
 
@@ -859,7 +866,9 @@ mod tests {
             p.prompt_block_hashes = vec![1, 2, 3, 4];
             p
         };
-        assert_eq!(m.peek_prefix_cache(&probe).hbm_tokens, 64);
+        // 3 of the 4 blocks are usable prefix (the last prompt block is
+        // always computed).
+        assert_eq!(m.peek_prefix_cache(&probe).hbm_tokens, 48);
     }
 
     #[test]
@@ -882,8 +891,8 @@ mod tests {
         );
         // Freeing a keeps its blocks hittable for b's siblings.
         free(&mut m, &mut a);
-        let mut c = create_test_request("c", 48);
-        c.prompt_block_hashes = vec![1, 2, 3];
+        let mut c = create_test_request("c", 49);
+        c.prompt_block_hashes = vec![1, 2, 3, 4];
         assert_eq!(m.peek_prefix_cache(&c).hbm_tokens, 48);
         assert_eq!(m.cached_prefix_tokens_estimate(&[1, 2, 3, 4]), 48);
         assert_eq!(m.hbm_prefix_tokens(&[1, 2, 3, 4]), 48);
@@ -1147,5 +1156,61 @@ mod tests {
         assert!((g.flows().bytes_submitted_write - 2.0 * 1600.0).abs() < 1e-9);
         assert!(g.holds_hash(0, 1) && g.holds_hash(0, 2));
         assert!(!g.holds_hash(0, 5) && !g.holds_hash(0, 6));
+    }
+}
+
+#[cfg(test)]
+mod landing_tests {
+    use super::*;
+    use crate::config::{EvictionPolicy, WritePolicy};
+
+    #[test]
+    fn a_multi_block_promotion_lands_resident_and_is_not_promoted_again() {
+        let graph = MemoryGraph::private_with(
+            1,
+            &[("host", 100, 1e9)],
+            16,
+            Arc::new(|t| 100 * t as u64),
+        )
+        .with_policies(WritePolicy::Selective { min_hits: 1 }, EvictionPolicy::Lru {})
+        .shared_handle();
+        let mut m = KVCacheManager::new(16 * 16 * 100, 16, |t| 100 * t as u64, 0, true)
+            .with_memory(graph.clone(), 0);
+        // Chain [1,2,3,4] sits in the tier (planted at its positions).
+        for k in 1..=4u64 {
+            let hashes: Vec<u64> = (1..=k).collect();
+            m.plant_in_tier_path(0, &hashes);
+        }
+        let mut r = Request::new("r".into(), 0, 0.0, 16 * 5, 1);
+        r.prompt_block_hashes = vec![1, 2, 3, 4, 5];
+        let lk = m.peek_prefix_cache(&r);
+        assert_eq!((lk.hbm_tokens, lk.in_flight_tokens), (0, 0));
+        assert_eq!(lk.promote_tokens_per_tier, vec![64]);
+        // Park: reserve 4 landing blocks, start the transfer.
+        r.num_cached_tokens = 64;
+        let n = m.reserve_blocks_for_transfer(&r, 64).unwrap();
+        r.kv_blocks.extend(n);
+        assert_eq!(r.kv_blocks.len(), 4);
+        m.start_transfer("r".into(), &lk, &r.prompt_block_hashes, 0.0);
+        // Another request sees it in flight and would join.
+        let mut j = Request::new("j".into(), 0, 0.0, 16 * 5, 1);
+        j.prompt_block_hashes = vec![1, 2, 3, 4, 9];
+        let lj = m.peek_prefix_cache(&j);
+        assert_eq!((lj.hbm_tokens, lj.in_flight_tokens), (0, 64));
+        assert_eq!(lj.join_leader.as_deref(), Some("r"));
+        // Land it.
+        let done = m.advance_transfers(10.0);
+        assert!(done.contains("r"));
+        m.publish_transferred_blocks(&r, 4);
+        r.num_computed_tokens = 64;
+        let lk2 = m.peek_prefix_cache(&r);
+        assert_eq!((lk2.hbm_tokens, lk2.in_flight_tokens), (64, 0), "landed → resident");
+        assert!(!lk2.needs_promotion());
+        // It now allocates its fifth block and runs.
+        let n = m.allocate_blocks(&r, 16).unwrap();
+        assert_eq!(n, 1);
+        r.kv_blocks.extend(n);
+        m.free_blocks(&r);
+        assert_eq!(m.num_free_blocks(), 16);
     }
 }

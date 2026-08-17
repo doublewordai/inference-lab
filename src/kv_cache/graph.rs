@@ -907,6 +907,16 @@ impl MemoryGraph {
         if wait > 0.0 {
             self.write_race_waits += 1;
         }
+        if std::env::var_os("IL_EVENT_DEBUG").is_some() {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n % 100_000 == 0 {
+                eprintln!(
+                    "[promo] #{n} worker={worker} tier={tier} request={request} bytes={bytes} spans={} wait={wait:.3} now={now:.1}",
+                    spans.len()
+                );
+            }
+        }
         self.flows.submit(
             promotion_id(request, tier),
             Owner::Worker(worker),

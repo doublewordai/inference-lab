@@ -90,6 +90,7 @@ pub struct Flows {
     edges: Vec<Edge>,
     in_flight: FxHashMap<String, Transfer>,
     peak_in_flight: usize,
+    submitted_counts: (u64, u64, u64),
     /// The in-flight set changed since rates were last computed. Rates are
     /// recomputed lazily, before the next drain over a positive interval or
     /// the next rate-dependent estimate, so a burst of submissions at one
@@ -138,6 +139,11 @@ impl Flows {
         self.peak_in_flight
     }
 
+    /// Transfers submitted so far, by owner kind `(worker, handoff, write)`.
+    pub fn submitted_counts(&self) -> (u64, u64, u64) {
+        self.submitted_counts
+    }
+
     pub fn contains(&self, id: &str) -> bool {
         self.in_flight.contains_key(id)
     }
@@ -164,9 +170,18 @@ impl Flows {
         // Bring everything to `now` under the old rates first.
         self.drain_to(now);
         match owner {
-            Owner::Worker(_) => self.bytes_submitted_worker += bytes as f64,
-            Owner::Handoff => self.bytes_submitted_handoff += bytes as f64,
-            Owner::Write => self.bytes_submitted_write += bytes as f64,
+            Owner::Worker(_) => {
+                self.bytes_submitted_worker += bytes as f64;
+                self.submitted_counts.0 += 1;
+            }
+            Owner::Handoff => {
+                self.bytes_submitted_handoff += bytes as f64;
+                self.submitted_counts.1 += 1;
+            }
+            Owner::Write => {
+                self.bytes_submitted_write += bytes as f64;
+                self.submitted_counts.2 += 1;
+            }
         }
         self.in_flight.insert(
             id,
