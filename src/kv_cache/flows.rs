@@ -98,6 +98,9 @@ pub struct Flows {
     /// Absolute time of the next completion under the current rates, valid
     /// while `rates_dirty` is false; recomputed with the rates.
     next_done_at: Option<f64>,
+    /// Transfers holding a share of each edge, as of the last recompute
+    /// (valid while `rates_dirty` is false).
+    edge_load: Vec<usize>,
     /// Completed transfers not yet collected, per owner.
     completed: HashMap<Owner, HashSet<String>>,
     /// Bytes submitted, by owner kind, for reporting.
@@ -118,6 +121,7 @@ impl Flows {
         let mut e = Edge::new(name.into(), capacity);
         e.last_update = self.now;
         self.edges.push(e);
+        self.rates_dirty = true;
         self.edges.len() - 1
     }
 
@@ -182,6 +186,24 @@ impl Flows {
     /// Advance every transfer to `now`. Returns `(owner, id)` for each
     /// transfer that completed, and queues them per owner too.
     pub fn advance(&mut self, now: f64) -> Vec<(Owner, String)> {
+        // Fast path: the set is unchanged and nothing completes by `now`.
+        // Rates are constant, every transfer keeps its own `last_update`,
+        // so only the edges' load-time integrals need moving.
+        if !self.rates_dirty
+            && now >= self.now
+            && self.next_done_at.is_none_or(|t| t > now)
+            && self.edge_load.len() == self.edges.len()
+        {
+            let dt = now - self.now;
+            if dt > 0.0 {
+                for (e, &c) in self.edges.iter_mut().zip(&self.edge_load) {
+                    e.busy_transfer_seconds += c as f64 * dt;
+                    e.last_update = now;
+                }
+                self.now = now;
+            }
+            return Vec::new();
+        }
         self.drain_to(now);
         self.ensure_rates();
         let eps = self.done_eps();
@@ -262,6 +284,10 @@ impl Flows {
     /// Projected remaining time for `id` under the current rates; 0 if
     /// unknown.
     pub fn estimate_remaining(&mut self, id: &str) -> f64 {
+        // Transfers may not have been drained since the last fast-path
+        // advance: bring them to `now` first.
+        let now = self.now;
+        self.drain_to(now);
         self.ensure_rates();
         self.in_flight
             .get(id)
@@ -359,6 +385,13 @@ impl Flows {
                 .filter_map(|t| Self::time_to_done(t, eps))
                 .min_by(f64::total_cmp)
                 .map(|d| now + d);
+            let mut load = vec![0usize; self.edges.len()];
+            for t in self.in_flight.values() {
+                for &e in &t.path {
+                    load[e] += 1;
+                }
+            }
+            self.edge_load = load;
         }
     }
 
