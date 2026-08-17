@@ -4,7 +4,7 @@ name = "H100"
 flops_fp8 = 1.979e15
 flops_bf16 = 9.895e14
 memory_bandwidth = 3.35e12
-memory_capacity = 85899345920
+memory_capacity = 80000000000
 
 # Fabric: HGX H100 — 8 GPUs on NVSwitch (NVLink 4, 900 GB/s bidirectional per
 # GPU = 450 GB/s per direction, NVLink SHARP), one ConnectX-7 400 Gb/s NIC per

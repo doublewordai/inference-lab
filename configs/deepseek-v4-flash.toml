@@ -14,17 +14,5 @@ tp = 4
 [hardware.b300]
 tp = 4
 
-[hardware.gh200-120]
+[hardware.gh200]
 tp = 4
-
-[hardware.b200-datasheet]
-tp = 1
-scheduler = { max_num_batched_tokens = 16384, policy = "fcfs", gpu_memory_utilization = 0.9 }
-
-[hardware.b200-datasheet.speculative]
-gamma = 4
-policy = "goodput_budget"
-
-[hardware.b200-datasheet.speculative.acceptance]
-kind = "constant"
-alpha = 0.75

@@ -29,7 +29,7 @@ use rayon::prelude::*;
 use std::collections::BTreeMap;
 
 const CONFIG_PATH: &str = "configs/llama-3.1-8b-instruct.toml";
-const HARDWARE: &str = "gh200-96";
+const HARDWARE: &str = "gh200";
 const CONCS: [u32; 3] = [1, 2, 4];
 // 2 and 3 added beyond the pre-registered {1,4,8,16,32}: the decay turned
 // out to complete before N=4, so the cliff needs the finer rungs.

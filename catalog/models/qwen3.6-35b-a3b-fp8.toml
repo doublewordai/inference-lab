@@ -9,7 +9,7 @@
 # B200 hardware (dense, not sparse, per-GPU; first-principles datasheet
 # numbers, deviations from achieved rates are findings):
 #   FP4  9.0e15 FLOP/s dense      FP8  4.5e15      BF16  2.25e15
-#   HBM3e 7.7e12 B/s, 180 GB capacity.
+#   HBM3e 8.0e12 B/s, 192 GB capacity.
 
 name = "Qwen3.6-35B-A3B-FP8"
 hidden_dim = 2048

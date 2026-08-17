@@ -15,7 +15,7 @@ model = "deepseek-v4-flash"    # catalog preset, or an inline [model] table
 
 [hardware.b200]                # one entry per hardware the model runs on
 tp = 4
-[hardware.gh200-120]
+[hardware.gh200]
 tp = 4
 scheduler = { max_num_batched_tokens = 4096 }
 ```
@@ -105,8 +105,8 @@ all-to-all moves each rank's `(g−1)/g` share at the scale-up rate, or, across
 nodes, its in-node and cross-node shares concurrently on their own links.
 `dp_attention` skips the per-layer all-reduce.
 
-Shipped presets: `b200` (180 GiB / 7.7 TB/s as reported on the fleet),
-`b200-datasheet` (192 GB / 8 TB/s), `b300`, `gh200-120`, `gh200-96`, `h100`;
+Shipped presets, at datasheet figures: `b200` (192 GB / 8 TB/s), `b300`
+(288 GB / 8 TB/s), `gh200` (96 GB / 4 TB/s), `h100` (80 GB / 3.35 TB/s);
 each carries its node's fabric (8-GPU NVSwitch + CX-7/CX-8 for the HGX
 boxes, 4-GPU NVLink + Slingshot for GH200).
 

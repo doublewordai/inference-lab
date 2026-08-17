@@ -15,7 +15,3 @@ dp_attention = true
 [hardware.b300]
 tp = 8
 dp_attention = true
-
-[hardware.b200-datasheet]
-tp = 8
-scheduler = { max_num_batched_tokens = 16384, max_num_seqs = 256, policy = "fcfs", gpu_memory_utilization = 0.9 }

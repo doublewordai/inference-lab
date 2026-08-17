@@ -19,5 +19,5 @@ path = "data/llama31_eagle3_gh200_rounds.csv"
 path = "data/llama31_eagle3_gh200_costs.csv"
 ref_seq_len = 1050
 
-[hardware.gh200-96]
+[hardware.gh200]
 tp = 1

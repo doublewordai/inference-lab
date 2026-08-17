@@ -41,7 +41,7 @@
 //!
 //! Config selection: `SWEEP_CONFIG=<path>` env var, else the first CLI arg,
 //! else the default Llama config; `SWEEP_HARDWARE=<name>` picks the
-//! `[hardware.<name>]` entry (default `gh200-96`). The Part 1 validation tables (measured
+//! `[hardware.<name>]` entry (default `gh200`). The Part 1 validation tables (measured
 //! ShareGPT envelope, native-k acceptance) are ground truth for the default
 //! Llama/EAGLE3 deployment only and are skipped for any other config; the
 //! bank acceptance summary and Part 2 target sweep run for every config.
@@ -59,7 +59,7 @@ use rayon::prelude::*;
 use std::collections::BTreeMap;
 
 const DEFAULT_CONFIG_PATH: &str = "configs/llama-3.1-8b-instruct.toml";
-const DEFAULT_HARDWARE: &str = "gh200-96";
+const DEFAULT_HARDWARE: &str = "gh200";
 
 /// `SWEEP_CONFIG` env var, else first CLI arg, else the default Llama config.
 fn config_path() -> String {

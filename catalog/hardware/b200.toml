@@ -1,12 +1,12 @@
-# NVIDIA B200 (HGX), dense datasheet peaks; memory as reported by nvidia-smi (180 GiB, 7.7 TB/s achievable).
+# NVIDIA B200 (HGX), dense datasheet peaks; 192 GB HBM3e, 8 TB/s.
 
 name = "B200"
 flops_fp4 = 9.0e15
 flops_fp8 = 4.5e15
 flops_bf16 = 2.25e15
 flops_fp16 = 2.25e15
-memory_bandwidth = 7.7e12
-memory_capacity = 193273528320
+memory_bandwidth = 8.0e12
+memory_capacity = 192000000000
 
 # Fabric: HGX B200 — 8 GPUs on NVSwitch (NVLink 5, 1.8 TB/s bidirectional per
 # GPU = 900 GB/s per direction, in-network reduction via NVLink SHARP), one
