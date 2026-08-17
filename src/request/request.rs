@@ -56,8 +56,13 @@ pub struct Request {
     /// Boxed: most requests carry none, and `Request` travels by value.
     pub session: Option<Box<SessionStep>>,
 
-    /// KV cache blocks allocated to this request.
+    /// Content KV blocks allocated to this request: block `i` holds prompt
+    /// block `i` (shareable through the prefix cache).
     pub kv_blocks: Vec<BlockId>,
+
+    /// Auxiliary KV blocks: fixed per-sequence state and sliding windows.
+    /// Unshared; released with the request.
+    pub aux_blocks: Vec<BlockId>,
 
     /// Number of times this request has been preempted.
     pub num_preemptions: u32,
@@ -118,6 +123,7 @@ impl Request {
             prompt_block_hashes: Vec::new(),
             session: None,
             kv_blocks: Vec::new(),
+            aux_blocks: Vec::new(),
             num_preemptions: 0,
             first_token_time: None,
             prefill_done_time: None,

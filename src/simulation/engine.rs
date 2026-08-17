@@ -85,18 +85,11 @@ impl Worker {
         let kv_capacity =
             cluster.kv_cache_capacity(&scheduler_config, cluster.resident_weight_bytes(&model));
 
-        // Blocks are charged from the model's exact KV curve: linear-KV
-        // models get ceil(t / block_size), models whose footprint is
-        // nonlinear in position (sliding window, DeepSeek-V4's window +
-        // compressed history) get their real bytes.
-        let kv_model = model.clone();
-        let mut kv_cache_manager = KVCacheManager::new(
-            kv_capacity,
-            scheduler_config.block_size,
-            move |t| kv_model.kv_storage_bytes(t),
-            model.per_sequence_state_bytes(),
-            true,
-        );
+        // Blocks are the model's content KV per block of tokens (the part
+        // that grows for life: full-context layers, compressed history);
+        // sliding windows and per-sequence state ride in auxiliary blocks.
+        let mut kv_cache_manager =
+            KVCacheManager::for_model(kv_capacity, scheduler_config.block_size, &model, true);
         if graph.lock().unwrap().num_tiers(global_id) > 0 {
             kv_cache_manager = kv_cache_manager.with_memory(graph.clone(), global_id);
         }
@@ -204,7 +197,7 @@ impl Topology {
         model: ModelSpec,
         scheduler_config: SchedulerConfig,
     ) -> Result<Self, String> {
-        let bytes_per_block = model.kv_storage_bytes(scheduler_config.block_size);
+        let bytes_per_block = model.kv_block_bytes(scheduler_config.block_size);
         let memory = MemoryGraph::build(&[&cluster], bytes_per_block, None)?.shared_handle();
         let workers = Self::build_pool(&cluster, &model, &scheduler_config, &memory, 0)?;
         Ok(Self {
@@ -242,7 +235,7 @@ impl Topology {
         model: ModelSpec,
         scheduler_config: SchedulerConfig,
     ) -> Result<Self, String> {
-        let bytes_per_block = model.kv_storage_bytes(scheduler_config.block_size);
+        let bytes_per_block = model.kv_block_bytes(scheduler_config.block_size);
         let memory = MemoryGraph::build(
             &[&topology.prefill, &topology.decode],
             bytes_per_block,

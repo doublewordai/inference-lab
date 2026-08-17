@@ -104,8 +104,7 @@ impl Scheduler {
         while idx < self.running.len() {
             if self.running[idx].is_finished() {
                 let mut req = self.running.remove(idx);
-                self.kv_cache_manager.free_blocks(&req.kv_blocks);
-                req.kv_blocks.clear();
+                self.kv_cache_manager.free_request(&mut req);
                 decision.completed.push(req);
             } else {
                 idx += 1;
@@ -155,11 +154,9 @@ impl Scheduler {
             }
 
             if blocks_needed > 0 {
-                let blocks = self
-                    .kv_cache_manager
-                    .allocate_blocks(&self.running[idx], tokens_to_schedule)
+                self.kv_cache_manager
+                    .allocate_blocks(&mut self.running[idx], tokens_to_schedule)
                     .expect("free-block check above guarantees allocation");
-                self.running[idx].kv_blocks.extend(blocks);
             }
 
             decision.batch.push(ScheduledSeq {
@@ -209,11 +206,9 @@ impl Scheduler {
                     // Prompt blocks this worker already holds are shared by
                     // reference (they were skipped by the transfer); the
                     // rest are fresh and publish the prompt's hashes here.
-                    let blocks = self
-                        .kv_cache_manager
-                        .allocate_blocks(&request, tokens_to_schedule)
+                    self.kv_cache_manager
+                        .allocate_blocks(&mut request, tokens_to_schedule)
                         .expect("free-block check above guarantees allocation");
-                    request.kv_blocks.extend(blocks);
                     decision.batch.push(ScheduledSeq {
                         idx: self.running.len(),
                         num_tokens: tokens_to_schedule,
@@ -243,11 +238,9 @@ impl Scheduler {
                     let mut request = self.waiting.remove(selected_idx).unwrap();
                     self.kv_cache_manager.record_prefix_lookup(&lookup);
                     request.num_cached_tokens = cached_tokens;
-                    let allocated = self
-                        .kv_cache_manager
-                        .reserve_blocks_for_transfer(&request, cached_tokens)
+                    self.kv_cache_manager
+                        .reserve_blocks_for_transfer(&mut request, cached_tokens)
                         .expect("blocks_needed already verified against capacity");
-                    request.kv_blocks.extend(allocated);
 
                     // Two paths, possibly both: start a transfer for the
                     // spillover portion, and/or join an existing one for
@@ -305,11 +298,9 @@ impl Scheduler {
                 }
                 request.num_cached_tokens = cached_tokens;
                 request.num_computed_tokens = cached_tokens;
-                let blocks = self
-                    .kv_cache_manager
-                    .allocate_blocks(&request, tokens_to_schedule)
+                self.kv_cache_manager
+                    .allocate_blocks(&mut request, tokens_to_schedule)
                     .expect("free-block check above guarantees allocation");
-                request.kv_blocks.extend(blocks);
 
                 decision.batch.push(ScheduledSeq {
                     idx: self.running.len(),
@@ -436,8 +427,7 @@ impl Scheduler {
     /// Preempt a running request: free its KV; it recomputes on resume.
     fn preempt_request(&mut self, request: &mut Request) {
         self.num_preemptions += 1;
-        self.kv_cache_manager.free_blocks(&request.kv_blocks);
-        request.kv_blocks.clear();
+        self.kv_cache_manager.free_request(request);
         request.preempt();
     }
 
@@ -477,8 +467,7 @@ impl Scheduler {
         let mut keep = Vec::with_capacity(self.running.len());
         for mut r in self.running.drain(..) {
             if !r.is_prefill() && !r.is_finished() {
-                self.kv_cache_manager.free_blocks(&r.kv_blocks);
-                r.kv_blocks.clear();
+                self.kv_cache_manager.free_request(&mut r);
                 handed.push(r);
             } else {
                 keep.push(r);
@@ -639,11 +628,11 @@ mod tests {
         let mgr = &mut scheduler.kv_cache_manager;
         let mut seed = create_test_request("seed", block_size, 1);
         seed.prompt_block_hashes = vec![prefix_hash];
-        let blocks = mgr.allocate_blocks(&seed, block_size).unwrap();
+        let blocks = mgr.allocate_blocks(&mut seed, block_size).unwrap();
         mgr.free_blocks(&blocks);
         let mut churn = create_test_request("churn", block_size * 4, 1);
         churn.prompt_block_hashes = vec![0xDEAD_u64, 0xDEAE, 0xDEAF, 0xDEB0];
-        let cb = mgr.allocate_blocks(&churn, block_size * 4).unwrap();
+        let cb = mgr.allocate_blocks(&mut churn, block_size * 4).unwrap();
         mgr.free_blocks(&cb);
 
         // A request whose prompt starts with the prefix hash.
@@ -695,13 +684,13 @@ mod tests {
             let mgr = &mut scheduler.kv_cache_manager;
             let mut seed = create_test_request("seed", block_size, 1);
             seed.prompt_block_hashes = vec![prefix_hash];
-            let blocks = mgr.allocate_blocks(&seed, block_size).unwrap();
+            let blocks = mgr.allocate_blocks(&mut seed, block_size).unwrap();
             mgr.free_blocks(&blocks);
             // Fill all four HBM blocks so the seed is evicted (LRU recycles
             // the oldest free block, so only a full HBM demotes).
             let mut churn = create_test_request("churn", block_size * 4, 1);
             churn.prompt_block_hashes = vec![0xDEAD, 0xBEEF, 0xF00D, 0xFACE];
-            let cb = mgr.allocate_blocks(&churn, block_size * 4).unwrap();
+            let cb = mgr.allocate_blocks(&mut churn, block_size * 4).unwrap();
             mgr.free_blocks(&cb);
         }
 

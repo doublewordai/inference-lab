@@ -240,16 +240,44 @@ impl LayerClass {
         }
     }
 
-    /// KV positions stored at context length `t` (one layer).
-    fn stored(&self, t: u32) -> u32 {
+    /// Stored positions that stay for the sequence's whole life and grow
+    /// with `t` (one layer): a full-context layer's every position, a
+    /// history path's compressed entries. Exactly linear in `t` (a
+    /// fractional entry count for a compressed history) so that a block of
+    /// tokens is a fixed byte quantum; the prefix-hashed, shareable part of
+    /// the KV.
+    fn content_stored(&self, t: u32) -> f64 {
         match self {
-            LayerClass::Attention { window, .. } => windowed(t, *window),
+            LayerClass::Attention { window, .. } => {
+                if *window == 0 {
+                    t as f64
+                } else {
+                    0.0
+                }
+            }
             LayerClass::Mla {
                 window, history, ..
             } => match history {
-                None => windowed(t, *window),
-                Some(h) => t.min(*window) + t / h.compress_ratio.max(1),
+                None if *window == 0 => t as f64,
+                None => 0.0,
+                Some(h) => t as f64 / h.compress_ratio.max(1) as f64,
             },
+            LayerClass::Linear { .. } => 0.0,
+        }
+    }
+
+    /// Stored positions of a sliding window at context length `t` (one
+    /// layer): the last `min(t, window)` positions, held per request and
+    /// released as the sequence slides past them.
+    fn window_stored(&self, t: u32) -> u32 {
+        match self {
+            LayerClass::Attention { window, .. } | LayerClass::Mla { window, .. } => {
+                if *window == 0 {
+                    0
+                } else {
+                    t.min(*window)
+                }
+            }
             LayerClass::Linear { .. } => 0,
         }
     }
@@ -278,7 +306,7 @@ impl LayerClass {
     }
 
     /// Indexer KV bytes for a `t`-token context (one layer): one entry per
-    /// history entry, `head_dim` wide.
+    /// history entry, `head_dim` wide. Linear in `t` like `content_stored`.
     fn indexer_kv_bytes(&self, t: u32) -> f64 {
         match self {
             LayerClass::Mla {
@@ -290,7 +318,7 @@ impl LayerClass {
                     }),
                 ..
             } => {
-                (t / (*compress_ratio).max(1)) as f64
+                t as f64 / (*compress_ratio).max(1) as f64
                     * ix.head_dim as f64
                     * ix.kv_precision.bytes_per_value()
             }
@@ -518,14 +546,46 @@ impl ModelSpec {
     /// Monotone non-decreasing in `seq_len`; the KV cache manager quantises
     /// it into blocks. Fixed per-sequence state is `per_sequence_state_bytes`.
     pub fn kv_storage_bytes(&self, seq_len: u32) -> u64 {
+        self.kv_content_bytes(seq_len) + self.kv_window_bytes(seq_len)
+    }
+
+    /// The part of `kv_storage_bytes` that grows with `seq_len` for the
+    /// sequence's whole life — full-context layers, compressed history and
+    /// indexer entries. Linear in `seq_len` (`kv_content_bytes(t) =
+    /// t × kv_content_bytes(1)` up to rounding), so a block of `block_size`
+    /// tokens is a fixed byte quantum and prefix-hashed blocks line up with
+    /// token blocks. `kv_content_bytes + kv_window_bytes = kv_storage_bytes`.
+    pub fn kv_content_bytes(&self, seq_len: u32) -> u64 {
         self.layers
             .iter()
             .map(|l| {
                 l.count() as f64
-                    * (l.kv_bytes_per_position() * l.stored(seq_len) as f64
+                    * (l.kv_bytes_per_position() * l.content_stored(seq_len)
                         + l.indexer_kv_bytes(seq_len))
             })
             .sum::<f64>() as u64
+    }
+
+    /// The sliding-window part of `kv_storage_bytes`: the last
+    /// `min(seq_len, window)` positions of every windowed layer, held per
+    /// request (never shared through the prefix cache) and flat once the
+    /// sequence is longer than the window.
+    pub fn kv_window_bytes(&self, seq_len: u32) -> u64 {
+        self.layers
+            .iter()
+            .map(|l| l.count() as f64 * l.kv_bytes_per_position() * l.window_stored(seq_len) as f64)
+            .sum::<f64>() as u64
+    }
+
+    /// Bytes of one KV block of `block_size` tokens, the unit the KV cache
+    /// manager and the memory graph count in: the content KV of a block of
+    /// tokens, or — for a model with no content stream (all sliding window)
+    /// — its whole footprint at `block_size`.
+    pub fn kv_block_bytes(&self, block_size: u32) -> u64 {
+        match self.kv_content_bytes(block_size) {
+            0 => self.kv_storage_bytes(block_size),
+            b => b,
+        }
     }
 
     /// Fixed per-sequence state bytes (linear / SSM layers), independent of
@@ -891,6 +951,13 @@ mod tests {
             o_latent_dim: None,
         }];
         assert_eq!(m.kv_storage_bytes(4096), (512 + 64) * (128 + 32));
+        // The window is the per-request part; the compressed history is
+        // the content that grows for life.
+        assert_eq!(m.kv_window_bytes(4096), (512 + 64) * 128);
+        assert_eq!(m.kv_content_bytes(4096), (512 + 64) * 32);
+        assert_eq!(m.kv_window_bytes(50), (512 + 64) * 50);
+        assert_eq!(m.kv_content_bytes(64), (512 + 64) / 2);
+        assert_eq!(m.kv_block_bytes(64), (512 + 64) / 2);
         assert_eq!(m.attention_flops(1, 4096, false), 4 * 7168 * (128 + 32));
         // History-only top-k selection (GLM-5 DSA): no local window.
         m.layers = vec![LayerClass::Mla {
