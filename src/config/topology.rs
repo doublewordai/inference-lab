@@ -98,6 +98,29 @@ impl ClusterSpec {
     /// `scheduler.kv_cache_capacity` when set, else what
     /// `aggregate_memory_capacity × gpu_memory_utilization` leaves after
     /// `model_size_bytes` of weights (vLLM's rule).
+    /// How many KV domains a replica has: `tp` under DP-attention (each
+    /// rank schedules its own sequences and holds their KV on its GPU),
+    /// else one.
+    pub fn kv_ranks(&self) -> u32 {
+        if self.parallel.dp_attention {
+            self.parallel.tp.max(1)
+        } else {
+            1
+        }
+    }
+
+    /// Workers as the memory graph sees them: `(count, gpus per worker)`.
+    /// A DP-attention replica contributes `tp` one-GPU workers.
+    pub fn graph_workers(&self) -> (usize, u32) {
+        let n = self.num_workers.max(1) as usize;
+        let ranks = self.kv_ranks();
+        if ranks > 1 {
+            (n * ranks as usize, 1)
+        } else {
+            (n, self.parallel.tp.max(1))
+        }
+    }
+
     pub fn kv_cache_capacity(&self, scheduler: &SchedulerConfig, model_size_bytes: u64) -> u64 {
         if scheduler.kv_cache_capacity > 0 {
             return scheduler.kv_cache_capacity;

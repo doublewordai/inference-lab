@@ -53,8 +53,12 @@ scheduler = { max_num_batched_tokens = 8192 }   # per-entry override
 - **[memory]** — KV tiers beyond HBM, picked from the stores the hardware
   offers (host DRAM over PCIe, Grace memory over NVLink-C2C, NVMe): evicted
   blocks fall through them and are promoted back instead of recomputed. A
-  `per = "node"` store is shared by the workers on a node (see the
-  reference).
+  `per = "node"` store is shared by the workers on a node. How KV moves —
+  fetch or recompute, what HBM and each tier evict, when blocks are
+  written, whether a re-entry's prefix is prefetched — is a set of policies
+  with two presets, `reactive` (decides from the past, like shipped
+  stacks) and `oracle` (knows every session's next re-entry); see the
+  reference.
 - **replicas / [router] / [decode_router]** — an entry's `replicas`
   (default 1) runs that many identical workers, each with its own scheduler
   and KV cache; the shared `[router]` (or an entry's `router`) picks which

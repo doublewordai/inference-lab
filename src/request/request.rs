@@ -1,4 +1,4 @@
-use super::session::SessionStep;
+use super::session::{Outlook, SessionStep};
 
 pub type BlockId = u32;
 
@@ -56,16 +56,24 @@ pub struct Request {
     /// Boxed: most requests carry none, and `Request` travels by value.
     pub session: Option<Box<SessionStep>>,
 
-    /// Content KV blocks allocated to this request: block `i` holds prompt
-    /// block `i` (shareable through the prefix cache).
-    pub kv_blocks: Vec<BlockId>,
+    /// Content KV blocks the request holds on its worker: content block
+    /// `i` holds prompt block `i` (shareable through the prefix cache). A
+    /// count: the blocks themselves are ranges of the worker's KV tree,
+    /// identified by the request's block hashes.
+    pub kv_blocks: KvHold,
 
     /// Auxiliary KV blocks: fixed per-sequence state and sliding windows.
-    /// Unshared; released with the request.
-    pub aux_blocks: Vec<BlockId>,
+    /// Unshared; released with the request. A count.
+    pub aux_blocks: KvHold,
 
     /// Number of times this request has been preempted.
     pub num_preemptions: u32,
+
+    /// The scheduler refused it at submission: its whole context (prompt +
+    /// planned output) needs more KV blocks than the worker has, so it
+    /// could never run to completion. Completed at once with no output;
+    /// counted apart from served requests.
+    pub rejected: bool,
 
     /// Time the first output token was produced (end of the prefill pass).
     pub first_token_time: Option<f64>,
@@ -97,7 +105,40 @@ pub struct Request {
     pub pending_round_commits: Option<u32>,
 }
 
+/// What a request holds of its worker's KV: a block count. Blocks are
+/// ranges of the worker's KV tree keyed by the request's hashes, so no
+/// per-block identity is kept here.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KvHold {
+    blocks: u32,
+}
+
+impl KvHold {
+    pub fn len(&self) -> usize {
+        self.blocks as usize
+    }
+    pub fn is_empty(&self) -> bool {
+        self.blocks == 0
+    }
+    pub fn clear(&mut self) {
+        self.blocks = 0;
+    }
+    /// Account for `n` more blocks.
+    pub fn extend(&mut self, n: u32) {
+        self.blocks += n;
+    }
+}
+
 impl Request {
+    /// The re-entry this request's session announces, if it is a session
+    /// step with a successor: arrival at `completion_time` plus the harness
+    /// gap, reusing `shared_tokens` of this context.
+    pub fn outlook_at(&self, completion_time: f64) -> Option<Outlook> {
+        self.session
+            .as_ref()
+            .and_then(|s| s.outlook_at(completion_time))
+    }
+
     /// Create a request that will produce `target_output_tokens` tokens (at
     /// least one: the prefill pass always yields a token) out of an allowed
     /// `max_output_tokens`.
@@ -122,9 +163,10 @@ impl Request {
             num_cached_tokens: 0,
             prompt_block_hashes: Vec::new(),
             session: None,
-            kv_blocks: Vec::new(),
-            aux_blocks: Vec::new(),
+            kv_blocks: KvHold::default(),
+            aux_blocks: KvHold::default(),
             num_preemptions: 0,
+            rejected: false,
             first_token_time: None,
             prefill_done_time: None,
             handoff_done_time: None,

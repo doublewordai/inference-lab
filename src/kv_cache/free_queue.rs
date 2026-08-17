@@ -154,3 +154,190 @@ mod tests {
         assert_eq!(q.len(), 1);
     }
 }
+
+/// Recycling key of a block from its outlook: blocks with no announced
+/// re-entry sort first (`0`), then re-entries farthest away first. Times
+/// are non-negative, so their bit patterns order like the floats.
+pub fn outlook_key(next_arrival: Option<f64>) -> u64 {
+    match next_arrival {
+        None => 0,
+        Some(t) => u64::MAX - t.max(0.0).to_bits(),
+    }
+}
+
+/// Free blocks ordered by outlook: the block recycled first is the one
+/// whose re-entry is farthest away — or that has none — each sequence tail
+/// first so what survives is a prefix. Blocks without an outlook keep LRU
+/// order among themselves.
+#[derive(Debug, Clone)]
+pub struct OutlookFree {
+    set: std::collections::BTreeSet<(u64, u64, BlockId)>,
+    key_of: Vec<Option<(u64, u64)>>,
+    seq: u64,
+}
+
+impl OutlookFree {
+    pub fn new(num_blocks: usize) -> Self {
+        let mut f = Self {
+            set: std::collections::BTreeSet::new(),
+            key_of: vec![None; num_blocks],
+            seq: 0,
+        };
+        for id in 0..num_blocks {
+            f.push_back(id as BlockId, None);
+        }
+        f
+    }
+
+    pub fn len(&self) -> usize {
+        self.set.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.set.is_empty()
+    }
+
+    pub fn contains(&self, id: BlockId) -> bool {
+        self.key_of[id as usize].is_some()
+    }
+
+    fn tiebreak(&mut self, key: u64, pos: u32) -> u64 {
+        if key == 0 {
+            self.seq += 1;
+            self.seq
+        } else {
+            u64::from(u32::MAX - pos)
+        }
+    }
+
+    /// Free `id` with the outlook `mark` (`(next_arrival, position in its
+    /// sequence)`, `None` = no re-entry announced). No-op if already free.
+    pub fn push_back(&mut self, id: BlockId, mark: Option<(f64, u32)>) {
+        if self.contains(id) {
+            return;
+        }
+        let key = outlook_key(mark.map(|m| m.0));
+        let tb = self.tiebreak(key, mark.map_or(0, |m| m.1));
+        self.key_of[id as usize] = Some((key, tb));
+        self.set.insert((key, tb, id));
+    }
+
+    /// Change a free block's outlook in place. No-op if it is not free.
+    pub fn rekey(&mut self, id: BlockId, mark: Option<(f64, u32)>) {
+        if self.remove(id) {
+            self.push_back(id, mark);
+        }
+    }
+
+    pub fn pop_front(&mut self) -> Option<BlockId> {
+        let first = *self.set.iter().next()?;
+        self.set.remove(&first);
+        self.key_of[first.2 as usize] = None;
+        Some(first.2)
+    }
+
+    pub fn remove(&mut self, id: BlockId) -> bool {
+        match self.key_of[id as usize].take() {
+            Some((k, tb)) => self.set.remove(&(k, tb, id)),
+            None => false,
+        }
+    }
+
+    pub fn front(&self, k: usize) -> Vec<BlockId> {
+        self.set.iter().take(k).map(|e| e.2).collect()
+    }
+}
+
+/// The free blocks of one worker under its HBM eviction policy.
+#[derive(Debug, Clone)]
+pub enum FreeSet {
+    Lru(FreeQueue),
+    Outlook(OutlookFree),
+}
+
+impl FreeSet {
+    pub fn len(&self) -> usize {
+        match self {
+            FreeSet::Lru(q) => q.len(),
+            FreeSet::Outlook(o) => o.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn contains(&self, id: BlockId) -> bool {
+        match self {
+            FreeSet::Lru(q) => q.contains(id),
+            FreeSet::Outlook(o) => o.contains(id),
+        }
+    }
+
+    pub fn push_back(&mut self, id: BlockId, mark: Option<(f64, u32)>) {
+        match self {
+            FreeSet::Lru(q) => q.push_back(id),
+            FreeSet::Outlook(o) => o.push_back(id, mark),
+        }
+    }
+
+    /// Re-order a free block after its outlook changed (LRU: no-op).
+    pub fn rekey(&mut self, id: BlockId, mark: Option<(f64, u32)>) {
+        if let FreeSet::Outlook(o) = self {
+            o.rekey(id, mark);
+        }
+    }
+
+    pub fn pop_front(&mut self) -> Option<BlockId> {
+        match self {
+            FreeSet::Lru(q) => q.pop_front(),
+            FreeSet::Outlook(o) => o.pop_front(),
+        }
+    }
+
+    pub fn remove(&mut self, id: BlockId) -> bool {
+        match self {
+            FreeSet::Lru(q) => q.remove(id),
+            FreeSet::Outlook(o) => o.remove(id),
+        }
+    }
+
+    pub fn front(&self, k: usize) -> Vec<BlockId> {
+        match self {
+            FreeSet::Lru(q) => q.front(k),
+            FreeSet::Outlook(o) => o.front(k),
+        }
+    }
+}
+
+#[cfg(test)]
+mod outlook_tests {
+    use super::*;
+
+    #[test]
+    fn outlook_order_is_dead_first_then_farthest_then_tail_first() {
+        let mut f = OutlookFree::new(0);
+        f.key_of.resize(8, None);
+        f.push_back(0, Some((10.0, 0))); // near, head
+        f.push_back(1, Some((10.0, 1))); // near, tail
+        f.push_back(2, Some((100.0, 0))); // far, head
+        f.push_back(3, Some((100.0, 1))); // far, tail
+        f.push_back(4, None); // dead, freed first
+        f.push_back(5, None); // dead, freed later
+        let order: Vec<BlockId> = std::iter::from_fn(|| f.pop_front()).collect();
+        assert_eq!(order, vec![4, 5, 3, 2, 1, 0]);
+    }
+
+    #[test]
+    fn rekey_moves_a_free_block_and_hits_pull_it_out() {
+        let mut f = OutlookFree::new(3);
+        // All dead: LRU order 0,1,2. Announce a near re-entry for 0.
+        f.rekey(0, Some((5.0, 0)));
+        assert!(f.remove(1));
+        assert_eq!(f.pop_front(), Some(2));
+        assert_eq!(f.pop_front(), Some(0));
+        assert!(f.is_empty());
+        f.rekey(1, None); // not free: no-op
+        assert!(!f.contains(1));
+    }
+}

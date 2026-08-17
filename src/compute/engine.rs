@@ -8,6 +8,7 @@
 use crate::config::{HardwareConfig, ModelSpec, ParallelConfig, Precision};
 use crate::request::Request;
 
+#[derive(Clone)]
 pub struct ComputeEngine {
     hardware: HardwareConfig,
     parallel: ParallelConfig,
@@ -246,6 +247,37 @@ impl ComputeEngine {
         }
         cost.time += self.collective_time(total_tokens);
         cost
+    }
+
+    /// Roofline time of the batch's attention alone (score/AV FLOPs, KV and
+    /// per-sequence state reads) on ONE GPU of the replica: what a
+    /// DP-attention rank spends on its own sequences before the ranks meet
+    /// at the FFN collective. `step_cost` over the union batch spreads the
+    /// same work over all `tp` GPUs, i.e. prices the mean rank; the max over
+    /// ranks minus that mean is the skew the step waits for.
+    pub fn attention_seconds_on_one_gpu(
+        &self,
+        batch_requests: &[&Request],
+        tokens_per_request: &[u32],
+    ) -> f64 {
+        if batch_requests.is_empty() {
+            return 0.0;
+        }
+        let state_bytes = self.model.per_sequence_state_bytes() as f64;
+        let mut flops = 0.0;
+        let mut bytes = 0.0;
+        for (req, &num_new) in batch_requests.iter().zip(tokens_per_request) {
+            // Same causal accounting as `assemble_streams`.
+            let mean_context = req.num_computed_tokens + num_new.div_ceil(2);
+            flops += self
+                .model
+                .attention_flops(num_new, mean_context, !req.is_prefill())
+                as f64;
+            bytes += self.model.kv_bytes_read_per_decode_step(mean_context) as f64 + state_bytes;
+        }
+        let prec = self.model.attention_precision;
+        let rate = self.hardware.flop_rate(prec).unwrap_or(f64::INFINITY);
+        (flops / rate).max(bytes / self.hardware.memory_bandwidth)
     }
 
     /// Wall time of a step (see [`ComputeEngine::step_cost`]).

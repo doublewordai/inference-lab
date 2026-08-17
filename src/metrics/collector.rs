@@ -105,6 +105,8 @@ pub struct MetricsCollector {
 
     pub completed_requests: u64,
     pub total_requests: u64,
+    /// Refused at submission: context larger than a worker's KV cache.
+    pub rejected_requests: u64,
 
     input_lengths: Vec<u32>,
     output_lengths: Vec<u32>,
@@ -131,6 +133,7 @@ impl MetricsCollector {
             total_preemptions: 0,
             completed_requests: 0,
             total_requests: 0,
+            rejected_requests: 0,
             input_lengths: Vec::new(),
             output_lengths: Vec::new(),
             interval_ttft: RunningMean::default(),
@@ -141,6 +144,10 @@ impl MetricsCollector {
 
     /// Record a completed request.
     pub fn record_request_completion(&mut self, timing: &RequestTiming) {
+        if timing.rejected {
+            self.rejected_requests += 1;
+            return;
+        }
         let observed_at = timing.completion_time;
         let ttft = timing.ttft();
         let e2e = timing.e2e();
@@ -308,12 +315,17 @@ impl MetricsCollector {
             requests: RequestCounts {
                 completed: self.completed_requests,
                 total: self.total_requests,
+                rejected: self.rejected_requests,
             },
             prefix_cache: PrefixCacheMetrics {
                 hits: prefix_cache.hits,
                 misses: prefix_cache.misses,
                 hit_rate: prefix_cache.hit_rate(),
                 mean_hit_size: prefix_cache.mean_hit_size(),
+                recomputed: prefix_cache.recomputed,
+                recomputed_tokens: prefix_cache.recomputed_tokens,
+                prefetches: prefix_cache.prefetches,
+                prefetch_tokens: prefix_cache.prefetch_tokens,
             },
             router,
             decode_router,
@@ -348,6 +360,7 @@ mod tests {
             num_cached_tokens: 0,
             session: None,
             num_preemptions: preemptions,
+            rejected: false,
         }
     }
 

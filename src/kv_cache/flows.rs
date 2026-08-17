@@ -14,6 +14,7 @@
 //! (a worker, or the hand-off path) so a worker that did not drive the
 //! advance can still collect its own.
 
+use rustc_hash::FxHashMap;
 use std::collections::{HashMap, HashSet};
 
 pub type EdgeId = usize;
@@ -22,7 +23,8 @@ pub type EdgeId = usize;
 const DONE_EPSILON_BYTES: f64 = 1e-6;
 /// A remainder that would drain in less than this counts as done: an event
 /// scheduled that soon lands at the same instant in floating point and
-/// would never move it.
+/// would never move it. Floor of the tolerance; see [`Flows::done_eps`],
+/// which widens it to the resolution of the clock at the current time.
 const DONE_EPSILON_SECONDS: f64 = 1e-12;
 
 /// Who a transfer belongs to: which completion queue it lands in.
@@ -86,7 +88,20 @@ struct Transfer {
 #[derive(Debug, Default)]
 pub struct Flows {
     edges: Vec<Edge>,
-    in_flight: HashMap<String, Transfer>,
+    in_flight: FxHashMap<String, Transfer>,
+    peak_in_flight: usize,
+    submitted_counts: (u64, u64, u64),
+    /// The in-flight set changed since rates were last computed. Rates are
+    /// recomputed lazily, before the next drain over a positive interval or
+    /// the next rate-dependent estimate, so a burst of submissions at one
+    /// instant costs one recomputation.
+    rates_dirty: bool,
+    /// Absolute time of the next completion under the current rates, valid
+    /// while `rates_dirty` is false; recomputed with the rates.
+    next_done_at: Option<f64>,
+    /// Transfers holding a share of each edge, as of the last recompute
+    /// (valid while `rates_dirty` is false).
+    edge_load: Vec<usize>,
     /// Completed transfers not yet collected, per owner.
     completed: HashMap<Owner, HashSet<String>>,
     /// Bytes submitted, by owner kind, for reporting.
@@ -107,6 +122,7 @@ impl Flows {
         let mut e = Edge::new(name.into(), capacity);
         e.last_update = self.now;
         self.edges.push(e);
+        self.rates_dirty = true;
         self.edges.len() - 1
     }
 
@@ -116,6 +132,16 @@ impl Flows {
 
     pub fn num_in_flight(&self) -> usize {
         self.in_flight.len()
+    }
+
+    /// Most transfers ever in flight at once.
+    pub fn peak_in_flight(&self) -> usize {
+        self.peak_in_flight
+    }
+
+    /// Transfers submitted so far, by owner kind `(worker, handoff, write)`.
+    pub fn submitted_counts(&self) -> (u64, u64, u64) {
+        self.submitted_counts
     }
 
     pub fn contains(&self, id: &str) -> bool {
@@ -144,9 +170,18 @@ impl Flows {
         // Bring everything to `now` under the old rates first.
         self.drain_to(now);
         match owner {
-            Owner::Worker(_) => self.bytes_submitted_worker += bytes as f64,
-            Owner::Handoff => self.bytes_submitted_handoff += bytes as f64,
-            Owner::Write => self.bytes_submitted_write += bytes as f64,
+            Owner::Worker(_) => {
+                self.bytes_submitted_worker += bytes as f64;
+                self.submitted_counts.0 += 1;
+            }
+            Owner::Handoff => {
+                self.bytes_submitted_handoff += bytes as f64;
+                self.submitted_counts.1 += 1;
+            }
+            Owner::Write => {
+                self.bytes_submitted_write += bytes as f64;
+                self.submitted_counts.2 += 1;
+            }
         }
         self.in_flight.insert(
             id,
@@ -159,17 +194,38 @@ impl Flows {
                 last_update: now,
             },
         );
-        self.recompute_rates();
+        self.peak_in_flight = self.peak_in_flight.max(self.in_flight.len());
+        self.rates_dirty = true;
     }
 
     /// Advance every transfer to `now`. Returns `(owner, id)` for each
     /// transfer that completed, and queues them per owner too.
     pub fn advance(&mut self, now: f64) -> Vec<(Owner, String)> {
+        // Fast path: the set is unchanged and nothing completes by `now`.
+        // Rates are constant, every transfer keeps its own `last_update`,
+        // so only the edges' load-time integrals need moving.
+        if !self.rates_dirty
+            && now >= self.now
+            && self.next_done_at.is_none_or(|t| t > now)
+            && self.edge_load.len() == self.edges.len()
+        {
+            let dt = now - self.now;
+            if dt > 0.0 {
+                for (e, &c) in self.edges.iter_mut().zip(&self.edge_load) {
+                    e.busy_transfer_seconds += c as f64 * dt;
+                    e.last_update = now;
+                }
+                self.now = now;
+            }
+            return Vec::new();
+        }
         self.drain_to(now);
+        self.ensure_rates();
+        let eps = self.done_eps();
         let mut done: Vec<(Owner, String)> = self
             .in_flight
             .iter()
-            .filter(|(_, t)| Self::is_done(t))
+            .filter(|(_, t)| Self::is_done(t, eps))
             .map(|(id, t)| (t.owner, id.clone()))
             .collect();
         done.sort_by(|a, b| a.1.cmp(&b.1));
@@ -178,7 +234,7 @@ impl Flows {
             self.completed.entry(*owner).or_default().insert(id.clone());
         }
         if !done.is_empty() {
-            self.recompute_rates();
+            self.rates_dirty = true;
         }
         done
     }
@@ -187,7 +243,7 @@ impl Flows {
     /// edges). Rates are recomputed. No-op for unknown ids.
     pub fn cancel(&mut self, id: &str) {
         if self.in_flight.remove(id).is_some() {
-            self.recompute_rates();
+            self.rates_dirty = true;
         }
     }
 
@@ -207,24 +263,63 @@ impl Flows {
 
     /// Time until the next completion under the current rates, measured
     /// from the last advance. `None` when nothing in flight can complete.
-    pub fn next_completion_delay(&self) -> Option<f64> {
-        self.in_flight
-            .values()
-            .filter_map(Self::time_to_done)
-            .min_by(f64::total_cmp)
+    pub fn next_completion_delay(&mut self) -> Option<f64> {
+        self.ensure_rates();
+        self.next_done_at.map(|t| (t - self.now).max(0.0))
+    }
+
+    /// Time a new transfer of `bytes` over `path` (after `latency`) would
+    /// take at the share it would get now: on every edge, capacity over
+    /// one more than the transfers already moving bytes on it, the
+    /// smallest along the path. A lower bound on its max-min share, so an
+    /// upper bound on the time; exact on an idle path.
+    pub fn estimate_new(&self, path: &[EdgeId], bytes: f64, latency: f64) -> f64 {
+        if path.is_empty() {
+            return latency.max(0.0);
+        }
+        let mut load = vec![0usize; self.edges.len()];
+        for t in self.in_flight.values() {
+            if t.bytes_remaining <= DONE_EPSILON_BYTES {
+                continue;
+            }
+            for &e in &t.path {
+                load[e] += 1;
+            }
+        }
+        let share = path
+            .iter()
+            .map(|&e| self.edges[e].capacity / (load[e] + 1) as f64)
+            .fold(f64::INFINITY, f64::min);
+        if share <= 0.0 || !share.is_finite() {
+            return f64::INFINITY;
+        }
+        latency.max(0.0) + bytes / share
     }
 
     /// Projected remaining time for `id` under the current rates; 0 if
     /// unknown.
-    pub fn estimate_remaining(&self, id: &str) -> f64 {
+    pub fn estimate_remaining(&mut self, id: &str) -> f64 {
+        // Transfers may not have been drained since the last fast-path
+        // advance: bring them to `now` first.
+        let now = self.now;
+        self.drain_to(now);
+        self.ensure_rates();
         self.in_flight
             .get(id)
-            .and_then(Self::time_to_done)
+            .and_then(|t| Self::time_to_done(t, self.done_eps()))
             .unwrap_or(0.0)
     }
 
-    fn time_to_done(t: &Transfer) -> Option<f64> {
-        if Self::is_done(t) {
+    /// Remaining time below which a transfer counts as finished: the
+    /// float resolution of the clock at `now` (a completion event closer
+    /// than that lands at the same instant and moves nothing), with
+    /// `DONE_EPSILON_SECONDS` as the floor.
+    fn done_eps(&self) -> f64 {
+        (self.now.abs() * 4.0 * f64::EPSILON).max(DONE_EPSILON_SECONDS)
+    }
+
+    fn time_to_done(t: &Transfer, eps: f64) -> Option<f64> {
+        if Self::is_done(t, eps) {
             return Some(0.0);
         }
         if t.bytes_remaining <= DONE_EPSILON_BYTES {
@@ -238,20 +333,23 @@ impl Flows {
     }
 
     /// Whether `t` has finished within float drift: no latency left and
-    /// no bytes, or a remainder that would drain in under
-    /// `DONE_EPSILON_SECONDS` at its rate.
-    fn is_done(t: &Transfer) -> bool {
-        if t.latency_remaining > DONE_EPSILON_SECONDS {
+    /// no bytes, or a remainder that would drain in under `eps` at its
+    /// rate.
+    fn is_done(t: &Transfer, eps: f64) -> bool {
+        if t.latency_remaining > eps {
             return false;
         }
         t.bytes_remaining <= DONE_EPSILON_BYTES
-            || (t.rate > 0.0 && t.bytes_remaining / t.rate <= DONE_EPSILON_SECONDS)
+            || (t.rate > 0.0 && t.bytes_remaining / t.rate <= eps)
     }
 
     /// Move every transfer forward to `now` at its current rate.
     fn drain_to(&mut self, now: f64) {
         if now < self.now {
             return;
+        }
+        if now > self.now {
+            self.ensure_rates();
         }
         for t in self.in_flight.values_mut() {
             let mut dt = now - t.last_update;
@@ -289,52 +387,83 @@ impl Flows {
         self.now = now;
     }
 
+    /// Recompute rates if the in-flight set changed since the last time.
+    fn ensure_rates(&mut self) {
+        if self.rates_dirty {
+            self.recompute_rates();
+            self.rates_dirty = false;
+            let eps = self.done_eps();
+            let now = self.now;
+            self.next_done_at = self
+                .in_flight
+                .values()
+                .filter_map(|t| Self::time_to_done(t, eps))
+                .min_by(f64::total_cmp)
+                .map(|d| now + d);
+            let mut load = vec![0usize; self.edges.len()];
+            for t in self.in_flight.values() {
+                for &e in &t.path {
+                    load[e] += 1;
+                }
+            }
+            self.edge_load = load;
+        }
+    }
+
     /// Max-min fair rates by progressive filling over every in-flight
     /// transfer. A transfer still paying its latency holds its share from
     /// submission (it moves no bytes until the latency is paid, so the
     /// share is reserved rather than used for those microseconds).
+    /// Transfers are bucketed by edge once, so the fill is linear in the
+    /// number of transfers (each is frozen exactly once).
     fn recompute_rates(&mut self) {
-        let ids: Vec<String> = self.in_flight.keys().cloned().collect();
+        let mut ts: Vec<&mut Transfer> = self
+            .in_flight
+            .values_mut()
+            .filter(|t| t.bytes_remaining > DONE_EPSILON_BYTES)
+            .collect();
+        let n = ts.len();
+        let ne = self.edges.len();
         let mut residual: Vec<f64> = self.edges.iter().map(|e| e.capacity).collect();
-        let mut load: Vec<usize> = vec![0; self.edges.len()];
-        let mut unfrozen: HashSet<String> = HashSet::new();
-        for id in &ids {
-            let t = &self.in_flight[id];
-            if t.bytes_remaining <= DONE_EPSILON_BYTES {
-                continue;
-            }
+        let mut load: Vec<usize> = vec![0; ne];
+        let mut on_edge: Vec<Vec<usize>> = vec![Vec::new(); ne];
+        let mut frozen = vec![false; n];
+        let mut unfrozen = 0usize;
+        for (i, t) in ts.iter_mut().enumerate() {
             if t.path.is_empty() {
                 // No edges: unconstrained; treat as instantaneous.
-                self.in_flight.get_mut(id).unwrap().rate = f64::INFINITY;
+                t.rate = f64::INFINITY;
+                frozen[i] = true;
                 continue;
             }
-            unfrozen.insert(id.clone());
+            unfrozen += 1;
             for &e in &t.path {
                 load[e] += 1;
+                on_edge[e].push(i);
             }
         }
-        while !unfrozen.is_empty() {
+        while unfrozen > 0 {
             // Most contended edge: smallest fair share among edges with load.
             let mut best: Option<(EdgeId, f64)> = None;
-            for (e, &n) in load.iter().enumerate() {
-                if n == 0 {
+            for (e, &l) in load.iter().enumerate() {
+                if l == 0 {
                     continue;
                 }
-                let share = residual[e] / n as f64;
+                let share = residual[e] / l as f64;
                 if best.is_none_or(|(_, s)| share < s) {
                     best = Some((e, share));
                 }
             }
             let Some((edge, share)) = best else { break };
             // Freeze every unfrozen transfer on that edge at `share`.
-            let frozen: Vec<String> = unfrozen
-                .iter()
-                .filter(|id| self.in_flight[*id].path.contains(&edge))
-                .cloned()
-                .collect();
-            for id in frozen {
-                unfrozen.remove(&id);
-                let t = self.in_flight.get_mut(&id).unwrap();
+            let members = std::mem::take(&mut on_edge[edge]);
+            for i in members {
+                if frozen[i] {
+                    continue;
+                }
+                frozen[i] = true;
+                unfrozen -= 1;
+                let t = &mut ts[i];
                 t.rate = share.max(0.0);
                 for &e in &t.path {
                     residual[e] = (residual[e] - share).max(0.0);
@@ -392,6 +521,26 @@ mod tests {
             f.take_completed(Owner::Worker(1)),
             HashSet::from(["b".to_string()])
         );
+    }
+
+    #[test]
+    fn a_remainder_below_the_clocks_resolution_counts_as_done() {
+        // At t ≈ 16649 s the clock's ulp is ~3.6e-12 s. A transfer with
+        // 2e-12 s of bytes left is neither drainable (its completion event
+        // lands at the same instant) nor, under a fixed 1e-12 s epsilon,
+        // done — the engine would re-fire that event forever.
+        let mut f = Flows::new();
+        let e = f.add_edge("pcie", 1e9);
+        let t0 = 16648.7;
+        f.submit("w".into(), Owner::Write, vec![e], 1_000_000_000, 0.0, t0);
+        // Drain to 2e-12 s short of the end.
+        let done = f.advance(t0 + 1.0 - 2e-12);
+        assert!(
+            done.iter().any(|(_, id)| id == "w"),
+            "counted done within the clock's resolution"
+        );
+        assert_eq!(f.next_completion_delay(), None);
+        assert_eq!(f.num_in_flight(), 0);
     }
 
     #[test]

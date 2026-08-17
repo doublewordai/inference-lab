@@ -76,6 +76,9 @@ pub struct MemoryMetrics {
     pub bytes_promoted: f64,
     /// Promotions that had to wait for a write still arriving.
     pub write_race_waits: u64,
+    /// Most transfers (promotions, writes, hand-offs) in flight at once.
+    #[serde(default)]
+    pub peak_transfers_in_flight: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize)]
@@ -116,6 +119,10 @@ pub struct Preemptions {
 pub struct RequestCounts {
     pub completed: u64,
     pub total: u64,
+    /// Refused at submission: the request's whole context needs more KV
+    /// than a worker has, so it could never complete.
+    #[serde(default)]
+    pub rejected: u64,
 }
 
 /// What the entry pool's router did (see `crate::router::RouterStats`).
@@ -163,4 +170,12 @@ pub struct PrefixCacheMetrics {
     pub hit_rate: f64,
     /// Mean cached prefix length per lookup, in tokens.
     pub mean_hit_size: f64,
+    /// Lookups whose tier-held prefix was recomputed rather than fetched
+    /// (`[memory] source = min_time`), and the tokens recomputed.
+    pub recomputed: u64,
+    pub recomputed_tokens: u64,
+    /// Prefetches started ahead of announced re-entries (`[memory]
+    /// prefetch = outlook`), and the tokens they pulled up.
+    pub prefetches: u64,
+    pub prefetch_tokens: u64,
 }

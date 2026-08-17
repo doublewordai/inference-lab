@@ -12,8 +12,8 @@ pub mod workload;
 pub use deployment::{Deployment, DeploymentError, ModelConfig};
 pub use hardware::{FabricConfig, FabricLink, HardwareConfig, Precision, TimeCorrection};
 pub use memory::{
-    EvictionPolicy, JunctionTemplate, LinkTemplate, MemoryConfig, MemoryTemplate, Scope,
-    StoreTemplate, WritePolicy,
+    EvictionPolicy, HbmEviction, JunctionTemplate, LinkTemplate, MemoryConfig, MemoryPolicies,
+    MemoryPreset, MemoryTemplate, PrefetchPolicy, Scope, SourcePolicy, StoreTemplate, WritePolicy,
 };
 pub use model::{
     expected_distinct_experts, History, Indexer, LayerClass, ModelSpec, Routing, WeightStream,

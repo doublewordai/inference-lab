@@ -87,6 +87,11 @@ pub enum WritePolicy {
         #[serde(default = "default_min_hits")]
         min_hits: u32,
     },
+    /// At eviction from HBM, only when the block's session has announced
+    /// a re-entry (an [`Outlook`](crate::request::Outlook)): blocks whose
+    /// trajectory is over are dropped. Needs a session workload; on other
+    /// workloads no block ever has an outlook and nothing is written.
+    Live {},
 }
 
 fn default_min_hits() -> u32 {
@@ -105,6 +110,7 @@ impl WritePolicy {
             WritePolicy::WriteBack {} => "write_back",
             WritePolicy::WriteThrough {} => "write_through",
             WritePolicy::Selective { .. } => "selective",
+            WritePolicy::Live {} => "live",
         }
     }
 }
@@ -121,6 +127,10 @@ pub enum EvictionPolicy {
     /// Least recently used, and any block untouched for `seconds` is
     /// dropped whether or not the store is full.
     Ttl { seconds: f64 },
+    /// Blocks with no announced re-entry first (least recently inserted
+    /// among them), then the block whose re-entry is farthest away
+    /// (Belady's rule over the sessions' outlooks).
+    Outlook {},
 }
 
 impl Default for EvictionPolicy {
@@ -135,7 +145,173 @@ impl EvictionPolicy {
             EvictionPolicy::Fifo {} => "fifo",
             EvictionPolicy::Lru {} => "lru",
             EvictionPolicy::Ttl { .. } => "ttl",
+            EvictionPolicy::Outlook {} => "outlook",
         }
+    }
+}
+
+/// Which free HBM block a worker recycles first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(tag = "policy", rename_all = "snake_case", deny_unknown_fields)]
+pub enum HbmEviction {
+    /// Least recently freed (the free queue's order).
+    Lru {},
+    /// Blocks with no announced re-entry first (least recently freed
+    /// among them), then the farthest re-entry first, each sequence tail
+    /// first so what survives is a prefix.
+    Outlook {},
+}
+
+impl Default for HbmEviction {
+    fn default() -> Self {
+        HbmEviction::Lru {}
+    }
+}
+
+impl HbmEviction {
+    pub fn name(&self) -> &'static str {
+        match self {
+            HbmEviction::Lru {} => "lru",
+            HbmEviction::Outlook {} => "outlook",
+        }
+    }
+}
+
+/// Where a re-entry's cached prefix comes from when a tier holds it.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(tag = "policy", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SourcePolicy {
+    /// Always promote from the tier (a prefix-cache hit is a hit).
+    Promote {},
+    /// Promote only if the transfer, at the fetch path's current fair
+    /// share, beats recomputing the prefix at the worker's roofline
+    /// prefill rate; otherwise recompute it (the tier keeps its copy).
+    MinTime {},
+}
+
+impl Default for SourcePolicy {
+    fn default() -> Self {
+        SourcePolicy::Promote {}
+    }
+}
+
+impl SourcePolicy {
+    pub fn name(&self) -> &'static str {
+        match self {
+            SourcePolicy::Promote {} => "promote",
+            SourcePolicy::MinTime {} => "min_time",
+        }
+    }
+}
+
+/// Whether a worker pulls a demoted prefix back before its announced
+/// re-entry.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(tag = "policy", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PrefetchPolicy {
+    /// Never; a re-entry promotes on arrival.
+    None {},
+    /// When a block with an outlook leaves HBM, schedule its promotion so
+    /// it lands (at the path's current fair share) `lead` seconds before
+    /// the re-entry; a block already overdue starts at once.
+    Outlook {
+        #[serde(default)]
+        lead: f64,
+    },
+}
+
+impl Default for PrefetchPolicy {
+    fn default() -> Self {
+        PrefetchPolicy::None {}
+    }
+}
+
+impl PrefetchPolicy {
+    pub fn name(&self) -> &'static str {
+        match self {
+            PrefetchPolicy::None {} => "none",
+            PrefetchPolicy::Outlook { .. } => "outlook",
+        }
+    }
+}
+
+/// A named bundle of movement policies. Explicit `[memory]` fields
+/// override the preset's choices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryPreset {
+    /// Decides only from what has already happened, the way shipped
+    /// stacks do: promote on any hit, LRU in HBM and in every tier,
+    /// write on the first HBM hit (SGLang HiCache's selective
+    /// write-through), no prefetch, recycle backed blocks first.
+    Reactive,
+    /// Knows every session's next re-entry: fetch or recompute by time,
+    /// Belady eviction in HBM and the tiers, write only live trajectories,
+    /// prefetch to land on arrival.
+    Oracle,
+}
+
+impl MemoryPreset {
+    pub fn name(&self) -> &'static str {
+        match self {
+            MemoryPreset::Reactive => "reactive",
+            MemoryPreset::Oracle => "oracle",
+        }
+    }
+}
+
+/// The movement policies a deployment runs, every choice made.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MemoryPolicies {
+    pub source: SourcePolicy,
+    pub hbm_eviction: HbmEviction,
+    pub write: WritePolicy,
+    pub eviction: EvictionPolicy,
+    pub prefetch: PrefetchPolicy,
+    pub hbm_evict_backed_first: bool,
+}
+
+impl Default for MemoryPolicies {
+    fn default() -> Self {
+        Self {
+            source: SourcePolicy::Promote {},
+            hbm_eviction: HbmEviction::Lru {},
+            write: WritePolicy::WriteBack {},
+            eviction: EvictionPolicy::Fifo {},
+            prefetch: PrefetchPolicy::None {},
+            hbm_evict_backed_first: false,
+        }
+    }
+}
+
+impl MemoryPolicies {
+    pub fn preset(preset: MemoryPreset) -> Self {
+        match preset {
+            MemoryPreset::Reactive => Self {
+                source: SourcePolicy::Promote {},
+                hbm_eviction: HbmEviction::Lru {},
+                write: WritePolicy::Selective { min_hits: 1 },
+                eviction: EvictionPolicy::Lru {},
+                prefetch: PrefetchPolicy::None {},
+                hbm_evict_backed_first: true,
+            },
+            MemoryPreset::Oracle => Self {
+                source: SourcePolicy::MinTime {},
+                hbm_eviction: HbmEviction::Outlook {},
+                write: WritePolicy::Live {},
+                eviction: EvictionPolicy::Outlook {},
+                prefetch: PrefetchPolicy::Outlook { lead: 0.0 },
+                hbm_evict_backed_first: true,
+            },
+        }
+    }
+
+    /// Whether any policy reads the sessions' outlooks.
+    pub fn uses_outlook(&self) -> bool {
+        matches!(self.hbm_eviction, HbmEviction::Outlook {})
+            || matches!(self.write, WritePolicy::Live {})
+            || matches!(self.eviction, EvictionPolicy::Outlook {})
+            || matches!(self.prefetch, PrefetchPolicy::Outlook { .. })
     }
 }
 
@@ -300,17 +476,59 @@ pub struct MemoryConfig {
     /// the store's full capacity.
     #[serde(default)]
     pub capacity: BTreeMap<String, f64>,
-    /// When KV is written to the first tier. Default `write_back`.
+    /// A named bundle of the policies below; explicit fields override it.
+    /// Default: `promote` / `lru` / `write_back` / `fifo` / no prefetch /
+    /// no backed-first recycling.
     #[serde(default)]
-    pub write: WritePolicy,
-    /// How every tier picks what to recycle. Default `fifo`.
+    pub preset: Option<MemoryPreset>,
+    /// Where a re-entry's tier-held prefix comes from: `promote` or
+    /// `min_time` (fetch vs recompute by time).
     #[serde(default)]
-    pub eviction: EvictionPolicy,
+    pub source: Option<SourcePolicy>,
+    /// Which free HBM block is recycled first: `lru` or `outlook`.
+    #[serde(default)]
+    pub hbm_eviction: Option<HbmEviction>,
+    /// When KV is written to the first tier.
+    #[serde(default)]
+    pub write: Option<WritePolicy>,
+    /// How every tier picks what to recycle.
+    #[serde(default)]
+    pub eviction: Option<EvictionPolicy>,
+    /// Whether demoted prefixes are pulled back ahead of their re-entry.
+    #[serde(default)]
+    pub prefetch: Option<PrefetchPolicy>,
     /// When HBM must recycle a block, prefer one whose KV a tier already
-    /// holds (dropping it is free) over the least recently freed one,
-    /// looking a bounded distance up the free queue. Default false.
+    /// holds (dropping it is free) over the policy's first choice,
+    /// looking a bounded distance up the free queue.
     #[serde(default)]
-    pub hbm_evict_backed_first: bool,
+    pub hbm_evict_backed_first: Option<bool>,
+}
+
+impl MemoryConfig {
+    /// The policies this deployment runs: the preset's choices (or the
+    /// defaults) with every explicit field applied over them.
+    pub fn policies(&self) -> MemoryPolicies {
+        let mut p = self.preset.map(MemoryPolicies::preset).unwrap_or_default();
+        if let Some(v) = self.source {
+            p.source = v;
+        }
+        if let Some(v) = self.hbm_eviction {
+            p.hbm_eviction = v;
+        }
+        if let Some(v) = self.write {
+            p.write = v;
+        }
+        if let Some(v) = self.eviction {
+            p.eviction = v;
+        }
+        if let Some(v) = self.prefetch {
+            p.prefetch = v;
+        }
+        if let Some(v) = self.hbm_evict_backed_first {
+            p.hbm_evict_backed_first = v;
+        }
+        p
+    }
 }
 
 impl MemoryConfig {
@@ -429,13 +647,41 @@ bandwidth = 450e9
             "tiers = [\"nvme\"]\nwrite = { policy = \"selective\", min_hits = 2 }\neviction = { policy = \"ttl\", seconds = 60 }\nhbm_evict_backed_first = true",
         )
         .unwrap();
-        assert_eq!(c.write, WritePolicy::Selective { min_hits: 2 });
-        assert_eq!(c.eviction, EvictionPolicy::Ttl { seconds: 60.0 });
-        assert!(c.hbm_evict_backed_first);
+        let p = c.policies();
+        assert_eq!(p.write, WritePolicy::Selective { min_hits: 2 });
+        assert_eq!(p.eviction, EvictionPolicy::Ttl { seconds: 60.0 });
+        assert!(p.hbm_evict_backed_first);
+        assert_eq!(p.source, SourcePolicy::Promote {});
+        assert_eq!(p.hbm_eviction, HbmEviction::Lru {});
+        assert_eq!(p.prefetch, PrefetchPolicy::None {});
         let d: MemoryConfig = toml::from_str("tiers = [\"nvme\"]").unwrap();
-        assert_eq!(d.write, WritePolicy::WriteBack {});
-        assert_eq!(d.eviction, EvictionPolicy::Fifo {});
+        assert_eq!(d.policies(), MemoryPolicies::default());
         assert!(toml::from_str::<MemoryConfig>("write = { policy = \"nope\" }").is_err());
+    }
+
+    #[test]
+    fn presets_bundle_policies_and_explicit_fields_override() {
+        let o: MemoryConfig = toml::from_str("tiers = [\"nvme\"]\npreset = \"oracle\"").unwrap();
+        let p = o.policies();
+        assert_eq!(p, MemoryPolicies::preset(MemoryPreset::Oracle));
+        assert_eq!(p.source, SourcePolicy::MinTime {});
+        assert_eq!(p.hbm_eviction, HbmEviction::Outlook {});
+        assert_eq!(p.write, WritePolicy::Live {});
+        assert_eq!(p.eviction, EvictionPolicy::Outlook {});
+        assert_eq!(p.prefetch, PrefetchPolicy::Outlook { lead: 0.0 });
+        assert!(p.uses_outlook());
+
+        let r: MemoryConfig = toml::from_str(
+            "tiers = [\"nvme\"]\npreset = \"reactive\"\nsource = { policy = \"min_time\" }\nprefetch = { policy = \"outlook\", lead = 2.5 }",
+        )
+        .unwrap();
+        let p = r.policies();
+        assert_eq!(p.source, SourcePolicy::MinTime {});
+        assert_eq!(p.prefetch, PrefetchPolicy::Outlook { lead: 2.5 });
+        assert_eq!(p.write, WritePolicy::Selective { min_hits: 1 });
+        assert_eq!(p.eviction, EvictionPolicy::Lru {});
+        assert!(!MemoryPolicies::preset(MemoryPreset::Reactive).uses_outlook());
+        assert!(toml::from_str::<MemoryConfig>("preset = \"dynamo\"").is_err());
     }
 
     #[test]

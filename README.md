@@ -26,10 +26,14 @@ absolute figures are needed.
 - **Memory graph**: KV tiers beyond HBM as a graph of stores and links per
   hardware preset (host DRAM / NVMe behind PCIe, Grace memory behind
   NVLink-C2C, NVLink, NICs); per-GPU or node-shared stores; write-back /
-  write-through / selective writes, FIFO / LRU / TTL eviction; transfers
-  at max-min fair share over every edge of their path
+  write-through / selective / live writes, FIFO / LRU / TTL / outlook
+  eviction, fetch-vs-recompute, prefetch; `reactive` and `oracle` policy
+  presets (what shipped stacks decide from vs what knowing every session's
+  re-entry buys); transfers at max-min fair share over every edge of their
+  path
 - **Replicas and routing**: N identical workers behind a pluggable router —
-  round-robin, least-loaded, prefix-affinity, KV-aware
+  round-robin, least-loaded, prefix-affinity, KV-aware; DP-attention ranks
+  are workers too (own KV, flat routing, lockstep steps with attention skew)
 - **Disaggregated serving**: prefill and decode pools; hand-offs ride the
   memory graph's NICs and network core
 - **Speculative decoding**: analytic or trace-replayed acceptance, fixed and

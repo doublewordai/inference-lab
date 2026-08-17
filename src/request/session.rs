@@ -111,6 +111,30 @@ pub struct SessionStep {
     pub reuse_distance_bytes: Option<u64>,
     pub parent_bytes_touched: Option<u64>,
     pub reuse_touched_bytes: Option<u64>,
+    /// The session's next step, if any: the harness gap after this step's
+    /// completion, and how many of this step's context tokens (prompt +
+    /// output, whole blocks) it re-enters with. What an oracle knows.
+    pub next_gap: Option<f64>,
+    pub next_shared_tokens: u32,
+}
+
+impl SessionStep {
+    /// The re-entry this step announces, given its completion time.
+    pub fn outlook_at(&self, completion_time: f64) -> Option<Outlook> {
+        self.next_gap.map(|gap| Outlook {
+            next_arrival: completion_time + gap.max(0.0),
+            shared_tokens: self.next_shared_tokens,
+        })
+    }
+}
+
+/// A session's announced re-entry: when its next step arrives and how many
+/// tokens of the current context it reuses. Oracle policies read it;
+/// reactive ones never see it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Outlook {
+    pub next_arrival: f64,
+    pub shared_tokens: u32,
 }
 
 /// State of a session that has started and not yet issued its last step.
@@ -270,6 +294,15 @@ impl SessionSource {
             self.next_hash += 1;
         }
 
+        // What the next step re-enters with, in whole blocks of this
+        // step's context.
+        let context = input + output;
+        let next = self.specs[active.spec_idx].steps.get(step_idx + 1);
+        let next_gap = next.map(|n| n.gap.max(0.0));
+        let next_shared_tokens = next
+            .map(|n| n.input.max(1).saturating_sub(n.new).min(context) / block_size * block_size)
+            .unwrap_or(0);
+
         let mut req = Request::new_with_target(
             format!("s{ordinal}/{step_idx}"),
             0,
@@ -289,6 +322,8 @@ impl SessionSource {
             reuse_distance_bytes: None,
             parent_bytes_touched: None,
             reuse_touched_bytes: None,
+            next_gap,
+            next_shared_tokens,
         }));
 
         active.hashes = hashes;

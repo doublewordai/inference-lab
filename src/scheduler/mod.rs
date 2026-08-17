@@ -6,4 +6,4 @@ pub mod scheduler;
 
 pub use decision::{ScheduleDecision, ScheduledSeq};
 pub use policy::SchedulingPolicy;
-pub use scheduler::Scheduler;
+pub use scheduler::{RecomputeFn, Scheduler};

@@ -763,6 +763,13 @@ fn print_final_metrics(
         "  • Total Requests: {} completed",
         summary.requests.completed
     );
+    if summary.requests.rejected > 0 {
+        println!(
+            "  • {} {} rejected: context larger than a worker's KV cache",
+            "⚠".yellow(),
+            summary.requests.rejected
+        );
+    }
     println!("  • Simulation Time: {:.1}s", sim_time);
     println!("  • Real Time: {:.2}s", real_time.as_secs_f64());
 
@@ -774,6 +781,18 @@ fn print_final_metrics(
         println!("  • Misses:    {}", pc.misses);
         println!("  • Avg hit size: {:.1} tokens", pc.mean_hit_size);
         println!("  • Hit Rate:  {:.1}%", pc.hit_rate * 100.0);
+        if pc.recomputed > 0 {
+            println!(
+                "  • Recomputed instead of fetched: {} lookups, {} tokens",
+                pc.recomputed, pc.recomputed_tokens
+            );
+        }
+        if pc.prefetches > 0 {
+            println!(
+                "  • Prefetched: {} prefixes, {} tokens",
+                pc.prefetches, pc.prefetch_tokens
+            );
+        }
     }
 
     // Router Section (only interesting with more than one replica)
@@ -781,7 +800,7 @@ fn print_final_metrics(
         println!("\n{}", title.yellow().bold());
         println!("  • Policy:    {}", rt.policy);
         let per: Vec<String> = rt.per_replica.iter().map(|n| n.to_string()).collect();
-        println!("  • Per replica: [{}]", per.join(", "));
+        println!("  • Per worker: [{}]", per.join(", "));
         if rt.prefix_available > 0 {
             println!(
                 "  • Prefix held somewhere: {} requests; routed to a holder: {} ({:.1}%); \
@@ -804,12 +823,13 @@ fn print_final_metrics(
     if let Some(m) = &summary.memory {
         println!("\n{}", "MEMORY".yellow().bold());
         println!(
-            "  • Write: {}; eviction: {}; written {:.2} GB; promoted {:.2} GB; promotions waiting on a write: {}",
+            "  • Write: {}; eviction: {}; written {:.2} GB; promoted {:.2} GB; promotions waiting on a write: {}; peak transfers in flight: {}",
             m.write_policy,
             m.eviction_policy,
             m.bytes_written / 1e9,
             m.bytes_promoted / 1e9,
-            m.write_race_waits
+            m.write_race_waits,
+            m.peak_transfers_in_flight
         );
         for st in &m.stores {
             println!(
