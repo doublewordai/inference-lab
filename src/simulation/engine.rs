@@ -475,12 +475,14 @@ impl Engine {
         }
     }
 
-    /// Apply an affine empirical correction to every executed iteration time:
-    /// `t = alpha * t_model + beta`. `alpha` captures the kernel-efficiency
-    /// gap to the roofline (dominant at large batch); `beta` captures fixed
-    /// per-iteration overhead — scheduler, CPU, launch latency (dominant at
-    /// small batch). Applied to the actual step time only, never to policy
-    /// candidate pricing, so speculative width choices stay model-relative.
+    /// Apply an affine empirical correction to every roofline-priced
+    /// iteration time: `t = alpha * t_model + beta`. `alpha` captures the
+    /// kernel-efficiency gap to the roofline (dominant at large batch);
+    /// `beta` captures fixed per-iteration overhead — scheduler, CPU, launch
+    /// latency (dominant at small batch). Applied to the actual step time
+    /// only, never to policy candidate pricing (so speculative width choices
+    /// stay model-relative) and never on top of a measured step-cost table.
+    /// Config: `[hardware.<name>] time_correction = { alpha, beta }`.
     pub fn set_time_correction(&mut self, alpha: f64, beta: f64) {
         self.time_correction = Some((alpha, beta));
     }
@@ -1227,10 +1229,12 @@ impl Engine {
             Some(t_dec + t_pre)
         });
         let cost = ce.step_cost(batch_refs, cost_tokens);
-        let iter_time = measured_time.unwrap_or(cost.time);
-        let iter_time = match correction {
-            Some((alpha, beta)) => alpha * iter_time + beta,
-            None => iter_time,
+        // A measured table already embodies the engine's overheads; the
+        // correction calibrates roofline-priced steps only.
+        let iter_time = match (measured_time, correction) {
+            (Some(t), _) => t,
+            (None, Some((alpha, beta))) => alpha * cost.time + beta,
+            (None, None) => cost.time,
         };
         let bw = ce.bandwidth_utilization(&cost, iter_time);
         let flops = ce.flops_utilization(&cost, iter_time);
