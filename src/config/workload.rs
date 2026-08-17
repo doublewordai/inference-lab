@@ -50,6 +50,22 @@ pub struct WorkloadConfig {
     #[serde(default)]
     pub dataset_path: Option<String>,
 
+    /// Path to a session file (JSONL, one session per line; see
+    /// [`crate::request::session`]). Session mode: the arrival pattern
+    /// governs when sessions *start* (`arrival_rate` is sessions/sec;
+    /// `closed_loop` keeps `num_concurrent_users` sessions in flight), and
+    /// each later step of a session arrives at its parent's completion plus
+    /// the step's gap. Mutually exclusive with `dataset_path`; the length
+    /// distributions are ignored.
+    #[serde(default)]
+    pub sessions_path: Option<String>,
+
+    /// Session mode: stop starting sessions after this many. Sessions cycle
+    /// through the file, so this may exceed the file's count. Without it (and
+    /// without `num_requests`) sessions keep starting for the whole run.
+    #[serde(default)]
+    pub num_sessions: Option<usize>,
+
     pub arrival_pattern: ArrivalPattern,
 
     /// Mean arrival rate (requests per second) for the open-loop patterns.

@@ -1,10 +1,13 @@
-//! Turns a [`WorkloadConfig`] into a stream of [`Request`]s, either synthetic
-//! (lengths sampled from the configured distributions) or from a dataset
-//! (real prompts, tokenised on a background thread).
+//! Turns a [`WorkloadConfig`] into a stream of [`Request`]s: synthetic
+//! (lengths sampled from the configured distributions), from a dataset (real
+//! prompts, tokenised on a background thread), or sessions (chains of
+//! re-entering requests, see [`super::session`]).
 
+use super::session::{SessionSource, SessionSpec};
 use super::Request;
 use crate::config::{ArrivalPattern, RateSchedule, WorkloadConfig};
 use crate::dataset::{BatchTokenizerFn, DatasetEntry, UnparsedEntry};
+use crate::simulation::RequestTiming;
 use rand::{rngs::StdRng, RngExt, SeedableRng};
 use rand_distr::{Distribution, Exp};
 use std::collections::hash_map::DefaultHasher;
@@ -28,6 +31,9 @@ enum Source {
         block_size: u32,
         exhausted: bool,
     },
+    /// Sessions: the arrival pattern starts sessions; each further step is
+    /// queued inside the source at its parent's completion plus gap.
+    Sessions(SessionSource),
 }
 
 /// Generates requests based on workload configuration.
@@ -105,6 +111,19 @@ impl RequestGenerator {
         )
     }
 
+    /// Session workload. `block_size` is the scheduler's KV block size, used
+    /// to build each step's block hashes.
+    pub fn from_sessions(
+        workload: WorkloadConfig,
+        block_size: u32,
+        sessions: Vec<SessionSpec>,
+    ) -> Self {
+        Self::build(
+            workload,
+            Source::Sessions(SessionSource::new(sessions, block_size)),
+        )
+    }
+
     fn build(workload: WorkloadConfig, source: Source) -> Self {
         let mut rng = StdRng::seed_from_u64(workload.seed);
         let mut pending_closed_loop = Vec::new();
@@ -170,10 +189,13 @@ impl RequestGenerator {
         Ok(())
     }
 
-    /// Next open-loop arrival time (0 for closed loop, where arrivals follow
-    /// completions).
+    /// Next arrival time: the next clock arrival (open loop) or the earliest
+    /// pending user slot (closed loop; infinite when none is pending), and
+    /// for sessions the earliest queued step if that comes first.
     pub fn peek_next_arrival_time(&self) -> f64 {
-        if self.workload.arrival_pattern.is_closed_loop() {
+        let next_start = if self.reached_start_limit() {
+            f64::INFINITY
+        } else if self.workload.arrival_pattern.is_closed_loop() {
             // Closed loop: the earliest pending user slot (jittered at init,
             // then each completion time); infinite when no slot is pending.
             self.pending_closed_loop
@@ -182,6 +204,10 @@ impl RequestGenerator {
                 .fold(f64::INFINITY, f64::min)
         } else {
             self.next_arrival_time
+        };
+        match &self.source {
+            Source::Sessions(src) => src.peek_pending().unwrap_or(f64::INFINITY).min(next_start),
+            _ => next_start,
         }
     }
 
@@ -209,12 +235,32 @@ impl RequestGenerator {
             .is_some_and(|max| self.requests_generated >= max)
     }
 
+    /// Sessions: no more sessions may start (`num_sessions` reached). Always
+    /// false for other sources.
+    fn reached_start_limit(&self) -> bool {
+        match (&self.source, self.workload.num_sessions) {
+            (Source::Sessions(src), Some(max)) => src.num_started() as usize >= max,
+            _ => false,
+        }
+    }
+
     /// The next request if it has arrived by `current_time`; `None` if no
     /// request is due or the workload is exhausted.
     pub fn next_if_before(&mut self, current_time: f64) -> Option<Request> {
         if self.reached_request_limit() {
             self.pending_closed_loop.clear();
             return None;
+        }
+        // Sessions: a queued step that is due comes before any new session.
+        if let Source::Sessions(src) = &mut self.source {
+            if let Some(req) = src.next_due(current_time) {
+                self.requests_generated += 1;
+                return Some(req);
+            }
+            if self.reached_start_limit() {
+                self.pending_closed_loop.clear();
+                return None;
+            }
         }
         let arrival_time = if self.workload.arrival_pattern.is_closed_loop() {
             let pos = self
@@ -274,6 +320,7 @@ impl RequestGenerator {
                     Self::compute_block_hashes(&entry.prompt_tokens, *block_size);
                 req
             }
+            Source::Sessions(src) => src.start_session(arrival_time),
         };
         self.requests_generated += 1;
 
@@ -312,13 +359,22 @@ impl RequestGenerator {
         }
     }
 
-    /// Whether every request has been generated (or the dataset ran out).
+    /// Whether every request has been generated: the request limit is
+    /// reached, the dataset ran out, or (sessions) no more sessions may start
+    /// and every started session has issued its last step.
     pub fn is_finished(&self) -> bool {
-        if let Source::Dataset {
-            exhausted: true, ..
-        } = self.source
-        {
-            return true;
+        match &self.source {
+            Source::Dataset {
+                exhausted: true, ..
+            } => return true,
+            Source::Sessions(src)
+                if self.reached_start_limit()
+                    && src.num_active() == 0
+                    && src.peek_pending().is_none() =>
+            {
+                return true;
+            }
+            _ => {}
         }
         match self.workload.num_requests {
             Some(_) => {
@@ -330,16 +386,30 @@ impl RequestGenerator {
         }
     }
 
-    /// Closed loop: a request completed at `completion_time`; its user slot
-    /// issues a new request there. No-op for other patterns.
-    pub fn on_request_complete(&mut self, completion_time: f64) {
-        if !self.workload.arrival_pattern.is_closed_loop() || self.reached_request_limit() {
-            return;
+    /// A request completed. Sessions: queue the session's next step at
+    /// `completion + gap`. Closed loop: the user slot issues a new request
+    /// (a new session, in session mode) at the completion time. Returns
+    /// `true` if the completed request has a successor step in its session.
+    pub fn on_request_complete(&mut self, timing: &RequestTiming) -> bool {
+        let completion_time = timing.completion_time;
+        let mut has_successor = false;
+        let mut slot_freed = true;
+        if let (Source::Sessions(src), Some(step)) = (&mut self.source, &timing.session) {
+            has_successor = src.on_step_complete(step, completion_time);
+            // The user slot stays busy until the session's last step is done.
+            slot_freed = !has_successor;
         }
-        // Replenish immediately at completion. The stagger established at
-        // init time persists, since fixed ISL/OSL means each user has the
-        // same cycle time — once unsynchronized, they stay that way.
-        self.pending_closed_loop.push(completion_time);
+        if slot_freed
+            && self.workload.arrival_pattern.is_closed_loop()
+            && !self.reached_request_limit()
+            && !self.reached_start_limit()
+        {
+            // Replenish immediately at completion. The stagger established at
+            // init time persists, since fixed ISL/OSL means each user has the
+            // same cycle time — once unsynchronized, they stay that way.
+            self.pending_closed_loop.push(completion_time);
+        }
+        has_successor
     }
 
     /// Requests generated so far.
@@ -360,6 +430,8 @@ mod tests {
     ) -> WorkloadConfig {
         WorkloadConfig {
             dataset_path: None,
+            sessions_path: None,
+            num_sessions: None,
             arrival_pattern: pattern,
             arrival_rate: rate,
             rate_schedule: None,
@@ -370,6 +442,40 @@ mod tests {
             duration_secs: None,
             seed: 42,
             closed_loop_jitter_secs: None,
+        }
+    }
+
+    /// A completion timing for a request nobody tracks (non-session).
+    fn done_at(t: f64) -> RequestTiming {
+        RequestTiming {
+            request_id: "x".into(),
+            arrival_time: 0.0,
+            prefill_done_time: t,
+            handoff_done_time: t,
+            first_token_time: t,
+            completion_time: t,
+            num_prompt_tokens: 1,
+            num_output_tokens: 1,
+            num_cached_tokens: 0,
+            session: None,
+            num_preemptions: 0,
+        }
+    }
+
+    /// Completion timing for a session request.
+    fn completed(req: &Request, t: f64) -> RequestTiming {
+        RequestTiming {
+            request_id: req.request_id.clone(),
+            arrival_time: req.arrival_time,
+            prefill_done_time: t,
+            handoff_done_time: t,
+            first_token_time: t,
+            completion_time: t,
+            num_prompt_tokens: req.num_prompt_tokens,
+            num_output_tokens: req.target_output_tokens,
+            num_cached_tokens: 0,
+            session: req.session.clone(),
+            num_preemptions: 0,
         }
     }
 
@@ -457,14 +563,14 @@ mod tests {
         assert!(generator.next_if_before(0.0).is_some());
         assert!(generator.next_if_before(0.0).is_none());
         // A completion at t=3 issues the next request at t=3.
-        generator.on_request_complete(3.0);
+        generator.on_request_complete(&done_at(3.0));
         assert!(generator.next_if_before(2.9).is_none());
         let req = generator.next_if_before(3.0).unwrap();
         assert_eq!(req.arrival_time, 3.0);
         assert!(!generator.is_finished());
         // Completions beyond the request limit issue nothing.
         for t in [4.0, 5.0, 6.0] {
-            generator.on_request_complete(t);
+            generator.on_request_complete(&done_at(t));
         }
         assert!(generator.next_if_before(10.0).is_some());
         assert!(generator.next_if_before(10.0).is_some());
@@ -490,8 +596,83 @@ mod tests {
         assert!(generator.next_if_before(0.5).is_some());
         // No pending slot: peek is infinite until a completion refills one.
         assert!(generator.peek_next_arrival_time().is_infinite());
-        generator.on_request_complete(3.0);
+        generator.on_request_complete(&done_at(3.0));
         assert_eq!(generator.peek_next_arrival_time(), 3.0);
+    }
+
+    fn session_specs() -> Vec<crate::request::SessionSpec> {
+        use crate::request::{SessionSpec, StepSpec};
+        let step = |input, new, output, gap| StepSpec {
+            input,
+            new,
+            output,
+            gap,
+            kind: None,
+        };
+        vec![
+            SessionSpec {
+                id: "a".into(),
+                steps: vec![step(64, 64, 16, 0.0), step(96, 16, 16, 2.0)],
+            },
+            SessionSpec {
+                id: "b".into(),
+                steps: vec![step(32, 32, 8, 0.0)],
+            },
+        ]
+    }
+
+    #[test]
+    fn sessions_steps_follow_completion_plus_gap_and_come_before_new_starts() {
+        // Uniform session starts every 10 s; a 2-step session's second step
+        // is due at completion + 2 s, ahead of the next session start.
+        let mut workload = create_test_workload(ArrivalPattern::Uniform, 0.1, 100);
+        workload.num_sessions = Some(2);
+        let mut g = RequestGenerator::from_sessions(workload, 16, session_specs());
+        assert_eq!(g.peek_next_arrival_time(), 10.0);
+        let a0 = g.next_if_before(10.0).unwrap();
+        assert_eq!(a0.request_id, "s0/0");
+        assert!(g.next_if_before(15.0).is_none());
+        // a0 completes at 12: step 1 due at 14, before the 20 s start.
+        assert!(g.on_request_complete(&completed(&a0, 12.0)));
+        assert_eq!(g.peek_next_arrival_time(), 14.0);
+        assert!(g.next_if_before(13.9).is_none());
+        let a1 = g.next_if_before(14.0).unwrap();
+        assert_eq!(a1.request_id, "s0/1");
+        assert_eq!(a1.arrival_time, 14.0);
+        assert_eq!(a1.session.as_ref().unwrap().shared_tokens, 80);
+        assert!(!g.on_request_complete(&completed(&a1, 15.0)));
+        // Second session starts at 20; the file cycles but num_sessions caps.
+        let b0 = g.next_if_before(20.0).unwrap();
+        assert_eq!(b0.request_id, "s1/0");
+        assert!(!g.is_finished());
+        assert!(g.next_if_before(1000.0).is_none());
+        assert!(g.peek_next_arrival_time().is_infinite());
+        assert!(!g.on_request_complete(&completed(&b0, 21.0)));
+        assert!(g.is_finished());
+        assert_eq!(g.num_generated(), 3);
+    }
+
+    #[test]
+    fn sessions_closed_loop_slot_is_held_for_the_whole_session() {
+        let mut workload = create_test_workload(ArrivalPattern::ClosedLoop, 0.0, 100);
+        workload.num_concurrent_users = Some(1);
+        workload.num_sessions = Some(2);
+        let mut g = RequestGenerator::from_sessions(workload, 16, session_specs());
+        let a0 = g.next_if_before(0.0).unwrap();
+        assert!(g.next_if_before(0.0).is_none());
+        // Completing step 0 queues step 1 and does not free the slot.
+        g.on_request_complete(&completed(&a0, 1.0));
+        assert!(g.next_if_before(2.9).is_none());
+        let a1 = g.next_if_before(3.0).unwrap();
+        assert_eq!(a1.request_id, "s0/1");
+        // The session's last step frees the slot: a new session starts.
+        g.on_request_complete(&completed(&a1, 4.0));
+        let b0 = g.next_if_before(4.0).unwrap();
+        assert_eq!(b0.request_id, "s1/0");
+        assert!(g.next_if_before(100.0).is_none());
+        g.on_request_complete(&completed(&b0, 5.0));
+        assert!(g.next_if_before(100.0).is_none());
+        assert!(g.is_finished());
     }
 
     #[test]

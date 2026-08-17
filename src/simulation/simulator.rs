@@ -13,7 +13,8 @@ use crate::metrics::{
     HandoffMetrics, LatencySamples, MetricsCollector, MetricsSummary, RequestRow, RouterMetrics,
     SampleCursor,
 };
-use crate::request::RequestGenerator;
+use crate::request::{RequestGenerator, SessionSpec};
+use std::collections::HashMap;
 
 /// One sample of the fixed-interval time series.
 #[derive(Debug, Clone)]
@@ -73,6 +74,12 @@ pub struct Simulator {
 
     /// Samples already delivered to the progress callback.
     sent: SampleCursor,
+
+    /// Session workloads: engine KV bytes written as of each completed step
+    /// that has a successor, keyed by (session, step). Stamped on the
+    /// successor when it is generated; the engine turns it into a reuse
+    /// distance at the successor's arrival.
+    bytes_at_completion: HashMap<(u32, u32), (u64, u64)>,
 }
 
 impl Simulator {
@@ -91,7 +98,17 @@ impl Simulator {
         )?
         .with_routers(&config.router, config.decode_router());
 
-        let request_generator = if let Some(dataset_path) = &config.workload.dataset_path {
+        if config.workload.dataset_path.is_some() && config.workload.sessions_path.is_some() {
+            return Err("workload sets both dataset_path and sessions_path".into());
+        }
+        let request_generator = if let Some(sessions_path) = &config.workload.sessions_path {
+            let sessions = SessionSpec::load(sessions_path)?;
+            RequestGenerator::from_sessions(
+                config.workload.clone(),
+                config.scheduler.block_size,
+                sessions,
+            )
+        } else if let Some(dataset_path) = &config.workload.dataset_path {
             let tokenizer = tokenizer.ok_or_else(|| {
                 format!("Dataset path '{dataset_path}' provided but no tokenizer function supplied")
             })?;
@@ -131,6 +148,7 @@ impl Simulator {
             window_prefill_tokens: 0,
             window_decode_tokens: 0,
             sent: SampleCursor::default(),
+            bytes_at_completion: HashMap::new(),
         })
     }
 
@@ -149,7 +167,16 @@ impl Simulator {
         // entries are visible once we reach their arrival time.
         let now = self.engine.current_time();
         let bound = self.request_generator.peek_next_arrival_time().max(now) + 1e-9;
-        while let Some(req) = self.request_generator.next_if_before(bound) {
+        while let Some(mut req) = self.request_generator.next_if_before(bound) {
+            if let Some(step) = &mut req.session {
+                if let Some((written, touched)) = self
+                    .bytes_at_completion
+                    .remove(&(step.session, step.step.wrapping_sub(1)))
+                {
+                    step.parent_bytes_written = Some(written);
+                    step.parent_bytes_touched = Some(touched);
+                }
+            }
             self.engine.submit(req);
             self.metrics.total_requests += 1;
             n += 1;
@@ -267,8 +294,18 @@ impl Simulator {
 
     fn handle_completion(&mut self, timing: &RequestTiming) {
         self.metrics.record_request_completion(timing);
-        self.request_generator
-            .on_request_complete(timing.completion_time);
+        let has_successor = self.request_generator.on_request_complete(timing);
+        if has_successor {
+            if let Some(step) = &timing.session {
+                self.bytes_at_completion.insert(
+                    (step.session, step.step),
+                    (
+                        self.engine.kv_bytes_written(),
+                        self.engine.kv_bytes_touched(),
+                    ),
+                );
+            }
+        }
     }
 
     fn emit_progress<F: FnMut(ProgressInfo)>(&mut self, callback: &mut F) {
@@ -445,6 +482,57 @@ mod tests {
         let mut simulator = Simulator::new(config, None).unwrap();
         let err = simulator.run_with_callback(|_| {}).unwrap_err();
         assert!(err.contains("stalled"), "{err}");
+    }
+
+    #[test]
+    fn session_re_entry_hits_its_parent_and_reports_a_reuse_distance() {
+        // One session of three steps on one worker: step 1 re-enters after
+        // step 0 with a 1 s gap and shares 200 tokens; step 2 shares 300.
+        // With enough KV both re-entries hit their whole shared prefix, and
+        // the reuse distance counts what step 0 wrote in between.
+        let dir = std::env::temp_dir().join(format!("il-sessions-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"id":"s","steps":["#,
+                r#"{"input":200,"new":200,"output":16,"gap":0},"#,
+                r#"{"input":260,"new":44,"output":16,"gap":1.0},"#,
+                r#"{"input":330,"new":54,"output":8,"gap":0.5}]}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let mut config = create_minimal_test_config();
+        config.workload.sessions_path = Some(path.to_string_lossy().into_owned());
+        config.workload.num_sessions = Some(1);
+        config.workload.num_requests = None;
+        config.workload.arrival_pattern = crate::config::ArrivalPattern::Batched;
+        let mut simulator = Simulator::new(config, None).unwrap();
+        simulator.run_with_callback(|_| {}).unwrap();
+        let rows = simulator.request_rows();
+        assert_eq!(rows.len(), 3);
+        let bs = simulator.config().scheduler.block_size;
+        let s0 = &rows[0];
+        assert_eq!(s0.session, Some((0, 0)));
+        assert_eq!(s0.cached_tokens, 0);
+        assert_eq!(s0.reuse_distance_bytes, None);
+        let s1 = &rows[1];
+        assert_eq!(s1.session, Some((0, 1)));
+        assert!((s1.arrival - (s0.completion + 1.0)).abs() < 1e-9);
+        // 216 tokens shared, in whole blocks.
+        assert_eq!(s1.shared_tokens, Some((216 / bs) * bs));
+        assert_eq!(s1.cached_tokens, s1.shared_tokens.unwrap());
+        // Nothing else ran: nothing was written between the parent's
+        // completion and this arrival.
+        assert_eq!(s1.reuse_distance_bytes, Some(0));
+        assert_eq!(s1.reuse_touched_bytes, Some(0));
+        let s2 = &rows[2];
+        assert_eq!(s2.shared_tokens, Some((276 / bs) * bs));
+        assert_eq!(s2.cached_tokens, s2.shared_tokens.unwrap());
+        assert!((s2.arrival - (s1.completion + 0.5)).abs() < 1e-9);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

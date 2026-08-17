@@ -120,7 +120,9 @@ struct SimArgs {
     output: Option<PathBuf>,
 
     /// Save per-request metrics to a CSV file (arrival, completion, ttft,
-    /// e2e, mean_tpot, prompt_toks, output_toks); times in seconds
+    /// e2e, mean_tpot, prompt_toks, output_toks, cached_toks, preemptions, and
+    /// for session workloads session, step, gap, shared_toks,
+    /// reuse_distance_bytes, reuse_touched_bytes); times in seconds
     #[arg(long)]
     request_csv: Option<PathBuf>,
 
@@ -568,11 +570,12 @@ fn run_sim(args: SimArgs) {
             }
         }
         let mut out = String::from(
-            "arrival,completion,ttft,e2e,mean_tpot,prompt_toks,output_toks,preemptions\n",
+            "arrival,completion,ttft,e2e,mean_tpot,prompt_toks,output_toks,cached_toks,preemptions,session,step,gap,shared_toks,reuse_distance_bytes,reuse_touched_bytes\n",
         );
         for r in simulator.request_rows() {
+            let opt = |v: Option<String>| v.unwrap_or_default();
             out.push_str(&format!(
-                "{:.4},{:.4},{:.5},{:.4},{:.6},{},{},{}\n",
+                "{:.4},{:.4},{:.5},{:.4},{:.6},{},{},{},{},{},{},{},{},{},{}\n",
                 r.arrival,
                 r.completion,
                 r.ttft,
@@ -580,7 +583,14 @@ fn run_sim(args: SimArgs) {
                 r.mean_tpot,
                 r.prompt_tokens,
                 r.output_tokens,
-                r.num_preemptions
+                r.cached_tokens,
+                r.num_preemptions,
+                opt(r.session.map(|(s, _)| s.to_string())),
+                opt(r.session.map(|(_, st)| st.to_string())),
+                opt(r.gap.map(|g| format!("{g:.3}"))),
+                opt(r.shared_tokens.map(|t| t.to_string())),
+                opt(r.reuse_distance_bytes.map(|b| b.to_string())),
+                opt(r.reuse_touched_bytes.map(|b| b.to_string())),
             ));
         }
         match std::fs::write(&csv_path, out) {

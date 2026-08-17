@@ -1,3 +1,5 @@
+use super::session::SessionStep;
+
 pub type BlockId = u32;
 
 /// One inference request as the scheduler and engine see it.
@@ -43,10 +45,16 @@ pub struct Request {
     /// Prefix tokens found in the KV cache at admission (set by the scheduler).
     pub num_cached_tokens: u32,
 
-    /// Incremental content hashes of the prompt, one per `block_size` tokens:
-    /// hash `n` covers all tokens up to the end of block `n`. Empty when the
-    /// prompt has no content identity (synthetic workloads).
+    /// Incremental content hashes of the sequence, one per `block_size`
+    /// tokens: hash `n` covers all tokens up to the end of block `n`. Empty
+    /// when the prompt has no content identity (synthetic workloads). Session
+    /// workloads extend the hashes past the prompt over the tokens the request
+    /// will generate, so the next step of the session can hit them.
     pub prompt_block_hashes: Vec<u64>,
+
+    /// Session workloads: which step of which session this request is.
+    /// Boxed: most requests carry none, and `Request` travels by value.
+    pub session: Option<Box<SessionStep>>,
 
     /// KV cache blocks allocated to this request.
     pub kv_blocks: Vec<BlockId>,
@@ -108,6 +116,7 @@ impl Request {
             num_output_tokens: 0,
             num_cached_tokens: 0,
             prompt_block_hashes: Vec::new(),
+            session: None,
             kv_blocks: Vec::new(),
             num_preemptions: 0,
             first_token_time: None,

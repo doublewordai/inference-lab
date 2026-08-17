@@ -68,7 +68,21 @@ pub struct RequestRow {
     pub mean_tpot: f64,
     pub prompt_tokens: u32,
     pub output_tokens: u32,
+    /// Prompt tokens served from the prefix cache.
+    pub cached_tokens: u32,
     pub num_preemptions: u32,
+    /// Session workloads: (session ordinal, step), the gap since the parent's
+    /// completion, and the KV bytes written into the caches between the
+    /// parent's completion and this arrival (the reuse distance).
+    pub session: Option<(u32, u32)>,
+    pub gap: Option<f64>,
+    /// Prompt tokens shared with the parent's context: the most the prefix
+    /// cache could have served.
+    pub shared_tokens: Option<u32>,
+    pub reuse_distance_bytes: Option<u64>,
+    /// `reuse_distance_bytes` plus the free blocks that hits pulled back into
+    /// use in between: with it, a bracket on the LRU stack distance.
+    pub reuse_touched_bytes: Option<u64>,
 }
 
 /// Accumulates per-request timings and per-iteration utilisation into a
@@ -154,7 +168,13 @@ impl MetricsCollector {
             mean_tpot,
             prompt_tokens: timing.num_prompt_tokens,
             output_tokens: timing.num_output_tokens,
+            cached_tokens: timing.num_cached_tokens,
             num_preemptions: timing.num_preemptions,
+            session: timing.session.as_ref().map(|s| (s.session, s.step)),
+            gap: timing.session.as_ref().map(|s| s.gap),
+            shared_tokens: timing.session.as_ref().map(|s| s.shared_tokens),
+            reuse_distance_bytes: timing.session.as_ref().and_then(|s| s.reuse_distance_bytes),
+            reuse_touched_bytes: timing.session.as_ref().and_then(|s| s.reuse_touched_bytes),
         });
 
         self.input_lengths.push(timing.num_prompt_tokens);
@@ -323,6 +343,8 @@ mod tests {
             completion_time: completion,
             num_prompt_tokens: prompt,
             num_output_tokens: output,
+            num_cached_tokens: 0,
+            session: None,
             num_preemptions: preemptions,
         }
     }
