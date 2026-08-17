@@ -184,6 +184,10 @@ cargo build --release
 ./target/release/inference-lab --config configs/llama-3-70b.toml --workload workloads/quick.toml
 ```
 
+For maximum simulator throughput on a machine you control, build with
+`RUSTFLAGS="-C target-cpu=native" cargo build --release`. The resulting binary
+may use instructions unavailable on other CPUs, so do not redistribute it.
+
 ### WASM Package
 
 ```bash

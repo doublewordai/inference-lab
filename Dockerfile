@@ -3,7 +3,7 @@ FROM rust:1.97-slim AS builder
 WORKDIR /app
 
 # Install build dependencies
-RUN apt-get update && apt-get install -y pkg-config libssl-dev g++ && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y pkg-config libssl-dev g++ make && rm -rf /var/lib/apt/lists/*
 
 # Copy manifests and the build script inputs first for layer caching
 # (build.rs embeds catalog/**/*.toml into the crate).
