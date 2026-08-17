@@ -573,8 +573,10 @@ impl Radix {
             // Drop this node's order entry; re-add both after the split.
             self.order_remove(w, node);
             let mut head = self.nodes[node as usize].hbm.remove(&w).unwrap();
-            let mut tail_state = HbmState::default();
-            tail_state.resident = head.resident.saturating_sub(k);
+            let mut tail_state = HbmState {
+                resident: head.resident.saturating_sub(k),
+                ..Default::default()
+            };
             head.resident = head.resident.min(k);
             // Refs: ends beyond k pin the whole head and continue in the tail.
             let mut head_refs = BTreeMap::new();
@@ -653,8 +655,10 @@ impl Radix {
         let stores: Vec<StoreId> = self.nodes[node as usize].tiers.keys().copied().collect();
         for s in stores {
             let mut head = self.nodes[node as usize].tiers.remove(&s).unwrap();
-            let mut tail_state = TierState::default();
-            tail_state.read_upto = head.read_upto.saturating_sub(k);
+            let mut tail_state = TierState {
+                read_upto: head.read_upto.saturating_sub(k),
+                ..Default::default()
+            };
             head.read_upto = head.read_upto.min(k);
             let mut head_ranges = Vec::new();
             for r in head.ranges.drain(..) {
@@ -1163,9 +1167,7 @@ impl Radix {
                         // segment (cur, end]
                         let seg_start = cur;
                         let seg_end = end;
-                        if seg_end <= a {
-                            new_hits.push((seg_end, c));
-                        } else if seg_start >= hb {
+                        if seg_end <= a || seg_start >= hb {
                             new_hits.push((seg_end, c));
                         } else {
                             // Split at a and hb.
@@ -1412,7 +1414,7 @@ impl Radix {
                         key,
                     });
                 }
-                runs.extend(h.runs.drain(..));
+                runs.append(&mut h.runs);
                 runs.sort_by_key(|r| r.start);
                 h.runs = runs;
             }
