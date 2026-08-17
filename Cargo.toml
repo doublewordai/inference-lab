@@ -51,13 +51,17 @@ getrandom = { version = "0.4", features = ["wasm_js"] }
 console_error_panic_hook = "0.1"
 rustc-hash = "2"
 
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tikv-jemallocator = { version = "0.6", optional = true }
+
 [dev-dependencies]
 tempfile = "3.8"
 rayon = "1"
 
 [features]
-default = ["cli"]
+default = ["cli", "jemalloc"]
 cli = ["clap", "env_logger", "tabled", "colored", "tokenizers", "minijinja"]
+jemalloc = ["dep:tikv-jemallocator"]
 serve = [
     "cli",
     "tokio",
@@ -74,3 +78,6 @@ serve = [
 [profile.release]
 opt-level = "s" # Optimize for size in WASM
 debug = true # Enable debug symbols for profiling
+lto = "fat"
+codegen-units = 1
+panic = "unwind"
