@@ -2318,6 +2318,31 @@ mod tests {
     }
 
     #[test]
+    fn a_landing_across_two_nodes_lands_whole_and_joins_are_seen() {
+        let mut r = radix();
+        r.register_worker(0, 8, HbmEviction::Lru {}, false);
+        // Two nodes: [1,2] and child [3,4] (created by inserting a diverging
+        // sibling first).
+        r.insert(&[1, 2, 9]);
+        let p = r.insert(&[1, 2, 3, 4]);
+        assert_eq!(p.segs.len(), 2);
+        let got = r.acquire(0, &p, 0, 4, 0, false, Some("L"), false).unwrap();
+        assert_eq!(got.fresh_blocks, 4);
+        let lk = r.lookup(0, &[1, 2, 3, 4]);
+        assert_eq!((lk.hbm, lk.landing), (0, 4));
+        assert_eq!(lk.leader.as_deref(), Some("L"));
+        // A joiner sees the whole landing range even though it spans nodes.
+        let lk2 = r.lookup(0, &[1, 2, 3, 4, 5]);
+        assert_eq!((lk2.hbm, lk2.landing), (0, 4));
+        r.landed(0, &p, 4);
+        let lk = r.lookup(0, &[1, 2, 3, 4]);
+        assert_eq!((lk.hbm, lk.landing), (4, 0));
+        assert_eq!(r.resident_prefix(0, &[1, 2, 3, 4]), 4);
+        r.release(0, &p, 4, 0);
+        assert_eq!(r.free_blocks(0), 8);
+    }
+
+    #[test]
     fn landing_then_landed_becomes_resident() {
         let mut r = radix();
         r.register_worker(0, 4, HbmEviction::Lru {}, false);
