@@ -9,9 +9,12 @@ use std::collections::{BinaryHeap, HashMap};
 
 use super::spec::{DepthSample, PlanCosts, SpecPlanner};
 use crate::compute::ComputeEngine;
-use crate::config::{ClusterSpec, DisaggTopology, ModelSpec, SchedulerConfig, SpeculativeConfig};
+use crate::config::{
+    ClusterSpec, DisaggTopology, ModelSpec, RouterConfig, SchedulerConfig, SpeculativeConfig,
+};
 use crate::kv_cache::{KVCacheManager, Link, PrefixCacheStats};
 use crate::request::Request;
+use crate::router::{build_router, Router, RouterStats, WorkerSignal};
 use crate::scheduler::Scheduler;
 
 pub type PoolId = usize;
@@ -108,21 +111,49 @@ impl Worker {
 
 pub(crate) struct WorkerPool {
     pub workers: Vec<Worker>,
-    next_worker: usize,
+    /// Picks the worker each request enters. Round-robin unless
+    /// [`Topology::with_router`] set another.
+    router: Box<dyn Router>,
+    router_stats: RouterStats,
 }
 
 impl WorkerPool {
     pub fn new(workers: Vec<Worker>) -> Self {
+        let n = workers.len();
         Self {
             workers,
-            next_worker: 0,
+            router: build_router(&RouterConfig::RoundRobin {}),
+            router_stats: RouterStats::new(n),
         }
     }
 
-    fn pick_round_robin(&mut self) -> usize {
-        let n = self.workers.len().max(1);
-        let idx = self.next_worker % n;
-        self.next_worker = (idx + 1) % n;
+    fn set_router(&mut self, cfg: &RouterConfig) {
+        self.router = build_router(cfg);
+        self.router_stats = RouterStats::new(self.workers.len());
+    }
+
+    /// Ask the router where `req` goes. Builds one signal per worker; the
+    /// per-worker prefix estimate is only computed for routers that ask.
+    fn pick(&mut self, req: &Request) -> usize {
+        let want_prefix = self.router.wants_prefix_signal();
+        let signals: Vec<WorkerSignal> = self
+            .workers
+            .iter()
+            .map(|w| {
+                let sched = &w.scheduler;
+                let mgr = sched.kv_cache_manager();
+                WorkerSignal {
+                    running: sched.num_running(),
+                    waiting: sched.num_waiting(),
+                    queued_prefill_tokens: sched.queued_prefill_tokens(),
+                    kv_util: mgr.utilization(),
+                    cached_prefix_tokens: want_prefix
+                        .then(|| mgr.cached_prefix_tokens_estimate(&req.prompt_block_hashes)),
+                }
+            })
+            .collect();
+        let idx = self.router.route(req, &signals).min(self.workers.len() - 1);
+        self.router_stats.record(&signals, idx);
         idx
     }
 }
@@ -208,6 +239,16 @@ impl Topology {
             },
             model,
         })
+    }
+
+    /// Front every pool with the router `cfg` names. On a disaggregated
+    /// topology the same policy routes arrivals into the prefill pool and
+    /// hand-offs into the decode pool.
+    pub fn with_router(mut self, cfg: &RouterConfig) -> Self {
+        for pool in &mut self.pools {
+            pool.set_router(cfg);
+        }
+        self
     }
 
     fn entry_pool(&self) -> PoolId {
@@ -494,6 +535,12 @@ impl Engine {
             .unwrap_or_default()
     }
 
+    /// Routing statistics for the pool arrivals enter (the prefill pool on
+    /// a disaggregated topology).
+    pub fn router_stats(&self) -> &RouterStats {
+        &self.topology.pools[self.topology.entry_pool()].router_stats
+    }
+
     /// Prefix-cache lookup statistics summed over every worker's KV manager.
     pub fn aggregate_prefix_cache(&self) -> PrefixCacheStats {
         let mut total = PrefixCacheStats::default();
@@ -592,7 +639,7 @@ impl Engine {
     }
 
     fn route_into_pool(&mut self, pool_id: PoolId, req: Request) {
-        let worker_idx = self.topology.pools[pool_id].pick_round_robin();
+        let worker_idx = self.topology.pools[pool_id].pick(&req);
         self.topology.pools[pool_id].workers[worker_idx]
             .scheduler
             .add_request(req);

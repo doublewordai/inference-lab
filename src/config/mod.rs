@@ -2,6 +2,7 @@ pub mod deployment;
 pub mod hardware;
 pub mod model;
 pub mod parallel;
+pub mod router;
 pub mod scheduler;
 pub mod speculative;
 pub mod topology;
@@ -13,6 +14,7 @@ pub use model::{
     expected_distinct_experts, History, Indexer, LayerClass, ModelSpec, Routing, WeightStream,
 };
 pub use parallel::ParallelConfig;
+pub use router::RouterConfig;
 pub use scheduler::SchedulerConfig;
 pub use speculative::{
     AcceptanceModel, DrafterCost, GammaPolicy, MeasuredCostConfig, SpeculativeConfig,
@@ -67,6 +69,13 @@ pub struct Config {
     #[serde(deserialize_with = "model_ref")]
     pub model: ModelSpec,
     pub scheduler: SchedulerConfig,
+    /// Identical replicas of this deployment fronted by `router`. Defaults
+    /// to 1.
+    #[serde(default = "default_replicas")]
+    pub replicas: u32,
+    /// How requests are spread across the replicas.
+    #[serde(default)]
+    pub router: RouterConfig,
     pub workload: WorkloadConfig,
     /// Optional speculative decoding. When set, decode steps verify `gamma + 1`
     /// tokens and advance by `accepted + 1` per the acceptance model.
@@ -78,6 +87,10 @@ pub struct Config {
     /// startup; inert outside `serve`.
     #[serde(default)]
     pub fault: Option<FaultConfig>,
+}
+
+fn default_replicas() -> u32 {
+    1
 }
 
 /// TOML shape of `[fault]` (see `serve::fault` for the mode list and semantics).
@@ -107,6 +120,8 @@ impl Config {
             parallel,
             model,
             scheduler,
+            replicas,
+            router,
             speculative,
             fault,
         } = deployment;
@@ -115,6 +130,8 @@ impl Config {
             parallel,
             model,
             scheduler,
+            replicas,
+            router,
             workload,
             speculative,
             fault,
@@ -133,13 +150,13 @@ impl Config {
         self.scheduler.set_default_prefill_threshold(max_model_len);
     }
 
-    /// The single worker pool this config describes: its hardware and
-    /// parallel layout as one `ClusterSpec` (one worker).
+    /// The worker pool this config describes: its hardware and parallel
+    /// layout as one `ClusterSpec` of `replicas` workers.
     pub fn cluster(&self) -> ClusterSpec {
         ClusterSpec {
             hardware: self.hardware.clone(),
             parallel: self.parallel.clone(),
-            num_workers: 1,
+            num_workers: self.replicas.max(1),
         }
     }
 
@@ -219,6 +236,8 @@ impl Config {
             parallel,
             model,
             scheduler,
+            replicas: 1,
+            router: RouterConfig::default(),
             workload,
             speculative: None,
             fault: None,

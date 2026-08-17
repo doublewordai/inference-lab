@@ -21,10 +21,15 @@
 //! scheduler = { max_num_batched_tokens = 4096 }   # per-hardware override
 //! ```
 //!
-//! Each `[hardware.<name>]` entry may set `tp`, `ep`, `dp_attention`, a
-//! partial `scheduler` override (merged over the shared block), and a
-//! `speculative` block (replacing the shared one). `spec` overrides the
-//! hardware itself: another catalog name, or an inline hardware table.
+//! Each `[hardware.<name>]` entry may set `tp`, `ep`, `dp_attention`,
+//! `replicas`, a partial `scheduler` override (merged over the shared
+//! block), a `speculative` block (replacing the shared one), and a `router`
+//! table (replacing the shared `[router]`). `spec` overrides the hardware
+//! itself: another catalog name, or an inline hardware table.
+//!
+//! `replicas` (default 1) is how many identical workers of this deployment
+//! run behind the router; `[router]` picks the policy that spreads requests
+//! across them (see [`super::router`]).
 //!
 //! [`ModelConfig::deployment`] resolves one entry into a [`Deployment`]: the
 //! model on that hardware, with no workload. A [`Deployment`] plus a
@@ -40,7 +45,7 @@ use toml::{Table, Value};
 
 use super::{
     hardware_ref, model_ref, ClusterSpec, Config, FaultConfig, HardwareConfig, ModelSpec,
-    ParallelConfig, SchedulerConfig, SpeculativeConfig, WorkloadConfig,
+    ParallelConfig, RouterConfig, SchedulerConfig, SpeculativeConfig, WorkloadConfig,
 };
 
 /// A model on one hardware: everything a simulation needs except the
@@ -55,19 +60,29 @@ pub struct Deployment {
     #[serde(deserialize_with = "model_ref")]
     pub model: ModelSpec,
     pub scheduler: SchedulerConfig,
+    /// Identical replicas behind the router. Defaults to 1.
+    #[serde(default = "default_replicas")]
+    pub replicas: u32,
+    #[serde(default)]
+    pub router: RouterConfig,
     #[serde(default)]
     pub speculative: Option<SpeculativeConfig>,
     #[serde(default)]
     pub fault: Option<FaultConfig>,
 }
 
+fn default_replicas() -> u32 {
+    1
+}
+
 impl Deployment {
-    /// This deployment's hardware and parallel layout as one worker pool.
+    /// This deployment's hardware and parallel layout as one worker pool of
+    /// `replicas` workers.
     pub fn cluster(&self) -> ClusterSpec {
         ClusterSpec {
             hardware: self.hardware.clone(),
             parallel: self.parallel.clone(),
-            num_workers: 1,
+            num_workers: self.replicas.max(1),
         }
     }
 
@@ -102,12 +117,18 @@ struct HardwareEntry {
     ep: Option<u32>,
     #[serde(default)]
     dp_attention: Option<bool>,
+    /// Identical replicas of this deployment. Defaults to 1.
+    #[serde(default)]
+    replicas: Option<u32>,
     /// Partial `[scheduler]` override, merged over the shared block.
     #[serde(default)]
     scheduler: Option<Table>,
     /// Replaces the shared `[speculative]` block for this hardware.
     #[serde(default)]
     speculative: Option<Table>,
+    /// Replaces the shared `[router]` block for this hardware.
+    #[serde(default)]
+    router: Option<Table>,
 }
 
 /// A parsed model config file. Resolve a hardware entry with
@@ -119,6 +140,8 @@ pub struct ModelConfig {
     scheduler: Table,
     #[serde(default)]
     speculative: Option<Table>,
+    #[serde(default)]
+    router: Option<Table>,
     #[serde(default)]
     fault: Option<Table>,
     hardware: BTreeMap<String, HardwareEntry>,
@@ -189,8 +212,14 @@ impl ModelConfig {
             }
         }
         merged.insert("scheduler".into(), Value::Table(scheduler));
+        if let Some(replicas) = entry.replicas {
+            merged.insert("replicas".into(), Value::Integer(replicas as i64));
+        }
         if let Some(spec) = entry.speculative.as_ref().or(self.speculative.as_ref()) {
             merged.insert("speculative".into(), Value::Table(spec.clone()));
+        }
+        if let Some(router) = entry.router.as_ref().or(self.router.as_ref()) {
+            merged.insert("router".into(), Value::Table(router.clone()));
         }
         if let Some(fault) = &self.fault {
             merged.insert("fault".into(), Value::Table(fault.clone()));
@@ -226,12 +255,17 @@ policy = "goodput_budget"
 kind = "constant"
 alpha = 0.75
 
+[router]
+policy = "least_loaded"
+
 [hardware.b200]
 tp = 4
+replicas = 4
 
 [hardware.gh200]
 tp = 4
 scheduler = { max_num_batched_tokens = 4096 }
+router = { policy = "prefix_affinity", max_load_ratio = 1.5 }
 [hardware.gh200.speculative]
 gamma = 2
 policy = "goodput_budget"
@@ -251,8 +285,18 @@ alpha = 0.5
         assert_eq!(b200.parallel.ep, 1);
         assert_eq!(b200.scheduler.max_num_batched_tokens, 8192);
         assert_eq!(b200.speculative.as_ref().unwrap().gamma, 4);
+        assert_eq!(b200.replicas, 4);
+        assert_eq!(b200.router, RouterConfig::LeastLoaded {});
+        assert_eq!(b200.cluster().num_workers, 4);
 
         let gh = cfg.deployment(Some("gh200")).unwrap();
+        assert_eq!(gh.replicas, 1);
+        assert_eq!(
+            gh.router,
+            RouterConfig::PrefixAffinity {
+                max_load_ratio: Some(1.5)
+            }
+        );
         assert_eq!(gh.hardware.name, "GH200");
         assert_eq!(gh.scheduler.max_num_batched_tokens, 4096);
         assert_eq!(gh.scheduler.max_num_seqs, 256);
@@ -320,8 +364,8 @@ memory_capacity = 80000000000
     #[test]
     fn rejects_unknown_fields_and_missing_hardware() {
         let e = ModelConfig::from_toml(&FILE.replace(
-            "tp = 4\n\n[hardware.gh",
-            "tp = 4\nnodes = 2\n\n[hardware.gh",
+            "replicas = 4\n\n[hardware.gh",
+            "replicas = 4\nnodes = 2\n\n[hardware.gh",
         ))
         .unwrap_err()
         .to_string();

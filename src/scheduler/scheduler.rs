@@ -460,6 +460,22 @@ impl Scheduler {
         self.waiting.len() + self.pending_transfers.len()
     }
 
+    /// Prompt tokens still to be prefilled on this worker: every queued or
+    /// parked request's remaining prefill plus the unfinished part of every
+    /// in-progress prefill. The prefill work ahead of a new arrival, for
+    /// routing.
+    pub fn queued_prefill_tokens(&self) -> u64 {
+        let remaining = |r: &Request| r.prefill_len().saturating_sub(r.num_computed_tokens) as u64;
+        self.waiting.iter().map(remaining).sum::<u64>()
+            + self.pending_transfers.iter().map(remaining).sum::<u64>()
+            + self
+                .running
+                .iter()
+                .filter(|r| r.is_prefill())
+                .map(remaining)
+                .sum::<u64>()
+    }
+
     /// Earliest `ready_at` among requests parked on a KV transfer.
     pub fn earliest_pending_ready(&self) -> Option<f64> {
         self.pending_transfers
@@ -568,28 +584,31 @@ mod tests {
     fn test_waiting_on_transfer_then_promoted() {
         let config = Config::test_default();
         let block_size = config.scheduler.block_size;
-        let kv =
-            kv_manager(&config, config.scheduler.kv_cache_capacity, true).with_tiers(&[KVTier {
-                name: "host_ram".into(),
-                // Plenty of host RAM.
-                capacity_bytes: 10 * 1024 * 1024 * 1024,
-                // 1 GB/s, very slow on purpose so the transfer time is observable.
-                bandwidth_to_hbm: 1e9,
-            }]);
+        let per_block = config.model.kv_storage_bytes(block_size);
+        // Four HBM blocks, so a churn allocation can push the seeded prefix
+        // out to host RAM (recycling is LRU: only a full HBM evicts).
+        let kv = kv_manager(&config, 4 * per_block, true).with_tiers(&[KVTier {
+            name: "host_ram".into(),
+            // Plenty of host RAM.
+            capacity_bytes: 10 * 1024 * 1024 * 1024,
+            // 1 GB/s, very slow on purpose so the transfer time is observable.
+            bandwidth_to_hbm: 1e9,
+        }]);
         let mut scheduler = scheduler_from(config, kv);
 
         // Seed the host-RAM tier: allocate then free a block carrying our
-        // prefix hash, then recycle it with a different hash so `prefix_hash`
-        // is demoted into host RAM.
+        // prefix hash, then fill HBM with other content so `prefix_hash` is
+        // demoted into host RAM. Free the churn again so HBM has room.
         let prefix_hash = 0xCAFE_u64;
         let mgr = &mut scheduler.kv_cache_manager;
         let mut seed = create_test_request("seed", block_size, 1);
         seed.prompt_block_hashes = vec![prefix_hash];
         let blocks = mgr.allocate_blocks(&seed, block_size).unwrap();
         mgr.free_blocks(&blocks);
-        let mut churn = create_test_request("churn", block_size, 1);
-        churn.prompt_block_hashes = vec![0xDEAD_u64];
-        mgr.allocate_blocks(&churn, block_size).unwrap();
+        let mut churn = create_test_request("churn", block_size * 4, 1);
+        churn.prompt_block_hashes = vec![0xDEAD_u64, 0xDEAE, 0xDEAF, 0xDEB0];
+        let cb = mgr.allocate_blocks(&churn, block_size * 4).unwrap();
+        mgr.free_blocks(&cb);
 
         // A request whose prompt starts with the prefix hash.
         let mut req = create_test_request("req", block_size * 2, 1);
@@ -642,9 +661,11 @@ mod tests {
             seed.prompt_block_hashes = vec![prefix_hash];
             let blocks = mgr.allocate_blocks(&seed, block_size).unwrap();
             mgr.free_blocks(&blocks);
-            let mut churn = create_test_request("churn", block_size * 2, 1);
-            churn.prompt_block_hashes = vec![0xDEAD, 0xBEEF];
-            let cb = mgr.allocate_blocks(&churn, block_size * 2).unwrap();
+            // Fill all four HBM blocks so the seed is evicted (LRU recycles
+            // the oldest free block, so only a full HBM demotes).
+            let mut churn = create_test_request("churn", block_size * 4, 1);
+            churn.prompt_block_hashes = vec![0xDEAD, 0xBEEF, 0xF00D, 0xFACE];
+            let cb = mgr.allocate_blocks(&churn, block_size * 4).unwrap();
             mgr.free_blocks(&cb);
         }
 

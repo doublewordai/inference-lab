@@ -9,7 +9,9 @@ use super::engine::{Engine, IterationInfo, RequestTiming, StepKind, Topology};
 use super::spec::DepthSample;
 use crate::config::Config;
 use crate::dataset::{BatchTokenizerFn, DatasetLoader};
-use crate::metrics::{LatencySamples, MetricsCollector, MetricsSummary, RequestRow, SampleCursor};
+use crate::metrics::{
+    LatencySamples, MetricsCollector, MetricsSummary, RequestRow, RouterMetrics, SampleCursor,
+};
 use crate::request::RequestGenerator;
 
 /// One sample of the fixed-interval time series.
@@ -85,7 +87,8 @@ impl Simulator {
             config.cluster(),
             config.model.clone(),
             config.scheduler.clone(),
-        )?;
+        )?
+        .with_router(&config.router);
 
         let request_generator = if let Some(dataset_path) = &config.workload.dataset_path {
             let tokenizer = tokenizer.ok_or_else(|| {
@@ -288,9 +291,18 @@ impl Simulator {
 
     /// Metrics summary as of the current simulated time.
     pub fn summary(&mut self) -> MetricsSummary {
+        let rs = self.engine.router_stats();
+        let router = RouterMetrics {
+            policy: self.config.router.name().to_string(),
+            per_replica: rs.per_worker.clone(),
+            prefix_available: rs.prefix_available,
+            prefix_routed: rs.prefix_routed,
+            prefix_forgone: rs.prefix_forgone,
+        };
         self.metrics.compute_summary(
             self.engine.current_time(),
             self.engine.aggregate_prefix_cache(),
+            router,
         )
     }
 

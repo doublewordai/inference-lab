@@ -50,6 +50,11 @@ scheduler = { max_num_batched_tokens = 8192 }   # per-entry override
 - **[speculative]** — speculative decoding, optional; a shared default that
   an entry's `speculative` replaces (acceptance traces and measured step
   costs are per hardware).
+- **replicas / [router]** — an entry's `replicas` (default 1) runs that
+  many identical workers, each with its own scheduler and KV cache; the
+  shared `[router]` (or an entry's `router`) picks which one each request
+  enters: `round_robin`, `least_loaded`, `prefix_affinity`, or `kv_aware`
+  (see the reference).
 
 `--hardware` picks the entry; it can be omitted when a file has one.
 `inference-lab serve --config configs/ --hardware b200` serves every model

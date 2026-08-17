@@ -162,7 +162,7 @@ mod tests {
     use super::*;
     use crate::config::{
         AcceptanceModel, ClusterSpec, DisaggTopology, GammaPolicy, HardwareConfig, LayerClass,
-        MeasuredCostConfig, ModelSpec, ParallelConfig, Precision, SchedulerConfig,
+        MeasuredCostConfig, ModelSpec, ParallelConfig, Precision, RouterConfig, SchedulerConfig,
         SpeculativeConfig, WeightStream,
     };
     use crate::scheduler::SchedulingPolicy;
@@ -240,6 +240,103 @@ mod tests {
             done.extend(engine.step().unwrap().completions);
         }
         done
+    }
+
+    /// `sessions` × `rounds` requests: session `s`, round `k` arrives at
+    /// `k + s/100` seconds with a `64 + 16k`-token prompt whose block hashes
+    /// extend the session's previous prompt by one block, so every round
+    /// after the first has a cached prefix on whichever replica served the
+    /// session before.
+    fn session_requests(sessions: u64, rounds: u32) -> Vec<Request> {
+        let mut reqs = Vec::new();
+        for s in 0..sessions {
+            for k in 0..rounds {
+                let tokens = 64 + 16 * k;
+                let mut r = Request::new(
+                    format!("s{s}-r{k}"),
+                    0,
+                    k as f64 + s as f64 / 100.0,
+                    tokens,
+                    2,
+                );
+                r.prompt_block_hashes = (1..=(tokens / 16) as u64).map(|b| s * 1000 + b).collect();
+                reqs.push(r);
+            }
+        }
+        reqs
+    }
+
+    fn replicated_engine(replicas: u32, router: &RouterConfig) -> Engine {
+        let (mut cluster, model, sched) = small_dense_parts();
+        cluster.num_workers = replicas;
+        Engine::new(
+            Topology::aggregated(cluster, model, sched)
+                .expect("topo")
+                .with_router(router),
+        )
+    }
+
+    #[test]
+    fn routers_spread_load_and_affinity_finds_the_prefix() {
+        // 5 sessions over 4 replicas: round-robin sends session s, round k to
+        // replica (5k + s) mod 4 = (k + s) mod 4 — a fresh replica every
+        // round for four rounds — so it never sees a session's prefix.
+        let (sessions, rounds) = (5u64, 4u32);
+        let n = sessions as usize * rounds as usize;
+
+        let mut rr = replicated_engine(4, &RouterConfig::RoundRobin {});
+        for r in session_requests(sessions, rounds) {
+            rr.submit(r);
+        }
+        run_until(&mut rr, n);
+        let rr_stats = rr.aggregate_prefix_cache();
+        assert_eq!(rr_stats.hits, 0, "{rr_stats:?}");
+        assert_eq!(rr.router_stats().per_worker, vec![5, 5, 5, 5]);
+        // Round-robin never asks for the prefix signal.
+        assert_eq!(rr.router_stats().prefix_available, 0);
+
+        let mut aff = replicated_engine(
+            4,
+            &RouterConfig::PrefixAffinity {
+                max_load_ratio: None,
+            },
+        );
+        for r in session_requests(sessions, rounds) {
+            aff.submit(r);
+        }
+        run_until(&mut aff, n);
+        let aff_stats = aff.aggregate_prefix_cache();
+        // Every round after a session's first hits its previous prompt.
+        assert_eq!(aff_stats.hits, sessions * (rounds as u64 - 1));
+        assert_eq!(aff_stats.misses, sessions);
+        let rs = aff.router_stats();
+        assert_eq!(rs.total(), n as u64);
+        assert_eq!(rs.prefix_available, aff_stats.hits);
+        assert_eq!(rs.prefix_routed, aff_stats.hits);
+        assert_eq!(rs.prefix_forgone, 0);
+
+        // Least-loaded and kv-aware both spread a burst of unrelated
+        // arrivals evenly: eight cold prompts at t = 0 over four replicas.
+        for cfg in [
+            RouterConfig::LeastLoaded {},
+            RouterConfig::KvAware { load_weight: 1.0 },
+        ] {
+            let mut eng = replicated_engine(4, &cfg);
+            for i in 0..8u64 {
+                let mut r = Request::new(format!("burst-{i}"), 0, 0.0, 64, 2);
+                r.prompt_block_hashes = (1..=4).map(|b| 10_000 * (i + 1) + b).collect();
+                eng.submit(r);
+            }
+            run_until(&mut eng, 8);
+            assert_eq!(eng.router_stats().per_worker, vec![2, 2, 2, 2], "{cfg:?}");
+        }
+        // kv_aware with an idle pool is pure affinity: same hits as above.
+        let mut kv = replicated_engine(4, &RouterConfig::KvAware { load_weight: 1.0 });
+        for r in session_requests(sessions, rounds) {
+            kv.submit(r);
+        }
+        run_until(&mut kv, n);
+        assert_eq!(kv.aggregate_prefix_cache().hits, aff_stats.hits);
     }
 
     #[test]

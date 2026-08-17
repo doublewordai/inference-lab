@@ -5,6 +5,7 @@ pub mod dataset;
 pub mod kv_cache;
 pub mod metrics;
 pub mod request;
+pub mod router;
 pub mod scheduler;
 pub mod simulation;
 

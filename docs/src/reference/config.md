@@ -11,10 +11,12 @@ model = "deepseek-v4-flash"    # catalog preset, or an inline [model] table
 
 [scheduler]                    # engine args shared by every hardware entry
 [speculative]                  # optional: speculative decoding, shared default
+[router]                       # optional: how requests spread over replicas
 [fault]                        # optional: serve-mode static fault injection
 
 [hardware.b200]                # one entry per hardware the model runs on
 tp = 4
+replicas = 4                   # identical workers behind the router
 [hardware.gh200]
 tp = 4
 scheduler = { max_num_batched_tokens = 4096 }
@@ -35,7 +37,8 @@ runs one; `--hardware` may be omitted when the file has one entry. In Rust,
 `ModelConfig::from_file(..).deployment(Some("b200"))` gives a `Deployment`
 (model on hardware) and `.with_workload(WorkloadConfig::from_file(..))` a
 `Config`. The WASM API takes that resolved `Config` as JSON: `hardware`,
-`parallel`, `model`, `scheduler`, `workload`, optional `speculative`.
+`parallel`, `model`, `scheduler`, `workload`, optional `replicas`, `router`,
+`speculative`.
 
 ## Catalog presets
 
@@ -57,9 +60,11 @@ hardware preset unless `spec` says otherwise.
 | `tp` | U32 | 1 | Replica world size: its GPUs pool FLOP rate, HBM bandwidth and memory; weights are sharded across them; each layer's output is all-reduced twice (after attention, after the FFN) |
 | `ep` | U32 | 1 | Experts sharded across `ep` of the ranks (divides `tp`). With TP attention every rank holds every token, so the MoE output is still combined by the FFN all-reduce (vLLM `--enable-expert-parallel`); under `dp_attention` the MoE layers dispatch + combine with all-to-alls over the `ep` group instead |
 | `dp_attention` | Bool | false | Attention runs data-parallel over the `tp` ranks (sglang `--enable-dp-attention`): the attention projections are replicated (`tp×` resident and read per step), a sequence's KV lives on one rank, no attention all-reduce; the TP-sharded FFN gathers the ranks' tokens with an all-gather and returns them with a reduce-scatter (with `ep > 1`, DeepEP-style dispatch + combine all-to-alls) |
+| `replicas` | U32 | 1 | Identical workers of this deployment (each a `tp`-GPU replica with its own scheduler and KV cache) behind the router |
 | `spec` | String or Table | the entry name | Another catalog preset, or an inline hardware table (fields below) |
 | `scheduler` | Table | `{}` | Keys merged over the shared `[scheduler]` for this entry |
 | `speculative` | Table | shared `[speculative]` | Replaces the shared block for this entry |
+| `router` | Table | shared `[router]` | Replaces the shared block for this entry |
 
 Collectives are priced on the hardware's `[fabric]` (below) and added
 serially to the step; an entry with `tp > 1` or `ep > 1` on hardware without
@@ -218,6 +223,35 @@ The `[workload]` table, at top level of `workloads/<name>.toml`.
 | `seed` | U64 | — | |
 
 ---
+
+## [router]
+
+Optional; `round_robin` when absent. Picks the replica each arriving
+request enters (`replicas` on the hardware entry). Only `prefix_affinity`
+and `kv_aware` look at the replicas' KV caches: on every arrival they read
+each replica's cached-prefix length for the prompt (an estimate from the
+replica's block index, as a KV-aware front end sees it, not the
+scheduler's admission-time lookup).
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `policy` | String | `"round_robin"` | `round_robin`, `least_loaded`, `prefix_affinity`, `kv_aware` |
+| `max_load_ratio` | F64 | unset | `prefix_affinity` only: pass over the prefix holder for the least-loaded replica when its requests in system exceed `max_load_ratio ×` the pool mean (bounded-load affinity) |
+| `load_weight` | F64 | 1.0 | `kv_aware` only: weight on the replica's queued prefill tokens |
+
+- `round_robin` cycles through the replicas.
+- `least_loaded` picks the fewest requests in system (running + waiting),
+  ties by queued prefill tokens, then index.
+- `prefix_affinity` picks the replica holding the longest cached prefix of
+  the prompt; with none anywhere it falls back to `least_loaded`.
+- `kv_aware` minimises `(prompt − cached prefix) + load_weight × queued
+  prefill tokens`: the prefill work the request adds plus the prefill work
+  already ahead of it, in tokens.
+
+The summary's `router` section reports requests per replica and, for the
+prefix-reading policies, how many arrivals had a cached prefix on some
+replica, how many were routed to a holder, and how many were routed away
+from the longest holder.
 
 ## [speculative]
 

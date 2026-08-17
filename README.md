@@ -15,6 +15,8 @@ performance modeling.
   FCFS / priority / length-based policies, preemption-free admission
 - **KV cache**: block allocation from each model's exact KV footprint,
   prefix caching with block sharing, spillover tiers, cascade attention
+- **Replicas and routing**: N identical workers behind a pluggable router —
+  round-robin, least-loaded, prefix-affinity, KV-aware
 - **Disaggregated serving**: prefill and decode pools with a shared hand-off link
 - **Speculative decoding**: analytic or trace-replayed acceptance, fixed and
   goodput-adaptive draft policies, measured step-cost tables
@@ -143,8 +145,9 @@ A simulation is a **model config** × one of its **hardware entries** × a
 
 - `configs/<model>.toml` — one file per model deployment: the model (a
   catalog preset name or an inline architecture), its engine args
-  (`[scheduler]`), optional `[speculative]`, and a `[hardware.<name>]` entry
-  per hardware it runs on (`tp`/`ep`, per-entry scheduler overrides). Every
+  (`[scheduler]`), optional `[speculative]` and `[router]`, and a
+  `[hardware.<name>]` entry per hardware it runs on (`tp`/`ep`, `replicas`,
+  per-entry scheduler overrides). Every
   model the production fleet serves has a file here with its B200 / B300 /
   GH200 entries.
 - `workloads/<name>.toml` — arrival pattern, request-length distributions or
@@ -190,6 +193,7 @@ inference-lab/
 │   ├── scheduler/      # Scheduling policies (FCFS, priority, SJF/SOF)
 │   ├── compute/        # Roofline performance model, measured step tables
 │   ├── kv_cache/       # KV block manager, prefix cache, tiers, links
+│   ├── router/         # Request routing across replicas
 │   ├── request/        # Request generation and tracking
 │   ├── metrics/        # Metrics collection and summaries
 │   ├── config/         # Configuration structures

@@ -6,5 +6,5 @@ pub use collector::{LatencySamples, MetricsCollector, RequestRow, SampleCursor, 
 pub use distribution::{Distribution, RunningMean};
 pub use summary::{
     LatencyMetrics, LatencyStats, MetricsSummary, Preemptions, PrefixCacheMetrics, RequestCounts,
-    ThroughputMetrics, Utilization,
+    RouterMetrics, ThroughputMetrics, Utilization,
 };

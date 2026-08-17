@@ -765,6 +765,25 @@ fn print_final_metrics(
         println!("  • Avg hit size: {:.1} tokens", pc.mean_hit_size);
         println!("  • Hit Rate:  {:.1}%", pc.hit_rate * 100.0);
     }
+
+    // Router Section (only interesting with more than one replica)
+    let rt = &summary.router;
+    if rt.per_replica.len() > 1 {
+        println!("\n{}", "ROUTER".yellow().bold());
+        println!("  • Policy:    {}", rt.policy);
+        let per: Vec<String> = rt.per_replica.iter().map(|n| n.to_string()).collect();
+        println!("  • Per replica: [{}]", per.join(", "));
+        if rt.prefix_available > 0 {
+            println!(
+                "  • Prefix held somewhere: {} requests; routed to a holder: {} ({:.1}%); \
+                 routed away from the longest holder: {}",
+                rt.prefix_available,
+                rt.prefix_routed,
+                100.0 * rt.prefix_routed as f64 / rt.prefix_available as f64,
+                rt.prefix_forgone
+            );
+        }
+    }
 }
 
 #[cfg(not(feature = "cli"))]
