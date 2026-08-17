@@ -1769,6 +1769,14 @@ impl Radix {
             if new_pinned > old_pinned {
                 let mut kept = Vec::with_capacity(h.runs.len());
                 for r in h.runs.drain(..) {
+                    // Only cut runs that overlap the newly pinned interval.
+                    // Extending a later stamped run back to `new_pinned`
+                    // would overlap the preceding run; after eviction that
+                    // leaves an order entry for an HBM state already removed.
+                    if r.end <= old_pinned || r.start >= new_pinned {
+                        kept.push(r);
+                        continue;
+                    }
                     let s = r.start.max(old_pinned);
                     let e = r.end.min(new_pinned);
                     if s < e {
