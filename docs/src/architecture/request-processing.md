@@ -59,6 +59,15 @@ measured step-cost table when one is configured.
 ## Disaggregated hand-off
 
 On a prefill/decode topology, a request whose prefill has completed leaves
-the prefill worker (its KV freed there), transfers its KV over the shared
-hand-off link, and joins the decode pool. `RequestTiming` records
-`prefill_done_time` and `handoff_done_time` alongside TTFT and completion.
+the prefill worker (its KV freed there, but still hittable in that worker's
+prefix cache until recycled), is routed to a decode worker, transfers its
+KV over the shared hand-off link, and joins that worker when the transfer
+drains. The decode worker is chosen when the transfer starts, so the
+router's KV-aware policies can pick a decoder that already holds part of
+the context; the transfer carries the context minus the prompt prefix that
+decoder has resident in HBM. On admission the decode worker treats the
+transferred positions as resident — it allocates blocks for them (sharing
+any it already held) and computes nothing but the decode step; the
+prompt's hashes are published into its prefix cache. `RequestTiming`
+records `prefill_done_time` and `handoff_done_time` alongside TTFT and
+completion.

@@ -1,4 +1,5 @@
 use super::block::Block;
+use super::free_queue::FreeQueue;
 use super::link::Link;
 use crate::config::KVTier;
 use crate::request::{BlockId, Request};
@@ -140,8 +141,11 @@ pub struct KVCacheManager {
     /// All blocks.
     blocks: Vec<Block>,
 
-    /// Free blocks (indices into `blocks`).
-    free_blocks: Vec<BlockId>,
+    /// Free blocks, least recently freed first. A freed block keeps its
+    /// hash and stays hittable until it is recycled from the front of this
+    /// queue, so recycling order is the prefix cache's eviction order: LRU
+    /// by free time. A hit on a free block pulls it back out.
+    free_blocks: FreeQueue,
 
     /// Enable prefix caching.
     enable_prefix_caching: bool,
@@ -250,7 +254,7 @@ impl KVCacheManager {
         };
 
         let blocks = vec![Block::default(); total_blocks as usize];
-        let free_blocks = (0..total_blocks).collect();
+        let free_blocks = FreeQueue::new(total_blocks as usize);
 
         Self {
             block_size,
@@ -292,6 +296,10 @@ impl KVCacheManager {
     }
 
     /// Bytes per block: the KV footprint of a `block_size`-token sequence.
+    pub fn block_size(&self) -> u32 {
+        self.block_size
+    }
+
     pub fn bytes_per_block(&self) -> u64 {
         self.bytes_per_block
     }
@@ -434,32 +442,42 @@ impl KVCacheManager {
             decisions.push(dec);
         }
 
-        if self.free_blocks.len() < fresh_needed {
+        // Hits on free-but-cached blocks leave the free queue when they are
+        // referenced below, so they are not available to the misses.
+        let hits_on_free = decisions
+            .iter()
+            .filter(|d| matches!(d, Decision::RefExisting(id) if self.free_blocks.contains(*id)))
+            .count();
+        if self.free_blocks.len() < fresh_needed + hits_on_free {
             return None;
         }
 
-        // Pass 2: execute. Track newly-allocated (hash, block_id) pairs so
-        // we can publish them to HBM or to in_flight_cache afterwards.
-        let mut allocated = Vec::with_capacity(blocks_needed);
+        // Pass 2: execute. Reference the hits first so a fresh pop can't
+        // recycle a block a later hit in this same call refers to. Track
+        // newly-allocated (hash, block_id) pairs so we can publish them to
+        // HBM or to in_flight_cache afterwards.
+        let mut allocated: Vec<Option<BlockId>> = vec![None; blocks_needed];
+        for (i, decision) in decisions.iter().enumerate() {
+            if let Decision::RefExisting(block_id) = decision {
+                self.free_blocks.remove(*block_id);
+                self.blocks[*block_id as usize].reference();
+                allocated[i] = Some(*block_id);
+            }
+        }
         let mut evicted_hashes = Vec::new();
         let mut newly_allocated: Vec<(u64, BlockId)> = Vec::new();
-        for (i, decision) in decisions.into_iter().enumerate() {
-            match decision {
-                Decision::Fresh => {
-                    let block_id = self.free_blocks.pop().unwrap();
-                    let evicted_hash = self.blocks[block_id as usize].allocate(hash_at(i));
-                    evicted_hashes.extend(evicted_hash);
-                    allocated.push(block_id);
-                    if let Some(h) = hash_at(i) {
-                        newly_allocated.push((h, block_id));
-                    }
-                }
-                Decision::RefExisting(block_id) => {
-                    self.blocks[block_id as usize].reference();
-                    allocated.push(block_id);
+        for (i, decision) in decisions.iter().enumerate() {
+            if let Decision::Fresh = decision {
+                let block_id = self.free_blocks.pop_front().unwrap();
+                let evicted_hash = self.blocks[block_id as usize].allocate(hash_at(i));
+                evicted_hashes.extend(evicted_hash);
+                allocated[i] = Some(block_id);
+                if let Some(h) = hash_at(i) {
+                    newly_allocated.push((h, block_id));
                 }
             }
         }
+        let allocated: Vec<BlockId> = allocated.into_iter().map(|b| b.unwrap()).collect();
 
         if self.enable_prefix_caching {
             for hash in evicted_hashes {
@@ -491,11 +509,13 @@ impl KVCacheManager {
         Some(allocated)
     }
 
-    /// Free blocks from a request (due to preemption or completion).
+    /// Free blocks from a request (due to preemption or completion). Blocks
+    /// are queued for recycling tail first, so the end of a sequence is
+    /// evicted before its beginning and what survives is always a prefix.
     pub fn free_blocks(&mut self, block_ids: &[BlockId]) {
-        for &block_id in block_ids {
+        for &block_id in block_ids.iter().rev() {
             if self.blocks[block_id as usize].release() {
-                self.free_blocks.push(block_id);
+                self.free_blocks.push_back(block_id);
             }
         }
     }
@@ -563,6 +583,63 @@ impl KVCacheManager {
         }
 
         lookup
+    }
+
+    /// Whether `hash` is held anywhere on this worker: HBM, in flight from a
+    /// slower tier, or resident in a spillover tier.
+    fn holds_block(&self, hash: u64) -> bool {
+        self.prefix_cache.contains_key(&hash)
+            || self.in_flight_cache.contains_key(&hash)
+            || self.tiers.iter().any(|tier| tier.contains(hash))
+    }
+
+    /// Estimated cached prefix length in tokens, for routing. Finds the
+    /// longest held prefix of `hashes` by galloping then binary search on
+    /// block presence — O(log n) lookups instead of `peek_prefix_cache`'s
+    /// walk — assuming presence is prefix-closed (block k held ⇒ blocks
+    /// 0..k held), which is how blocks enter the cache and how they leave it
+    /// under LRU eviction of leaves. Where eviction has punched a hole the
+    /// estimate can overshoot; the scheduler's admission-time lookup is the
+    /// truth, and a router working from an approximate view of each
+    /// replica's prefix tree is what real KV-aware front ends do too.
+    pub fn cached_prefix_tokens_estimate(&self, hashes: &[u64]) -> u32 {
+        if !self.enable_prefix_caching || hashes.is_empty() {
+            return 0;
+        }
+        let n = hashes.len();
+        // `lo` blocks are known held; probe at lo + step.
+        let mut lo = 0usize;
+        let mut step = 1usize;
+        while lo + step <= n && self.holds_block(hashes[lo + step - 1]) {
+            lo += step;
+            step *= 2;
+        }
+        // Held count lies in [lo, min(lo + step, n)); binary search it.
+        let mut hi = (lo + step).min(n + 1); // exclusive upper bound on count
+        while lo + 1 < hi {
+            let mid = (lo + hi) / 2; // candidate count; block mid-1 must be held
+            if self.holds_block(hashes[mid - 1]) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        lo as u32 * self.block_size
+    }
+
+    /// Contiguous prompt prefix already resident in HBM, in tokens: the part
+    /// of an incoming context a remote KV transfer (disaggregated hand-off)
+    /// can skip. Stops at the first block that is not in HBM (in flight or
+    /// in a spillover tier counts as not resident).
+    pub fn hbm_prefix_tokens(&self, hashes: &[u64]) -> u32 {
+        if !self.enable_prefix_caching {
+            return 0;
+        }
+        let held = hashes
+            .iter()
+            .take_while(|h| self.prefix_cache.contains_key(h))
+            .count();
+        held as u32 * self.block_size
     }
 
     /// Record a prefix-cache lookup in the hit/miss statistics.
@@ -827,6 +904,122 @@ mod tests {
         manager.record_prefix_lookup(&lookup);
         assert_eq!(lookup.total_cached_tokens, 0);
         assert_eq!(manager.stats.misses, 2);
+    }
+
+    #[test]
+    fn prefix_estimate_matches_peek_on_a_prefix_closed_cache() {
+        let mut manager = KVCacheManager::new(64 * 16 * 100, 16, |t| 100 * t as u64, 0, true);
+        // Cache a 37-block prompt.
+        let mut held = create_test_request("held", 37 * 16);
+        held.prompt_block_hashes = (1..=37).collect();
+        let blocks = manager.allocate_blocks(&held, 37 * 16).unwrap();
+        held.kv_blocks.extend(blocks);
+
+        for (hashes, want) in [
+            ((1..=37).collect::<Vec<u64>>(), 37 * 16),      // exact
+            ((1..=50).collect(), 37 * 16),                  // longer prompt, same prefix
+            ((1..=5).collect(), 5 * 16),                    // shorter prompt
+            ((1..=1).collect(), 16),                        // one block
+            (vec![99, 100], 0),                             // cold
+            (vec![], 0),                                    // empty
+            ((1..=20).chain(200..=210).collect(), 20 * 16), // diverges at block 21
+        ] {
+            let mut probe = create_test_request("probe", hashes.len() as u32 * 16);
+            probe.prompt_block_hashes = hashes.clone();
+            let peek = manager.peek_prefix_cache(&probe).total_cached_tokens;
+            assert_eq!(peek, want, "peek for {} blocks", hashes.len());
+            assert_eq!(
+                manager.cached_prefix_tokens_estimate(&hashes),
+                want,
+                "estimate for {} blocks",
+                hashes.len()
+            );
+        }
+
+        let off = KVCacheManager::new(64 * 16 * 100, 16, |t| 100 * t as u64, 0, false);
+        assert_eq!(off.cached_prefix_tokens_estimate(&[1, 2, 3]), 0);
+    }
+
+    #[test]
+    fn freed_prefixes_survive_churn_and_are_recycled_lru_tail_first() {
+        // 8 blocks. Session A caches 3, completes; B allocates 2 in between;
+        // A's re-entry must still hit all 3 (LRU recycles the oldest free
+        // blocks, not the ones A just released).
+        let mut m = KVCacheManager::new(8 * 16 * 100, 16, |t| 100 * t as u64, 0, true);
+        let mut a = create_test_request("a", 48);
+        a.prompt_block_hashes = vec![1, 2, 3];
+        let a_blocks = m.allocate_blocks(&a, 48).unwrap();
+        m.free_blocks(&a_blocks);
+        assert_eq!(m.num_free_blocks(), 8);
+
+        let mut b = create_test_request("b", 32);
+        b.prompt_block_hashes = vec![10, 20];
+        let b_blocks = m.allocate_blocks(&b, 32).unwrap();
+        // B took the untouched blocks, not A's.
+        assert!(
+            b_blocks.iter().all(|id| !a_blocks.contains(id)),
+            "{b_blocks:?}"
+        );
+
+        let mut a2 = create_test_request("a2", 64);
+        a2.prompt_block_hashes = vec![1, 2, 3, 4];
+        assert_eq!(m.peek_prefix_cache(&a2).total_cached_tokens, 48);
+        let a2_blocks = m.allocate_blocks(&a2, 64).unwrap();
+        // The three hits are A's physical blocks, now referenced and out of
+        // the free queue: 8 − 2 (B) − 3 (hits) − 1 (fresh) = 2 free.
+        assert_eq!(&a2_blocks[..3], &a_blocks[..]);
+        assert_eq!(m.num_free_blocks(), 2);
+        for id in &a2_blocks[..3] {
+            assert_eq!(m.block_ref_count(*id), 1);
+        }
+
+        // Fill the rest: the two remaining fresh blocks, then eviction has
+        // to recycle A's *tail* first (block for hash 4 was freed last of
+        // A2's, and B's are still held), i.e. what survives is a prefix.
+        m.free_blocks(&a2_blocks);
+        let mut c = create_test_request("c", 32);
+        c.prompt_block_hashes = vec![100, 200];
+        m.allocate_blocks(&c, 32).unwrap(); // takes the 2 never-used blocks
+        let mut d = create_test_request("d", 16);
+        d.prompt_block_hashes = vec![300];
+        m.allocate_blocks(&d, 16).unwrap(); // evicts hash 4 (A2's tail)
+        let mut probe = create_test_request("p", 64);
+        probe.prompt_block_hashes = vec![1, 2, 3, 4];
+        assert_eq!(m.peek_prefix_cache(&probe).total_cached_tokens, 48);
+        assert_eq!(m.cached_prefix_tokens_estimate(&[1, 2, 3, 4]), 48);
+        let mut e = create_test_request("e", 16);
+        e.prompt_block_hashes = vec![400];
+        m.allocate_blocks(&e, 16).unwrap(); // evicts hash 3
+        assert_eq!(m.peek_prefix_cache(&probe).total_cached_tokens, 32);
+    }
+
+    #[test]
+    fn a_hit_on_a_free_block_cannot_be_recycled_underneath_it() {
+        // 2 blocks. A caches [1], frees. B hits hash 1 and needs one fresh
+        // block: the fresh pop must not return A's block (now B's).
+        let mut m = KVCacheManager::new(2 * 16 * 100, 16, |t| 100 * t as u64, 0, true);
+        let mut a = create_test_request("a", 16);
+        a.prompt_block_hashes = vec![1];
+        let a_blocks = m.allocate_blocks(&a, 16).unwrap();
+        m.free_blocks(&a_blocks);
+        let mut b = create_test_request("b", 32);
+        b.prompt_block_hashes = vec![1, 2];
+        let b_blocks = m.allocate_blocks(&b, 32).unwrap();
+        assert_eq!(b_blocks[0], a_blocks[0]);
+        assert_ne!(b_blocks[0], b_blocks[1]);
+        assert_eq!(m.num_free_blocks(), 0);
+        // With both blocks held, a third request that hits nothing can't be
+        // allocated: the hit did not leave a phantom free block behind.
+        let mut c = create_test_request("c", 16);
+        c.prompt_block_hashes = vec![9];
+        assert!(m.allocate_blocks(&c, 16).is_none());
+        // And a request that hits [1] but needs one more block is also
+        // refused (the hit's block is not available to its own miss).
+        let mut d = create_test_request("d", 32);
+        d.prompt_block_hashes = vec![1, 3];
+        m.free_blocks(&b_blocks[1..]);
+        assert_eq!(m.num_free_blocks(), 1);
+        assert!(m.allocate_blocks(&d, 32).is_some());
     }
 
     #[test]

@@ -1,4 +1,5 @@
 pub mod block;
+pub mod free_queue;
 pub mod link;
 pub mod manager;
 

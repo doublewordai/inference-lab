@@ -1,7 +1,7 @@
 use super::distribution::{Distribution, RunningMean};
 use super::summary::{
-    LatencyMetrics, LatencyStats, MetricsSummary, Preemptions, PrefixCacheMetrics, RequestCounts,
-    ThroughputMetrics, Utilization,
+    HandoffMetrics, LatencyMetrics, LatencyStats, MetricsSummary, Preemptions, PrefixCacheMetrics,
+    RequestCounts, RouterMetrics, ThroughputMetrics, Utilization,
 };
 use crate::kv_cache::PrefixCacheStats;
 use crate::simulation::RequestTiming;
@@ -254,6 +254,9 @@ impl MetricsCollector {
         &mut self,
         current_time: f64,
         prefix_cache: PrefixCacheStats,
+        router: RouterMetrics,
+        decode_router: Option<RouterMetrics>,
+        handoff: Option<HandoffMetrics>,
     ) -> MetricsSummary {
         let elapsed = current_time - self.start_time;
         let per_sec = |n: f64| if elapsed > 0.0 { n / elapsed } else { 0.0 };
@@ -291,6 +294,9 @@ impl MetricsCollector {
                 hit_rate: prefix_cache.hit_rate(),
                 mean_hit_size: prefix_cache.mean_hit_size(),
             },
+            router,
+            decode_router,
+            handoff,
         }
     }
 }
@@ -327,7 +333,13 @@ mod tests {
         // TTFT 1.0s, e2e 4.0s, 3 output tokens over a 3.0s decode span:
         // mean TPOT 1.5s.
         m.record_request_completion(&timing("a", 1.0, 2.0, 5.0, 100, 3, 0));
-        let s = m.compute_summary(10.0, PrefixCacheStats::default());
+        let s = m.compute_summary(
+            10.0,
+            PrefixCacheStats::default(),
+            RouterMetrics::default(),
+            None,
+            None,
+        );
         assert!((s.latency_metrics.ttft_ms.mean - 1000.0).abs() < 1e-9);
         assert!((s.latency_metrics.e2e_ms.mean - 4000.0).abs() < 1e-9);
         assert!((s.latency_metrics.per_token_ms.mean - 1500.0).abs() < 1e-9);
@@ -350,7 +362,13 @@ mod tests {
         let mut m = MetricsCollector::new(0.0);
         m.record_request_completion(&timing("a", 0.0, 1.0, 5.0, 100, 50, 2));
         m.record_request_completion(&timing("b", 0.0, 1.0, 5.0, 300, 150, 0));
-        let s = m.compute_summary(10.0, PrefixCacheStats::default());
+        let s = m.compute_summary(
+            10.0,
+            PrefixCacheStats::default(),
+            RouterMetrics::default(),
+            None,
+            None,
+        );
         assert_eq!(s.preemptions.total, 2);
         assert!((s.preemptions.per_request_mean - 1.0).abs() < 1e-12);
         assert!((s.throughput_metrics.input_tokens_per_sec - 40.0).abs() < 1e-9);
@@ -393,7 +411,13 @@ mod tests {
         let mut m = MetricsCollector::new(0.0);
         m.record_iteration_metrics(0.5, 0.2, 0.8);
         m.record_iteration_metrics(1.0, 0.4, 0.6);
-        let s = m.compute_summary(1.0, PrefixCacheStats::default());
+        let s = m.compute_summary(
+            1.0,
+            PrefixCacheStats::default(),
+            RouterMetrics::default(),
+            None,
+            None,
+        );
         assert!((s.utilization.avg_kv_cache_util - 0.75).abs() < 1e-12);
         assert!((s.utilization.avg_flops_util - 0.3).abs() < 1e-12);
         assert!((s.utilization.avg_bandwidth_util - 0.7).abs() < 1e-12);

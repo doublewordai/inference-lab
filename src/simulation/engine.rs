@@ -9,9 +9,12 @@ use std::collections::{BinaryHeap, HashMap};
 
 use super::spec::{DepthSample, PlanCosts, SpecPlanner};
 use crate::compute::ComputeEngine;
-use crate::config::{ClusterSpec, DisaggTopology, ModelSpec, SchedulerConfig, SpeculativeConfig};
+use crate::config::{
+    ClusterSpec, DisaggTopology, ModelSpec, RouterConfig, SchedulerConfig, SpeculativeConfig,
+};
 use crate::kv_cache::{KVCacheManager, Link, PrefixCacheStats};
 use crate::request::Request;
+use crate::router::{build_router, PrefixSignal, Router, RouterStats, WorkerSignal};
 use crate::scheduler::Scheduler;
 
 pub type PoolId = usize;
@@ -108,21 +111,54 @@ impl Worker {
 
 pub(crate) struct WorkerPool {
     pub workers: Vec<Worker>,
-    next_worker: usize,
+    /// Picks the worker each request enters. Round-robin unless
+    /// [`Topology::with_router`] set another.
+    router: Box<dyn Router>,
+    router_stats: RouterStats,
 }
 
 impl WorkerPool {
     pub fn new(workers: Vec<Worker>) -> Self {
+        let n = workers.len();
         Self {
             workers,
-            next_worker: 0,
+            router: build_router(&RouterConfig::RoundRobin {}),
+            router_stats: RouterStats::new(n),
         }
     }
 
-    fn pick_round_robin(&mut self) -> usize {
-        let n = self.workers.len().max(1);
-        let idx = self.next_worker % n;
-        self.next_worker = (idx + 1) % n;
+    fn set_router(&mut self, cfg: &RouterConfig) {
+        self.router = build_router(cfg);
+        self.router_stats = RouterStats::new(self.workers.len());
+    }
+
+    /// Ask the router where `req` goes. Builds one signal per worker; the
+    /// per-worker prefix estimate is only computed for routers that ask.
+    fn pick(&mut self, req: &Request) -> usize {
+        let prefix = self.router.prefix_signal();
+        let signals: Vec<WorkerSignal> = self
+            .workers
+            .iter()
+            .map(|w| {
+                let sched = &w.scheduler;
+                let mgr = sched.kv_cache_manager();
+                let hashes = &req.prompt_block_hashes;
+                WorkerSignal {
+                    running: sched.num_running(),
+                    waiting: sched.num_waiting(),
+                    queued_prefill_tokens: sched.queued_prefill_tokens(),
+                    kv_util: mgr.utilization(),
+                    free_kv_tokens: mgr.num_free_blocks() as u64 * mgr.block_size() as u64,
+                    cached_prefix_tokens: match prefix {
+                        PrefixSignal::None => None,
+                        PrefixSignal::Cached => Some(mgr.cached_prefix_tokens_estimate(hashes)),
+                        PrefixSignal::Resident => Some(mgr.hbm_prefix_tokens(hashes)),
+                    },
+                }
+            })
+            .collect();
+        let idx = self.router.route(req, &signals).min(self.workers.len() - 1);
+        self.router_stats.record(&signals, idx);
         idx
     }
 }
@@ -210,6 +246,26 @@ impl Topology {
         })
     }
 
+    /// Front every pool with the router `cfg` names. On a disaggregated
+    /// topology the same policy routes arrivals into the prefill pool and
+    /// hand-offs into the decode pool; see `with_routers` to split them.
+    pub fn with_router(mut self, cfg: &RouterConfig) -> Self {
+        for pool in &mut self.pools {
+            pool.set_router(cfg);
+        }
+        self
+    }
+
+    /// Front the pool arrivals enter with `entry` and, on a disaggregated
+    /// topology, the decode pool with `decode`.
+    pub fn with_routers(mut self, entry: &RouterConfig, decode: &RouterConfig) -> Self {
+        let entry_pool = self.entry_pool();
+        for (i, pool) in self.pools.iter_mut().enumerate() {
+            pool.set_router(if i == entry_pool { entry } else { decode });
+        }
+        self
+    }
+
     fn entry_pool(&self) -> PoolId {
         match self.roles {
             Roles::Aggregated { pool } => pool,
@@ -249,6 +305,11 @@ enum EventKind {
         link: LinkId,
         generation: u64,
     },
+    /// A request's prefill finishes at this instant on the P pool: pick its
+    /// decode worker and put its KV on the hand-off link. Its own event (not
+    /// done inside the iteration that produced it) so the link is advanced
+    /// to a time no later than any transfer's pending drain event.
+    HandoffStart(Request),
 }
 
 #[derive(Debug)]
@@ -316,6 +377,7 @@ pub enum StepKind {
     Arrival,
     Iteration,
     LinkComplete,
+    HandoffStart,
 }
 
 #[derive(Debug)]
@@ -330,14 +392,18 @@ pub struct Engine {
     topology: Topology,
     events: BinaryHeap<TimedEvent>,
     /// Requests that finished prefill on the P pool and are mid-handoff over
-    /// the link.
-    parked: HashMap<String, Request>,
+    /// the link, with the decode worker each was routed to when the transfer
+    /// began.
+    parked: HashMap<String, (Request, usize)>,
     /// Per-link generation of the scheduled `LinkDrain` event; only the
     /// event carrying the current generation is acted on.
     link_generation: Vec<u64>,
     /// `worker_busy[pool][worker]` is true iff a `WorkerReady` for that
     /// worker is currently scheduled in the queue.
     worker_busy: Vec<Vec<bool>>,
+    /// Hand-off transfers started, bytes moved, and bytes skipped because
+    /// the chosen decoder already held the prompt prefix.
+    handoff_stats: HandoffStats,
     /// Per-pool (∑ batch·dt, ∑ dt) for time-weighted mean batch size.
     pool_batch_acc: Vec<(f64, f64)>,
     current_time: f64,
@@ -362,6 +428,7 @@ impl Engine {
             parked: HashMap::new(),
             link_generation,
             worker_busy,
+            handoff_stats: HandoffStats::default(),
             pool_batch_acc,
             current_time: 0.0,
             seq_counter: 0,
@@ -494,6 +561,35 @@ impl Engine {
             .unwrap_or_default()
     }
 
+    /// Routing statistics for the pool arrivals enter (the prefill pool on
+    /// a disaggregated topology).
+    pub fn router_stats(&self) -> &RouterStats {
+        &self.topology.pools[self.topology.entry_pool()].router_stats
+    }
+
+    /// Routing statistics per pool, in pool order (prefill then decode on a
+    /// disaggregated topology).
+    pub fn pool_router_stats(&self) -> Vec<&RouterStats> {
+        self.topology
+            .pools
+            .iter()
+            .map(|p| &p.router_stats)
+            .collect()
+    }
+
+    /// Routing statistics for the decode pool of a disaggregated topology.
+    pub fn decode_router_stats(&self) -> Option<&RouterStats> {
+        match self.topology.roles {
+            Roles::Disagg { decode, .. } => Some(&self.topology.pools[decode].router_stats),
+            Roles::Aggregated { .. } => None,
+        }
+    }
+
+    /// Hand-off transfer totals (zero on an aggregated topology).
+    pub fn handoff_stats(&self) -> HandoffStats {
+        self.handoff_stats
+    }
+
     /// Prefix-cache lookup statistics summed over every worker's KV manager.
     pub fn aggregate_prefix_cache(&self) -> PrefixCacheStats {
         let mut total = PrefixCacheStats::default();
@@ -583,6 +679,15 @@ impl Engine {
                     completions: Vec::new(),
                 })
             }
+            EventKind::HandoffStart(req) => {
+                self.start_handoff(req)?;
+                Ok(StepOutcome {
+                    time: self.current_time,
+                    kind: StepKind::HandoffStart,
+                    iteration: None,
+                    completions: Vec::new(),
+                })
+            }
         }
     }
 
@@ -592,7 +697,11 @@ impl Engine {
     }
 
     fn route_into_pool(&mut self, pool_id: PoolId, req: Request) {
-        let worker_idx = self.topology.pools[pool_id].pick_round_robin();
+        let worker_idx = self.topology.pools[pool_id].pick(&req);
+        self.deliver_to_worker(pool_id, worker_idx, req);
+    }
+
+    fn deliver_to_worker(&mut self, pool_id: PoolId, worker_idx: usize, req: Request) {
         self.topology.pools[pool_id].workers[worker_idx]
             .scheduler
             .add_request(req);
@@ -620,7 +729,9 @@ impl Engine {
 
         // Completions from `schedule()` finished at the end of the *previous*
         // iteration, i.e. `now`. Handoffs finished prefill in the iter that
-        // ran *during* this step, so they're stamped at `end_time`.
+        // ran *during* this step, so they start at `end_time`: each gets its
+        // own event there (queued before this worker's next `WorkerReady`,
+        // so it fires first at that instant).
         let mut timings = Vec::with_capacity(outcome.completed.len());
         for req in outcome.completed {
             timings.push(self.finalise(req, now));
@@ -631,7 +742,7 @@ impl Engine {
             .map(|i| i.end_time)
             .unwrap_or(now);
         for req in outcome.handed_off {
-            self.start_handoff(req, handoff_time);
+            self.push(handoff_time, EventKind::HandoffStart(req));
         }
         if let Some(end) = outcome.iteration.as_ref().map(|i| i.end_time) {
             self.worker_busy[pool][worker] = true;
@@ -917,25 +1028,67 @@ impl Engine {
         (iter_time, measured_time.is_some(), bw, flops)
     }
 
-    fn start_handoff(&mut self, mut req: Request, prefill_done_at: f64) {
+    /// A request's prefill on the P pool finishes now. Pick its decode
+    /// worker (the router sees the decode pool's load and, for the KV-aware
+    /// policies, which decoders already hold part of this context), size the
+    /// transfer at the context minus the prompt prefix that decoder already
+    /// has resident, and start it on the hand-off link. The request is
+    /// delivered to that worker when the transfer drains.
+    fn start_handoff(&mut self, mut req: Request) -> Result<(), String> {
+        let prefill_done_at = self.current_time;
         req.prefill_done_time = Some(prefill_done_at);
-        let kv_bytes = self
+        let (link, decode) = match self.topology.roles {
+            Roles::Disagg {
+                handoff, decode, ..
+            } => (handoff, decode),
+            _ => return Err("hand-off on an aggregated topology".to_string()),
+        };
+        let worker_idx = self.topology.pools[decode].pick(&req);
+        let resident = self.topology.pools[decode].workers[worker_idx]
+            .scheduler
+            .kv_cache_manager()
+            .hbm_prefix_tokens(&req.prompt_block_hashes)
+            .min(req.num_computed_tokens);
+        let full_bytes = self
             .topology
             .model
             .kv_storage_bytes(req.num_computed_tokens);
+        let kv_bytes = full_bytes.saturating_sub(self.topology.model.kv_storage_bytes(resident));
+        self.handoff_stats.transfers += 1;
+        self.handoff_stats.bytes += kv_bytes;
+        self.handoff_stats.bytes_skipped += full_bytes - kv_bytes;
         let id = req.request_id.clone();
-        let link = match self.topology.roles {
-            Roles::Disagg { handoff, .. } => handoff,
-            _ => return,
-        };
-        // Bring the link up to date under the old contention, then add the
-        // new transfer and re-plan the next completion under the new one.
-        // (`advance` returns nothing here: any completion due before now was
-        // handled by its own drain event.)
-        let _ = self.topology.links[link].advance(prefill_done_at);
+        // Bring the link up to date under the old contention (delivering
+        // anything that completes exactly now, whose own drain event may be
+        // queued behind this one and is superseded below), then add the new
+        // transfer and re-plan the next completion under the new one.
+        let done = self.topology.links[link].advance(prefill_done_at);
+        self.deliver_drained(decode, done, prefill_done_at)?;
         self.topology.links[link].submit(id.clone(), kv_bytes, prefill_done_at);
-        self.parked.insert(id, req);
+        self.parked.insert(id, (req, worker_idx));
         self.schedule_link_drain(link, prefill_done_at);
+        Ok(())
+    }
+
+    /// Deliver drained hand-offs, in a deterministic order, each to the
+    /// decode worker chosen when its transfer began.
+    fn deliver_drained(
+        &mut self,
+        decode_pool: PoolId,
+        done: std::collections::HashSet<String>,
+        now: f64,
+    ) -> Result<(), String> {
+        let mut done: Vec<String> = done.into_iter().collect();
+        done.sort();
+        for request_id in done {
+            let (mut req, worker_idx) = self
+                .parked
+                .remove(&request_id)
+                .ok_or_else(|| format!("link complete for unknown request {request_id}"))?;
+            req.handoff_done_time = Some(now);
+            self.deliver_to_worker(decode_pool, worker_idx, req);
+        }
+        Ok(())
     }
 
     /// Schedule the next completion on `link` under its current contention,
@@ -958,17 +1111,7 @@ impl Engine {
             Roles::Disagg { decode, .. } => decode,
             _ => return Err("link drain on an aggregated topology".to_string()),
         };
-        // Route completed hand-offs in a deterministic order.
-        let mut done: Vec<String> = done.into_iter().collect();
-        done.sort();
-        for request_id in done {
-            let mut req = self
-                .parked
-                .remove(&request_id)
-                .ok_or_else(|| format!("link complete for unknown request {request_id}"))?;
-            req.handoff_done_time = Some(now);
-            self.route_into_pool(decode_pool, req);
-        }
+        self.deliver_drained(decode_pool, done, now)?;
         self.schedule_link_drain(link, now);
         Ok(())
     }
@@ -991,6 +1134,17 @@ impl Engine {
             num_preemptions: req.num_preemptions,
         }
     }
+}
+
+/// Hand-off transfer totals over the run.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HandoffStats {
+    pub transfers: u64,
+    /// Bytes put on the hand-off link.
+    pub bytes: u64,
+    /// Bytes not transferred because the chosen decoder already held that
+    /// prompt prefix in HBM.
+    pub bytes_skipped: u64,
 }
 
 struct RunIterationOutcome {

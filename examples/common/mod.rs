@@ -58,6 +58,9 @@ pub fn closed_loop_config(
             enable_preemption_free: true,
             enable_cascade_attention: false,
         },
+        replicas: 1,
+        router: Default::default(),
+        decode_router: None,
         workload: WorkloadConfig {
             dataset_path: None,
             arrival_pattern: ArrivalPattern::ClosedLoop,

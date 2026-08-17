@@ -9,7 +9,10 @@ use super::engine::{Engine, IterationInfo, RequestTiming, StepKind, Topology};
 use super::spec::DepthSample;
 use crate::config::Config;
 use crate::dataset::{BatchTokenizerFn, DatasetLoader};
-use crate::metrics::{LatencySamples, MetricsCollector, MetricsSummary, RequestRow, SampleCursor};
+use crate::metrics::{
+    HandoffMetrics, LatencySamples, MetricsCollector, MetricsSummary, RequestRow, RouterMetrics,
+    SampleCursor,
+};
 use crate::request::RequestGenerator;
 
 /// One sample of the fixed-interval time series.
@@ -85,7 +88,8 @@ impl Simulator {
             config.cluster(),
             config.model.clone(),
             config.scheduler.clone(),
-        )?;
+        )?
+        .with_routers(&config.router, config.decode_router());
 
         let request_generator = if let Some(dataset_path) = &config.workload.dataset_path {
             let tokenizer = tokenizer.ok_or_else(|| {
@@ -288,9 +292,26 @@ impl Simulator {
 
     /// Metrics summary as of the current simulated time.
     pub fn summary(&mut self) -> MetricsSummary {
+        let router =
+            RouterMetrics::from_stats(self.config.router.name(), self.engine.router_stats());
+        let decode_router = self
+            .engine
+            .decode_router_stats()
+            .map(|rs| RouterMetrics::from_stats(self.config.decode_router().name(), rs));
+        let handoff = decode_router.as_ref().map(|_| {
+            let h = self.engine.handoff_stats();
+            HandoffMetrics {
+                transfers: h.transfers,
+                bytes: h.bytes,
+                bytes_skipped: h.bytes_skipped,
+            }
+        });
         self.metrics.compute_summary(
             self.engine.current_time(),
             self.engine.aggregate_prefix_cache(),
+            router,
+            decode_router,
+            handoff,
         )
     }
 

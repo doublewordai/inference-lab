@@ -16,7 +16,8 @@ pub mod simulator;
 pub mod spec;
 
 pub use engine::{
-    Engine, IterationInfo, RequestProgress, RequestTiming, StepKind, StepOutcome, Topology,
+    Engine, HandoffStats, IterationInfo, RequestProgress, RequestTiming, StepKind, StepOutcome,
+    Topology,
 };
 pub use roofline::{predict_decode_tpot, predict_prefill_time};
 pub use simulator::{ProgressInfo, Simulator, TimeSeriesPoint};
@@ -162,7 +163,7 @@ mod tests {
     use super::*;
     use crate::config::{
         AcceptanceModel, ClusterSpec, DisaggTopology, GammaPolicy, HardwareConfig, LayerClass,
-        MeasuredCostConfig, ModelSpec, ParallelConfig, Precision, SchedulerConfig,
+        MeasuredCostConfig, ModelSpec, ParallelConfig, Precision, RouterConfig, SchedulerConfig,
         SpeculativeConfig, WeightStream,
     };
     use crate::scheduler::SchedulingPolicy;
@@ -240,6 +241,321 @@ mod tests {
             done.extend(engine.step().unwrap().completions);
         }
         done
+    }
+
+    /// `sessions` × `rounds` requests: session `s`, round `k` arrives at
+    /// `k + s/100` seconds with a `64 + 16k`-token prompt whose block hashes
+    /// extend the session's previous prompt by one block, so every round
+    /// after the first has a cached prefix on whichever replica served the
+    /// session before.
+    fn session_requests(sessions: u64, rounds: u32) -> Vec<Request> {
+        let mut reqs = Vec::new();
+        for s in 0..sessions {
+            for k in 0..rounds {
+                let tokens = 64 + 16 * k;
+                let mut r = Request::new(
+                    format!("s{s}-r{k}"),
+                    0,
+                    k as f64 + s as f64 / 100.0,
+                    tokens,
+                    2,
+                );
+                r.prompt_block_hashes = (1..=(tokens / 16) as u64).map(|b| s * 1000 + b).collect();
+                reqs.push(r);
+            }
+        }
+        reqs
+    }
+
+    fn replicated_engine(replicas: u32, router: &RouterConfig) -> Engine {
+        let (mut cluster, model, sched) = small_dense_parts();
+        cluster.num_workers = replicas;
+        Engine::new(
+            Topology::aggregated(cluster, model, sched)
+                .expect("topo")
+                .with_router(router),
+        )
+    }
+
+    #[test]
+    fn routers_spread_load_and_affinity_finds_the_prefix() {
+        // 5 sessions over 4 replicas: round-robin sends session s, round k to
+        // replica (5k + s) mod 4 = (k + s) mod 4 — a fresh replica every
+        // round for four rounds — so it never sees a session's prefix.
+        let (sessions, rounds) = (5u64, 4u32);
+        let n = sessions as usize * rounds as usize;
+
+        let mut rr = replicated_engine(4, &RouterConfig::RoundRobin {});
+        for r in session_requests(sessions, rounds) {
+            rr.submit(r);
+        }
+        run_until(&mut rr, n);
+        let rr_stats = rr.aggregate_prefix_cache();
+        assert_eq!(rr_stats.hits, 0, "{rr_stats:?}");
+        assert_eq!(rr.router_stats().per_worker, vec![5, 5, 5, 5]);
+        // Round-robin never asks for the prefix signal.
+        assert_eq!(rr.router_stats().prefix_available, 0);
+
+        let mut aff = replicated_engine(
+            4,
+            &RouterConfig::PrefixAffinity {
+                max_load_ratio: None,
+            },
+        );
+        for r in session_requests(sessions, rounds) {
+            aff.submit(r);
+        }
+        run_until(&mut aff, n);
+        let aff_stats = aff.aggregate_prefix_cache();
+        // Every round after a session's first hits its previous prompt.
+        assert_eq!(aff_stats.hits, sessions * (rounds as u64 - 1));
+        assert_eq!(aff_stats.misses, sessions);
+        let rs = aff.router_stats();
+        assert_eq!(rs.total(), n as u64);
+        assert_eq!(rs.prefix_available, aff_stats.hits);
+        assert_eq!(rs.prefix_routed, aff_stats.hits);
+        assert_eq!(rs.prefix_forgone, 0);
+
+        // Least-loaded and kv-aware both spread a burst of unrelated
+        // arrivals evenly: eight cold prompts at t = 0 over four replicas.
+        for cfg in [
+            RouterConfig::LeastLoaded {},
+            RouterConfig::KvAware { load_weight: 1.0 },
+        ] {
+            let mut eng = replicated_engine(4, &cfg);
+            for i in 0..8u64 {
+                let mut r = Request::new(format!("burst-{i}"), 0, 0.0, 64, 2);
+                r.prompt_block_hashes = (1..=4).map(|b| 10_000 * (i + 1) + b).collect();
+                eng.submit(r);
+            }
+            run_until(&mut eng, 8);
+            assert_eq!(eng.router_stats().per_worker, vec![2, 2, 2, 2], "{cfg:?}");
+        }
+        // kv_aware with an idle pool is pure affinity: same hits as above.
+        let mut kv = replicated_engine(4, &RouterConfig::KvAware { load_weight: 1.0 });
+        for r in session_requests(sessions, rounds) {
+            kv.submit(r);
+        }
+        run_until(&mut kv, n);
+        assert_eq!(kv.aggregate_prefix_cache().hits, aff_stats.hits);
+    }
+
+    /// `(pool, request_id, was_prefill, num_tokens)` for one request in one
+    /// iteration.
+    type Progress = (usize, String, bool, u32);
+
+    /// Run `engine` until `n` requests complete; returns their timings and
+    /// every iteration's per-request progress.
+    fn run_until_with_progress(
+        engine: &mut Engine,
+        n: usize,
+    ) -> (Vec<RequestTiming>, Vec<Progress>) {
+        let mut done = Vec::new();
+        let mut progress = Vec::new();
+        while done.len() < n {
+            assert!(engine.next_event_time().is_some(), "queue drained");
+            let out = engine.step().unwrap();
+            if let Some(it) = &out.iteration {
+                for p in &it.progress {
+                    progress.push((it.pool, p.request_id.clone(), p.was_prefill, p.num_tokens));
+                }
+            }
+            done.extend(out.completions);
+        }
+        (done, progress)
+    }
+
+    #[test]
+    fn disagg_decode_pool_does_not_reprefill_handed_off_requests() {
+        let (cluster, model, sched) = small_dense_parts();
+        let topo = DisaggTopology {
+            prefill: cluster.clone(),
+            decode: cluster,
+            kv_link_bw: 1e12,
+        };
+        let mut engine = Engine::new(Topology::from_disagg(&topo, model, sched).unwrap());
+        engine.submit(Request::new("a".into(), 0, 0.0, 640, 4));
+        let (timings, progress) = run_until_with_progress(&mut engine, 1);
+        // Exactly one prefill pass, on the prefill pool (pool 0).
+        let prefills: Vec<_> = progress.iter().filter(|p| p.2).collect();
+        assert_eq!(prefills.len(), 1, "{progress:?}");
+        assert_eq!(prefills[0].0, 0);
+        assert_eq!(prefills[0].3, 640);
+        // Every decode-pool pass is a decode step.
+        assert!(
+            progress
+                .iter()
+                .filter(|p| p.0 == 1)
+                .all(|p| !p.2 && p.3 == 1),
+            "{progress:?}"
+        );
+        assert_eq!(timings[0].num_output_tokens, 4);
+    }
+
+    #[test]
+    fn disagg_handoff_skips_the_prefix_the_decoder_already_holds() {
+        let (cluster, model, sched) = small_dense_parts();
+        // The link moves the KV of 16 tokens in exactly 1.0 s.
+        let kv16 = model.kv_storage_bytes(16) as f64;
+        let topo = DisaggTopology {
+            prefill: cluster.clone(),
+            decode: cluster,
+            kv_link_bw: kv16,
+        };
+        let mut engine = Engine::new(Topology::from_disagg(&topo, model, sched).unwrap());
+        // Round 1: 64-token prompt, blocks 1..4. Round 2 arrives well after
+        // round 1 finished: same session, one more block (hashes 1..5).
+        let mut r1 = Request::new("r1".into(), 0, 0.0, 64, 2);
+        r1.prompt_block_hashes = (1..=4).collect();
+        let mut r2 = Request::new("r2".into(), 0, 100.0, 80, 2);
+        r2.prompt_block_hashes = (1..=5).collect();
+        engine.submit(r1);
+        engine.submit(r2);
+        let (timings, progress) = run_until_with_progress(&mut engine, 2);
+        let get = |id: &str| timings.iter().find(|t| t.request_id == id).unwrap();
+        let handoff = |t: &RequestTiming| t.handoff_done_time - t.prefill_done_time;
+        // Round 1 ships all 64 tokens (4.0 s); round 2 only the 16 the
+        // decoder does not already hold (1.0 s).
+        assert!(
+            (handoff(get("r1")) - 4.0).abs() < 1e-6,
+            "{}",
+            handoff(get("r1"))
+        );
+        assert!(
+            (handoff(get("r2")) - 1.0).abs() < 1e-6,
+            "{}",
+            handoff(get("r2"))
+        );
+        // And the prefill pool only computed the new block of round 2 (its
+        // own cache held blocks 1..4 from round 1).
+        let r2_prefill: Vec<_> = progress
+            .iter()
+            .filter(|p| p.0 == 0 && p.1 == "r2" && p.2)
+            .collect();
+        assert_eq!(r2_prefill.len(), 1, "{progress:?}");
+        assert_eq!(r2_prefill[0].3, 16);
+        // The decoder never prefilled anything.
+        assert!(
+            progress.iter().filter(|p| p.0 == 1).all(|p| !p.2),
+            "{progress:?}"
+        );
+    }
+
+    #[test]
+    fn disagg_many_prefill_workers_on_a_fast_link_never_stall() {
+        // Four prefill workers finishing at different instants, and a link
+        // that moves a prompt's KV in microseconds (far less than an
+        // iteration): every hand-off must still drain and be delivered.
+        // (Starting a hand-off from inside the iteration that produced it
+        // used to advance the link to that iteration's end time and drop
+        // transfers that completed in between.)
+        for cfg in [
+            RouterConfig::LeastLoaded {},
+            RouterConfig::PrefixAffinity {
+                max_load_ratio: None,
+            },
+        ] {
+            let (mut cluster, model, sched) = small_dense_parts();
+            cluster.num_workers = 4;
+            let topo = DisaggTopology {
+                prefill: cluster.clone(),
+                decode: cluster,
+                kv_link_bw: 1e12,
+            };
+            let mut engine = Engine::new(
+                Topology::from_disagg(&topo, model, sched)
+                    .unwrap()
+                    .with_router(&cfg),
+            );
+            for i in 0..32u64 {
+                let mut r = Request::new(format!("r{i}"), 0, i as f64 * 0.001, 512, 200);
+                r.prompt_block_hashes = (1..=32).map(|b| 100_000 * (i + 1) + b).collect();
+                engine.submit(r);
+            }
+            let timings = run_until(&mut engine, 32);
+            assert!(engine.is_idle(), "{cfg:?}: work left after 32 completions");
+            assert!(timings
+                .iter()
+                .all(|t| t.handoff_done_time >= t.prefill_done_time));
+            // Cold contexts on the decode pool: both policies spread them.
+            let st = engine.pool_router_stats();
+            assert_eq!(
+                st[1].per_worker,
+                vec![8, 8, 8, 8],
+                "{cfg:?}: {:?}",
+                st[1].per_worker
+            );
+        }
+    }
+
+    #[test]
+    fn decode_router_is_separate_and_kv_aware_decode_spreads_and_prefers_holders() {
+        // The prefill-side kv_aware policy has no load signal on a decode
+        // pool (decoders never prefill) and piles every hand-off onto the
+        // first decoder; kv_aware_decode weighs running sequences.
+        let build = |decode: RouterConfig| {
+            let (mut cluster, model, sched) = small_dense_parts();
+            cluster.num_workers = 4;
+            let topo = DisaggTopology {
+                prefill: cluster.clone(),
+                decode: cluster,
+                kv_link_bw: 1e12,
+            };
+            Engine::new(
+                Topology::from_disagg(&topo, model, sched)
+                    .unwrap()
+                    .with_routers(&RouterConfig::LeastLoaded {}, &decode),
+            )
+        };
+        let cold = |engine: &mut Engine| {
+            for i in 0..32u64 {
+                let mut r = Request::new(format!("r{i}"), 0, i as f64 * 0.001, 512, 200);
+                r.prompt_block_hashes = (1..=32).map(|b| 100_000 * (i + 1) + b).collect();
+                engine.submit(r);
+            }
+            run_until(engine, 32);
+        };
+        let mut kv = build(RouterConfig::KvAware { load_weight: 1.0 });
+        cold(&mut kv);
+        assert_eq!(
+            kv.decode_router_stats().unwrap().per_worker,
+            vec![32, 0, 0, 0]
+        );
+
+        let mut kd = build(RouterConfig::KvAwareDecode { load_weight: 64.0 });
+        cold(&mut kd);
+        assert_eq!(
+            kd.decode_router_stats().unwrap().per_worker,
+            vec![8, 8, 8, 8]
+        );
+        // Prefill pool kept its own (least-loaded) policy.
+        assert_eq!(kd.router_stats().total(), 32);
+        assert_eq!(kd.handoff_stats().transfers, 32);
+        assert_eq!(kd.handoff_stats().bytes_skipped, 0);
+
+        // Re-entries: each of the 32 sessions returns with one more block
+        // after everything drained. The decoder that ran the session holds
+        // its prompt; kv_aware_decode sends the hand-off back there and the
+        // transfer skips the resident 32 blocks.
+        for i in 0..32u64 {
+            let mut r = Request::new(format!("r{i}-2"), 0, 10.0 + i as f64 * 0.001, 528, 8);
+            r.prompt_block_hashes = (1..=33).map(|b| 100_000 * (i + 1) + b).collect();
+            kd.submit(r);
+        }
+        run_until(&mut kd, 32);
+        let st = kd.decode_router_stats().unwrap();
+        assert_eq!(st.prefix_available, 32);
+        assert_eq!(st.prefix_routed, 32);
+        assert_eq!(st.prefix_forgone, 0);
+        let h = kd.handoff_stats();
+        assert_eq!(h.transfers, 64);
+        assert!(h.bytes_skipped > 0);
+        // Round 1 moved 32 blocks per session, round 2 one (KV is linear
+        // in position on this model, so bytes are per-block exact).
+        let (_, model, _) = small_dense_parts();
+        let per_block = model.kv_storage_bytes(16);
+        assert_eq!(h.bytes_skipped, 32 * 32 * per_block);
+        assert_eq!(h.bytes, 32 * 33 * per_block);
     }
 
     #[test]

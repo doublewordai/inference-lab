@@ -49,10 +49,13 @@ worker's `KVCacheManager`. Each iteration:
 
 ## Topologies
 
-`Topology::aggregated` is one pool of identical workers; arrivals are
-round-robined across them. `Topology::from_disagg` is a prefill pool and a
-decode pool joined by a KV hand-off `Link` whose bandwidth is shared by every
-hand-off in flight (processor sharing, event-driven).
+`Topology::aggregated` is one pool of identical workers; a `Router`
+(round-robin by default; least-loaded, prefix-affinity or KV-aware by
+config) picks the worker each arrival enters. `Topology::from_disagg` is a
+prefill pool and a decode pool joined by a KV hand-off `Link` whose
+bandwidth is shared by every hand-off in flight (processor sharing,
+event-driven); `[router]` fronts the prefill pool and `[decode_router]`
+the decode pool.
 
 ## Time
 
