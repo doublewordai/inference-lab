@@ -1147,7 +1147,7 @@ impl Engine {
             let p = &self.topology.pools[pool];
             p.members_of(worker)
                 .iter()
-                .filter_map(|&m| p.workers[m].scheduler.earliest_pending_ready())
+                .filter_map(|&m| p.workers[m].scheduler.earliest_pending_ready(now))
                 .min_by(f64::total_cmp)
         } {
             // Nothing ran, but a request is parked on a KV tier promotion.

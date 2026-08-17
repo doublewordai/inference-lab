@@ -14,6 +14,7 @@
 //! (a worker, or the hand-off path) so a worker that did not drive the
 //! advance can still collect its own.
 
+use rustc_hash::FxHashMap;
 use std::collections::{HashMap, HashSet};
 
 pub type EdgeId = usize;
@@ -87,8 +88,13 @@ struct Transfer {
 #[derive(Debug, Default)]
 pub struct Flows {
     edges: Vec<Edge>,
-    in_flight: HashMap<String, Transfer>,
+    in_flight: FxHashMap<String, Transfer>,
     peak_in_flight: usize,
+    /// The in-flight set changed since rates were last computed. Rates are
+    /// recomputed lazily, before the next drain over a positive interval or
+    /// the next rate-dependent estimate, so a burst of submissions at one
+    /// instant costs one recomputation.
+    rates_dirty: bool,
     /// Completed transfers not yet collected, per owner.
     completed: HashMap<Owner, HashSet<String>>,
     /// Bytes submitted, by owner kind, for reporting.
@@ -167,13 +173,14 @@ impl Flows {
             },
         );
         self.peak_in_flight = self.peak_in_flight.max(self.in_flight.len());
-        self.recompute_rates();
+        self.rates_dirty = true;
     }
 
     /// Advance every transfer to `now`. Returns `(owner, id)` for each
     /// transfer that completed, and queues them per owner too.
     pub fn advance(&mut self, now: f64) -> Vec<(Owner, String)> {
         self.drain_to(now);
+        self.ensure_rates();
         let eps = self.done_eps();
         let mut done: Vec<(Owner, String)> = self
             .in_flight
@@ -187,7 +194,7 @@ impl Flows {
             self.completed.entry(*owner).or_default().insert(id.clone());
         }
         if !done.is_empty() {
-            self.recompute_rates();
+            self.rates_dirty = true;
         }
         done
     }
@@ -196,7 +203,7 @@ impl Flows {
     /// edges). Rates are recomputed. No-op for unknown ids.
     pub fn cancel(&mut self, id: &str) {
         if self.in_flight.remove(id).is_some() {
-            self.recompute_rates();
+            self.rates_dirty = true;
         }
     }
 
@@ -216,7 +223,8 @@ impl Flows {
 
     /// Time until the next completion under the current rates, measured
     /// from the last advance. `None` when nothing in flight can complete.
-    pub fn next_completion_delay(&self) -> Option<f64> {
+    pub fn next_completion_delay(&mut self) -> Option<f64> {
+        self.ensure_rates();
         self.in_flight
             .values()
             .filter_map(|t| Self::time_to_done(t, self.done_eps()))
@@ -253,7 +261,8 @@ impl Flows {
 
     /// Projected remaining time for `id` under the current rates; 0 if
     /// unknown.
-    pub fn estimate_remaining(&self, id: &str) -> f64 {
+    pub fn estimate_remaining(&mut self, id: &str) -> f64 {
+        self.ensure_rates();
         self.in_flight
             .get(id)
             .and_then(|t| Self::time_to_done(t, self.done_eps()))
@@ -298,6 +307,9 @@ impl Flows {
         if now < self.now {
             return;
         }
+        if now > self.now {
+            self.ensure_rates();
+        }
         for t in self.in_flight.values_mut() {
             let mut dt = now - t.last_update;
             t.last_update = now;
@@ -334,52 +346,68 @@ impl Flows {
         self.now = now;
     }
 
+    /// Recompute rates if the in-flight set changed since the last time.
+    fn ensure_rates(&mut self) {
+        if self.rates_dirty {
+            self.recompute_rates();
+            self.rates_dirty = false;
+        }
+    }
+
     /// Max-min fair rates by progressive filling over every in-flight
     /// transfer. A transfer still paying its latency holds its share from
     /// submission (it moves no bytes until the latency is paid, so the
     /// share is reserved rather than used for those microseconds).
+    /// Transfers are bucketed by edge once, so the fill is linear in the
+    /// number of transfers (each is frozen exactly once).
     fn recompute_rates(&mut self) {
-        let ids: Vec<String> = self.in_flight.keys().cloned().collect();
+        let mut ts: Vec<&mut Transfer> = self
+            .in_flight
+            .values_mut()
+            .filter(|t| t.bytes_remaining > DONE_EPSILON_BYTES)
+            .collect();
+        let n = ts.len();
+        let ne = self.edges.len();
         let mut residual: Vec<f64> = self.edges.iter().map(|e| e.capacity).collect();
-        let mut load: Vec<usize> = vec![0; self.edges.len()];
-        let mut unfrozen: HashSet<String> = HashSet::new();
-        for id in &ids {
-            let t = &self.in_flight[id];
-            if t.bytes_remaining <= DONE_EPSILON_BYTES {
-                continue;
-            }
+        let mut load: Vec<usize> = vec![0; ne];
+        let mut on_edge: Vec<Vec<usize>> = vec![Vec::new(); ne];
+        let mut frozen = vec![false; n];
+        let mut unfrozen = 0usize;
+        for (i, t) in ts.iter_mut().enumerate() {
             if t.path.is_empty() {
                 // No edges: unconstrained; treat as instantaneous.
-                self.in_flight.get_mut(id).unwrap().rate = f64::INFINITY;
+                t.rate = f64::INFINITY;
+                frozen[i] = true;
                 continue;
             }
-            unfrozen.insert(id.clone());
+            unfrozen += 1;
             for &e in &t.path {
                 load[e] += 1;
+                on_edge[e].push(i);
             }
         }
-        while !unfrozen.is_empty() {
+        while unfrozen > 0 {
             // Most contended edge: smallest fair share among edges with load.
             let mut best: Option<(EdgeId, f64)> = None;
-            for (e, &n) in load.iter().enumerate() {
-                if n == 0 {
+            for (e, &l) in load.iter().enumerate() {
+                if l == 0 {
                     continue;
                 }
-                let share = residual[e] / n as f64;
+                let share = residual[e] / l as f64;
                 if best.is_none_or(|(_, s)| share < s) {
                     best = Some((e, share));
                 }
             }
             let Some((edge, share)) = best else { break };
             // Freeze every unfrozen transfer on that edge at `share`.
-            let frozen: Vec<String> = unfrozen
-                .iter()
-                .filter(|id| self.in_flight[*id].path.contains(&edge))
-                .cloned()
-                .collect();
-            for id in frozen {
-                unfrozen.remove(&id);
-                let t = self.in_flight.get_mut(&id).unwrap();
+            let members = std::mem::take(&mut on_edge[edge]);
+            for i in members {
+                if frozen[i] {
+                    continue;
+                }
+                frozen[i] = true;
+                unfrozen -= 1;
+                let t = &mut ts[i];
                 t.rate = share.max(0.0);
                 for &e in &t.path {
                     residual[e] = (residual[e] - share).max(0.0);

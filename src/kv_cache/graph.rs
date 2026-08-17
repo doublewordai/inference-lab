@@ -1019,19 +1019,20 @@ impl MemoryGraph {
         self.flows.owners_with_completions()
     }
 
-    pub fn next_completion_delay(&self) -> Option<f64> {
+    pub fn next_completion_delay(&mut self) -> Option<f64> {
         self.flows.next_completion_delay()
     }
 
     /// Projected remaining time for `request`'s promotions on `worker`,
     /// tiers taken serially.
-    pub fn estimate_promotion_remaining(&self, worker: WorkerId, request: &str) -> f64 {
-        (0..self.num_tiers(worker))
+    pub fn estimate_promotion_remaining(&mut self, worker: WorkerId, request: &str) -> f64 {
+        let n = self.num_tiers(worker);
+        (0..n)
             .map(|i| self.flows.estimate_remaining(&promotion_id(request, i)))
             .sum()
     }
 
-    pub fn estimate_remaining(&self, id: &str) -> f64 {
+    pub fn estimate_remaining(&mut self, id: &str) -> f64 {
         self.flows.estimate_remaining(id)
     }
 

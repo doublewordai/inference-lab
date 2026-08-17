@@ -252,10 +252,9 @@ impl Scheduler {
                 // remote KV landed on the next pass).
                 self.waiting.push_front(req);
             } else {
-                let remaining = self
-                    .kv_cache_manager
-                    .estimate_remaining_time(&req.request_id);
-                req.ready_at = Some(current_time + remaining);
+                // Its `ready_at` (the estimate made when it parked) is
+                // refreshed only when the worker would otherwise idle — see
+                // `earliest_pending_ready`.
                 still_pending.push(req);
             }
         }
@@ -783,11 +782,16 @@ impl Scheduler {
                 .sum::<u64>()
     }
 
-    /// Earliest `ready_at` among requests parked on a KV transfer.
-    pub fn earliest_pending_ready(&self) -> Option<f64> {
+    /// Earliest projected ready time among requests parked on a KV
+    /// transfer, under the transfers' current rates at `now`.
+    pub fn earliest_pending_ready(&self, now: f64) -> Option<f64> {
         self.pending_transfers
             .iter()
-            .filter_map(|r| r.ready_at)
+            .map(|r| {
+                now + self
+                    .kv_cache_manager
+                    .estimate_remaining_time(&r.request_id)
+            })
             .min_by(f64::total_cmp)
     }
 
@@ -1285,7 +1289,7 @@ mod tests {
         assert_eq!(scheduler.pending_transfers.len(), 1);
         let ready_at = scheduler.pending_transfers[0].ready_at.unwrap();
         assert!(ready_at > 0.0);
-        assert_eq!(scheduler.earliest_pending_ready(), Some(ready_at));
+        assert!((scheduler.earliest_pending_ready(0.0).unwrap() - ready_at).abs() < 1e-9);
 
         // Before the transfer completes: still pending.
         let decision = scheduler.schedule(ready_at / 2.0);
