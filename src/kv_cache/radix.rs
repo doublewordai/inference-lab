@@ -1841,6 +1841,31 @@ impl Radix {
             if !refresh {
                 continue;
             }
+            // Common case: one range, wholly inside the span — re-stamp in
+            // place.
+            let overlapping: Vec<usize> = ts
+                .ranges
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.start < sp.end && sp.start < r.end)
+                .map(|(i, _)| i)
+                .collect();
+            if overlapping.len() == 1 {
+                let i = overlapping[0];
+                let r = &ts.ranges[i];
+                if r.start >= sp.start && r.end <= sp.end {
+                    let old = (r.key, r.seq, node_id, r.start);
+                    self.stores[s].seq += 1;
+                    let seq = self.stores[s].seq;
+                    let r = &mut ts.ranges[i];
+                    r.seq = seq;
+                    r.touched = now;
+                    let new = (r.key, r.seq, node_id, r.start);
+                    self.stores[s].order.remove(&old);
+                    self.stores[s].order.insert(new);
+                    continue;
+                }
+            }
             let mut ranges = Vec::with_capacity(ts.ranges.len() + 1);
             let mut removed = Vec::new();
             let mut added = Vec::new();
