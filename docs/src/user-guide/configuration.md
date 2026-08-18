@@ -312,6 +312,8 @@ sessions_path = "data/sessions/tracelab.jsonl"
 arrival_pattern = "poisson"   # governs session starts
 arrival_rate = 0.05           # sessions/s
 num_sessions = 200            # stop starting sessions after this many
+# Optional: seed the first live population part-way through its traces.
+stationary_start_sessions = 128
 seed = 42
 
 input_len_dist = { type = "fixed", value = 1 }   # ignored in session mode
@@ -327,6 +329,13 @@ step's `gap`, so the simulated latency feeds back into the arrival process
 and long gaps are preserved. Sessions are taken from the file in order and
 the file is cycled. `num_sessions` bounds session starts; `num_requests`
 separately bounds total emitted request steps across all sessions.
+
+`stationary_start_sessions` avoids waiting a session-lifetime tail for an
+open-loop live population to reach stationarity. Each of the first N sessions
+starts at a trace step sampled in proportion to that step's `gap` (the time
+the session waits before issuing it). Its inherited context receives fresh
+block hashes, so the first emitted request reports its shared prefix but must
+prefill that context once; later sessions start at step 0 normally.
 
 **Session file:** JSONL, one session per line:
 

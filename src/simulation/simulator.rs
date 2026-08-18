@@ -577,6 +577,40 @@ mod tests {
     }
 
     #[test]
+    fn stationary_session_starts_mid_trace_with_a_cold_shared_prefix() {
+        let dir =
+            std::env::temp_dir().join(format!("il-stationary-sessions-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"id":"s","steps":["#,
+                r#"{"input":64,"new":64,"output":16,"gap":0},"#,
+                r#"{"input":96,"new":16,"output":8,"gap":10.0}]}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let mut config = create_minimal_test_config();
+        config.workload.sessions_path = Some(path.to_string_lossy().into_owned());
+        config.workload.num_sessions = Some(1);
+        config.workload.stationary_start_sessions = Some(512);
+        config.workload.num_requests = Some(1);
+        config.workload.arrival_pattern = crate::config::ArrivalPattern::Batched;
+        let mut simulator = Simulator::new(config, None).unwrap();
+
+        simulator.run_with_callback(|_| {}).unwrap();
+
+        let rows = simulator.request_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].session, Some((0, 1)));
+        assert_eq!(rows[0].shared_tokens, Some(80));
+        assert_eq!(rows[0].cached_tokens, 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn closed_loop_with_jitter_starts_at_the_first_staggered_arrival() {
         let mut config = create_minimal_test_config();
         config.workload.arrival_pattern = crate::config::ArrivalPattern::ClosedLoop;

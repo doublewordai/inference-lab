@@ -22,6 +22,8 @@
 //! prompt.
 
 use super::Request;
+use rand::rngs::StdRng;
+use rand::{RngExt, SeedableRng};
 use serde::Deserialize;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
@@ -161,6 +163,9 @@ pub struct SessionSource {
     /// Steps due: (arrival time, session ordinal), earliest first.
     pending: BinaryHeap<Reverse<(OrderedTime, u32)>>,
     next_hash: u64,
+    /// First sessions to start at a sampled mid-trace step.
+    stationary_starts: u32,
+    rng: Option<Box<StdRng>>,
 }
 
 /// f64 wrapper ordered by value so it can sit in a heap key. Times are
@@ -191,7 +196,40 @@ impl SessionSource {
             // Fresh hashes are drawn from a counter; start high so they
             // cannot collide with small literal hashes used elsewhere.
             next_hash: 1 << 40,
+            stationary_starts: 0,
+            rng: None,
         }
+    }
+
+    /// Start the first `count` sessions at a time-weighted trace step.
+    pub fn with_stationary_starts(mut self, count: u32, seed: u64) -> Self {
+        self.stationary_starts = count;
+        self.rng = Some(Box::new(StdRng::seed_from_u64(seed)));
+        self
+    }
+
+    /// Draw a step in proportion to the time the session spends waiting to
+    /// issue it. A step's non-negative `gap` is its weight.
+    fn sample_start_step(&mut self, spec_idx: usize) -> usize {
+        let steps = &self.specs[spec_idx].steps;
+        let total: f64 = steps.iter().map(|step| step.gap.max(0.0)).sum();
+        if total <= 0.0 || steps.len() < 2 {
+            return 0;
+        }
+
+        let mut target = self
+            .rng
+            .as_mut()
+            .expect("stationary starts configure an RNG")
+            .random_range(0.0..total);
+        for (index, step) in steps.iter().enumerate() {
+            let weight = step.gap.max(0.0);
+            if target < weight {
+                return index;
+            }
+            target -= weight;
+        }
+        steps.len() - 1
     }
 
     /// Sessions in the file.
@@ -225,13 +263,36 @@ impl SessionSource {
         self.next_spec = (self.next_spec + 1) % self.specs.len();
         let ordinal = self.started;
         self.started += 1;
+        // A seeded session joins mid-trace with the context its preceding
+        // step would have built. Give that inherited context fresh hashes:
+        // this session instance has not populated any worker's cache yet, so
+        // its first emitted request must prefill the context once.
+        let start_step = if ordinal < self.stationary_starts {
+            self.sample_start_step(spec_idx)
+        } else {
+            0
+        };
+        let (hashes, context_tokens) = if start_step == 0 {
+            (Vec::new(), 0)
+        } else {
+            let previous = &self.specs[spec_idx].steps[start_step - 1];
+            let context = previous.input.max(1) + previous.output.max(1);
+            let hashes = (0..context.div_ceil(self.block_size))
+                .map(|_| {
+                    let hash = self.next_hash;
+                    self.next_hash += 1;
+                    hash
+                })
+                .collect();
+            (hashes, context)
+        };
         self.active.insert(
             ordinal,
             ActiveSession {
                 spec_idx,
-                next_step: 0,
-                hashes: Vec::new(),
-                context_tokens: 0,
+                next_step: start_step,
+                hashes,
+                context_tokens,
             },
         );
         self.issue_step(ordinal, arrival_time, 0.0)
@@ -435,6 +496,45 @@ mod tests {
         src.on_step_complete(first.session.as_ref().unwrap(), 1.0);
         let second = src.next_due(10.0).unwrap();
         assert_eq!(second.session.unwrap().shared_tokens, 112);
+    }
+
+    #[test]
+    fn stationary_start_step_is_weighted_by_gap() {
+        let mut specs = two_step();
+        specs[0].steps.push(StepSpec {
+            input: 160,
+            new: 25,
+            output: 5,
+            gap: 7.5,
+            kind: None,
+        });
+        // Weights are [0, 2.5, 7.5], so the two eligible steps should be
+        // sampled in a 1:3 ratio and the zero-gap first step never selected.
+        let mut source = SessionSource::new(specs, 16).with_stationary_starts(1, 42);
+        let mut counts = [0usize; 3];
+        for _ in 0..20_000 {
+            counts[source.sample_start_step(0)] += 1;
+        }
+        assert_eq!(counts[0], 0);
+        let second_share = counts[1] as f64 / (counts[1] + counts[2]) as f64;
+        assert!((0.23..0.27).contains(&second_share), "{counts:?}");
+    }
+
+    #[test]
+    fn only_the_configured_first_sessions_start_mid_trace() {
+        // In two_step(), only step 1 has positive weight, so the seeded
+        // session deterministically starts there.
+        let mut source = SessionSource::new(two_step(), 16).with_stationary_starts(1, 7);
+        let seeded = source.start_session(0.0);
+        let normal = source.start_session(0.0);
+
+        let seeded_step = seeded.session.as_ref().unwrap();
+        assert_eq!((seeded_step.session, seeded_step.step), (0, 1));
+        assert_eq!(seeded_step.shared_tokens, 112);
+        assert!(!seeded.prompt_block_hashes.is_empty());
+        let normal_step = normal.session.as_ref().unwrap();
+        assert_eq!((normal_step.session, normal_step.step), (1, 0));
+        assert_eq!(normal_step.shared_tokens, 0);
     }
 
     #[test]
