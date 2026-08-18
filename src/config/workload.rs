@@ -60,9 +60,10 @@ pub struct WorkloadConfig {
     #[serde(default)]
     pub sessions_path: Option<String>,
 
-    /// Session mode: stop starting sessions after this many. Sessions cycle
-    /// through the file, so this may exceed the file's count. Without it (and
-    /// without `num_requests`) sessions keep starting for the whole run.
+    /// Session mode: maximum number of session starts. This does not limit
+    /// the total request steps emitted by those sessions; `num_requests`
+    /// provides that separate bound. Sessions cycle through the file, so this
+    /// may exceed the file's count.
     #[serde(default)]
     pub num_sessions: Option<usize>,
 
@@ -86,7 +87,9 @@ pub struct WorkloadConfig {
     /// Output sequence length distribution (ignored in dataset mode)
     pub output_len_dist: LengthDistribution,
 
-    /// Total number of requests to simulate (None = run until duration)
+    /// Maximum total requests generated. In session mode every step of every
+    /// session counts toward this limit; use `num_sessions` to bound session
+    /// starts instead. `None` leaves the total request count unbounded.
     pub num_requests: Option<usize>,
 
     /// Number of concurrent users for closed-loop pattern

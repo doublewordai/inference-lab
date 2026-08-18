@@ -612,9 +612,26 @@ fn run_quiet(simulator: &mut Simulator) {
         .unwrap();
 }
 
-fn run_with_dashboard(simulator: &mut Simulator, config: &Config) {
-    let total_requests = config.workload.num_requests.unwrap_or(1000) as u64;
+/// Dashboard request progress. Without a request-count limit there is no
+/// meaningful percentage or denominator to display.
+fn request_progress_status(completed: u64, request_limit: Option<usize>) -> (Option<f64>, String) {
+    match request_limit {
+        Some(total) => {
+            let percent = if total == 0 {
+                100.0
+            } else {
+                (completed as f64 / total as f64 * 100.0).min(100.0)
+            };
+            (
+                Some(percent),
+                format!("{completed}/{total} ({percent:.0}%)"),
+            )
+        }
+        None => (None, format!("{completed} completed (no request limit)")),
+    }
+}
 
+fn run_with_dashboard(simulator: &mut Simulator, config: &Config) {
     println!("{}", "━".repeat(60).bright_black());
     println!("{}", "Simulation Progress".bright_cyan().bold());
     println!("{}", "━".repeat(60).bright_black());
@@ -624,11 +641,8 @@ fn run_with_dashboard(simulator: &mut Simulator, config: &Config) {
 
     simulator
         .run_with_callback(|progress| {
-            let percent =
-                (progress.completed_requests as f64 / total_requests as f64 * 100.0).min(100.0);
-            let bar_width = 40;
-            let filled = (bar_width as f64 * percent / 100.0) as usize;
-            let bar: String = "█".repeat(filled) + &"░".repeat(bar_width - filled);
+            let (percent, status) =
+                request_progress_status(progress.completed_requests, config.workload.num_requests);
 
             // Clear previous dashboard (move cursor up and clear lines)
             if !first_update {
@@ -637,13 +651,14 @@ fn run_with_dashboard(simulator: &mut Simulator, config: &Config) {
             }
             first_update = false;
 
-            println!(
-                "  Progress: [{}] {}/{} ({:.0}%)",
-                bar.cyan(),
-                progress.completed_requests,
-                total_requests,
-                percent
-            );
+            if let Some(percent) = percent {
+                let bar_width = 40;
+                let filled = (bar_width as f64 * percent / 100.0) as usize;
+                let bar: String = "█".repeat(filled) + &"░".repeat(bar_width - filled);
+                println!("  Progress: [{}] {}", bar.cyan(), status);
+            } else {
+                println!("  Progress: {}", status);
+            }
             println!(
                 "  Time:     {}s simulated",
                 format!("{:.1}", progress.current_time).yellow()
@@ -902,4 +917,21 @@ fn save_metrics_json(
 ) -> Result<(), Box<dyn std::error::Error>> {
     std::fs::write(path, serde_json::to_string_pretty(summary)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::request_progress_status;
+
+    #[test]
+    fn progress_status_only_shows_a_real_request_limit() {
+        assert_eq!(
+            request_progress_status(91517, None),
+            (None, "91517 completed (no request limit)".to_string())
+        );
+        assert_eq!(
+            request_progress_status(250, Some(1000)),
+            (Some(25.0), "250/1000 (25%)".to_string())
+        );
+    }
 }
