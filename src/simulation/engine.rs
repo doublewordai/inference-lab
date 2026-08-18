@@ -44,6 +44,8 @@ pub struct RequestTiming {
     pub num_cached_tokens: u32,
     /// Session workloads: which step of which session this was.
     pub session: Option<Box<SessionStep>>,
+    /// Memory-graph id of the worker that served the request.
+    pub worker: Option<u32>,
     /// Times the request was preempted (and recomputed) before completing.
     pub num_preemptions: u32,
     /// Refused at submission (context larger than the worker's KV cache).
@@ -1128,7 +1130,8 @@ impl Engine {
         self.deliver_to_worker(pool_id, worker_idx, req);
     }
 
-    fn deliver_to_worker(&mut self, pool_id: PoolId, worker_idx: usize, req: Request) {
+    fn deliver_to_worker(&mut self, pool_id: PoolId, worker_idx: usize, mut req: Request) {
+        req.worker = Some(self.topology.pools[pool_id].workers[worker_idx].global_id as u32);
         self.topology.pools[pool_id].workers[worker_idx]
             .scheduler
             .add_request(req);
@@ -1663,6 +1666,7 @@ impl Engine {
             num_output_tokens: req.num_output_tokens,
             num_cached_tokens: req.num_cached_tokens,
             session: req.session,
+            worker: req.worker,
             num_preemptions: req.num_preemptions,
             rejected: req.rejected,
         }

@@ -75,6 +75,8 @@ pub struct RequestRow {
     /// completion, and the KV bytes written into the caches between the
     /// parent's completion and this arrival (the reuse distance).
     pub session: Option<(u32, u32)>,
+    /// Memory-graph id of the worker that served the request.
+    pub worker: Option<u32>,
     pub gap: Option<f64>,
     /// Prompt tokens shared with the parent's context: the most the prefix
     /// cache could have served.
@@ -178,6 +180,7 @@ impl MetricsCollector {
             cached_tokens: timing.num_cached_tokens,
             num_preemptions: timing.num_preemptions,
             session: timing.session.as_ref().map(|s| (s.session, s.step)),
+            worker: timing.worker,
             gap: timing.session.as_ref().map(|s| s.gap),
             shared_tokens: timing.session.as_ref().map(|s| s.shared_tokens),
             reuse_distance_bytes: timing.session.as_ref().and_then(|s| s.reuse_distance_bytes),
@@ -359,6 +362,7 @@ mod tests {
             num_output_tokens: output,
             num_cached_tokens: 0,
             session: None,
+            worker: None,
             num_preemptions: preemptions,
             rejected: false,
         }

@@ -5,6 +5,8 @@ use inference_lab::simulation::Simulator;
 use std::path::PathBuf;
 use std::time::Instant;
 
+const REQUEST_CSV_HEADER: &str = "arrival,completion,ttft,e2e,mean_tpot,prompt_toks,output_toks,cached_toks,preemptions,session,step,worker,gap,shared_toks,reuse_distance_bytes,reuse_touched_bytes\n";
+
 #[cfg(feature = "cli")]
 use tokenizers::Tokenizer;
 
@@ -121,7 +123,7 @@ struct SimArgs {
 
     /// Save per-request metrics to a CSV file (arrival, completion, ttft,
     /// e2e, mean_tpot, prompt_toks, output_toks, cached_toks, preemptions, and
-    /// for session workloads session, step, gap, shared_toks,
+    /// for session workloads session, step, worker, gap, shared_toks,
     /// reuse_distance_bytes, reuse_touched_bytes); times in seconds
     #[arg(long)]
     request_csv: Option<PathBuf>,
@@ -569,29 +571,9 @@ fn run_sim(args: SimArgs) {
                 eprintln!("Error saving depth CSV: {}", e);
             }
         }
-        let mut out = String::from(
-            "arrival,completion,ttft,e2e,mean_tpot,prompt_toks,output_toks,cached_toks,preemptions,session,step,gap,shared_toks,reuse_distance_bytes,reuse_touched_bytes\n",
-        );
+        let mut out = String::from(REQUEST_CSV_HEADER);
         for r in simulator.request_rows() {
-            let opt = |v: Option<String>| v.unwrap_or_default();
-            out.push_str(&format!(
-                "{:.4},{:.4},{:.5},{:.4},{:.6},{},{},{},{},{},{},{},{},{},{}\n",
-                r.arrival,
-                r.completion,
-                r.ttft,
-                r.e2e,
-                r.mean_tpot,
-                r.prompt_tokens,
-                r.output_tokens,
-                r.cached_tokens,
-                r.num_preemptions,
-                opt(r.session.map(|(s, _)| s.to_string())),
-                opt(r.session.map(|(_, st)| st.to_string())),
-                opt(r.gap.map(|g| format!("{g:.3}"))),
-                opt(r.shared_tokens.map(|t| t.to_string())),
-                opt(r.reuse_distance_bytes.map(|b| b.to_string())),
-                opt(r.reuse_touched_bytes.map(|b| b.to_string())),
-            ));
+            append_request_csv_row(&mut out, r);
         }
         match std::fs::write(&csv_path, out) {
             Ok(_) => {
@@ -602,6 +584,29 @@ fn run_sim(args: SimArgs) {
             Err(e) => eprintln!("Error saving request CSV: {}", e),
         }
     }
+}
+
+fn append_request_csv_row(out: &mut String, r: &inference_lab::metrics::RequestRow) {
+    let opt = |v: Option<String>| v.unwrap_or_default();
+    out.push_str(&format!(
+        "{:.4},{:.4},{:.5},{:.4},{:.6},{},{},{},{},{},{},{},{},{},{},{}\n",
+        r.arrival,
+        r.completion,
+        r.ttft,
+        r.e2e,
+        r.mean_tpot,
+        r.prompt_tokens,
+        r.output_tokens,
+        r.cached_tokens,
+        r.num_preemptions,
+        opt(r.session.map(|(s, _)| s.to_string())),
+        opt(r.session.map(|(_, st)| st.to_string())),
+        opt(r.worker.map(|w| w.to_string())),
+        opt(r.gap.map(|g| format!("{g:.3}"))),
+        opt(r.shared_tokens.map(|t| t.to_string())),
+        opt(r.reuse_distance_bytes.map(|b| b.to_string())),
+        opt(r.reuse_touched_bytes.map(|b| b.to_string())),
+    ));
 }
 
 fn run_quiet(simulator: &mut Simulator) {
@@ -921,7 +926,8 @@ fn save_metrics_json(
 
 #[cfg(test)]
 mod tests {
-    use super::request_progress_status;
+    use super::{append_request_csv_row, request_progress_status, REQUEST_CSV_HEADER};
+    use inference_lab::metrics::RequestRow;
 
     #[test]
     fn progress_status_only_shows_a_real_request_limit() {
@@ -933,5 +939,33 @@ mod tests {
             request_progress_status(250, Some(1000)),
             (Some(25.0), "250/1000 (25%)".to_string())
         );
+    }
+
+    #[test]
+    fn request_csv_places_worker_between_step_and_gap() {
+        let header: Vec<_> = REQUEST_CSV_HEADER.trim_end().split(',').collect();
+        assert_eq!(&header[10..13], ["step", "worker", "gap"]);
+
+        let row = RequestRow {
+            arrival: 1.0,
+            completion: 2.0,
+            ttft: 0.25,
+            e2e: 1.0,
+            mean_tpot: 0.05,
+            prompt_tokens: 100,
+            output_tokens: 20,
+            cached_tokens: 64,
+            num_preemptions: 0,
+            session: Some((3, 4)),
+            worker: Some(7),
+            gap: Some(1.25),
+            shared_tokens: Some(80),
+            reuse_distance_bytes: Some(1024),
+            reuse_touched_bytes: Some(2048),
+        };
+        let mut csv = String::new();
+        append_request_csv_row(&mut csv, &row);
+        let fields: Vec<_> = csv.trim_end().split(',').collect();
+        assert_eq!(&fields[9..13], ["3", "4", "7", "1.250"]);
     }
 }
