@@ -205,9 +205,14 @@ impl RequestGenerator {
         } else {
             self.next_arrival_time
         };
-        match &self.source {
+        let next = match &self.source {
             Source::Sessions(src) => src.peek_pending().unwrap_or(f64::INFINITY).min(next_start),
             _ => next_start,
+        };
+        if Self::within_duration(self.workload.duration_secs, next) {
+            next
+        } else {
+            f64::INFINITY
         }
     }
 
@@ -235,6 +240,12 @@ impl RequestGenerator {
             .is_some_and(|max| self.requests_generated >= max)
     }
 
+    /// Whether an arrival belongs to the configured simulation window.
+    /// Requests admitted by the deadline are allowed to finish afterwards.
+    fn within_duration(duration_secs: Option<f64>, arrival_time: f64) -> bool {
+        duration_secs.is_none_or(|deadline| arrival_time <= deadline)
+    }
+
     /// Sessions: no more sessions may start (`num_sessions` reached). Always
     /// false for other sources.
     fn reached_start_limit(&self) -> bool {
@@ -251,11 +262,17 @@ impl RequestGenerator {
             self.pending_closed_loop.clear();
             return None;
         }
+        let duration_secs = self.workload.duration_secs;
         // Sessions: a queued step that is due comes before any new session.
         if let Source::Sessions(src) = &mut self.source {
-            if let Some(req) = src.next_due(current_time) {
-                self.requests_generated += 1;
-                return Some(req);
+            if src
+                .peek_pending()
+                .is_some_and(|t| Self::within_duration(duration_secs, t))
+            {
+                if let Some(req) = src.next_due(current_time) {
+                    self.requests_generated += 1;
+                    return Some(req);
+                }
             }
             if self.reached_start_limit() {
                 self.pending_closed_loop.clear();
@@ -266,10 +283,12 @@ impl RequestGenerator {
             let pos = self
                 .pending_closed_loop
                 .iter()
-                .position(|&t| t <= current_time)?;
+                .position(|&t| t <= current_time && Self::within_duration(duration_secs, t))?;
             self.pending_closed_loop.remove(pos)
         } else {
-            if self.next_arrival_time > current_time {
+            if self.next_arrival_time > current_time
+                || !Self::within_duration(duration_secs, self.next_arrival_time)
+            {
                 return None;
             }
             self.next_arrival_time
@@ -376,6 +395,9 @@ impl RequestGenerator {
             }
             _ => {}
         }
+        if self.workload.duration_secs.is_some() && self.peek_next_arrival_time().is_infinite() {
+            return true;
+        }
         match self.workload.num_requests {
             Some(_) => {
                 self.reached_request_limit()
@@ -395,7 +417,8 @@ impl RequestGenerator {
         let mut has_successor = false;
         let mut slot_freed = true;
         if let (Source::Sessions(src), Some(step)) = (&mut self.source, &timing.session) {
-            has_successor = src.on_step_complete(step, completion_time);
+            has_successor =
+                src.on_step_complete_before(step, completion_time, self.workload.duration_secs);
             // The user slot stays busy until the session's last step is done.
             slot_freed = !has_successor;
         }
@@ -403,6 +426,7 @@ impl RequestGenerator {
             && self.workload.arrival_pattern.is_closed_loop()
             && !self.reached_request_limit()
             && !self.reached_start_limit()
+            && Self::within_duration(self.workload.duration_secs, completion_time)
         {
             // Replenish immediately at completion. The stagger established at
             // init time persists, since fixed ISL/OSL means each user has the
@@ -533,6 +557,22 @@ mod tests {
     }
 
     #[test]
+    fn duration_stops_open_loop_arrivals_at_the_deadline() {
+        let mut workload = create_test_workload(ArrivalPattern::Uniform, 1.0, 100);
+        workload.duration_secs = Some(2.0);
+        let mut generator = RequestGenerator::new(workload);
+
+        let requests = drain(&mut generator);
+
+        assert_eq!(
+            requests.iter().map(|r| r.arrival_time).collect::<Vec<_>>(),
+            vec![1.0, 2.0]
+        );
+        assert_eq!(generator.num_generated(), 2);
+        assert!(generator.is_finished());
+    }
+
+    #[test]
     fn test_request_properties() {
         let mut generator =
             RequestGenerator::new(create_test_workload(ArrivalPattern::Poisson, 1.0, 1));
@@ -652,6 +692,22 @@ mod tests {
         assert!(!g.on_request_complete(&completed(&b0, 21.0)));
         assert!(g.is_finished());
         assert_eq!(g.num_generated(), 3);
+    }
+
+    #[test]
+    fn duration_stops_future_session_steps_and_starts() {
+        let mut workload = create_test_workload(ArrivalPattern::Uniform, 1.0, 100);
+        workload.duration_secs = Some(1.0);
+        let mut generator = RequestGenerator::from_sessions(workload, 16, session_specs());
+
+        let first = generator.next_if_before(1.0).unwrap();
+        assert_eq!(first.request_id, "s0/0");
+        // Step 1 would arrive at completion (2 s) + its 2 s gap, and the
+        // next session would start at 2 s. Both fall after the deadline.
+        assert!(!generator.on_request_complete(&completed(&first, 2.0)));
+        assert!(generator.next_if_before(100.0).is_none());
+        assert!(generator.peek_next_arrival_time().is_infinite());
+        assert!(generator.is_finished());
     }
 
     #[test]

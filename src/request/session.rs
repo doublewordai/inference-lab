@@ -255,6 +255,17 @@ impl SessionSource {
     /// at `completion_time + gap`. Returns `true` if a step was queued, and
     /// `false` if the session is over (it is retired here).
     pub fn on_step_complete(&mut self, step: &SessionStep, completion_time: f64) -> bool {
+        self.on_step_complete_before(step, completion_time, None)
+    }
+
+    /// Complete a step, but retire the session instead of queueing a successor
+    /// whose arrival would fall after `deadline`.
+    pub(crate) fn on_step_complete_before(
+        &mut self,
+        step: &SessionStep,
+        completion_time: f64,
+        deadline: Option<f64>,
+    ) -> bool {
         let Some(active) = self.active.get(&step.session) else {
             return false;
         };
@@ -264,8 +275,13 @@ impl SessionSource {
             return false;
         }
         let gap = spec.steps[active.next_step].gap.max(0.0);
+        let arrival_time = completion_time + gap;
+        if deadline.is_some_and(|limit| arrival_time > limit) {
+            self.active.remove(&step.session);
+            return false;
+        }
         self.pending
-            .push(Reverse((OrderedTime(completion_time + gap), step.session)));
+            .push(Reverse((OrderedTime(arrival_time), step.session)));
         true
     }
 
