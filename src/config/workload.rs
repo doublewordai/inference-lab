@@ -67,6 +67,13 @@ pub struct WorkloadConfig {
     #[serde(default)]
     pub num_sessions: Option<usize>,
 
+    /// Session mode: start this many of the first sessions part-way through
+    /// their own trace, at a step drawn in proportion to the time the session
+    /// spends there. Without it an open-loop run needs a warm-up on the order
+    /// of the session-lifetime tail before the live population is stationary.
+    #[serde(default)]
+    pub stationary_start_sessions: Option<u32>,
+
     pub arrival_pattern: ArrivalPattern,
 
     /// Mean arrival rate (requests per second) for the open-loop patterns.

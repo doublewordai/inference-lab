@@ -118,10 +118,11 @@ impl RequestGenerator {
         block_size: u32,
         sessions: Vec<SessionSpec>,
     ) -> Self {
-        Self::build(
-            workload,
-            Source::Sessions(SessionSource::new(sessions, block_size)),
-        )
+        let mut source = SessionSource::new(sessions, block_size);
+        if let Some(count) = workload.stationary_start_sessions {
+            source = source.with_stationary_starts(count, workload.seed);
+        }
+        Self::build(workload, Source::Sessions(source))
     }
 
     fn build(workload: WorkloadConfig, source: Source) -> Self {
@@ -456,6 +457,7 @@ mod tests {
             dataset_path: None,
             sessions_path: None,
             num_sessions: None,
+            stationary_start_sessions: None,
             arrival_pattern: pattern,
             arrival_rate: rate,
             rate_schedule: None,

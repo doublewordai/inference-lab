@@ -255,6 +255,7 @@ The `[workload]` table, at top level of `workloads/<name>.toml`.
 | `dataset_path` | String | unset | JSONL in OpenAI batch format; prompts are tokenised with `--tokenizer` and hashed per KV block so shared prefixes hit the prefix cache |
 | `sessions_path` | String | unset | Session file (JSONL, one session per line, see [Sessions](../user-guide/configuration.md#sessions)). The arrival pattern then governs session *starts* (`arrival_rate` in sessions/s; `closed_loop` holds `num_concurrent_users` sessions in flight); each later step arrives at its parent's completion plus the step's gap. Mutually exclusive with `dataset_path`; length distributions are ignored |
 | `num_sessions` | U32 | unset | Session mode: maximum session starts; does not limit the total request steps emitted by those sessions (the file is cycled, so it may exceed the file's count) |
+| `stationary_start_sessions` | U32 | unset | Session mode: start this many of the first sessions at a time-weighted step in their trace, with fresh inherited-context hashes |
 | `seed` | U64 | — | |
 
 ---
