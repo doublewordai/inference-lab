@@ -5,7 +5,7 @@ use inference_lab::simulation::Simulator;
 use std::path::PathBuf;
 use std::time::Instant;
 
-const REQUEST_CSV_HEADER: &str = "arrival,completion,ttft,e2e,mean_tpot,prompt_toks,output_toks,cached_toks,preemptions,session,step,worker,gap,shared_toks,reuse_distance_bytes,reuse_touched_bytes\n";
+const REQUEST_CSV_HEADER: &str = "arrival,completion,ttft,e2e,mean_tpot,prompt_toks,output_toks,cached_toks,preemptions,session,step,worker,gap,shared_toks,reuse_distance_bytes,reuse_touched_bytes,lookup_at,hbm_cached_toks,tier_cached_toks,promote_start,promote_land,lookups\n";
 
 #[cfg(feature = "cli")]
 use tokenizers::Tokenizer;
@@ -124,7 +124,9 @@ struct SimArgs {
     /// Save per-request metrics to a CSV file (arrival, completion, ttft,
     /// e2e, mean_tpot, prompt_toks, output_toks, cached_toks, preemptions, and
     /// for session workloads session, step, worker, gap, shared_toks,
-    /// reuse_distance_bytes, reuse_touched_bytes); times in seconds
+    /// reuse_distance_bytes, reuse_touched_bytes, and the prefix lookup that
+    /// fixed cached_toks: lookup_at, hbm_cached_toks, tier_cached_toks,
+    /// promote_start, promote_land, lookups); times in seconds
     #[arg(long)]
     request_csv: Option<PathBuf>,
 
@@ -589,7 +591,7 @@ fn run_sim(args: SimArgs) {
 fn append_request_csv_row(out: &mut String, r: &inference_lab::metrics::RequestRow) {
     let opt = |v: Option<String>| v.unwrap_or_default();
     out.push_str(&format!(
-        "{:.4},{:.4},{:.5},{:.4},{:.6},{},{},{},{},{},{},{},{},{},{},{}\n",
+        "{:.4},{:.4},{:.5},{:.4},{:.6},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
         r.arrival,
         r.completion,
         r.ttft,
@@ -606,6 +608,18 @@ fn append_request_csv_row(out: &mut String, r: &inference_lab::metrics::RequestR
         opt(r.shared_tokens.map(|t| t.to_string())),
         opt(r.reuse_distance_bytes.map(|b| b.to_string())),
         opt(r.reuse_touched_bytes.map(|b| b.to_string())),
+        opt(r.lookup.map(|l| format!("{:.4}", l.at))),
+        opt(r.lookup.map(|l| l.hbm_tokens.to_string())),
+        opt(r.lookup.map(|l| l.tier_tokens.to_string())),
+        opt(r
+            .lookup
+            .and_then(|l| l.promote_start)
+            .map(|t| format!("{t:.4}"))),
+        opt(r
+            .lookup
+            .and_then(|l| l.promote_land)
+            .map(|t| format!("{t:.4}"))),
+        opt(r.lookup.map(|l| l.lookups.to_string())),
     ));
 }
 
@@ -962,10 +976,19 @@ mod tests {
             shared_tokens: Some(80),
             reuse_distance_bytes: Some(1024),
             reuse_touched_bytes: Some(2048),
+            lookup: Some(inference_lab::request::LookupRecord {
+                at: 1.5,
+                hbm_tokens: 64,
+                tier_tokens: 0,
+                promote_start: None,
+                promote_land: None,
+                lookups: 1,
+            }),
         };
         let mut csv = String::new();
         append_request_csv_row(&mut csv, &row);
         let fields: Vec<_> = csv.trim_end().split(',').collect();
         assert_eq!(&fields[9..13], ["3", "4", "7", "1.250"]);
+        assert_eq!(&fields[16..22], ["1.5000", "64", "0", "", "", "1"]);
     }
 }

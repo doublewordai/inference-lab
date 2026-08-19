@@ -23,6 +23,23 @@ pub(crate) struct KvLeaf {
 /// generated: on resume the request re-prefills the prompt plus the generated
 /// tokens whose KV was lost, then continues decoding (vLLM v1 recompute
 /// semantics).
+/// What the scheduler's prefix lookup found for a request, and when.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct LookupRecord {
+    /// Simulation time of the lookup that fixed the request's cached prefix.
+    pub at: f64,
+    /// Prefix tokens resident in (or in flight to) the worker's HBM then.
+    pub hbm_tokens: u32,
+    /// Prefix tokens promoted from the worker's tiers.
+    pub tier_tokens: u32,
+    /// When the promotion transfer started and landed, if any.
+    pub promote_start: Option<f64>,
+    pub promote_land: Option<f64>,
+    /// How many admission decisions the request went through (re-lookups
+    /// after preemption or a released landing).
+    pub lookups: u32,
+}
+
 #[derive(Debug, Clone)]
 pub struct Request {
     /// Unique request ID.
@@ -54,6 +71,12 @@ pub struct Request {
 
     /// Prefix tokens found in the KV cache at admission (set by the scheduler).
     pub num_cached_tokens: u32,
+
+    /// The prefix lookup that decided `num_cached_tokens`: when it happened
+    /// and what it found where (diagnostics, `--request-csv`). Set on the
+    /// first admission decision; later lookups (after a preemption or a
+    /// released landing) only bump `lookups`.
+    pub lookup: Option<LookupRecord>,
 
     /// Incremental content hashes of the sequence, one per `block_size`
     /// tokens: hash `n` covers all tokens up to the end of block `n`. Empty
@@ -184,6 +207,7 @@ impl Request {
             num_computed_tokens: 0,
             num_output_tokens: 0,
             num_cached_tokens: 0,
+            lookup: None,
             prompt_block_hashes: Vec::new(),
             session: None,
             worker: None,

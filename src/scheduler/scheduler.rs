@@ -263,6 +263,11 @@ impl Scheduler {
                     (cached_blocks as u32).saturating_mul(self.kv_cache_manager.block_size());
                 self.kv_cache_manager
                     .publish_transferred_blocks(&mut req, cached_blocks);
+                if let Some(l) = req.lookup.as_mut() {
+                    if l.promote_land.is_none() {
+                        l.promote_land = Some(current_time);
+                    }
+                }
                 req.ready_at = None;
                 req.num_computed_tokens = req.num_cached_tokens;
                 // Its prefix is hot and its landing blocks are held: admit
@@ -496,6 +501,25 @@ impl Scheduler {
                     let mut request = self.waiting.remove(selected_idx).unwrap();
                     self.kv_cache_manager.record_prefix_lookup(&lookup);
                     request.num_cached_tokens = cached_tokens;
+                    let tier_tokens: u32 = lookup.promote_tokens_per_tier.iter().sum();
+                    match request.lookup.as_mut() {
+                        Some(l) => {
+                            l.lookups += 1;
+                            if l.promote_start.is_none() {
+                                l.promote_start = Some(current_time);
+                            }
+                        }
+                        None => {
+                            request.lookup = Some(crate::request::LookupRecord {
+                                at: current_time,
+                                hbm_tokens: resident.min(cached_tokens),
+                                tier_tokens,
+                                promote_start: Some(current_time),
+                                promote_land: None,
+                                lookups: 1,
+                            })
+                        }
+                    }
                     // A request back from an earlier promotion already holds
                     // (and has computed) that prefix; reserve only the
                     // positions beyond it — a sibling on a node-shared tier
@@ -566,6 +590,19 @@ impl Scheduler {
                     self.kv_cache_manager.record_prefix_lookup(&lookup);
                 }
                 request.num_cached_tokens = cached_tokens;
+                match request.lookup.as_mut() {
+                    Some(l) => l.lookups += 1,
+                    None => {
+                        request.lookup = Some(crate::request::LookupRecord {
+                            at: current_time,
+                            hbm_tokens: cached_tokens,
+                            tier_tokens: 0,
+                            promote_start: None,
+                            promote_land: None,
+                            lookups: 1,
+                        })
+                    }
+                }
                 request.num_computed_tokens = cached_tokens;
                 self.kv_cache_manager
                     .allocate_blocks(&mut request, tokens_to_schedule)
