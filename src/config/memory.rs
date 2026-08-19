@@ -44,6 +44,7 @@
 //! write = { policy = "write_through" }        # write_back | write_through | selective
 //! eviction = { policy = "ttl", seconds = 3600 }   # fifo | lru | ttl
 //! backup = "on_evict"                              # on_evict | on_land
+//! hit_refresh = "first_tier"                       # first_tier | none
 //! hbm_evict_backed_first = true
 //! [memory.capacity]
 //! grace_dram = 200e9
@@ -63,7 +64,10 @@
 //! backend the moment its device → host copy completes), so a private host
 //! tier's contents reach a shared storage tier within a step rather than
 //! when the host tier evicts them; `on_evict` (default) forwards only on
-//! eviction.
+//! eviction. Under `hit_refresh = "first_tier"` (default) a prefix hit in
+//! HBM re-stamps the first tier's copy as recently used, so that tier ages
+//! with HBM the way HiCache's host tier does (one radix tree, one
+//! `last_access_time`); lower tiers see only the references that reach them.
 //!
 //! `kind = "peer_hbm"` is the one virtual tier: it names KV already
 //! resident in a sibling worker's HBM on the same node. It has no capacity
@@ -137,6 +141,30 @@ fn default_min_hits() -> u32 {
 impl Default for WritePolicy {
     fn default() -> Self {
         WritePolicy::WriteBack {}
+    }
+}
+
+/// Whether an HBM prefix hit re-stamps the tier copies of those blocks as
+/// recently used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HitRefresh {
+    /// The first tier below HBM ages with HBM: a hit on a resident prefix
+    /// counts as a use of its tier copy (HiCache's device and host tiers
+    /// share one radix tree and one `last_access_time`). Lower tiers see
+    /// only what reaches them.
+    #[default]
+    FirstTier,
+    /// Tier copies are re-stamped only when promoted from.
+    None,
+}
+
+impl HitRefresh {
+    pub fn name(&self) -> &'static str {
+        match self {
+            HitRefresh::FirstTier => "first_tier",
+            HitRefresh::None => "none",
+        }
     }
 }
 
@@ -328,6 +356,7 @@ pub struct MemoryPolicies {
     pub eviction: EvictionPolicy,
     pub prefetch: PrefetchPolicy,
     pub backup: BackupPolicy,
+    pub hit_refresh: HitRefresh,
     pub hbm_evict_backed_first: bool,
 }
 
@@ -340,6 +369,7 @@ impl Default for MemoryPolicies {
             eviction: EvictionPolicy::Fifo {},
             prefetch: PrefetchPolicy::None {},
             backup: BackupPolicy::OnEvict,
+            hit_refresh: HitRefresh::FirstTier,
             hbm_evict_backed_first: false,
         }
     }
@@ -355,6 +385,7 @@ impl MemoryPolicies {
                 eviction: EvictionPolicy::Lru {},
                 prefetch: PrefetchPolicy::None {},
                 backup: BackupPolicy::OnEvict,
+                hit_refresh: HitRefresh::FirstTier,
                 hbm_evict_backed_first: true,
             },
             MemoryPreset::Oracle => Self {
@@ -364,6 +395,7 @@ impl MemoryPolicies {
                 eviction: EvictionPolicy::Outlook {},
                 prefetch: PrefetchPolicy::Outlook { lead: 0.0 },
                 backup: BackupPolicy::OnEvict,
+                hit_refresh: HitRefresh::FirstTier,
                 hbm_evict_backed_first: true,
             },
         }
@@ -655,6 +687,9 @@ pub struct MemoryConfig {
     /// soon as the block lands.
     #[serde(default)]
     pub backup: Option<BackupPolicy>,
+    /// Whether an HBM prefix hit re-stamps the first tier's copies as used.
+    #[serde(default)]
+    pub hit_refresh: Option<HitRefresh>,
     /// When HBM must recycle a block, prefer one whose KV a tier already
     /// holds (dropping it is free) over the policy's first choice,
     /// looking a bounded distance up the free queue.
@@ -684,6 +719,9 @@ impl MemoryConfig {
         }
         if let Some(v) = self.backup {
             p.backup = v;
+        }
+        if let Some(v) = self.hit_refresh {
+            p.hit_refresh = v;
         }
         if let Some(v) = self.hbm_evict_backed_first {
             p.hbm_evict_backed_first = v;

@@ -38,7 +38,8 @@ use super::radix::{
     TierSourceRange,
 };
 use crate::config::{
-    BackupPolicy, ClusterSpec, EvictionPolicy, MemoryTemplate, Scope, StoreKind, WritePolicy,
+    BackupPolicy, ClusterSpec, EvictionPolicy, HitRefresh, MemoryTemplate, Scope, StoreKind,
+    WritePolicy,
 };
 
 pub type StoreId = usize;
@@ -162,6 +163,8 @@ pub struct MemoryGraph {
     /// When a store forwards a block to the store below it: on eviction, or
     /// as soon as the block's write lands.
     backup: BackupPolicy,
+    /// Whether an HBM prefix hit re-stamps the first tier's copies.
+    hit_refresh: HitRefresh,
     /// In-flight writes: transfer id → the (destination store, span)
     /// ranges it carries that have not landed or been dropped. A batch of
     /// blocks written together moves as one transfer.
@@ -214,6 +217,7 @@ impl MemoryGraph {
             write_of: Vec::new(),
             evict_backed_first: Vec::new(),
             backup: BackupPolicy::default(),
+            hit_refresh: HitRefresh::default(),
             pending_writes: HashMap::new(),
             pending_pins: HashMap::new(),
             wake_workers: HashSet::new(),
@@ -359,6 +363,7 @@ impl MemoryGraph {
             let template = cluster.hardware.memory.as_ref();
             selection.validate(template)?;
             g.backup = policies.backup;
+            g.hit_refresh = policies.hit_refresh;
             // Under DP-attention every rank of a replica is its own worker
             // in the graph: one GPU, its own port into the node's stores.
             let (num_workers, tp) = cluster.graph_workers();
@@ -623,6 +628,12 @@ impl MemoryGraph {
         self
     }
 
+    /// Set whether HBM hits re-stamp the first tier (tests and examples).
+    pub fn with_hit_refresh(mut self, hit_refresh: HitRefresh) -> Self {
+        self.hit_refresh = hit_refresh;
+        self
+    }
+
     /// Set every worker's HBM recycling preference (tests and examples).
     pub fn with_hbm_evict_backed_first(mut self, on: bool) -> Self {
         for e in &mut self.evict_backed_first {
@@ -792,6 +803,14 @@ impl MemoryGraph {
     /// `selective` those on their `min_hits`-th hit go to the first tier
     /// as one transfer.
     pub fn hit_batch(&mut self, worker: WorkerId, items: &[(Span, u32)]) {
+        if self.hit_refresh == HitRefresh::FirstTier && !items.is_empty() {
+            if let Some(first) = self.tiers[worker].iter().find(|t| !t.is_peer_hbm()) {
+                let store = first.store;
+                let now = self.flows.now();
+                let spans: Vec<Span> = items.iter().map(|&(s, _)| s).collect();
+                self.radix.lock().unwrap().store_touched(store, &spans, now);
+            }
+        }
         if let WritePolicy::Selective { min_hits } = self.write_policy(worker) {
             let n = min_hits.max(1);
             let batch: Vec<(Span, Option<f64>)> = items
@@ -2205,6 +2224,34 @@ bandwidth = 900
         let totals = g.store_totals();
         assert_eq!(totals[1].0, "t1");
         assert_eq!(totals[1].1.evictions, 1);
+    }
+
+    #[test]
+    fn hbm_hit_refreshes_first_tier_recency_under_first_tier_hit_refresh() {
+        // Tier 0 holds 1 then 2 (2 newer). An HBM hit on 1 re-stamps tier
+        // 0's copy, so when 3 is planted, 2 is the LRU victim and cascades;
+        // nothing was read from the store for the touch.
+        let mut g = two_tier_private(WritePolicy::WriteBack {}, EvictionPolicy::Lru {});
+        let (s1, s2, s3) = (sp(&g, 1), sp(&g, 2), sp(&g, 3));
+        g.plant(0, 0, s1);
+        g.plant(0, 0, s2);
+        let read_before = g.stores()[0].bytes_read;
+        g.hit_batch(0, &[(s1, 1)]);
+        assert_eq!(g.stores()[0].bytes_read, read_before);
+        g.plant(0, 0, s3);
+        assert_eq!(tier_holding(&g, 0, 1), Some(0));
+        assert_eq!(tier_holding(&g, 0, 2), Some(1));
+
+        // hit_refresh = none: the hit changes nothing and 1 is the victim.
+        let mut n = two_tier_private(WritePolicy::WriteBack {}, EvictionPolicy::Lru {})
+            .with_hit_refresh(HitRefresh::None);
+        let (n1, n2, n3) = (sp(&n, 1), sp(&n, 2), sp(&n, 3));
+        n.plant(0, 0, n1);
+        n.plant(0, 0, n2);
+        n.hit_batch(0, &[(n1, 1)]);
+        n.plant(0, 0, n3);
+        assert_eq!(tier_holding(&n, 0, 1), Some(1));
+        assert_eq!(tier_holding(&n, 0, 2), Some(0));
     }
 
     #[test]
