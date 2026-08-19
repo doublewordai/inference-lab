@@ -482,6 +482,7 @@ mod tests {
             num_output_tokens: 1,
             num_cached_tokens: 0,
             session: None,
+            worker: None,
             num_preemptions: 0,
             rejected: false,
         }
@@ -500,6 +501,7 @@ mod tests {
             num_output_tokens: req.target_output_tokens,
             num_cached_tokens: 0,
             session: req.session.clone(),
+            worker: None,
             num_preemptions: 0,
             rejected: false,
         }

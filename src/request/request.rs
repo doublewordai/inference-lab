@@ -65,6 +65,9 @@ pub struct Request {
     /// Session workloads: which step of which session this request is.
     /// Boxed: most requests carry none, and `Request` travels by value.
     pub session: Option<Box<SessionStep>>,
+    /// Memory-graph id of the worker this request was delivered to, set by
+    /// the engine at delivery. Identifies which worker's KV served it.
+    pub worker: Option<u32>,
 
     /// Content KV blocks the request holds on its worker: content block
     /// `i` holds prompt block `i` (shareable through the prefix cache). A
@@ -183,6 +186,7 @@ impl Request {
             num_cached_tokens: 0,
             prompt_block_hashes: Vec::new(),
             session: None,
+            worker: None,
             kv_blocks: KvHold::default(),
             aux_blocks: KvHold::default(),
             kv_leaf: None,

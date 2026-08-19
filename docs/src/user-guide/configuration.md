@@ -350,7 +350,8 @@ only: a partial block continued with new tokens is new content.
 `per_step_stats.parquet` into this format.
 
 **Per-request CSV** (`--request-csv`) carries, for session steps, `session`,
-`step`, `gap`, `shared_toks` (the most the prefix cache could serve),
+`step`, `worker` (the memory-graph id of the worker that served it), `gap`,
+`shared_toks` (the most the prefix cache could serve),
 `cached_toks` (what it did), and two reuse distances: `reuse_distance_bytes`
 (KV bytes written into the caches between the parent's completion and this
 arrival) and `reuse_touched_bytes` (the same plus the free blocks that hits

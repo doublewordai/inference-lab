@@ -592,6 +592,25 @@ mod tests {
     }
 
     #[test]
+    fn request_rows_report_the_serving_worker() {
+        let mut config = create_minimal_test_config();
+        config.replicas = 2;
+        config.workload.arrival_pattern = crate::config::ArrivalPattern::Batched;
+        config.workload.num_requests = Some(2);
+        let mut simulator = Simulator::new(config, None).unwrap();
+
+        simulator.run_with_callback(|_| {}).unwrap();
+
+        let mut workers: Vec<_> = simulator
+            .request_rows()
+            .iter()
+            .map(|row| row.worker.expect("worker is stamped at delivery"))
+            .collect();
+        workers.sort_unstable();
+        assert_eq!(workers, [0, 1]);
+    }
+
+    #[test]
     fn test_progress_callback_streams_each_sample_once() {
         let config = create_minimal_test_config();
         let mut simulator = Simulator::new(config, None).unwrap();
