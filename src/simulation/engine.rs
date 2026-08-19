@@ -50,6 +50,9 @@ pub struct RequestTiming {
     pub num_preemptions: u32,
     /// Refused at submission (context larger than the worker's KV cache).
     pub rejected: bool,
+    /// The prefix lookup that fixed `num_cached_tokens` (see
+    /// [`crate::request::LookupRecord`]).
+    pub lookup: Option<crate::request::LookupRecord>,
 }
 
 impl RequestTiming {
@@ -1698,6 +1701,7 @@ impl Engine {
             worker: req.worker,
             num_preemptions: req.num_preemptions,
             rejected: req.rejected,
+            lookup: req.lookup,
         }
     }
 }

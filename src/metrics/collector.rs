@@ -85,6 +85,9 @@ pub struct RequestRow {
     /// `reuse_distance_bytes` plus the free blocks that hits pulled back into
     /// use in between: with it, a bracket on the LRU stack distance.
     pub reuse_touched_bytes: Option<u64>,
+    /// The prefix lookup that fixed `cached_tokens`: when, and what it found
+    /// in HBM vs the tiers; when the promotion started and landed.
+    pub lookup: Option<crate::request::LookupRecord>,
 }
 
 /// Accumulates per-request timings and per-iteration utilisation into a
@@ -185,6 +188,7 @@ impl MetricsCollector {
             shared_tokens: timing.session.as_ref().map(|s| s.shared_tokens),
             reuse_distance_bytes: timing.session.as_ref().and_then(|s| s.reuse_distance_bytes),
             reuse_touched_bytes: timing.session.as_ref().and_then(|s| s.reuse_touched_bytes),
+            lookup: timing.lookup,
         });
 
         self.input_lengths.push(timing.num_prompt_tokens);
@@ -365,6 +369,7 @@ mod tests {
             worker: None,
             num_preemptions: preemptions,
             rejected: false,
+            lookup: None,
         }
     }
 
