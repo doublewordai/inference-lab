@@ -169,7 +169,7 @@ impl ComputeEngine {
                 (self.parallel.tp - 1) as f64 * self.model.attention_weight_bytes() as f64;
         }
 
-        let attn = &mut streams[self.model.attention_precision.index()];
+        let attn_idx = self.model.attention_precision.index();
 
         // With cascade attention, the KV bytes for the shared prompt prefix
         // are loaded once per iteration instead of once per request.
@@ -178,9 +178,9 @@ impl ComputeEngine {
         } else {
             0
         };
-        attn.bytes += self
-            .model
-            .kv_bytes_read_per_decode_step(shared_prefix_tokens) as f64;
+        streams[attn_idx].bytes +=
+            self.model
+                .kv_bytes_read_per_decode_step(shared_prefix_tokens) as f64;
 
         // Fixed per-sequence state (Mamba / GatedDeltaNet) is read once per
         // sequence per step, independent of context length.
@@ -192,13 +192,18 @@ impl ComputeEngine {
             // `computed + (num_new+1)/2` (a fresh s-token prompt costs
             // ~s²/2 pairs, a decode token attends `computed + 1`).
             let mean_context = req.num_computed_tokens + num_new.div_ceil(2);
-            attn.flops += self
-                .model
-                .attention_flops(num_new, mean_context, !req.is_prefill())
-                as f64;
+            // Score/AV at the attention precision; an indexer's scoring GEMM
+            // at its own (an fp8 indexer runs at the fp8 rate).
+            for (prec, flops) in
+                self.model
+                    .attention_flops_by_prec(num_new, mean_context, !req.is_prefill())
+            {
+                streams[prec.index()].flops += flops;
+            }
 
             let unshared = mean_context.saturating_sub(shared_prefix_tokens);
-            attn.bytes += self.model.kv_bytes_read_per_decode_step(unshared) as f64 + state_bytes;
+            streams[attn_idx].bytes +=
+                self.model.kv_bytes_read_per_decode_step(unshared) as f64 + state_bytes;
         }
 
         streams
@@ -264,20 +269,21 @@ impl ComputeEngine {
             return 0.0;
         }
         let state_bytes = self.model.per_sequence_state_bytes() as f64;
-        let mut flops = 0.0;
+        let mut compute = 0.0;
         let mut bytes = 0.0;
         for (req, &num_new) in batch_requests.iter().zip(tokens_per_request) {
-            // Same causal accounting as `assemble_streams`.
+            // Same causal accounting as `assemble_streams`, each precision's
+            // FLOPs at its own rate.
             let mean_context = req.num_computed_tokens + num_new.div_ceil(2);
-            flops += self
-                .model
-                .attention_flops(num_new, mean_context, !req.is_prefill())
-                as f64;
+            for (prec, flops) in
+                self.model
+                    .attention_flops_by_prec(num_new, mean_context, !req.is_prefill())
+            {
+                compute += flops / self.hardware.flop_rate(prec).unwrap_or(f64::INFINITY);
+            }
             bytes += self.model.kv_bytes_read_per_decode_step(mean_context) as f64 + state_bytes;
         }
-        let prec = self.model.attention_precision;
-        let rate = self.hardware.flop_rate(prec).unwrap_or(f64::INFINITY);
-        (flops / rate).max(bytes / self.hardware.memory_bandwidth)
+        compute.max(bytes / self.hardware.memory_bandwidth)
     }
 
     /// Wall time of a step (see [`ComputeEngine::step_cost`]).

@@ -85,6 +85,13 @@ pub struct Indexer {
     pub heads: u32,
     pub head_dim: u32,
     pub kv_precision: Precision,
+    /// Precision of the scoring GEMM (query × candidate key). DeepSeek-style
+    /// indexers quantise queries and keys to fp8 and score with an fp8 GEMM,
+    /// so their FLOPs run at the fp8 rate while the main attention stays at
+    /// `ModelSpec::attention_precision`. Unset = the model's attention
+    /// precision.
+    #[serde(default)]
+    pub precision: Option<Precision>,
 }
 
 /// The long-range path of an MLA layer: the whole history at stride
@@ -347,7 +354,6 @@ impl LayerClass {
                 v_head_dim,
                 latent_dim,
                 rope_dim,
-                history,
                 ..
             } => {
                 let per_pair = match (heads, qk_head_dim, v_head_dim) {
@@ -357,24 +363,39 @@ impl LayerClass {
                     (Some(h), Some(qk), Some(v)) => 2.0 * *h as f64 * (*qk as f64 + *v as f64),
                     _ => 4.0 * hidden_dim as f64,
                 };
-                // Indexer scoring over every history entry: 2 × head_dim
-                // FLOPs per (query, candidate, head).
-                let indexer_flops = match history {
+                per_pair * s * attended + self.indexer_flops(t) * s
+            }
+            LayerClass::Linear { .. } => 0.0,
+        }
+    }
+
+    /// Indexer scoring FLOPs per new token at context length `t`: 2 ×
+    /// head_dim per (candidate, head) over every history entry. Zero
+    /// without an indexer.
+    fn indexer_flops(&self, t: u32) -> f64 {
+        match self {
+            LayerClass::Mla {
+                history:
                     Some(History {
                         compress_ratio,
                         indexer: Some(ix),
                         ..
-                    }) => {
-                        2.0 * ix.heads as f64
-                            * ix.head_dim as f64
-                            * s
-                            * (t / (*compress_ratio).max(1)) as f64
-                    }
-                    _ => 0.0,
-                };
-                per_pair * s * attended + indexer_flops
-            }
-            LayerClass::Linear { .. } => 0.0,
+                    }),
+                ..
+            } => 2.0 * ix.heads as f64 * ix.head_dim as f64 * (t / (*compress_ratio).max(1)) as f64,
+            _ => 0.0,
+        }
+    }
+
+    fn indexer_precision(&self) -> Option<Precision> {
+        match self {
+            LayerClass::Mla {
+                history: Some(History {
+                    indexer: Some(ix), ..
+                }),
+                ..
+            } => ix.precision,
+            _ => None,
         }
     }
 
@@ -526,6 +547,33 @@ impl ModelSpec {
                     * l.attention_flops(self.hidden_dim, new_tokens, attended_tokens, decode)
             })
             .sum::<f64>() as u64
+    }
+
+    /// `attention_flops` split by the precision each part runs at: the
+    /// score/AV work at `attention_precision`, and each layer class's
+    /// indexer scoring at its own `Indexer::precision` (falling back to
+    /// `attention_precision`). Entries with zero FLOPs are omitted.
+    pub fn attention_flops_by_prec(
+        &self,
+        new_tokens: u32,
+        attended_tokens: u32,
+        decode: bool,
+    ) -> Vec<(Precision, f64)> {
+        let mut by: [f64; Precision::COUNT] = [0.0; Precision::COUNT];
+        for l in &self.layers {
+            let n = l.count() as f64;
+            let total = n * l.attention_flops(self.hidden_dim, new_tokens, attended_tokens, decode);
+            let ix = n * l.indexer_flops(attended_tokens) * new_tokens as f64;
+            let ix_prec = l.indexer_precision().unwrap_or(self.attention_precision);
+            by[self.attention_precision.index()] += total - ix;
+            by[ix_prec.index()] += ix;
+        }
+        Precision::ALL
+            .iter()
+            .zip(by)
+            .filter(|(_, f)| *f > 0.0)
+            .map(|(p, f)| (*p, f))
+            .collect()
     }
 
     /// Bytes of attention KV read per decode step for a `seq_len`-token
@@ -868,6 +916,7 @@ mod tests {
             heads: 1,
             head_dim: 16,
             kv_precision: Precision::Fp8,
+            precision: None,
         };
         let mut m = dense(1000, Precision::Bf16, 4, 1024, 8, 8);
         m.layers = vec![near(4, Some(ix))];
@@ -905,6 +954,34 @@ mod tests {
         assert_eq!(
             m.attention_flops(1, t, false),
             4 * 4 * 1024 * 256 + 4 * (2 * 16 * 256)
+        );
+        // Without its own precision the indexer's FLOPs sit in the attention
+        // stream; with one they split out at that rate.
+        assert_eq!(
+            m.attention_flops_by_prec(1, t, false),
+            vec![(
+                Precision::Bf16,
+                (4 * 4 * 1024 * 256 + 4 * (2 * 16 * 256)) as f64
+            )]
+        );
+        let mut fp8 = m.clone();
+        fp8.layers = vec![near(
+            4,
+            Some(Indexer {
+                precision: Some(Precision::Fp8),
+                ..ix
+            }),
+        )];
+        assert_eq!(
+            fp8.attention_flops_by_prec(1, t, false),
+            vec![
+                (Precision::Fp8, (4 * (2 * 16 * 256)) as f64),
+                (Precision::Bf16, (4 * 4 * 1024 * 256) as f64),
+            ]
+        );
+        assert_eq!(
+            fp8.attention_flops(1, t, false),
+            m.attention_flops(1, t, false)
         );
     }
 

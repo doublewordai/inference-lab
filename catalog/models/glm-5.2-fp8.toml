@@ -48,7 +48,7 @@ q_latent_dim = 2048
 rope_dim = 64
 kv_precision = "fp8"
 window = 0
-history = { compress_ratio = 1, index_topk = 2048, indexer = { heads = 32, head_dim = 128, kv_precision = "fp8" } }
+history = { compress_ratio = 1, index_topk = 2048, indexer = { heads = 32, head_dim = 128, kv_precision = "fp8", precision = "fp8" } }
 heads = 64
 qk_head_dim = 256
 v_head_dim = 256
