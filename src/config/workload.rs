@@ -101,7 +101,9 @@ pub struct WorkloadConfig {
     #[serde(default)]
     pub closed_loop_jitter_secs: Option<f64>,
 
-    /// Simulation duration in seconds (None = run until num_requests)
+    /// Stop admitting arrivals after this many simulated seconds. Requests
+    /// admitted by the deadline are allowed to finish. Without this bound,
+    /// generation stops at `num_requests` (or a source-specific limit).
     pub duration_secs: Option<f64>,
 
     /// Random seed for reproducibility

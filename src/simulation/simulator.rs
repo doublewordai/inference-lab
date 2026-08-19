@@ -450,6 +450,23 @@ mod tests {
     }
 
     #[test]
+    fn duration_stops_arrivals_then_drains_in_flight_requests() {
+        let mut config = create_minimal_test_config();
+        config.workload.arrival_pattern = crate::config::ArrivalPattern::Uniform;
+        config.workload.arrival_rate = 1.0;
+        config.workload.num_requests = Some(100);
+        config.workload.duration_secs = Some(1.0);
+        let mut simulator = Simulator::new(config, None).unwrap();
+
+        simulator.run_with_callback(|_| {}).unwrap();
+
+        let summary = simulator.summary();
+        assert_eq!(summary.requests.total, 1);
+        assert_eq!(summary.requests.completed, 1);
+        assert!(simulator.current_time() > 1.0);
+    }
+
+    #[test]
     fn test_simulation_metrics_reasonable() {
         let config = create_minimal_test_config();
         let mut simulator = Simulator::new(config, None).unwrap();
