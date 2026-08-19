@@ -38,8 +38,8 @@ use super::radix::{
     TierSourceRange,
 };
 use crate::config::{
-    BackupPolicy, ClusterSpec, EvictionPolicy, HitRefresh, MemoryTemplate, Scope, StoreKind,
-    WritePolicy,
+    BackupPolicy, ClusterSpec, EvictionPolicy, HitRefresh, MemoryTemplate, PromoteFill, Scope,
+    StoreKind, WritePolicy,
 };
 
 pub type StoreId = usize;
@@ -165,6 +165,8 @@ pub struct MemoryGraph {
     backup: BackupPolicy,
     /// Whether an HBM prefix hit re-stamps the first tier's copies.
     hit_refresh: HitRefresh,
+    /// Where a promotion from a lower tier is left on the way up.
+    promote_fill: PromoteFill,
     /// In-flight writes: transfer id → the (destination store, span)
     /// ranges it carries that have not landed or been dropped. A batch of
     /// blocks written together moves as one transfer.
@@ -218,6 +220,7 @@ impl MemoryGraph {
             evict_backed_first: Vec::new(),
             backup: BackupPolicy::default(),
             hit_refresh: HitRefresh::default(),
+            promote_fill: PromoteFill::default(),
             pending_writes: HashMap::new(),
             pending_pins: HashMap::new(),
             wake_workers: HashSet::new(),
@@ -364,6 +367,7 @@ impl MemoryGraph {
             selection.validate(template)?;
             g.backup = policies.backup;
             g.hit_refresh = policies.hit_refresh;
+            g.promote_fill = policies.promote_fill;
             // Under DP-attention every rank of a replica is its own worker
             // in the graph: one GPU, its own port into the node's stores.
             let (num_workers, tp) = cluster.graph_workers();
@@ -631,6 +635,12 @@ impl MemoryGraph {
     /// Set whether HBM hits re-stamp the first tier (tests and examples).
     pub fn with_hit_refresh(mut self, hit_refresh: HitRefresh) -> Self {
         self.hit_refresh = hit_refresh;
+        self
+    }
+
+    /// Set where promotions are left on the way up (tests and examples).
+    pub fn with_promote_fill(mut self, promote_fill: PromoteFill) -> Self {
+        self.promote_fill = promote_fill;
         self
     }
 
@@ -1046,10 +1056,38 @@ impl MemoryGraph {
             .filter(|t| !t.is_peer_hbm())
             .map(|t| t.store)
             .collect();
-        let mut r = self.radix.lock().unwrap();
-        for s in stores {
-            let read = r.store_promoted(s, spans, now);
-            self.stores[s].bytes_read += read;
+        let mut fills: Vec<(StoreId, Span)> = Vec::new();
+        {
+            let mut r = self.radix.lock().unwrap();
+            for &s in &stores {
+                let read = r.store_promoted(s, spans, now);
+                self.stores[s].bytes_read += read;
+            }
+            // Through-fill: what a lower tier supplied is left in every
+            // tier above it (the hierarchy stays inclusive).
+            if self.promote_fill == PromoteFill::Through {
+                for &sp in spans {
+                    let Some(src) = stores.iter().position(|&s| r.store_holds(s, sp)) else {
+                        continue;
+                    };
+                    for &s in &stores[..src] {
+                        for m in r.store_missing(s, sp) {
+                            if !m.is_empty() {
+                                fills.push((s, m));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for (s, m) in fills {
+            let (bytes, evicted) = {
+                let mut r = self.radix.lock().unwrap();
+                let evicted = r.store_insert(s, m, None, now);
+                (r.span_bytes(m), evicted)
+            };
+            self.stores[s].bytes_written += bytes;
+            self.cascade_batch(s, evicted);
         }
     }
 
@@ -2224,6 +2262,29 @@ bandwidth = 900
         let totals = g.store_totals();
         assert_eq!(totals[1].0, "t1");
         assert_eq!(totals[1].1.evictions, 1);
+    }
+
+    #[test]
+    fn promotion_from_a_lower_tier_refills_the_tiers_above_under_through_fill() {
+        // Block 7 lives in tier 1 only. Promoting it lands it in HBM and,
+        // under `through`, inserts it into tier 0 as well; under `direct`
+        // tier 0 stays empty of it.
+        let mut g = two_tier_private(WritePolicy::WriteBack {}, EvictionPolicy::Lru {});
+        let s7 = sp(&g, 7);
+        g.plant(0, 1, s7);
+        assert_eq!(tier_holding(&g, 0, 7), Some(1));
+        let written = g.stores()[0].bytes_written;
+        g.promoted_batch(0, &[s7]);
+        assert_eq!(tier_holding(&g, 0, 7), Some(0));
+        assert!(store_contains(&g, 1, 7));
+        assert_eq!(g.stores()[0].bytes_written - written, 100);
+
+        let mut d = two_tier_private(WritePolicy::WriteBack {}, EvictionPolicy::Lru {})
+            .with_promote_fill(PromoteFill::Direct);
+        let d7 = sp(&d, 7);
+        d.plant(0, 1, d7);
+        d.promoted_batch(0, &[d7]);
+        assert_eq!(tier_holding(&d, 0, 7), Some(1));
     }
 
     #[test]
