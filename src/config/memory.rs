@@ -45,6 +45,7 @@
 //! eviction = { policy = "ttl", seconds = 3600 }   # fifo | lru | ttl
 //! backup = "on_evict"                              # on_evict | on_land
 //! hit_refresh = "first_tier"                       # first_tier | none
+//! promote_fill = "through"                         # through | direct
 //! hbm_evict_backed_first = true
 //! [memory.capacity]
 //! grace_dram = 200e9
@@ -68,6 +69,10 @@
 //! HBM re-stamps the first tier's copy as recently used, so that tier ages
 //! with HBM the way HiCache's host tier does (one radix tree, one
 //! `last_access_time`); lower tiers see only the references that reach them.
+//! Under `promote_fill = "through"` (default) a prefix promoted from a lower
+//! tier is also inserted into the tiers above its source as it lands, as
+//! HiCache stages a storage hit through host memory; `direct` lands it in
+//! HBM only.
 //!
 //! `kind = "peer_hbm"` is the one virtual tier: it names KV already
 //! resident in a sibling worker's HBM on the same node. It has no capacity
@@ -164,6 +169,31 @@ impl HitRefresh {
         match self {
             HitRefresh::FirstTier => "first_tier",
             HitRefresh::None => "none",
+        }
+    }
+}
+
+/// Where a prefix promoted from a lower tier is left on the way up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromoteFill {
+    /// The promoted ranges are inserted into every tier above the source as
+    /// they land (HiCache stages a storage hit through host memory: the
+    /// prefetch allocates host pages and `_insert_helper_host` publishes
+    /// them before the device loads from host). Keeps the hierarchy
+    /// inclusive.
+    #[default]
+    Through,
+    /// The promotion lands in HBM only; tiers above the source are not
+    /// refilled.
+    Direct,
+}
+
+impl PromoteFill {
+    pub fn name(&self) -> &'static str {
+        match self {
+            PromoteFill::Through => "through",
+            PromoteFill::Direct => "direct",
         }
     }
 }
@@ -357,6 +387,7 @@ pub struct MemoryPolicies {
     pub prefetch: PrefetchPolicy,
     pub backup: BackupPolicy,
     pub hit_refresh: HitRefresh,
+    pub promote_fill: PromoteFill,
     pub hbm_evict_backed_first: bool,
 }
 
@@ -370,6 +401,7 @@ impl Default for MemoryPolicies {
             prefetch: PrefetchPolicy::None {},
             backup: BackupPolicy::OnEvict,
             hit_refresh: HitRefresh::FirstTier,
+            promote_fill: PromoteFill::Through,
             hbm_evict_backed_first: false,
         }
     }
@@ -386,6 +418,7 @@ impl MemoryPolicies {
                 prefetch: PrefetchPolicy::None {},
                 backup: BackupPolicy::OnEvict,
                 hit_refresh: HitRefresh::FirstTier,
+                promote_fill: PromoteFill::Through,
                 hbm_evict_backed_first: true,
             },
             MemoryPreset::Oracle => Self {
@@ -396,6 +429,7 @@ impl MemoryPolicies {
                 prefetch: PrefetchPolicy::Outlook { lead: 0.0 },
                 backup: BackupPolicy::OnEvict,
                 hit_refresh: HitRefresh::FirstTier,
+                promote_fill: PromoteFill::Through,
                 hbm_evict_backed_first: true,
             },
         }
@@ -690,6 +724,9 @@ pub struct MemoryConfig {
     /// Whether an HBM prefix hit re-stamps the first tier's copies as used.
     #[serde(default)]
     pub hit_refresh: Option<HitRefresh>,
+    /// Where a promotion from a lower tier is left on the way up.
+    #[serde(default)]
+    pub promote_fill: Option<PromoteFill>,
     /// When HBM must recycle a block, prefer one whose KV a tier already
     /// holds (dropping it is free) over the policy's first choice,
     /// looking a bounded distance up the free queue.
@@ -722,6 +759,9 @@ impl MemoryConfig {
         }
         if let Some(v) = self.hit_refresh {
             p.hit_refresh = v;
+        }
+        if let Some(v) = self.promote_fill {
+            p.promote_fill = v;
         }
         if let Some(v) = self.hbm_evict_backed_first {
             p.hbm_evict_backed_first = v;
