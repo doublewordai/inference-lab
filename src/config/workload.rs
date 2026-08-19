@@ -74,6 +74,13 @@ pub struct WorkloadConfig {
     #[serde(default)]
     pub stationary_start_sessions: Option<u32>,
 
+    /// Session mode: draw each new session uniformly at random from the file
+    /// with replacement instead of walking the file in order. Every sampled
+    /// instance receives fresh block hashes, so repeated traces do not share
+    /// cache state.
+    #[serde(default)]
+    pub resample_sessions: bool,
+
     pub arrival_pattern: ArrivalPattern,
 
     /// Mean arrival rate (requests per second) for the open-loop patterns.

@@ -165,6 +165,9 @@ pub struct SessionSource {
     next_hash: u64,
     /// First sessions to start at a sampled mid-trace step.
     stationary_starts: u32,
+    /// Draw each new session uniformly with replacement instead of walking
+    /// the file in order.
+    resample: bool,
     rng: Option<Box<StdRng>>,
 }
 
@@ -197,8 +200,16 @@ impl SessionSource {
             // cannot collide with small literal hashes used elsewhere.
             next_hash: 1 << 40,
             stationary_starts: 0,
+            resample: false,
             rng: None,
         }
+    }
+
+    /// Draw sessions uniformly at random with replacement.
+    pub fn with_resampling(mut self, seed: u64) -> Self {
+        self.resample = true;
+        self.rng = Some(Box::new(StdRng::seed_from_u64(seed)));
+        self
     }
 
     /// Start the first `count` sessions at a time-weighted trace step.
@@ -259,8 +270,17 @@ impl SessionSource {
 
     /// Start the next session at `arrival_time` and return its first step.
     pub fn start_session(&mut self, arrival_time: f64) -> Request {
-        let spec_idx = self.next_spec;
-        self.next_spec = (self.next_spec + 1) % self.specs.len();
+        let spec_idx = if self.resample {
+            let num_specs = self.specs.len();
+            self.rng
+                .as_mut()
+                .expect("resampling configures an RNG")
+                .random_range(0..num_specs)
+        } else {
+            let spec_idx = self.next_spec;
+            self.next_spec = (self.next_spec + 1) % self.specs.len();
+            spec_idx
+        };
         let ordinal = self.started;
         self.started += 1;
         // A seeded session joins mid-trace with the context its preceding
@@ -535,6 +555,44 @@ mod tests {
         let normal_step = normal.session.as_ref().unwrap();
         assert_eq!((normal_step.session, normal_step.step), (1, 0));
         assert_eq!(normal_step.shared_tokens, 0);
+    }
+
+    #[test]
+    fn resampling_is_uniform_with_replacement_and_keeps_hashes_fresh() {
+        let specs = (1..=3)
+            .map(|index| SessionSpec {
+                id: format!("s{index}"),
+                steps: vec![StepSpec {
+                    input: index * 16,
+                    new: index * 16,
+                    output: 1,
+                    gap: 0.0,
+                    kind: None,
+                }],
+            })
+            .collect();
+        let mut source = SessionSource::new(specs, 16).with_resampling(42);
+        let mut sampled_inputs = Vec::new();
+        let mut counts = [0usize; 3];
+        let mut first_hashes = std::collections::HashSet::new();
+
+        for _ in 0..600 {
+            let request = source.start_session(0.0);
+            sampled_inputs.push(request.num_prompt_tokens);
+            counts[(request.num_prompt_tokens / 16 - 1) as usize] += 1;
+            assert!(first_hashes.insert(request.prompt_block_hashes[0]));
+        }
+
+        // Every file entry is sampled at approximately its 1/3 probability.
+        assert!(
+            counts.iter().all(|count| (150..250).contains(count)),
+            "{counts:?}"
+        );
+        // At least one group of three contains a repeated entry: draws are
+        // with replacement, not shuffled cycles through the file.
+        assert!(sampled_inputs
+            .chunks_exact(3)
+            .any(|chunk| { chunk[0] == chunk[1] || chunk[0] == chunk[2] || chunk[1] == chunk[2] }));
     }
 
     #[test]
