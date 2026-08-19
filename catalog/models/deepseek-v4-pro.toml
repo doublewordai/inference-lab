@@ -40,7 +40,7 @@ v_head_dim = 512
 rope_dim = 64
 kv_precision = "fp8"
 window = 128
-history = { compress_ratio = 4, index_topk = 1024, indexer = { heads = 64, head_dim = 128, kv_precision = "fp8" } }
+history = { compress_ratio = 4, index_topk = 1024, indexer = { heads = 64, head_dim = 128, kv_precision = "fp8", precision = "fp8" } }
 
 [[layers]]
 kind = "mla"

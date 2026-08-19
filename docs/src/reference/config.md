@@ -199,7 +199,7 @@ routing plus an fp8 non-expert stream; gpt-oss is fp4 experts + bf16 rest.
 | `latent_dim`, `rope_dim` | U32 | — / 0 | KV per token = (latent + rope) × bytes |
 | `kv_precision` | Precision | — | |
 | `window` | U32 | 0 | Recent tokens attended directly. Without a `history` path, 0 means the whole context; with one, 0 means no local window |
-| `history` | Table | unset | Long-range path `{ compress_ratio, index_topk, indexer }`: the history at stride `compress_ratio` (1 = every position), all of it or the `index_topk` entries an `indexer = { heads, head_dim, kv_precision }` selects (the indexer scores every entry and keeps its own KV) |
+| `history` | Table | unset | Long-range path `{ compress_ratio, index_topk, indexer }`: the history at stride `compress_ratio` (1 = every position), all of it or the `index_topk` entries an `indexer = { heads, head_dim, kv_precision, precision }` selects (the indexer scores every entry and keeps its own KV; `precision` is the scoring GEMM's rate, default `attention_precision` — DeepSeek-style indexers score in fp8) |
 | `heads`, `qk_head_dim`, `v_head_dim` | U32 | unset | Head shape for the score/AV FLOP count (2 × heads × (qk + v) per pair). All three or none; absent = 4 × hidden_dim per pair |
 | `q_latent_dim`, `o_latent_dim` | U32 | unset | Low-rank query / output projections (`q_lora_rank`, `o_lora_rank`); size the attention projections replicated under `dp_attention`. Absent = full-rank |
 
