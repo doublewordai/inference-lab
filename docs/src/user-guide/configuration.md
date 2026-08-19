@@ -325,7 +325,8 @@ its session's last step completes), `batched` starts every session at t=0.
 Every later step of a session arrives at its parent's completion plus the
 step's `gap`, so the simulated latency feeds back into the arrival process
 and long gaps are preserved. Sessions are taken from the file in order and
-the file is cycled; stop with `num_sessions` or `num_requests` (steps).
+the file is cycled. `num_sessions` bounds session starts; `num_requests`
+separately bounds total emitted request steps across all sessions.
 
 **Session file:** JSONL, one session per line:
 

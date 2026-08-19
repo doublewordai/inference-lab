@@ -250,11 +250,11 @@ The `[workload]` table, at top level of `workloads/<name>.toml`.
 | `num_concurrent_users` | U32 | unset | Users for `closed_loop` |
 | `closed_loop_jitter_secs` | Float | unset | Uniform stagger of the initial closed-loop arrivals |
 | `input_len_dist`, `output_len_dist` | Table | — | `{ type = "fixed", value }`, `{ type = "uniform", min, max }`, `{ type = "normal", mean, std_dev }`, `{ type = "lognormal", mean, std_dev }` (ignored in dataset mode for input) |
-| `num_requests` | U32 | unset | Stop after this many; unset = run the dataset out |
+| `num_requests` | U32 | unset | Maximum total generated requests; in session mode every step counts (use `num_sessions` to bound starts instead) |
 | `duration_secs` | Float | unset | Stop admitting arrivals after this many simulated seconds, then drain requests already in flight |
 | `dataset_path` | String | unset | JSONL in OpenAI batch format; prompts are tokenised with `--tokenizer` and hashed per KV block so shared prefixes hit the prefix cache |
 | `sessions_path` | String | unset | Session file (JSONL, one session per line, see [Sessions](../user-guide/configuration.md#sessions)). The arrival pattern then governs session *starts* (`arrival_rate` in sessions/s; `closed_loop` holds `num_concurrent_users` sessions in flight); each later step arrives at its parent's completion plus the step's gap. Mutually exclusive with `dataset_path`; length distributions are ignored |
-| `num_sessions` | U32 | unset | Session mode: stop starting sessions after this many (the file is cycled, so it may exceed the file's count) |
+| `num_sessions` | U32 | unset | Session mode: maximum session starts; does not limit the total request steps emitted by those sessions (the file is cycled, so it may exceed the file's count) |
 | `seed` | U64 | — | |
 
 ---

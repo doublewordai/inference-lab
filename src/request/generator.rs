@@ -711,6 +711,43 @@ mod tests {
     }
 
     #[test]
+    fn session_and_request_limits_count_starts_and_steps_respectively() {
+        let run = |mut g: RequestGenerator| {
+            let mut ids = Vec::new();
+            while !g.is_finished() {
+                let arrival = g.peek_next_arrival_time();
+                assert!(arrival.is_finite());
+                let req = g.next_if_before(arrival).unwrap();
+                ids.push(req.request_id.clone());
+                g.on_request_complete(&completed(&req, arrival));
+            }
+            ids
+        };
+
+        let mut starts_limited = create_test_workload(ArrivalPattern::Uniform, 0.1, 100);
+        starts_limited.num_sessions = Some(2);
+        assert_eq!(
+            run(RequestGenerator::from_sessions(
+                starts_limited,
+                16,
+                session_specs()
+            )),
+            ["s0/0", "s0/1", "s1/0"]
+        );
+
+        let mut steps_limited = create_test_workload(ArrivalPattern::Uniform, 0.1, 2);
+        steps_limited.num_sessions = Some(100);
+        assert_eq!(
+            run(RequestGenerator::from_sessions(
+                steps_limited,
+                16,
+                session_specs()
+            )),
+            ["s0/0", "s0/1"]
+        );
+    }
+
+    #[test]
     fn sessions_closed_loop_slot_is_held_for_the_whole_session() {
         let mut workload = create_test_workload(ArrivalPattern::ClosedLoop, 0.0, 100);
         workload.num_concurrent_users = Some(1);
