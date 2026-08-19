@@ -2834,6 +2834,18 @@ impl Radix {
     /// refresh recency under LRU / TTL (splitting a range at `upto` so the
     /// untouched tail keeps its stamp).
     pub fn store_promoted(&mut self, s: StoreId, spans: &[Span], now: f64) -> u64 {
+        self.store_used(s, spans, now, true)
+    }
+
+    /// `spans` were used while resident in HBM (a prefix hit there): the
+    /// store's copies are re-stamped as recently used under LRU / TTL, with
+    /// nothing read from the store (a shared radix tree's host copies age
+    /// with the device copies, as HiCache's do).
+    pub fn store_touched(&mut self, s: StoreId, spans: &[Span], now: f64) {
+        self.store_used(s, spans, now, false);
+    }
+
+    fn store_used(&mut self, s: StoreId, spans: &[Span], now: f64, count_read: bool) -> u64 {
         let refresh = !matches!(self.stores[s].eviction, EvictionPolicy::Fifo {});
         let mut read_bytes = 0u64;
         for sp in spans {
@@ -2855,11 +2867,13 @@ impl Radix {
             if !overlap {
                 continue;
             }
-            ts.read_upto = ts.read_upto.max(sp.end);
-            for (a, b) in held_ranges {
-                read_bytes += self
-                    .bytes_at_boundary(depth + b)
-                    .saturating_sub(self.bytes_at_boundary(depth + a));
+            if count_read {
+                ts.read_upto = ts.read_upto.max(sp.end);
+                for (a, b) in held_ranges {
+                    read_bytes += self
+                        .bytes_at_boundary(depth + b)
+                        .saturating_sub(self.bytes_at_boundary(depth + a));
+                }
             }
             if !refresh {
                 continue;
