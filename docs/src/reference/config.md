@@ -279,6 +279,7 @@ hbm_eviction = { policy = "lru" }              # lru | outlook
 write = { policy = "write_back" }              # write_back | write_through | selective | live
 eviction = { policy = "fifo" }                 # fifo | lru | ttl | outlook
 prefetch = { policy = "none" }                 # none | outlook
+backup = "on_evict"                            # on_evict | on_land
 hbm_evict_backed_first = false
 [memory.capacity]
 host_dram = 1.0e12          # bytes per instance given to KV
@@ -294,6 +295,7 @@ host_dram = 1.0e12          # bytes per instance given to KV
 | `write` | Table | `write_back` | When a block's KV is written to the first tier: `write_back` — when its HBM block is recycled, if no tier holds it; `write_through` — as soon as it is produced; `selective` (`min_hits`, default 1) — on its `min_hits`-th HBM hit, and dropped on eviction otherwise (SGLang HiCache's three positions); `live` — when recycled, only if its session has announced a re-entry (a finished trajectory is dropped) |
 | `eviction` | Table | `fifo` | How every tier picks what to recycle: `fifo` (least recently inserted), `lru` (least recently inserted or promoted from), `ttl` (`seconds`: LRU, and any block untouched that long is dropped whether or not the store is full), `outlook` (no announced re-entry first, then farthest re-entry first). Stores hold ranges of a sequence, written and stamped together; a victim range is recycled from its tail under every policy, so what survives of a sequence in a store is a prefix |
 | `prefetch` | Table | `none` | Whether a demoted prefix is pulled back ahead of its re-entry: `none`; `outlook` (`lead`, default 0 s) — when a session step completes, plan a promotion of the prefix its next step re-enters with, starting so it lands `lead` seconds before that arrival at the fetch path's fair share at planning time; whatever is still in HBM when the plan fires needs nothing, and a re-entry that arrives mid-transfer joins it |
+| `backup` | String | `on_evict` | When a tier forwards a block to the tier below it: `on_evict` — only when it evicts the block (a store → store transfer of what would otherwise be dropped); `on_land` — as soon as the block's write into it lands, so every tier below the first receives a copy within a transfer of production (SGLang HiCache backs a node up to its storage backend the moment its device → host DMA completes). Under `on_land` a private per-rank host tier's fresh KV reaches a shared storage tier at once rather than when the host tier ages it out |
 | `hbm_evict_backed_first` | Bool | false | When HBM must recycle a block, take one whose KV a tier already holds (a free drop) over the policy's first choice, looking 16 blocks up the free queue |
 
 The `outlook`, `live` and `min_time`/`prefetch` policies act on a session

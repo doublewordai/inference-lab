@@ -37,7 +37,9 @@ use super::radix::{
     HbmEvicted, KvBytesFn, NodeId, Radix, RadixTier, SharedRadix, Span, TierEvicted, TierSource,
     TierSourceRange,
 };
-use crate::config::{ClusterSpec, EvictionPolicy, MemoryTemplate, Scope, StoreKind, WritePolicy};
+use crate::config::{
+    BackupPolicy, ClusterSpec, EvictionPolicy, MemoryTemplate, Scope, StoreKind, WritePolicy,
+};
 
 pub type StoreId = usize;
 pub type WorkerId = usize;
@@ -157,6 +159,9 @@ pub struct MemoryGraph {
     /// whether HBM prefers recycling blocks a tier already holds.
     write_of: Vec<WritePolicy>,
     evict_backed_first: Vec<bool>,
+    /// When a store forwards a block to the store below it: on eviction, or
+    /// as soon as the block's write lands.
+    backup: BackupPolicy,
     /// In-flight writes: transfer id → the (destination store, span)
     /// ranges it carries that have not landed or been dropped. A batch of
     /// blocks written together moves as one transfer.
@@ -208,6 +213,7 @@ impl MemoryGraph {
             made_links: HashSet::new(),
             write_of: Vec::new(),
             evict_backed_first: Vec::new(),
+            backup: BackupPolicy::default(),
             pending_writes: HashMap::new(),
             pending_pins: HashMap::new(),
             wake_workers: HashSet::new(),
@@ -352,6 +358,7 @@ impl MemoryGraph {
             let policies = selection.policies();
             let template = cluster.hardware.memory.as_ref();
             selection.validate(template)?;
+            g.backup = policies.backup;
             // Under DP-attention every rank of a replica is its own worker
             // in the graph: one GPU, its own port into the node's stores.
             let (num_workers, tp) = cluster.graph_workers();
@@ -607,6 +614,12 @@ impl MemoryGraph {
             r.set_store_eviction(i, eviction);
         }
         drop(r);
+        self
+    }
+
+    /// Set when stores forward blocks to the store below (tests and examples).
+    pub fn with_backup(mut self, backup: BackupPolicy) -> Self {
+        self.backup = backup;
         self
     }
 
@@ -940,6 +953,18 @@ impl MemoryGraph {
             }
             return;
         };
+        let spans: Vec<Span> = moving.iter().map(|e| e.span).collect();
+        self.forward_batch(store, next, &spans);
+        let mut r = self.radix.lock().unwrap();
+        for n in nodes {
+            r.prune_if_empty(n);
+        }
+    }
+
+    /// Copy `spans` (held by `store`, or just evicted from it) into `next`
+    /// as one store → store transfer, skipping what `next` already holds;
+    /// `next`'s own evictions cascade on.
+    fn forward_batch(&mut self, store: StoreId, next: StoreId, spans: &[Span]) {
         let now = self.flows.now();
         let mut path = match self.shortest_path(self.stores[store].vertex, self.stores[next].vertex)
         {
@@ -964,22 +989,16 @@ impl MemoryGraph {
         let id = format!("c:{store}:{next}:{}", self.next_write_seq);
         self.next_write_seq += 1;
         let mut total = 0u64;
-        let mut entries = Vec::with_capacity(moving.len());
+        let mut entries = Vec::with_capacity(spans.len());
         let mut evicted = Vec::new();
         {
             let mut r = self.radix.lock().unwrap();
-            for e in moving {
-                for m in r.store_missing(next, e.span) {
+            for &span in spans {
+                for m in r.store_missing(next, span) {
                     total += r.span_bytes(m);
                     entries.push((next, m));
                     evicted.extend(r.store_insert(next, m, Some(id.clone()), now));
                 }
-            }
-        }
-        {
-            let mut r = self.radix.lock().unwrap();
-            for n in nodes {
-                r.prune_if_empty(n);
             }
         }
         if entries.is_empty() {
@@ -1033,12 +1052,25 @@ impl MemoryGraph {
     /// Land finished writes and drop TTL-expired ranges.
     fn settle_writes(&mut self, now: f64) {
         if let Some(completed) = self.flows.take_completed(Owner::Write) {
+            let mut landed: Vec<(StoreId, Vec<Span>)> = Vec::new();
             for id in completed {
                 if let Some(entries) = self.pending_writes.remove(&id) {
                     let mut r = self.radix.lock().unwrap();
+                    let mut by_store: HashMap<StoreId, Vec<Span>> = HashMap::new();
                     for (store, span) in entries {
                         r.store_landed(store, &[span]);
                         self.stores[store].bytes_written += r.span_bytes(span);
+                        by_store.entry(store).or_default().push(span);
+                    }
+                    landed.extend(by_store);
+                }
+            }
+            // Under `on_land` every landed range is forwarded to the next
+            // tier at once (HiCache's storage backup after the host DMA).
+            if self.backup == BackupPolicy::OnLand {
+                for (store, spans) in landed {
+                    if let Some(next) = self.stores[store].next {
+                        self.forward_batch(store, next, &spans);
                     }
                 }
             }
@@ -2109,6 +2141,39 @@ bandwidth = 900
         let s8 = sp(&g, 8);
         g.demote(0, s8, None);
         assert!(!holds(&g, 0, 8));
+    }
+
+    #[test]
+    fn on_land_backup_forwards_a_landed_write_to_the_next_tier_at_once() {
+        // Default (on_evict): a produced block reaches tier 1 only when tier
+        // 0 evicts it.
+        let mut g = two_tier_private(WritePolicy::WriteThrough {}, EvictionPolicy::Fifo {});
+        let s7 = sp(&g, 7);
+        g.produced_batch(0, &[s7]);
+        g.advance(10.0); // 100 B at 10 B/s: landed in tier 0
+        assert!(store_resident(&g, 0, 7));
+        assert_eq!(tier_holding(&g, 0, 7), Some(0));
+        g.advance(100.0);
+        assert!(!store_contains(&g, 1, 7));
+
+        // on_land: the landing itself starts the tier 0 → tier 1 copy
+        // (100 B over the 5 B/s drive: resident at 10 + 20 s), and tier 0
+        // keeps its copy.
+        let mut g = two_tier_private(WritePolicy::WriteThrough {}, EvictionPolicy::Fifo {})
+            .with_backup(BackupPolicy::OnLand);
+        let s7 = sp(&g, 7);
+        g.produced_batch(0, &[s7]);
+        g.advance(10.0);
+        assert!(store_resident(&g, 0, 7));
+        assert!(store_contains(&g, 1, 7));
+        assert!(!store_resident(&g, 1, 7));
+        g.advance(30.0);
+        assert!(store_resident(&g, 1, 7));
+        assert!(store_resident(&g, 0, 7));
+        // Both tiers hold it, so its next HBM eviction writes nothing.
+        assert!(close(g.flows().bytes_submitted_write, 200.0));
+        g.demote(0, s7, None);
+        assert!(close(g.flows().bytes_submitted_write, 200.0));
     }
 
     #[test]

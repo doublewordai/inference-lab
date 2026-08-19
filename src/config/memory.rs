@@ -43,6 +43,7 @@
 //! tiers = ["grace_dram", "nvme"]
 //! write = { policy = "write_through" }        # write_back | write_through | selective
 //! eviction = { policy = "ttl", seconds = 3600 }   # fifo | lru | ttl
+//! backup = "on_evict"                              # on_evict | on_land
 //! hbm_evict_backed_first = true
 //! [memory.capacity]
 //! grace_dram = 200e9
@@ -56,7 +57,13 @@
 //! hit and dropped otherwise. Writes are transfers GPU → store on the same
 //! graph as promotions; a block is promotable once its write has landed
 //! (a promotion of a block still arriving waits for it). A full store
-//! evicts into the next tier — a store → store transfer — or drops.
+//! evicts into the next tier — a store → store transfer — or drops. Under
+//! `backup = "on_land"` a block is also forwarded to the next tier as soon
+//! as its write lands (SGLang HiCache backs a node up to its storage
+//! backend the moment its device → host copy completes), so a private host
+//! tier's contents reach a shared storage tier within a step rather than
+//! when the host tier evicts them; `on_evict` (default) forwards only on
+//! eviction.
 //!
 //! `kind = "peer_hbm"` is the one virtual tier: it names KV already
 //! resident in a sibling worker's HBM on the same node. It has no capacity
@@ -130,6 +137,29 @@ fn default_min_hits() -> u32 {
 impl Default for WritePolicy {
     fn default() -> Self {
         WritePolicy::WriteBack {}
+    }
+}
+
+/// When a tier forwards a block to the tier below it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackupPolicy {
+    /// Only when the tier evicts it (a store → store transfer of what would
+    /// otherwise be dropped).
+    #[default]
+    OnEvict,
+    /// As soon as its write into the tier lands: every tier below the first
+    /// receives a copy within a transfer of production (HiCache's storage
+    /// backup after the device → host DMA).
+    OnLand,
+}
+
+impl BackupPolicy {
+    pub fn name(&self) -> &'static str {
+        match self {
+            BackupPolicy::OnEvict => "on_evict",
+            BackupPolicy::OnLand => "on_land",
+        }
     }
 }
 
@@ -297,6 +327,7 @@ pub struct MemoryPolicies {
     pub write: WritePolicy,
     pub eviction: EvictionPolicy,
     pub prefetch: PrefetchPolicy,
+    pub backup: BackupPolicy,
     pub hbm_evict_backed_first: bool,
 }
 
@@ -308,6 +339,7 @@ impl Default for MemoryPolicies {
             write: WritePolicy::WriteBack {},
             eviction: EvictionPolicy::Fifo {},
             prefetch: PrefetchPolicy::None {},
+            backup: BackupPolicy::OnEvict,
             hbm_evict_backed_first: false,
         }
     }
@@ -322,6 +354,7 @@ impl MemoryPolicies {
                 write: WritePolicy::Selective { min_hits: 1 },
                 eviction: EvictionPolicy::Lru {},
                 prefetch: PrefetchPolicy::None {},
+                backup: BackupPolicy::OnEvict,
                 hbm_evict_backed_first: true,
             },
             MemoryPreset::Oracle => Self {
@@ -330,6 +363,7 @@ impl MemoryPolicies {
                 write: WritePolicy::Live {},
                 eviction: EvictionPolicy::Outlook {},
                 prefetch: PrefetchPolicy::Outlook { lead: 0.0 },
+                backup: BackupPolicy::OnEvict,
                 hbm_evict_backed_first: true,
             },
         }
@@ -617,6 +651,10 @@ pub struct MemoryConfig {
     /// Whether demoted prefixes are pulled back ahead of their re-entry.
     #[serde(default)]
     pub prefetch: Option<PrefetchPolicy>,
+    /// When a tier forwards a block to the tier below: on eviction, or as
+    /// soon as the block lands.
+    #[serde(default)]
+    pub backup: Option<BackupPolicy>,
     /// When HBM must recycle a block, prefer one whose KV a tier already
     /// holds (dropping it is free) over the policy's first choice,
     /// looking a bounded distance up the free queue.
@@ -643,6 +681,9 @@ impl MemoryConfig {
         }
         if let Some(v) = self.prefetch {
             p.prefetch = v;
+        }
+        if let Some(v) = self.backup {
+            p.backup = v;
         }
         if let Some(v) = self.hbm_evict_backed_first {
             p.hbm_evict_backed_first = v;
