@@ -256,6 +256,7 @@ impl Config {
             sessions_path: None,
             num_sessions: None,
             stationary_start_sessions: None,
+            resample_sessions: false,
             arrival_pattern: ArrivalPattern::Poisson,
             arrival_rate: 1.0,
             rate_schedule: None,

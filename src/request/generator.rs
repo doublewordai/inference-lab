@@ -119,6 +119,9 @@ impl RequestGenerator {
         sessions: Vec<SessionSpec>,
     ) -> Self {
         let mut source = SessionSource::new(sessions, block_size);
+        if workload.resample_sessions {
+            source = source.with_resampling(workload.seed);
+        }
         if let Some(count) = workload.stationary_start_sessions {
             source = source.with_stationary_starts(count, workload.seed);
         }
@@ -128,6 +131,11 @@ impl RequestGenerator {
     fn build(workload: WorkloadConfig, source: Source) -> Self {
         let mut rng = StdRng::seed_from_u64(workload.seed);
         let mut pending_closed_loop = Vec::new();
+        let seed_sessions_at_zero = !workload.arrival_pattern.is_closed_loop()
+            && workload
+                .stationary_start_sessions
+                .is_some_and(|count| count > 0)
+            && matches!(&source, Source::Sessions(_));
         let next_arrival_time;
         if workload.arrival_pattern.is_closed_loop() {
             // Seed the N initial arrivals. With `closed_loop_jitter_secs > 0`,
@@ -144,6 +152,13 @@ impl RequestGenerator {
                     }
                 })
                 .collect();
+            next_arrival_time = 0.0;
+        } else if seed_sessions_at_zero {
+            // The experimental reference sampled the first clock arrival
+            // before holding it for the seeded population. Consume that draw
+            // so post-seed Poisson/burst arrivals retain the same seeded RNG
+            // stream, while correcting the seed population's time to t=0.
+            let _ = Self::sample_next_arrival(&workload, 0.0, &mut rng);
             next_arrival_time = 0.0;
         } else {
             next_arrival_time = Self::sample_next_arrival(&workload, 0.0, &mut rng);
@@ -256,6 +271,15 @@ impl RequestGenerator {
         }
     }
 
+    /// Whether the open-loop clock is still admitting the initial stationary
+    /// population at t=0.
+    fn seeding_stationary_sessions(&self) -> bool {
+        match (&self.source, self.workload.stationary_start_sessions) {
+            (Source::Sessions(source), Some(count)) => source.num_started() < count,
+            _ => false,
+        }
+    }
+
     /// The next request if it has arrived by `current_time`; `None` if no
     /// request is due or the workload is exhausted.
     pub fn next_if_before(&mut self, current_time: f64) -> Option<Request> {
@@ -344,8 +368,12 @@ impl RequestGenerator {
         };
         self.requests_generated += 1;
 
-        // Sample the next open-loop arrival only if more requests will exist.
-        if !self.workload.arrival_pattern.is_closed_loop() && !self.reached_request_limit() {
+        // Seeded sessions are the population present when the run begins, so
+        // hold the open-loop clock at t=0 until all of them have started.
+        if !self.seeding_stationary_sessions()
+            && !self.workload.arrival_pattern.is_closed_loop()
+            && !self.reached_request_limit()
+        {
             self.next_arrival_time =
                 Self::sample_next_arrival(&self.workload, self.next_arrival_time, &mut self.rng);
         }
@@ -458,6 +486,7 @@ mod tests {
             sessions_path: None,
             num_sessions: None,
             stationary_start_sessions: None,
+            resample_sessions: false,
             arrival_pattern: pattern,
             arrival_rate: rate,
             rate_schedule: None,
@@ -748,6 +777,34 @@ mod tests {
                 session_specs()
             )),
             ["s0/0", "s0/1"]
+        );
+    }
+
+    #[test]
+    fn all_seeded_sessions_have_started_at_t_zero() {
+        let mut workload = create_test_workload(ArrivalPattern::Uniform, 0.1, 100);
+        workload.num_sessions = Some(4);
+        workload.stationary_start_sessions = Some(3);
+        let mut generator = RequestGenerator::from_sessions(workload, 16, session_specs());
+
+        assert_eq!(generator.peek_next_arrival_time(), 0.0);
+        let seeded: Vec<_> = (0..3)
+            .map(|_| generator.next_if_before(0.0).unwrap())
+            .collect();
+        assert!(seeded.iter().all(|request| request.arrival_time == 0.0));
+        assert_eq!(
+            seeded
+                .iter()
+                .map(|request| request.request_id.as_str())
+                .collect::<Vec<_>>(),
+            ["s0/1", "s1/0", "s2/1"]
+        );
+        assert!(generator.next_if_before(0.0).is_none());
+        assert_eq!(generator.peek_next_arrival_time(), 10.0);
+        let ordinary = generator.next_if_before(10.0).unwrap();
+        assert_eq!(
+            (ordinary.request_id.as_str(), ordinary.arrival_time),
+            ("s3/0", 10.0)
         );
     }
 

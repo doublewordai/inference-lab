@@ -314,6 +314,8 @@ arrival_rate = 0.05           # sessions/s
 num_sessions = 200            # stop starting sessions after this many
 # Optional: seed the first live population part-way through its traces.
 stationary_start_sessions = 128
+# Optional: draw sessions uniformly with replacement instead of in file order.
+resample_sessions = true
 seed = 42
 
 input_len_dist = { type = "fixed", value = 1 }   # ignored in session mode
@@ -326,16 +328,24 @@ The arrival pattern decides when sessions **start**: `poisson` / `uniform` /
 its session's last step completes), `batched` starts every session at t=0.
 Every later step of a session arrives at its parent's completion plus the
 step's `gap`, so the simulated latency feeds back into the arrival process
-and long gaps are preserved. Sessions are taken from the file in order and
-the file is cycled. `num_sessions` bounds session starts; `num_requests`
-separately bounds total emitted request steps across all sessions.
+and long gaps are preserved. By default sessions are taken from the file in
+order and the file is cycled. `num_sessions` bounds session starts;
+`num_requests` separately bounds total emitted request steps across all
+sessions.
 
 `stationary_start_sessions` avoids waiting a session-lifetime tail for an
-open-loop live population to reach stationarity. Each of the first N sessions
-starts at a trace step sampled in proportion to that step's `gap` (the time
-the session waits before issuing it). Its inherited context receives fresh
-block hashes, so the first emitted request reports its shared prefix but must
-prefill that context once; later sessions start at step 0 normally.
+open-loop live population to reach stationarity. All N seeded sessions enter
+at t=0; the arrival clock is held until they have started, then resumes
+normally. Each starts at a trace step sampled in proportion to that step's
+`gap` (the time the session waits before issuing it). Its inherited context
+receives fresh block hashes, so the first emitted request reports its shared
+prefix but must prefill that context once; later sessions start at step 0
+normally.
+
+`resample_sessions = true` draws every new session uniformly from the file
+with replacement. It preserves each sampled session's within-trace structure
+while avoiding file-order effects. Repeated instances receive fresh block
+hashes and therefore do not share cache state.
 
 **Session file:** JSONL, one session per line:
 

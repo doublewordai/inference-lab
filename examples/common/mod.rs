@@ -68,6 +68,7 @@ pub fn closed_loop_config(
             sessions_path: None,
             num_sessions: None,
             stationary_start_sessions: None,
+            resample_sessions: false,
             arrival_pattern: ArrivalPattern::ClosedLoop,
             arrival_rate: 1.0,
             rate_schedule: None,
