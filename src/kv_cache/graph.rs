@@ -642,9 +642,7 @@ impl MemoryGraph {
     /// Set every worker's write policy and every store's eviction policy
     /// (tests and examples; configs set them through `[memory]`).
     pub fn with_policies(mut self, write: WritePolicy, eviction: EvictionPolicy) -> Self {
-        for w in &mut self.write_of {
-            *w = write;
-        }
+        self.write_of.fill(write);
         let mut r = self.radix.lock().unwrap();
         for (i, st) in self.stores.iter_mut().enumerate() {
             st.eviction = eviction;
@@ -674,9 +672,7 @@ impl MemoryGraph {
 
     /// Set every worker's HBM recycling preference (tests and examples).
     pub fn with_hbm_evict_backed_first(mut self, on: bool) -> Self {
-        for e in &mut self.evict_backed_first {
-            *e = on;
-        }
+        self.evict_backed_first.fill(on);
         self
     }
 

@@ -591,7 +591,9 @@ mod tests {
         // At least one group of three contains a repeated entry: draws are
         // with replacement, not shuffled cycles through the file.
         assert!(sampled_inputs
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .any(|chunk| { chunk[0] == chunk[1] || chunk[0] == chunk[2] || chunk[1] == chunk[2] }));
     }
 
