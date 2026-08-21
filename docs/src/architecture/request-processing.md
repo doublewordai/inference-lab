@@ -20,12 +20,22 @@ Dataset prompts carry incremental content hashes, one per KV block of
 the KV cache: blocks resident in HBM are shared by reference and their
 compute is skipped (block-aligned, and never the whole prompt — the last
 block is always computed, as in vLLM); blocks in a memory tier (a store of
-the pool's memory graph the worker can reach) or already in flight for
-another request are promoted / joined asynchronously while the request waits
-with its landing blocks reserved — started only when the whole prompt would
-fit the worker's KV, and given back (the tier copy stays) whenever a running
-request needs the blocks. Synthetic workloads carry no prompt content and
-never hit.
+the pool's memory graph the worker can reach) move according to
+`promote_fill`. The default, `through`, models HiCache read-through: an
+external-store hit first transfers into the next closer store and becomes
+resident there, repeating one level at a time, then loads from the closest
+store into HBM. These storage stages consume real tier capacity and bandwidth
+but reserve no HBM. Only the final host-to-device leg reserves landing blocks,
+and it starts only when the whole prompt would fit. With
+`load_overlap = "layerwise"`, its elapsed time overlaps the first prefill pass
+as an aggregate pipeline (`max(load, compute)`); `none` serialises them.
+`storage_prefetch` decides whether the demand waits for staging, abandons it
+when admission is available, or waits to a deadline. Abandonment keeps fully
+landed closer stages and recomputes the still-external suffix. `buffer` follows
+the same path but releases transient intermediate copies after the HBM load;
+`direct` retains the legacy store-to-HBM transfer. Requests can still join an
+HBM landing already in flight for another request. Synthetic workloads carry
+no prompt content and never hit.
 
 ## KV blocks
 
@@ -71,11 +81,12 @@ available source first.
 
 A tier entry may pin fetch sources. While pinned, a peer's free HBM run or a
 normal store range cannot be recycled; an allocation with no other victim
-waits and records a pin stall. Peer HBM pins by default, while normal stores
-retain the historical unpinned default. If pinning is disabled and eviction
-removes a source suffix during the transfer, completion rechecks the ordered
-source spans, publishes only the surviving prefix, releases the unused
-landing reservation, and recomputes the rest. This records a partial landing.
+waits and records a pin stall. Staged store reads always protect their source
+until that leg drains, because their destination is a real cache fill. For
+legacy direct reads, peer HBM pins by default and normal stores retain the
+historical unpinned default. If an unpinned direct source loses a suffix,
+completion publishes only the surviving prefix, releases the unused landing
+reservation, and recomputes the rest. This records a partial landing.
 
 ## Preemption
 

@@ -1728,6 +1728,12 @@ impl Radix {
         }
     }
 
+    /// Whether an in-flight reader currently protects any of `span` in a
+    /// concrete store.
+    pub fn store_span_pinned(&self, s: StoreId, span: Span) -> bool {
+        self.store_range_pinned(s, span.node, span.start, span.end)
+    }
+
     /// Release a source pin. Store pins can have left their store
     /// temporarily over capacity; return the evictions now unblocked.
     pub fn unpin_source(&mut self, source: TierSource, span: Span) -> Vec<TierEvicted> {

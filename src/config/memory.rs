@@ -45,14 +45,17 @@
 //! eviction = { policy = "ttl", seconds = 3600 }   # fifo | lru | ttl
 //! backup = "on_evict"                              # on_evict | on_land
 //! hit_refresh = "first_tier"                       # first_tier | none
-//! promote_fill = "through"                         # through | direct
+//! promote_fill = "through"                         # through | buffer | direct
+//! storage_prefetch = { policy = "wait_complete" }  # wait_complete | best_effort | timeout
+//! load_overlap = "layerwise"                       # layerwise | none
 //! hbm_evict_backed_first = true
 //! [memory.capacity]
 //! grace_dram = 200e9
 //! ```
 //!
-//! Tiers are inclusive: a block promoted back to HBM keeps its tier copy
-//! (KV is immutable), so its next eviction from HBM is a free drop. Under
+//! Under the default `promote_fill = "through"`, tiers are inclusive: a block
+//! promoted back to HBM keeps every tier copy it staged through (KV is
+//! immutable), so its next eviction from HBM is a free drop. Under
 //! `write_back` a block no tier holds is written when its HBM block is
 //! recycled; under `write_through` every fresh block is written as it is
 //! produced; under `selective` a block is written on its `min_hits`-th HBM
@@ -70,16 +73,21 @@
 //! with HBM the way HiCache's host tier does (one radix tree, one
 //! `last_access_time`); lower tiers see only the references that reach them.
 //! Under `promote_fill = "through"` (default) a prefix promoted from a lower
-//! tier is also inserted into the tiers above its source as it lands, as
-//! HiCache stages a storage hit through host memory; `direct` lands it in
-//! HBM only.
+//! tier moves one tier at a time and remains cached in every tier it crosses,
+//! as HiCache stages a storage hit through host memory. `buffer` uses the same
+//! path but releases the intermediate copy after the HBM load; `direct` lands
+//! it in HBM without staging. HBM is reserved only for the final host-to-device
+//! leg. `storage_prefetch` chooses whether a demand waits, abandons the
+//! prefetch when it can run, or abandons it at a deadline. `load_overlap`
+//! controls whether that final leg overlaps the request's first prefill pass.
 //!
 //! `kind = "peer_hbm"` is the one virtual tier: it names KV already
 //! resident in a sibling worker's HBM on the same node. It has no capacity
 //! or write path; promotions traverse GPU → switch → GPU. A store's `pin`
-//! controls whether its source survives until a fetch drains (default true
-//! for peer HBM, false for capacity-bearing stores). An unpinned fetch
-//! rechecks its source on completion and lands only the surviving prefix.
+//! controls whether its source survives until a direct fetch drains (default
+//! true for peer HBM, false for capacity-bearing stores). Staged store reads
+//! always pin their source; an unpinned direct fetch rechecks its source on
+//! completion and lands only the surviving prefix.
 //!
 //! With no `[memory]` on the deployment there is no tiering (HBM only).
 
@@ -184,6 +192,10 @@ pub enum PromoteFill {
     /// inclusive.
     #[default]
     Through,
+    /// The promoted ranges stage through every tier above the source, but
+    /// those intermediate copies are transient buffers and are released
+    /// after the HBM load completes.
+    Buffer,
     /// The promotion lands in HBM only; tiers above the source are not
     /// refilled.
     Direct,
@@ -193,7 +205,67 @@ impl PromoteFill {
     pub fn name(&self) -> &'static str {
         match self {
             PromoteFill::Through => "through",
+            PromoteFill::Buffer => "buffer",
             PromoteFill::Direct => "direct",
+        }
+    }
+}
+
+impl PromoteFill {
+    pub fn stages(self) -> bool {
+        matches!(self, Self::Through | Self::Buffer)
+    }
+}
+
+/// What a request does while an external-tier hit is being staged into the
+/// first local tier.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(tag = "policy", rename_all = "snake_case", deny_unknown_fields)]
+pub enum StoragePrefetchPolicy {
+    /// Wait until the storage-to-host prefetch has completed.
+    WaitComplete {},
+    /// Let the prefetch run while the request is queued, but cancel it and
+    /// use whatever closer prefix has landed once the request can run.
+    BestEffort {},
+    /// Wait at most `seconds`, then cancel and use the closer prefix which
+    /// has landed by the deadline.
+    Timeout { seconds: f64 },
+}
+
+impl Default for StoragePrefetchPolicy {
+    fn default() -> Self {
+        Self::WaitComplete {}
+    }
+}
+
+impl StoragePrefetchPolicy {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::WaitComplete {} => "wait_complete",
+            Self::BestEffort {} => "best_effort",
+            Self::Timeout { .. } => "timeout",
+        }
+    }
+}
+
+/// Whether the first prefill pass is pipelined with the final host-to-device
+/// KV load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoadOverlap {
+    /// HiCache's layer-wise load-back: the step lasts for the slower of its
+    /// compute work and the host-to-device transfer.
+    #[default]
+    Layerwise,
+    /// Finish the whole HBM load before starting compute.
+    None,
+}
+
+impl LoadOverlap {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Layerwise => "layerwise",
+            Self::None => "none",
         }
     }
 }
@@ -388,6 +460,8 @@ pub struct MemoryPolicies {
     pub backup: BackupPolicy,
     pub hit_refresh: HitRefresh,
     pub promote_fill: PromoteFill,
+    pub storage_prefetch: StoragePrefetchPolicy,
+    pub load_overlap: LoadOverlap,
     pub hbm_evict_backed_first: bool,
 }
 
@@ -402,6 +476,8 @@ impl Default for MemoryPolicies {
             backup: BackupPolicy::OnEvict,
             hit_refresh: HitRefresh::FirstTier,
             promote_fill: PromoteFill::Through,
+            storage_prefetch: StoragePrefetchPolicy::WaitComplete {},
+            load_overlap: LoadOverlap::Layerwise,
             hbm_evict_backed_first: false,
         }
     }
@@ -419,6 +495,8 @@ impl MemoryPolicies {
                 backup: BackupPolicy::OnEvict,
                 hit_refresh: HitRefresh::FirstTier,
                 promote_fill: PromoteFill::Through,
+                storage_prefetch: StoragePrefetchPolicy::WaitComplete {},
+                load_overlap: LoadOverlap::Layerwise,
                 hbm_evict_backed_first: true,
             },
             MemoryPreset::Oracle => Self {
@@ -430,6 +508,8 @@ impl MemoryPolicies {
                 backup: BackupPolicy::OnEvict,
                 hit_refresh: HitRefresh::FirstTier,
                 promote_fill: PromoteFill::Through,
+                storage_prefetch: StoragePrefetchPolicy::WaitComplete {},
+                load_overlap: LoadOverlap::Layerwise,
                 hbm_evict_backed_first: true,
             },
         }
@@ -697,7 +777,8 @@ pub struct MemoryConfig {
     #[serde(default)]
     pub capacity: BTreeMap<String, f64>,
     /// A named bundle of the policies below; explicit fields override it.
-    /// Default: `promote` / `lru` / `write_back` / `fifo` / no prefetch /
+    /// Default: `promote` / `lru` / `write_back` / `fifo` / no outlook
+    /// prefetch / staged wait-complete reads with layer-wise final loading /
     /// no backed-first recycling.
     #[serde(default)]
     pub preset: Option<MemoryPreset>,
@@ -727,6 +808,12 @@ pub struct MemoryConfig {
     /// Where a promotion from a lower tier is left on the way up.
     #[serde(default)]
     pub promote_fill: Option<PromoteFill>,
+    /// What an external-tier prefetch does when the request becomes runnable.
+    #[serde(default)]
+    pub storage_prefetch: Option<StoragePrefetchPolicy>,
+    /// Whether the final host-to-device load overlaps the first prefill pass.
+    #[serde(default)]
+    pub load_overlap: Option<LoadOverlap>,
     /// When HBM must recycle a block, prefer one whose KV a tier already
     /// holds (dropping it is free) over the policy's first choice,
     /// looking a bounded distance up the free queue.
@@ -763,6 +850,12 @@ impl MemoryConfig {
         if let Some(v) = self.promote_fill {
             p.promote_fill = v;
         }
+        if let Some(v) = self.storage_prefetch {
+            p.storage_prefetch = v;
+        }
+        if let Some(v) = self.load_overlap {
+            p.load_overlap = v;
+        }
         if let Some(v) = self.hbm_evict_backed_first {
             p.hbm_evict_backed_first = v;
         }
@@ -778,6 +871,13 @@ impl MemoryConfig {
     /// Check every tier names a store the template has, reachable from a
     /// GPU over its links, and every capacity override names a tier.
     pub fn validate(&self, template: Option<&MemoryTemplate>) -> Result<(), String> {
+        if let Some(StoragePrefetchPolicy::Timeout { seconds }) = self.storage_prefetch {
+            if !seconds.is_finite() || seconds <= 0.0 {
+                return Err(
+                    "[memory] storage_prefetch timeout seconds must be finite and > 0".to_string(),
+                );
+            }
+        }
         if self.tiers.is_empty() {
             if let Some(name) = self.capacity.keys().next() {
                 return Err(format!(
@@ -955,7 +1055,7 @@ bandwidth = 1e12
     #[test]
     fn parses_write_and_eviction_policies() {
         let c: MemoryConfig = toml::from_str(
-            "tiers = [\"nvme\"]\nwrite = { policy = \"selective\", min_hits = 2 }\neviction = { policy = \"ttl\", seconds = 60 }\nhbm_evict_backed_first = true",
+            "tiers = [\"nvme\"]\nwrite = { policy = \"selective\", min_hits = 2 }\neviction = { policy = \"ttl\", seconds = 60 }\npromote_fill = \"buffer\"\nstorage_prefetch = { policy = \"timeout\", seconds = 2.5 }\nload_overlap = \"none\"\nhbm_evict_backed_first = true",
         )
         .unwrap();
         let p = c.policies();
@@ -965,9 +1065,22 @@ bandwidth = 1e12
         assert_eq!(p.source, SourcePolicy::Promote {});
         assert_eq!(p.hbm_eviction, HbmEviction::Lru {});
         assert_eq!(p.prefetch, PrefetchPolicy::None {});
+        assert_eq!(p.promote_fill, PromoteFill::Buffer);
+        assert_eq!(
+            p.storage_prefetch,
+            StoragePrefetchPolicy::Timeout { seconds: 2.5 }
+        );
+        assert_eq!(p.load_overlap, LoadOverlap::None);
         let d: MemoryConfig = toml::from_str("tiers = [\"nvme\"]").unwrap();
         assert_eq!(d.policies(), MemoryPolicies::default());
         assert!(toml::from_str::<MemoryConfig>("write = { policy = \"nope\" }").is_err());
+        for seconds in [0.0, -1.0, f64::INFINITY] {
+            let bad = MemoryConfig {
+                storage_prefetch: Some(StoragePrefetchPolicy::Timeout { seconds }),
+                ..Default::default()
+            };
+            assert!(bad.validate(None).is_err());
+        }
     }
 
     #[test]

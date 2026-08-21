@@ -17,10 +17,11 @@
 //! neighbours can promote. A `per = "cluster"` store is one instance behind
 //! the scale-out network and visible to every worker. Its striped bandwidth
 //! caps one transfer while an aggregate edge is shared topology-wide. A
-//! promotion moves bytes along the shortest path from the store to the
-//! worker's GPU; a prefill → decode hand-off along the shortest path from one
-//! GPU to the other (through the network when they are on different nodes,
-//! with an optional core capacity).
+//! promotion either stages bytes one store at a time before the final GPU
+//! load, or moves them directly from the source store to the worker's GPU; a
+//! prefill → decode hand-off follows the shortest path from one GPU to the
+//! other (through the network when they are on different nodes, with an
+//! optional core capacity).
 //! A `peer_hbm` tier is virtual: radix lookup selects a same-node sibling
 //! whose HBM holds the next span, then the graph moves it GPU → switch → GPU
 //! over the existing scale-up links. Source pins are held here for the
@@ -118,6 +119,24 @@ struct PendingPin {
     ranges: Option<Vec<TierSourceRange>>,
 }
 
+#[derive(Debug, Clone)]
+struct PendingStageFill {
+    worker: WorkerId,
+    request: String,
+    source: StoreId,
+    destination: StoreId,
+    source_spans: Vec<Span>,
+    entries: Vec<Span>,
+}
+
+#[derive(Debug, Clone)]
+struct LandedStageFill {
+    store: StoreId,
+    span: Span,
+    /// Set once the scheduler observes this leg before its deadline.
+    accepted: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum VertexKey {
     Gpu(WorkerId),
@@ -171,6 +190,20 @@ pub struct MemoryGraph {
     /// ranges it carries that have not landed or been dropped. A batch of
     /// blocks written together moves as one transfer.
     pending_writes: HashMap<String, Vec<(StoreId, Span)>>,
+    /// Demand-load stages from a lower store into the next closer store.
+    /// Unlike a direct promotion these consume and populate the destination
+    /// store before the request starts its final HBM load.
+    pending_stage_fills: HashMap<String, PendingStageFill>,
+    /// Store reads in flight, used to refresh and account only the concrete
+    /// source rather than every inclusive copy of the range.
+    pending_reads: HashMap<String, (StoreId, Vec<Span>)>,
+    /// Store copies created by completed stage legs. Tracking whether the
+    /// scheduler accepted each leg lets a timeout discard a copy that landed
+    /// before another worker advanced this shared graph.
+    landed_stage_fills: HashMap<String, Vec<LandedStageFill>>,
+    /// Transient stage copies whose cleanup was deferred while another
+    /// transfer still had the same range pinned.
+    pending_buffer_cleanup: Vec<(StoreId, Span)>,
     /// Source ranges held resident until their promotion flow drains.
     pending_pins: HashMap<String, PendingPin>,
     /// Workers whose free HBM changed when a peer-source pin released.
@@ -222,6 +255,10 @@ impl MemoryGraph {
             hit_refresh: HitRefresh::default(),
             promote_fill: PromoteFill::default(),
             pending_writes: HashMap::new(),
+            pending_stage_fills: HashMap::new(),
+            pending_reads: HashMap::new(),
+            landed_stage_fills: HashMap::new(),
+            pending_buffer_cleanup: Vec::new(),
             pending_pins: HashMap::new(),
             wake_workers: HashSet::new(),
             deferred_store_trims: HashSet::new(),
@@ -614,9 +651,7 @@ impl MemoryGraph {
     /// Set every worker's write policy and every store's eviction policy
     /// (tests and examples; configs set them through `[memory]`).
     pub fn with_policies(mut self, write: WritePolicy, eviction: EvictionPolicy) -> Self {
-        for w in &mut self.write_of {
-            *w = write;
-        }
+        self.write_of.fill(write);
         let mut r = self.radix.lock().unwrap();
         for (i, st) in self.stores.iter_mut().enumerate() {
             st.eviction = eviction;
@@ -646,9 +681,7 @@ impl MemoryGraph {
 
     /// Set every worker's HBM recycling preference (tests and examples).
     pub fn with_hbm_evict_backed_first(mut self, on: bool) -> Self {
-        for e in &mut self.evict_backed_first {
-            *e = on;
-        }
+        self.evict_backed_first.fill(on);
         self
     }
 
@@ -925,7 +958,7 @@ impl MemoryGraph {
     /// removed) before landing: the transfer keeps moving for the rest of
     /// its batch and is cancelled once none remain.
     fn drop_pending(&mut self, id: &str, store: StoreId, span: Span) {
-        let empty = match self.pending_writes.get_mut(id) {
+        let write_empty = match self.pending_writes.get_mut(id) {
             Some(v) => {
                 v.retain(|&(s, sp)| {
                     !(s == store
@@ -937,9 +970,16 @@ impl MemoryGraph {
             }
             None => false,
         };
-        if empty {
+        if write_empty {
             self.pending_writes.remove(id);
             self.flows.cancel(id);
+        }
+        if let Some(fill) = self.pending_stage_fills.get_mut(id) {
+            if fill.destination != store {
+                return;
+            }
+            fill.entries
+                .retain(|sp| !(sp.node == span.node && sp.start < span.end && span.start < sp.end));
         }
     }
 
@@ -1046,49 +1086,60 @@ impl MemoryGraph {
         self.cascade_batch(next, evicted);
     }
 
-    /// `spans` were promoted from `worker`'s tiers back into its HBM in
-    /// one transfer: each tier keeps its copies, marked read (and recently
-    /// used under LRU / TTL).
-    pub fn promoted_batch(&mut self, worker: WorkerId, spans: &[Span]) {
-        let now = self.flows.now();
-        let stores: Vec<StoreId> = self.tiers[worker]
-            .iter()
-            .filter(|t| !t.is_peer_hbm())
-            .map(|t| t.store)
+    fn cleanup_stage_entries(&mut self, mut entries: Vec<(StoreId, Span)>) {
+        entries.extend(std::mem::take(&mut self.pending_buffer_cleanup));
+        let mut radix = self.radix.lock().unwrap();
+        for (store, span) in entries {
+            if radix.store_span_pinned(store, span) {
+                self.pending_buffer_cleanup.push((store, span));
+            } else {
+                radix.store_remove(store, span);
+                radix.prune_if_empty(span.node);
+            }
+        }
+    }
+
+    /// The scheduler observed the latest stage leg before its deadline.
+    pub fn accept_staged_batch(&mut self, request: &str) {
+        if let Some(entries) = self.landed_stage_fills.get_mut(request) {
+            for entry in entries {
+                entry.accepted = true;
+            }
+        }
+    }
+
+    /// Abandon a staged load. Buffer mode drops every intermediate copy;
+    /// through mode retains earlier accepted legs but drops a late leg that
+    /// landed before another worker advanced this shared graph.
+    pub fn cancel_staged_batch(&mut self, request: &str) {
+        let entries = self
+            .landed_stage_fills
+            .remove(request)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|entry| self.promote_fill == PromoteFill::Buffer || !entry.accepted)
+            .map(|entry| (entry.store, entry.span))
             .collect();
-        let mut fills: Vec<(StoreId, Span)> = Vec::new();
-        {
-            let mut r = self.radix.lock().unwrap();
-            for &s in &stores {
-                let read = r.store_promoted(s, spans, now);
-                self.stores[s].bytes_read += read;
-            }
-            // Through-fill: what a lower tier supplied is left in every
-            // tier above it (the hierarchy stays inclusive).
-            if self.promote_fill == PromoteFill::Through {
-                for &sp in spans {
-                    let Some(src) = stores.iter().position(|&s| r.store_holds(s, sp)) else {
-                        continue;
-                    };
-                    for &s in &stores[..src] {
-                        for m in r.store_missing(s, sp) {
-                            if !m.is_empty() {
-                                fills.push((s, m));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        for (s, m) in fills {
-            let (bytes, evicted) = {
-                let mut r = self.radix.lock().unwrap();
-                let evicted = r.store_insert(s, m, None, now);
-                (r.span_bytes(m), evicted)
-            };
-            self.stores[s].bytes_written += bytes;
-            self.cascade_batch(s, evicted);
-        }
+        self.cleanup_stage_entries(entries);
+    }
+
+    /// A request's final HBM load landed. Store-source reads were accounted
+    /// when their flows drained; this only releases transient intermediate
+    /// copies used by `promote_fill = "buffer"` and ends stage tracking for
+    /// retained through copies.
+    pub fn promoted_batch(&mut self, _worker: WorkerId, request: &str, _spans: &[Span]) {
+        let entries = self.landed_stage_fills.remove(request).unwrap_or_default();
+        let cleanup = if self.promote_fill == PromoteFill::Buffer {
+            entries
+                .into_iter()
+                .map(|entry| (entry.store, entry.span))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        // Even a retained through completion may be the last pin blocking
+        // cleanup queued by a different abandoned request.
+        self.cleanup_stage_entries(cleanup);
     }
 
     /// Remove `span` from whichever of `worker`'s tiers hold it.
@@ -1189,6 +1240,48 @@ impl MemoryGraph {
         source: TierSource,
         bytes: u64,
     ) -> f64 {
+        if self.can_stage_source(worker, tier, source) {
+            let TierSource::Store(source_store) = source else {
+                unreachable!()
+            };
+            let destination_tier = self.tiers[worker][..tier]
+                .iter()
+                .rposition(|t| !t.is_peer_hbm())
+                .expect("can_stage_source found a closer store");
+            let destination_store = self.tiers[worker][destination_tier].store;
+            if let Some(mut path) = self.shortest_path(
+                self.stores[source_store].vertex,
+                self.stores[destination_store].vertex,
+            ) {
+                if let Some(edge) = self.stores[source_store].throughput_edge {
+                    path.edges.insert(0, edge);
+                }
+                if let Some(edge) = self.stores[destination_store].throughput_edge {
+                    path.edges.push(edge);
+                }
+                path.latency +=
+                    self.stores[source_store].latency + self.stores[destination_store].latency;
+                let cap = match (
+                    self.stores[source_store].transfer_bandwidth,
+                    self.stores[destination_store].transfer_bandwidth,
+                ) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (Some(a), None) | (None, Some(a)) => Some(a),
+                    (None, None) => None,
+                };
+                let stage =
+                    self.flows
+                        .estimate_new_capped(&path.edges, bytes as f64, path.latency, cap);
+                return stage
+                    + self.estimate_source_promotion(
+                        worker,
+                        destination_tier,
+                        TierSource::Store(destination_store),
+                        bytes,
+                    );
+            }
+            return f64::INFINITY;
+        }
         let (path, transfer_bandwidth) = match source {
             TierSource::Store(store) => (
                 self.tiers[worker][tier].fetch_path.clone(),
@@ -1201,6 +1294,186 @@ impl MemoryGraph {
         };
         self.flows
             .estimate_new_capped(&path.edges, bytes as f64, path.latency, transfer_bandwidth)
+    }
+
+    /// Whether `source` can be staged from `tier` into the next closer real
+    /// store. Peer-HBM is already an HBM source and is never staged.
+    pub fn can_stage_source(&self, worker: WorkerId, tier: usize, source: TierSource) -> bool {
+        self.promote_fill.stages()
+            && matches!(source, TierSource::Store(_))
+            && self.tiers[worker]
+                .get(..tier)
+                .is_some_and(|tiers| tiers.iter().any(|t| !t.is_peer_hbm()))
+    }
+
+    /// Stage a concrete store hit into the next closer real store. The
+    /// destination ranges are inserted as arriving now, become resident only
+    /// when the flow drains, and consume that store's real capacity. Returns
+    /// `None` when no closer store exists or it already holds every span.
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_stage_promotion(
+        &mut self,
+        worker: WorkerId,
+        tier: usize,
+        request: &str,
+        source: TierSource,
+        spans: &[Span],
+        now: f64,
+    ) -> Option<String> {
+        if !self.can_stage_source(worker, tier, source) {
+            return None;
+        }
+        let TierSource::Store(source) = source else {
+            return None;
+        };
+        let destination_tier = self.tiers[worker][..tier]
+            .iter()
+            .rposition(|t| !t.is_peer_hbm())?;
+        let destination = self.tiers[worker][destination_tier].store;
+        if source == destination {
+            return None;
+        }
+
+        let mut path =
+            self.shortest_path(self.stores[source].vertex, self.stores[destination].vertex)?;
+        if let Some(edge) = self.stores[source].throughput_edge {
+            path.edges.insert(0, edge);
+        }
+        if let Some(edge) = self.stores[destination].throughput_edge {
+            path.edges.push(edge);
+        }
+        path.latency += self.stores[source].latency + self.stores[destination].latency;
+        let transfer_bandwidth = match (
+            self.stores[source].transfer_bandwidth,
+            self.stores[destination].transfer_bandwidth,
+        ) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (None, None) => None,
+        };
+        let id = format!("{request}#stage:{tier}:{source}:{destination}");
+        let mut total = 0u64;
+        let mut entries = Vec::new();
+        let mut evicted = Vec::new();
+        {
+            let mut radix = self.radix.lock().unwrap();
+            for &span in spans {
+                for missing in radix.store_missing(destination, span) {
+                    if missing.is_empty() {
+                        continue;
+                    }
+                    total = total.saturating_add(radix.span_bytes(missing));
+                    entries.push(missing);
+                    evicted.extend(radix.store_insert(destination, missing, Some(id.clone()), now));
+                }
+            }
+        }
+        if entries.is_empty() {
+            return None;
+        }
+        self.pending_stage_fills.insert(
+            id.clone(),
+            PendingStageFill {
+                worker,
+                request: request.to_string(),
+                source,
+                destination,
+                source_spans: entries.clone(),
+                entries: entries.clone(),
+            },
+        );
+        self.cascade_batch(destination, evicted);
+        if !self.pending_stage_fills.contains_key(&id) {
+            return None;
+        }
+
+        let mut wait = 0.0_f64;
+        {
+            let radix = self.radix.lock().unwrap();
+            for &span in spans {
+                for write in radix.store_arriving(source, span) {
+                    wait = wait.max(self.flows.estimate_remaining(&write));
+                }
+            }
+        }
+        if wait > 0.0 {
+            self.write_race_waits += 1;
+        }
+        // A stage requires a stable source: unlike the legacy direct mode,
+        // losing this store copy mid-flow cannot be represented as a partial
+        // destination-store landing.
+        let mut radix = self.radix.lock().unwrap();
+        for &span in spans {
+            radix.pin_source(TierSource::Store(source), span);
+        }
+        drop(radix);
+        self.pending_pins.insert(
+            id.clone(),
+            PendingPin {
+                source: TierSource::Store(source),
+                spans: spans.to_vec(),
+                worker,
+                leader: request.to_string(),
+                ranges: None,
+            },
+        );
+        self.flows.submit_capped(
+            id.clone(),
+            Owner::Worker(worker),
+            path.edges,
+            total,
+            path.latency + wait,
+            transfer_bandwidth,
+            now,
+        );
+        Some(id)
+    }
+
+    /// Cancel an in-flight storage-to-closer-tier stage. Bytes already moved
+    /// remain in link accounting, but an incomplete destination range is not
+    /// made resident.
+    pub fn cancel_stage_promotion(&mut self, id: &str) {
+        self.flows.cancel(id);
+        self.pending_reads.remove(id);
+        if let Some(fill) = self.pending_stage_fills.remove(id) {
+            let mut radix = self.radix.lock().unwrap();
+            for span in fill.entries {
+                radix.store_remove(fill.destination, span);
+                radix.prune_if_empty(span.node);
+            }
+        }
+        self.release_pending_pin(id);
+    }
+
+    fn release_pending_pin(&mut self, id: &str) {
+        let Some(pin) = self.pending_pins.remove(id) else {
+            return;
+        };
+        let evicted = {
+            let mut radix = self.radix.lock().unwrap();
+            let mut evicted = Vec::new();
+            let spans = if let Some(ranges) = pin.ranges {
+                radix.landing_source_spans(pin.worker, &pin.leader, &ranges)
+            } else {
+                pin.spans
+                    .into_iter()
+                    .map(|span| (pin.source, span))
+                    .collect()
+            };
+            for (source, span) in spans {
+                evicted.extend(radix.unpin_source(source, span));
+            }
+            evicted
+        };
+        match pin.source {
+            TierSource::PeerHbm(source) => {
+                self.wake_workers.insert(source);
+            }
+            TierSource::Store(store) => {
+                debug_assert!(evicted.is_empty());
+                self.deferred_store_trims.insert(store);
+            }
+        }
     }
 
     /// GPU source → node switch → destination GPU. Keeping the switch
@@ -1281,7 +1554,15 @@ impl MemoryGraph {
                 format!("{}@{}", promotion_id(request, tier), source_worker)
             }
         };
-        if self.tiers[worker][tier].pin {
+        if let TierSource::Store(store) = source {
+            self.pending_reads
+                .insert(id.clone(), (store, spans.to_vec()));
+        }
+        // Pin the final host-to-device source in staged modes so a transient
+        // buffer cannot be reclaimed underneath another reader.
+        if self.tiers[worker][tier].pin
+            || (self.promote_fill.stages() && matches!(source, TierSource::Store(_)))
+        {
             let mut r = self.radix.lock().unwrap();
             let pin_spans: Vec<Span> = match ranges {
                 Some(ranges) => r
@@ -1400,34 +1681,36 @@ impl MemoryGraph {
     pub fn advance(&mut self, now: f64) -> Vec<(Owner, String)> {
         let done = self.flows.advance(now);
         for (_, id) in &done {
-            let Some(pin) = self.pending_pins.remove(id) else {
-                continue;
-            };
-            let evicted = {
-                let mut r = self.radix.lock().unwrap();
-                let mut evicted = Vec::new();
-                let spans = if let Some(ranges) = pin.ranges {
-                    r.landing_source_spans(pin.worker, &pin.leader, &ranges)
-                } else {
-                    pin.spans
-                        .into_iter()
-                        .map(|span| (pin.source, span))
-                        .collect()
-                };
-                for (source, span) in spans {
-                    evicted.extend(r.unpin_source(source, span));
+            if let Some(fill) = self.pending_stage_fills.remove(id) {
+                let mut radix = self.radix.lock().unwrap();
+                let read = radix.store_promoted(fill.source, &fill.source_spans, now);
+                self.stores[fill.source].bytes_read =
+                    self.stores[fill.source].bytes_read.saturating_add(read);
+                for &span in &fill.entries {
+                    radix.store_landed(fill.destination, &[span]);
+                    self.stores[fill.destination].bytes_written = self.stores[fill.destination]
+                        .bytes_written
+                        .saturating_add(radix.span_bytes(span));
                 }
-                evicted
-            };
-            match pin.source {
-                TierSource::PeerHbm(source) => {
-                    self.wake_workers.insert(source);
-                }
-                TierSource::Store(store) => {
-                    debug_assert!(evicted.is_empty());
-                    self.deferred_store_trims.insert(store);
-                }
+                self.landed_stage_fills
+                    .entry(fill.request)
+                    .or_default()
+                    .extend(fill.entries.iter().map(|&span| LandedStageFill {
+                        store: fill.destination,
+                        span,
+                        accepted: false,
+                    }));
+                self.wake_workers.insert(fill.worker);
             }
+            if let Some((store, spans)) = self.pending_reads.remove(id) {
+                let read = self
+                    .radix
+                    .lock()
+                    .unwrap()
+                    .store_promoted(store, &spans, now);
+                self.stores[store].bytes_read = self.stores[store].bytes_read.saturating_add(read);
+            }
+            self.release_pending_pin(id);
         }
         self.settle_writes(now);
         done
@@ -1846,7 +2129,7 @@ bandwidth = 900
         assert!(graph.lock().unwrap().pin_stalls() > 0);
 
         let done = managers[1].advance_transfers(1.0).unwrap();
-        assert_eq!(done.get("fetch"), Some(&1));
+        assert_eq!(done.hbm.get("fetch"), Some(&1));
         assert!(managers[0].allocate_blocks(&mut replacement, 1).is_some());
     }
 
@@ -1882,7 +2165,7 @@ bandwidth = 900
             .expect("the unpinned session suffix remains evictable");
 
         let done = managers[1].advance_transfers(1.0).unwrap();
-        assert_eq!(done.get("fetch"), Some(&1));
+        assert_eq!(done.hbm.get("fetch"), Some(&1));
 
         // Once the pin drains, the two remaining session blocks are both
         // ordinary eviction candidates. Their order must not retain an
@@ -1917,7 +2200,7 @@ bandwidth = 900
             .expect("unpinned source is evictable while the fetch is in flight");
 
         let done = managers[1].advance_transfers(1.0).unwrap();
-        assert_eq!(done.get("fetch"), Some(&1));
+        assert_eq!(done.hbm.get("fetch"), Some(&1));
         managers[1].publish_transferred_blocks(&mut fetch, 1);
         fetch.num_cached_tokens = 1;
         fetch.num_computed_tokens = 1;
@@ -2147,7 +2430,7 @@ bandwidth = 900
         assert_eq!(done.len(), 1);
         assert_eq!(g.take_completed(Owner::Worker(0)).unwrap().len(), 1);
         // Promotion marks the range read; the tier keeps its copy.
-        g.promoted_batch(0, &[s1]);
+        g.promoted_batch(0, "test", &[s1]);
         assert!(holds(&g, 0, 1));
         assert_eq!(g.stores()[0].bytes_read, 100);
         // Re-eviction of a backed block writes nothing.
@@ -2265,26 +2548,134 @@ bandwidth = 900
     }
 
     #[test]
-    fn promotion_from_a_lower_tier_refills_the_tiers_above_under_through_fill() {
-        // Block 7 lives in tier 1 only. Promoting it lands it in HBM and,
-        // under `through`, inserts it into tier 0 as well; under `direct`
-        // tier 0 stays empty of it.
+    fn lower_tier_reads_really_stage_through_the_closer_store() {
+        // Block 7 lives in tier 1 only. `through` first moves the bytes into
+        // tier 0, then a separate flow loads them into HBM. Both links and
+        // both stores are accounted at the time their leg lands.
         let mut g = two_tier_private(WritePolicy::WriteBack {}, EvictionPolicy::Lru {});
         let s7 = sp(&g, 7);
         g.plant(0, 1, s7);
         assert_eq!(tier_holding(&g, 0, 7), Some(1));
-        let written = g.stores()[0].bytes_written;
-        g.promoted_batch(0, &[s7]);
+        let source = TierSource::Store(g.tiers[0][1].store);
+        assert!(close(g.estimate_source_promotion(0, 1, source, 100), 30.0));
+        let stage = g
+            .submit_stage_promotion(0, 1, "through", source, &[s7], 0.0)
+            .unwrap();
+        assert!(!store_resident(&g, 0, 7), "destination is arriving");
+        assert!(g.advance(19.0).is_empty());
+        let done = g.advance(20.0);
+        assert!(done.iter().any(|(_, id)| id == &stage));
         assert_eq!(tier_holding(&g, 0, 7), Some(0));
         assert!(store_contains(&g, 1, 7));
-        assert_eq!(g.stores()[0].bytes_written - written, 100);
+        assert_eq!(g.stores()[1].bytes_read, 100);
+        assert_eq!(g.stores()[0].bytes_written, 100);
 
+        g.submit_source_promotion(
+            0,
+            0,
+            "through",
+            TierSource::Store(g.tiers[0][0].store),
+            100,
+            &[s7],
+            None,
+            20.0,
+        );
+        g.advance(30.0);
+        assert_eq!(g.stores()[0].bytes_read, 100);
+        g.promoted_batch(0, "through", &[s7]);
+        assert!(store_contains(&g, 0, 7), "through retains the host copy");
+
+        // `direct` has no storage-to-storage stage.
         let mut d = two_tier_private(WritePolicy::WriteBack {}, EvictionPolicy::Lru {})
             .with_promote_fill(PromoteFill::Direct);
         let d7 = sp(&d, 7);
         d.plant(0, 1, d7);
-        d.promoted_batch(0, &[d7]);
+        assert!(!d.can_stage_source(0, 1, TierSource::Store(d.tiers[0][1].store)));
         assert_eq!(tier_holding(&d, 0, 7), Some(1));
+    }
+
+    #[test]
+    fn buffer_fill_drops_the_intermediate_copy_after_the_hbm_leg() {
+        let mut g = two_tier_private(WritePolicy::WriteBack {}, EvictionPolicy::Lru {})
+            .with_promote_fill(PromoteFill::Buffer);
+        let s7 = sp(&g, 7);
+        g.plant(0, 1, s7);
+        let lower = TierSource::Store(g.tiers[0][1].store);
+        g.submit_stage_promotion(0, 1, "buffer", lower, &[s7], 0.0)
+            .unwrap();
+        g.advance(20.0);
+        assert_eq!(tier_holding(&g, 0, 7), Some(0));
+
+        let host = TierSource::Store(g.tiers[0][0].store);
+        g.submit_source_promotion(0, 0, "buffer", host, 100, &[s7], None, 20.0);
+        g.advance(30.0);
+        g.promoted_batch(0, "buffer", &[s7]);
+        assert!(!store_contains(&g, 0, 7));
+        assert!(store_contains(&g, 1, 7), "the backing copy remains");
+    }
+
+    #[test]
+    fn abandoning_buffer_fill_drops_completed_intermediate_legs() {
+        let mut g = two_tier_private(WritePolicy::WriteBack {}, EvictionPolicy::Lru {})
+            .with_promote_fill(PromoteFill::Buffer);
+        let s7 = sp(&g, 7);
+        g.plant(0, 1, s7);
+        let lower = TierSource::Store(g.tiers[0][1].store);
+        g.submit_stage_promotion(0, 1, "buffer", lower, &[s7], 0.0)
+            .unwrap();
+        g.advance(20.0);
+        g.accept_staged_batch("buffer");
+        assert!(store_contains(&g, 0, 7));
+
+        g.cancel_staged_batch("buffer");
+        assert!(!store_contains(&g, 0, 7));
+        assert!(store_contains(&g, 1, 7), "the backing copy remains");
+    }
+
+    #[test]
+    fn late_through_fill_is_dropped_but_an_accepted_leg_is_retained() {
+        let build = || {
+            let mut g = two_tier_private(WritePolicy::WriteBack {}, EvictionPolicy::Lru {});
+            let span = sp(&g, 7);
+            g.plant(0, 1, span);
+            let lower = TierSource::Store(g.tiers[0][1].store);
+            g.submit_stage_promotion(0, 1, "through", lower, &[span], 0.0)
+                .unwrap();
+            g.advance(20.0);
+            (g, span)
+        };
+
+        let (mut late, _) = build();
+        late.cancel_staged_batch("through");
+        assert_eq!(tier_holding(&late, 0, 7), Some(1));
+
+        let (mut accepted, _) = build();
+        accepted.accept_staged_batch("through");
+        accepted.cancel_staged_batch("through");
+        assert_eq!(tier_holding(&accepted, 0, 7), Some(0));
+    }
+
+    #[test]
+    fn an_evicted_stage_destination_still_completes_and_wakes_its_request() {
+        let mut g = MemoryGraph::private_with(
+            1,
+            &[("t0", 1, 10.0), ("t1", 4, 5.0)],
+            1,
+            Arc::new(|t| 100 * t as u64),
+        );
+        let (staged, replacement) = (sp(&g, 7), sp(&g, 8));
+        g.plant(0, 1, staged);
+        let source = TierSource::Store(g.tiers[0][1].store);
+        let id = g
+            .submit_stage_promotion(0, 1, "request", source, &[staged], 0.0)
+            .unwrap();
+        g.plant(0, 0, replacement);
+        assert!(!store_contains(&g, 0, 7));
+
+        let done = g.advance(20.0);
+        assert!(done.iter().any(|(_, completed)| completed == &id));
+        assert_eq!(g.stores()[1].bytes_read, 100);
+        assert!(store_contains(&g, 1, 7));
     }
 
     #[test]
@@ -2321,8 +2712,9 @@ bandwidth = 900
         let (s1, s2, s3) = (sp(&g, 1), sp(&g, 2), sp(&g, 3));
         g.plant(0, 0, s1);
         g.plant(0, 0, s2);
-        // Under LRU, promoting 1 makes 2 the victim.
-        g.promoted_batch(0, &[s1]);
+        // Under LRU, reading 1 makes 2 the victim.
+        g.submit_promotion(0, 0, "lru", 100, &[s1], 0.0);
+        g.advance(10.0);
         g.plant(0, 0, s3);
         assert!(holds(&g, 0, 1));
         assert_eq!(tier_holding(&g, 0, 2), Some(1)); // cascaded to t1
@@ -2331,7 +2723,8 @@ bandwidth = 900
         let (f1, f2, f3) = (sp(&f, 1), sp(&f, 2), sp(&f, 3));
         f.plant(0, 0, f1);
         f.plant(0, 0, f2);
-        f.promoted_batch(0, &[f1]);
+        f.submit_promotion(0, 0, "fifo", 100, &[f1], 0.0);
+        f.advance(10.0);
         f.plant(0, 0, f3);
         assert_eq!(tier_holding(&f, 0, 1), Some(1));
         assert_eq!(tier_holding(&f, 0, 2), Some(0));

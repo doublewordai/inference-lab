@@ -282,7 +282,9 @@ eviction = { policy = "fifo" }                 # fifo | lru | ttl | outlook
 prefetch = { policy = "none" }                 # none | outlook
 backup = "on_evict"                            # on_evict | on_land
 hit_refresh = "first_tier"                     # first_tier | none
-promote_fill = "through"                       # through | direct
+promote_fill = "through"                       # through | buffer | direct
+storage_prefetch = { policy = "wait_complete" } # wait_complete | best_effort | timeout
+load_overlap = "layerwise"                     # layerwise | none
 hbm_evict_backed_first = false
 [memory.capacity]
 host_dram = 1.0e12          # bytes per instance given to KV
@@ -292,7 +294,7 @@ host_dram = 1.0e12          # bytes per instance given to KV
 |-------|------|---------|-------------|
 | `tiers` | Array | `[]` | Tier names from the hardware's `[memory]`, closest first. Each must be reachable from a GPU over the hardware's links. `peer_hbm` consults same-node sibling HBM and has no capacity or write step |
 | `capacity` | Table | full | Per-store cap on bytes per instance |
-| `preset` | String | unset | A named bundle of the five policies below plus `hbm_evict_backed_first`; any field set explicitly overrides the preset's choice. `reactive`: `promote` / `lru` / `selective` (`min_hits` 1) / `lru` / `none` / backed-first — decides only from what has already happened, as shipped stacks do. `oracle`: `min_time` / `outlook` / `live` / `outlook` / `outlook` / backed-first — reads every session's announced re-entry. The preset covers KV movement only: on a pool with several workers or DP-attention ranks, pair it with a `[router]` that sends a re-entry to the worker holding (or prefetching) its prefix — `kv_aware` or `prefix_affinity` — or its evictions and prefetches serve arrivals that land elsewhere |
+| `preset` | String | unset | A named policy bundle; any field set explicitly overrides the preset's choice. `reactive`: `promote` / `lru` / `selective` (`min_hits` 1) / `lru` / `none` / backed-first — decides only from what has already happened, as shipped stacks do. `oracle`: `min_time` / `outlook` / `live` / `outlook` / `outlook` / backed-first — reads every session's announced re-entry. Both use staged `through` reads, wait for storage prefetch, and overlap the final load layer-wise. The preset covers KV movement only: on a pool with several workers or DP-attention ranks, pair it with a `[router]` that sends a re-entry to the worker holding (or prefetching) its prefix — `kv_aware` or `prefix_affinity` — or its evictions and prefetches serve arrivals that land elsewhere |
 | `source` | Table | `promote` | Where a re-entry's tier-held prefix comes from: `promote` — fetch it (a hit is a hit); `min_time` — fetch it only if the transfer, at the fetch path's current fair share, beats recomputing those tokens at the worker's roofline; otherwise recompute (the tier keeps its copy) |
 | `hbm_eviction` | Table | `lru` | Which free HBM block is recycled first: `lru` — least recently freed; `outlook` — blocks with no announced re-entry first (LRU among them), then the farthest re-entry first, each sequence tail first |
 | `write` | Table | `write_back` | When a block's KV is written to the first tier: `write_back` — when its HBM block is recycled, if no tier holds it; `write_through` — as soon as it is produced; `selective` (`min_hits`, default 1) — on its `min_hits`-th HBM hit, and dropped on eviction otherwise (SGLang HiCache's three positions); `live` — when recycled, only if its session has announced a re-entry (a finished trajectory is dropped) |
@@ -300,7 +302,9 @@ host_dram = 1.0e12          # bytes per instance given to KV
 | `prefetch` | Table | `none` | Whether a demoted prefix is pulled back ahead of its re-entry: `none`; `outlook` (`lead`, default 0 s) — when a session step completes, plan a promotion of the prefix its next step re-enters with, starting so it lands `lead` seconds before that arrival at the fetch path's fair share at planning time; whatever is still in HBM when the plan fires needs nothing, and a re-entry that arrives mid-transfer joins it |
 | `backup` | String | `on_evict` | When a tier forwards a block to the tier below it: `on_evict` — only when it evicts the block (a store → store transfer of what would otherwise be dropped); `on_land` — as soon as the block's write into it lands, so every tier below the first receives a copy within a transfer of production (SGLang HiCache backs a node up to its storage backend the moment its device → host DMA completes). Under `on_land` a private per-rank host tier's fresh KV reaches a shared storage tier at once rather than when the host tier ages it out |
 | `hit_refresh` | String | `first_tier` | Whether a prefix hit in HBM re-stamps tier copies as recently used: `first_tier` — the first tier below HBM ages with HBM (HiCache's device and host tiers share one radix tree and one `last_access_time`; lower tiers see only the references that reach them); `none` — tier copies are re-stamped only when promoted from |
-| `promote_fill` | String | `through` | Where a prefix promoted from a lower tier is left on the way up: `through` — inserted into every tier above its source as it lands (HiCache stages a storage hit through host memory and publishes the pages there before the device loads them), keeping the hierarchy inclusive; `direct` — lands in HBM only |
+| `promote_fill` | String | `through` | How a lower-tier read reaches HBM: `through` — transfer into each closer store in turn, publishing and retaining each copy before a separate final HBM load; `buffer` — use the same real staged transfers but release their intermediate copies after the final load; `direct` — one legacy source-to-HBM transfer with no staged cache fill |
+| `storage_prefetch` | Table | `wait_complete` | What a demand does while an external-store hit is staging: `wait_complete` — wait for the stage; `best_effort` — stage only while queued, then cancel an unfinished leg when an admission slot is available; `timeout` (`seconds`, finite and > 0) — wait no longer than the deadline. Cancellation keeps earlier completed stages, uses any prefix already in the closest tier, and recomputes the still-external suffix |
+| `load_overlap` | String | `layerwise` | Whether the final closest-store-to-HBM load pipelines with the request's first prefill pass: `layerwise` — aggregate approximation with elapsed time `max(load, compute)`; `none` — the full load completes before compute begins |
 | `hbm_evict_backed_first` | Bool | false | When HBM must recycle a block, take one whose KV a tier already holds (a free drop) over the policy's first choice, looking 16 blocks up the free queue |
 
 The `outlook`, `live` and `min_time`/`prefetch` policies act on a session
@@ -312,25 +316,28 @@ nothing, so under `live` nothing is written and `outlook` eviction reduces
 to LRU. The gap between the `reactive` and `oracle` presets on the same
 replay is the value of knowing the re-entry.
 
-Tiers are inclusive: a promoted block keeps its tier copy (KV is
-immutable), so its next eviction from HBM is a free drop and only blocks no
-tier holds ever cost a write. Writes are transfers GPU → store on the same
+Under `promote_fill = "through"`, tiers are inclusive: a promoted block keeps
+every tier copy it staged through (KV is immutable), so its next eviction from
+HBM is a free drop and only blocks no tier holds ever cost a write. `buffer`
+keeps only the backing source; `direct` changes no store residency. Writes are
+transfers GPU → store on the same
 graph as promotions (full duplex: they share a port with fetches only in
 the reverse direction, but do share an NVMe pool's drives); a block is
 resident once its write lands and a promotion of a block still arriving
 waits for it (the write-before-reuse race). A full store evicts its victim
 into the next tier as a store → store transfer, or drops it; a block
 dropped without ever having been promoted counts as dead bytes. A prompt
-whose blocks sit in a tier is promoted along the path from that store to
-the worker's GPU — sharing every edge on it with whatever else is in
-flight — while the request waits with its landing blocks reserved.
+whose blocks sit below the closest store is staged upward one store at a time,
+sharing every traversed edge with whatever else is in flight. These legs hold
+no HBM. The final closest-store-to-GPU leg reserves the request's landing
+blocks; direct mode instead reserves them for its one source-to-GPU transfer.
 
-`pin` is set on each hardware store entry. While true, its source range
-cannot be recycled until the promotion drains; an allocation with no other
-HBM victim records a pin stall and waits. With `pin = false`, completion
-rechecks the ordered source spans, lands only the prefix still present,
-releases the unused landing reservation, and recomputes the suffix. Peer HBM
-defaults to pinned; normal stores preserve the unpinned default.
+`pin` is set on each hardware store entry. Staged reads always protect their
+store source until that leg drains. On a direct read, `pin = true` prevents
+the source from being recycled; with `pin = false`, completion lands only the
+prefix still present, releases the unused HBM reservation, and recomputes the
+suffix. Peer HBM defaults to pinned; normal stores preserve the unpinned
+direct-read default.
 
 The summary's `memory` section reports, per store name, blocks held, bytes
 written / read / dead, evictions and expiries; per link name, bytes moved
