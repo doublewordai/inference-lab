@@ -13,8 +13,8 @@ pub use deployment::{Deployment, DeploymentError, ModelConfig};
 pub use hardware::{FabricConfig, FabricLink, HardwareConfig, Precision, TimeCorrection};
 pub use memory::{
     BackupPolicy, EvictionPolicy, HbmEviction, HitRefresh, JunctionTemplate, LinkTemplate,
-    MemoryConfig, MemoryPolicies, MemoryPreset, MemoryTemplate, PrefetchPolicy, PromoteFill, Scope,
-    SourcePolicy, StoreKind, StoreTemplate, WritePolicy,
+    LoadOverlap, MemoryConfig, MemoryPolicies, MemoryPreset, MemoryTemplate, PrefetchPolicy,
+    PromoteFill, Scope, SourcePolicy, StoragePrefetchPolicy, StoreKind, StoreTemplate, WritePolicy,
 };
 pub use model::{
     expected_distinct_experts, History, Indexer, LayerClass, ModelSpec, Routing, WeightStream,

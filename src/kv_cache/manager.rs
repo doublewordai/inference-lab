@@ -57,6 +57,12 @@ struct PromotionGroup {
     ranges: Vec<TierSourceRange>,
 }
 
+#[derive(Debug, Default)]
+pub(crate) struct TransferCompletions {
+    pub hbm: HashMap<String, u32>,
+    pub staged: Vec<String>,
+}
+
 impl PrefixCacheLookup {
     pub fn needs_promotion(&self) -> bool {
         self.promote_tokens_per_tier.iter().any(|&t| t > 0)
@@ -179,6 +185,11 @@ pub struct KVCacheManager {
     /// sibling source under the same tier).
     leader_transfer_ids: HashMap<String, Vec<String>>,
 
+    /// Storage-to-closer-tier stages in flight. These reserve store capacity,
+    /// not HBM, and return the request to admission after each stage.
+    staging_active: HashMap<String, u32>,
+    staging_transfer_ids: HashMap<String, Vec<String>>,
+
     /// Joiners piggybacking on each leader, keyed by leader id. Joiners
     /// contribute no bandwidth load and become ready when the leader does.
     /// Modelled after vLLM's block-ref-count sharing of in-flight prefixes.
@@ -241,6 +252,8 @@ impl KVCacheManager {
             leader_active_tiers: HashMap::new(),
             leader_sources: HashMap::new(),
             leader_transfer_ids: HashMap::new(),
+            staging_active: HashMap::new(),
+            staging_transfer_ids: HashMap::new(),
             leader_joiners: HashMap::new(),
             joiner_to_leader: HashMap::new(),
             per_seq_state_bytes,
@@ -646,7 +659,9 @@ impl KVCacheManager {
             blocks: landed as u32,
         });
         if let Some((g, w)) = &self.memory {
-            g.lock().unwrap().promoted_batch(*w, &spans);
+            g.lock()
+                .unwrap()
+                .promoted_batch(*w, &request.request_id, &spans);
         }
     }
 
@@ -785,10 +800,11 @@ impl KVCacheManager {
         self.stats
     }
 
-    /// Time the promotions a lookup needs would take if started now:
-    /// every tier's share moves in parallel, so the slowest of them, at
-    /// each fetch path's current fair share. 0 when nothing needs
-    /// promoting; infinite without a memory graph.
+    /// Time the promotions a lookup needs would take if started now. Each
+    /// concrete source group can move in parallel; a staged group's
+    /// store-to-store and final HBM legs are serial. Returns the slowest
+    /// group at the paths' current fair shares, 0 when nothing moves, and
+    /// infinity without a memory graph.
     pub fn estimate_fetch(&self, lookup: &PrefixCacheLookup) -> f64 {
         let Some((g, w)) = &self.memory else {
             return if lookup.needs_promotion() {
@@ -797,27 +813,25 @@ impl KVCacheManager {
                 0.0
             };
         };
-        let g = g.lock().unwrap();
-        if lookup
-            .tier_spans
-            .iter()
-            .any(|item| matches!(item.source, TierSource::PeerHbm(_)))
+        let mut groups: Vec<(usize, TierSource, u64)> = Vec::new();
         {
-            return lookup
-                .tier_spans
-                .iter()
-                .map(|item| {
-                    let bytes = self.radix.lock().unwrap().span_bytes(item.span);
-                    g.estimate_source_promotion(*w, item.tier, item.source, bytes)
-                })
-                .fold(0.0, f64::max);
+            let radix = self.radix.lock().unwrap();
+            for item in &lookup.tier_spans {
+                let bytes = radix.span_bytes(item.span);
+                if let Some(group) = groups
+                    .iter_mut()
+                    .find(|group| group.0 == item.tier && group.1 == item.source)
+                {
+                    group.2 = group.2.saturating_add(bytes);
+                } else {
+                    groups.push((item.tier, item.source, bytes));
+                }
+            }
         }
-        lookup
-            .promote_bytes_per_tier
-            .iter()
-            .enumerate()
-            .filter(|(_, &b)| b > 0)
-            .map(|(tier, &b)| g.estimate_promotion(*w, tier, b))
+        let g = g.lock().unwrap();
+        groups
+            .into_iter()
+            .map(|(tier, source, bytes)| g.estimate_source_promotion(*w, tier, source, bytes))
             .fold(0.0, f64::max)
     }
 
@@ -880,6 +894,121 @@ impl KVCacheManager {
     /// The announced re-entry time of the sequence starting with `hash`.
     pub fn outlook_of(&self, hash: u64) -> Option<f64> {
         self.radix.lock().unwrap().outlook_of(&[hash])
+    }
+
+    /// Whether the lookup contains a concrete lower-store source which must
+    /// first be staged into a closer store under the configured fill mode.
+    pub fn needs_staging(&self, lookup: &PrefixCacheLookup) -> bool {
+        let Some((graph, worker)) = &self.memory else {
+            return false;
+        };
+        let graph = graph.lock().unwrap();
+        lookup
+            .tier_spans
+            .iter()
+            .any(|item| graph.can_stage_source(*worker, item.tier, item.source))
+    }
+
+    /// Keep only the contiguous prefix which can reach HBM without another
+    /// storage-to-storage stage. Used after a best-effort prefetch is
+    /// abandoned or times out, so admission consumes a closer copy that
+    /// already landed but recomputes the still-external suffix.
+    pub fn discard_unstaged_sources(&self, lookup: &mut PrefixCacheLookup) {
+        let Some((graph, worker)) = &self.memory else {
+            return;
+        };
+        let graph = graph.lock().unwrap();
+        let radix = self.radix.lock().unwrap();
+        let mut tier_tokens = vec![0u32; lookup.promote_tokens_per_tier.len()];
+        let mut tier_bytes = vec![0u64; lookup.promote_bytes_per_tier.len()];
+        let mut kept = 0usize;
+        for item in &lookup.tier_spans {
+            if graph.can_stage_source(*worker, item.tier, item.source) {
+                break;
+            }
+            kept += 1;
+            tier_tokens[item.tier] = tier_tokens[item.tier]
+                .saturating_add(item.span.len().saturating_mul(self.block_size));
+            tier_bytes[item.tier] =
+                tier_bytes[item.tier].saturating_add(radix.span_bytes(item.span));
+        }
+        lookup.tier_spans.truncate(kept);
+        lookup.promote_tokens_per_tier = tier_tokens;
+        lookup.promote_bytes_per_tier = tier_bytes;
+        lookup.total_cached_tokens = lookup
+            .hbm_tokens
+            .saturating_add(lookup.in_flight_tokens)
+            .saturating_add(lookup.promote_tokens_per_tier.iter().sum::<u32>());
+    }
+
+    /// Start one storage-to-closer-store stage for every lower-tier source in
+    /// `lookup`. The request holds no HBM while these flows run. A later
+    /// lookup sees the newly landed closer copy and either stages again or
+    /// starts the final HBM load.
+    pub fn start_staging(
+        &mut self,
+        request_id: String,
+        lookup: &PrefixCacheLookup,
+        current_time: f64,
+    ) -> bool {
+        let Some((graph, worker)) = &self.memory else {
+            return false;
+        };
+        let mut groups: Vec<PromotionGroup> = Vec::new();
+        for item in &lookup.tier_spans {
+            if let Some(group) = groups
+                .iter_mut()
+                .find(|g| g.tier == item.tier && g.source == item.source)
+            {
+                group.spans.push(item.span);
+            } else {
+                groups.push(PromotionGroup {
+                    tier: item.tier,
+                    source: item.source,
+                    spans: vec![item.span],
+                    ranges: Vec::new(),
+                });
+            }
+        }
+        let mut graph = graph.lock().unwrap();
+        let mut ids = Vec::new();
+        for group in groups {
+            if !graph.can_stage_source(*worker, group.tier, group.source) {
+                continue;
+            }
+            if let Some(id) = graph.submit_stage_promotion(
+                *worker,
+                group.tier,
+                &request_id,
+                group.source,
+                &group.spans,
+                current_time,
+            ) {
+                ids.push(id);
+            }
+        }
+        if ids.is_empty() {
+            return false;
+        }
+        self.staging_active
+            .insert(request_id.clone(), ids.len() as u32);
+        self.staging_transfer_ids.insert(request_id, ids);
+        true
+    }
+
+    /// Abandon the outstanding stage flows for `request_id`. Fully landed
+    /// earlier stages remain cached; incomplete destination ranges disappear.
+    pub fn cancel_staging(&mut self, request_id: &str) {
+        if let (Some((graph, _)), Some(ids)) =
+            (&self.memory, self.staging_transfer_ids.remove(request_id))
+        {
+            let mut graph = graph.lock().unwrap();
+            for id in ids {
+                graph.cancel_stage_promotion(&id);
+            }
+            graph.settle_source_pins();
+        }
+        self.staging_active.remove(request_id);
     }
 
     /// Begin tracking an in-flight promotion for `request_id`: one transfer
@@ -1015,7 +1144,7 @@ impl KVCacheManager {
     /// has completed (leaders plus their joiners) and the number of prefix
     /// blocks that actually landed, or `None` without constructing a map
     /// when this worker has no completions.
-    pub fn advance_transfers(&mut self, current_time: f64) -> Option<HashMap<String, u32>> {
+    pub(crate) fn advance_transfers(&mut self, current_time: f64) -> Option<TransferCompletions> {
         let mine: Option<Vec<String>> = match &self.memory {
             Some((g, w)) => {
                 let mut g = g.lock().unwrap();
@@ -1029,8 +1158,19 @@ impl KVCacheManager {
             None => None,
         };
         let mine = mine?;
-        let mut completed: HashMap<String, u32> = HashMap::new();
+        let mut completed = TransferCompletions::default();
         for id in mine {
+            if let Some((stage_leader, _)) = id.rsplit_once("#stage:") {
+                if let Some(active) = self.staging_active.get_mut(stage_leader) {
+                    *active = active.saturating_sub(1);
+                    if *active == 0 {
+                        self.staging_active.remove(stage_leader);
+                        self.staging_transfer_ids.remove(stage_leader);
+                        completed.staged.push(stage_leader.to_string());
+                    }
+                }
+                continue;
+            }
             let leader = promotion_request(&id).to_string();
             if let Some(active) = self.leader_active_tiers.get_mut(&leader) {
                 *active = active.saturating_sub(1);
@@ -1068,14 +1208,20 @@ impl KVCacheManager {
                     if let Some(joiners) = self.leader_joiners.remove(&leader) {
                         for joiner in joiners {
                             self.joiner_to_leader.remove(&joiner);
-                            completed.insert(joiner, landed);
+                            completed.hbm.insert(joiner, landed);
                         }
                     }
-                    completed.insert(leader, landed);
+                    completed.hbm.insert(leader, landed);
                 }
             }
         }
-        (!completed.is_empty()).then_some(completed)
+        // Stage reads pin their concrete source even when the configured
+        // tier does not normally pin direct fetches. Apply any capacity trim
+        // left behind after every completion has rechecked its source.
+        if let Some((graph, _)) = &self.memory {
+            graph.lock().unwrap().settle_source_pins();
+        }
+        (!completed.hbm.is_empty() || !completed.staged.is_empty()).then_some(completed)
     }
 
     /// Project the remaining time for an in-flight transfer at `current_time`,
@@ -1087,12 +1233,15 @@ impl KVCacheManager {
             .get(request_id)
             .map(String::as_str)
             .unwrap_or(request_id);
-        if !self.leader_active_tiers.contains_key(leader) {
-            return 0.0;
-        }
         match &self.memory {
             Some((g, w)) => {
                 let mut g = g.lock().unwrap();
+                if let Some(ids) = self.staging_transfer_ids.get(leader) {
+                    return ids.iter().map(|id| g.estimate_remaining(id)).sum();
+                }
+                if !self.leader_active_tiers.contains_key(leader) {
+                    return 0.0;
+                }
                 match self.leader_transfer_ids.get(leader) {
                     Some(ids) => ids.iter().map(|id| g.estimate_remaining(id)).sum(),
                     None => g.estimate_promotion_remaining(*w, leader),
@@ -1592,7 +1741,7 @@ mod landing_tests {
         assert_eq!(lj.join_leader.as_deref(), Some("r"));
         // Land it.
         let done = m.advance_transfers(10.0);
-        assert!(done.as_ref().is_some_and(|done| done.contains_key("r")));
+        assert!(done.as_ref().is_some_and(|done| done.hbm.contains_key("r")));
         m.publish_transferred_blocks(&mut r, 4);
         r.num_computed_tokens = 64;
         let lk2 = m.peek_prefix_cache(&r);

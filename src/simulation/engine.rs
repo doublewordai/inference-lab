@@ -145,7 +145,12 @@ impl Worker {
         };
         let scheduler = Scheduler::new(scheduler_config.clone(), kv_cache_manager)
             .with_source(policies.source, recompute)
-            .with_prefetch(policies.prefetch);
+            .with_prefetch(policies.prefetch)
+            .with_hicache(
+                policies.promote_fill,
+                policies.storage_prefetch,
+                policies.load_overlap,
+            );
         Ok(Self {
             scheduler,
             compute_engine,
@@ -1554,11 +1559,32 @@ impl Engine {
         let cost = ce.step_cost(batch_refs, cost_tokens);
         // A measured table already embodies the engine's overheads; the
         // correction calibrates roofline-priced steps only.
-        let iter_time = match (measured_time, correction) {
+        let mut iter_time = match (measured_time, correction) {
             (Some(t), _) => t,
             (None, Some((alpha, beta))) => alpha * cost.time + beta,
             (None, None) => cost.time,
         };
+        let overlap_credit = batch_refs
+            .iter()
+            .zip(was_prefill)
+            .filter(|(_, prefill)| **prefill)
+            .map(|(request, _)| request.load_overlap_credit)
+            .fold(0.0_f64, f64::max);
+        if overlap_credit > 0.0 {
+            let pre_idx: Vec<usize> = (0..batch_size).filter(|&i| was_prefill[i]).collect();
+            let pre_refs: Vec<&Request> = pre_idx.iter().map(|&i| batch_refs[i]).collect();
+            let pre_tokens: Vec<u32> = pre_idx.iter().map(|&i| cost_tokens[i]).collect();
+            let pre_time = ce.calculate_iteration_time(&pre_refs, &pre_tokens);
+            let dec_idx: Vec<usize> = (0..batch_size).filter(|&i| !was_prefill[i]).collect();
+            let decode_floor = if dec_idx.is_empty() {
+                0.0
+            } else {
+                let refs: Vec<&Request> = dec_idx.iter().map(|&i| batch_refs[i]).collect();
+                let tokens: Vec<u32> = dec_idx.iter().map(|&i| cost_tokens[i]).collect();
+                ce.calculate_iteration_time(&refs, &tokens)
+            };
+            iter_time = (iter_time - overlap_credit.min(pre_time)).max(decode_floor);
+        }
         let bw = ce.bandwidth_utilization(&cost, iter_time);
         let flops = ce.flops_utilization(&cost, iter_time);
         (iter_time, measured_time.is_some(), bw, flops)
@@ -1829,5 +1855,25 @@ mod tests {
         let r2 = Request::new("p".into(), 0, 0.0, 4096, 1);
         let union2 = ce.calculate_iteration_time(&[&r2, &r2], &[ca, cb]);
         assert!((step.iteration_time - union2).abs() < 1e-12);
+    }
+
+    #[test]
+    fn layerwise_load_credit_prices_load_and_prefill_as_a_pipeline() {
+        let (cluster, model, _) = cluster(1, false);
+        let ce = cluster.compute_engine(model);
+        let mut request = Request::new("prefill".into(), 0, 0.0, 1024, 1);
+        let tokens = 512;
+        let compute = ce.calculate_iteration_time(&[&request], &[tokens]);
+
+        let load = compute * 0.4;
+        request.load_overlap_credit = load;
+        let (after_load, ..) = Engine::price_step(None, &ce, &[&request], &[tokens], &[true], None);
+        assert!((load + after_load - compute).abs() < 1e-12);
+
+        let load = compute * 2.0;
+        request.load_overlap_credit = load;
+        let (after_load, ..) = Engine::price_step(None, &ce, &[&request], &[tokens], &[true], None);
+        assert!(after_load.abs() < 1e-12);
+        assert!((load + after_load - load.max(compute)).abs() < 1e-12);
     }
 }

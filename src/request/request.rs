@@ -107,6 +107,21 @@ pub struct Request {
     /// it is parked on an in-flight KV promotion from a slower tier.
     pub ready_at: Option<f64>,
 
+    /// Seconds of the final host-to-device KV load which HiCache's
+    /// layer-wise loader can hide under this request's first prefill pass.
+    /// Consumed by the first scheduled step after the load lands.
+    pub load_overlap_credit: f64,
+
+    /// Start of that final load, while it is in flight. Used to derive the
+    /// overlap credit when the transfer lands.
+    pub(crate) load_started_at: Option<f64>,
+
+    /// The on-demand storage prefetch was abandoned by `best_effort` or a
+    /// timeout. Until this scheduling attempt admits the request, deeper
+    /// storage hits are ignored instead of immediately restarting the same
+    /// stage.
+    pub(crate) storage_prefetch_abandoned: bool,
+
     /// Speculative decoding: draft length to verify on this request's NEXT
     /// decode step. Decided at the end of the iteration that produced the last
     /// token (the simulator's analogue of vLLM proposing draft tokens at the
@@ -197,6 +212,9 @@ impl Request {
             prefill_done_time: None,
             handoff_done_time: None,
             ready_at: None,
+            load_overlap_credit: 0.0,
+            load_started_at: None,
+            storage_prefetch_abandoned: false,
             pending_draft_len: 0,
             pending_round_commits: None,
         }
@@ -322,6 +340,8 @@ impl Request {
         self.num_preemptions += 1;
         self.num_computed_tokens = 0;
         self.num_cached_tokens = 0;
+        self.load_overlap_credit = 0.0;
+        self.load_started_at = None;
         self.pending_draft_len = 0;
         self.pending_round_commits = None;
     }

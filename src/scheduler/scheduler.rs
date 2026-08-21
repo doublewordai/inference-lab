@@ -1,5 +1,7 @@
 use super::{decision::ScheduleDecision, decision::ScheduledSeq, policy::SchedulingPolicy};
-use crate::config::{PrefetchPolicy, SchedulerConfig, SourcePolicy};
+use crate::config::{
+    LoadOverlap, PrefetchPolicy, PromoteFill, SchedulerConfig, SourcePolicy, StoragePrefetchPolicy,
+};
 use crate::kv_cache::{KVCacheManager, PrefixCacheLookup};
 use crate::request::Request;
 use ordered_float::OrderedFloat;
@@ -35,6 +37,10 @@ pub struct Scheduler {
     /// transfer completes.
     pending_transfers: Vec<Request>,
 
+    /// Requests whose external-tier hit is being staged into the next closer
+    /// store. They hold store capacity but no HBM.
+    pending_storage: Vec<Request>,
+
     policy: SchedulingPolicy,
 
     kv_cache_manager: KVCacheManager,
@@ -54,12 +60,18 @@ pub struct Scheduler {
 
     /// Whether demoted prefixes are pulled back ahead of their re-entry.
     prefetch: PrefetchPolicy,
+    promote_fill: PromoteFill,
+    storage_prefetch: StoragePrefetchPolicy,
+    load_overlap: LoadOverlap,
     /// Prefetches planned, soonest first.
     prefetch_plans: Vec<PrefetchPlan>,
     /// Prefetches in flight: synthetic requests holding the landing
     /// blocks; on completion their blocks are published and freed
     /// (hittable) instead of scheduled.
     prefetches: Vec<Request>,
+    /// Synthetic outlook prefetches still moving through external stores;
+    /// like demand stages, these hold no HBM yet.
+    pending_prefetch_storage: Vec<Request>,
     next_prefetch_seq: u64,
 
     /// Requests refused at submission, handed back as completed on the
@@ -78,13 +90,18 @@ impl Scheduler {
             waiting: VecDeque::new(),
             running: Vec::new(),
             pending_transfers: Vec::new(),
+            pending_storage: Vec::new(),
             kv_cache_manager,
             num_preemptions: 0,
             source: SourcePolicy::Promote {},
             recompute_seconds: None,
             prefetch: PrefetchPolicy::None {},
+            promote_fill: PromoteFill::Direct,
+            storage_prefetch: StoragePrefetchPolicy::WaitComplete {},
+            load_overlap: LoadOverlap::None,
             prefetch_plans: Vec::new(),
             prefetches: Vec::new(),
+            pending_prefetch_storage: Vec::new(),
             next_prefetch_seq: 0,
             rejected: Vec::new(),
         }
@@ -93,6 +110,19 @@ impl Scheduler {
     /// Set the prefetch policy.
     pub fn with_prefetch(mut self, prefetch: PrefetchPolicy) -> Self {
         self.prefetch = prefetch;
+        self
+    }
+
+    /// Configure HiCache-style staged reads and final-leg overlap.
+    pub fn with_hicache(
+        mut self,
+        promote_fill: PromoteFill,
+        storage_prefetch: StoragePrefetchPolicy,
+        load_overlap: LoadOverlap,
+    ) -> Self {
+        self.promote_fill = promote_fill;
+        self.storage_prefetch = storage_prefetch;
+        self.load_overlap = load_overlap;
         self
     }
 
@@ -155,34 +185,67 @@ impl Scheduler {
             if !lookup.needs_promotion() {
                 continue;
             }
-            let cached = lookup.total_cached_tokens.min(plan.tokens);
-            let blocks_needed = self.kv_cache_manager.blocks_for_context(cached);
-            if self.kv_cache_manager.num_free_blocks() < blocks_needed {
-                continue;
+            let promoted: u32 = lookup.promote_tokens_per_tier.iter().sum();
+            if self.start_prefetch_leg(probe, lookup, now) {
+                self.kv_cache_manager.record_prefetch(promoted);
             }
-            if self
+        }
+    }
+
+    /// Start the next leg of a synthetic outlook prefetch. External sources
+    /// stage without HBM; the first source that no longer needs staging
+    /// reserves the final landing blocks and loads into HBM.
+    fn start_prefetch_leg(
+        &mut self,
+        mut probe: Request,
+        lookup: PrefixCacheLookup,
+        now: f64,
+    ) -> bool {
+        let cached = lookup.total_cached_tokens.min(probe.num_prompt_tokens - 1);
+        if self.kv_cache_manager.needs_staging(&lookup) {
+            if !self
+                .kv_cache_manager
+                .start_staging(probe.request_id.clone(), &lookup, now)
+            {
+                return false;
+            }
+            probe.num_cached_tokens = cached;
+            self.pending_prefetch_storage.push(probe);
+            return true;
+        }
+        let blocks_needed = self.kv_cache_manager.blocks_for_context(cached);
+        if self.kv_cache_manager.num_free_blocks() < blocks_needed
+            || self
                 .kv_cache_manager
                 .reserve_blocks_for_transfer(&mut probe, cached)
                 .is_none()
-            {
-                continue;
-            }
-            probe.num_cached_tokens = cached;
-            self.kv_cache_manager.start_transfer(
-                plan.id.clone(),
-                &lookup,
-                &probe.prompt_block_hashes,
-                now,
-            );
-            let promoted: u32 = lookup.promote_tokens_per_tier.iter().sum();
-            self.kv_cache_manager.record_prefetch(promoted);
-            self.prefetches.push(probe);
+        {
+            return false;
         }
+        probe.num_cached_tokens = cached;
+        self.kv_cache_manager.start_transfer(
+            probe.request_id.clone(),
+            &lookup,
+            &probe.prompt_block_hashes,
+            now,
+        );
+        self.prefetches.push(probe);
+        true
     }
 
     /// When the next prefetch plan is due, if any.
     pub fn next_prefetch_at(&self) -> Option<f64> {
-        self.prefetch_plans.first().map(|p| p.fire_at)
+        let planned = self.prefetch_plans.first().map(|p| p.fire_at);
+        let deadline = self
+            .pending_storage
+            .iter()
+            .filter_map(|r| r.ready_at)
+            .min_by(f64::total_cmp);
+        match (planned, deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (None, None) => None,
+        }
     }
 
     /// Whether calling [`Scheduler::schedule`] can change scheduler-local
@@ -193,6 +256,7 @@ impl Scheduler {
         !self.running.is_empty()
             || !self.waiting.is_empty()
             || !self.pending_transfers.is_empty()
+            || !self.pending_storage.is_empty()
             || !self.rejected.is_empty()
             || self.next_prefetch_at().is_some_and(|at| at <= now)
     }
@@ -235,6 +299,32 @@ impl Scheduler {
         recompute <= fetch
     }
 
+    fn park_on_storage_stage(
+        &mut self,
+        mut request: Request,
+        lookup: &PrefixCacheLookup,
+        cached_tokens: u32,
+        current_time: f64,
+    ) -> Option<Request> {
+        if !self.promote_fill.stages()
+            || !self.kv_cache_manager.needs_staging(lookup)
+            || !self.kv_cache_manager.start_staging(
+                request.request_id.clone(),
+                lookup,
+                current_time,
+            )
+        {
+            return Some(request);
+        }
+        request.num_cached_tokens = cached_tokens;
+        request.ready_at = match self.storage_prefetch {
+            StoragePrefetchPolicy::Timeout { seconds } => Some(current_time + seconds),
+            _ => None,
+        };
+        self.pending_storage.push(request);
+        None
+    }
+
     /// Promote any pending KV-transfer requests whose transfer has finished
     /// back to the waiting queue so they can be scheduled normally. On
     /// promotion the request's computed-token count is bumped to the cached
@@ -250,7 +340,7 @@ impl Scheduler {
         for mut req in self.pending_transfers.drain(..) {
             if let Some(landed_blocks) = completed
                 .as_ref()
-                .and_then(|completed| completed.get(&req.request_id))
+                .and_then(|completed| completed.hbm.get(&req.request_id))
                 .copied()
             {
                 // Publish the now-resident blocks to the HBM prefix cache so
@@ -263,6 +353,12 @@ impl Scheduler {
                     (cached_blocks as u32).saturating_mul(self.kv_cache_manager.block_size());
                 self.kv_cache_manager
                     .publish_transferred_blocks(&mut req, cached_blocks);
+                if self.load_overlap == LoadOverlap::Layerwise && self.promote_fill.stages() {
+                    req.load_overlap_credit = req
+                        .load_started_at
+                        .map_or(0.0, |started| (current_time - started).max(0.0));
+                }
+                req.load_started_at = None;
                 req.ready_at = None;
                 req.num_computed_tokens = req.num_cached_tokens;
                 // Its prefix is hot and its landing blocks are held: admit
@@ -279,13 +375,56 @@ impl Scheduler {
         }
         self.pending_transfers = still_pending;
 
+        let mut still_staging = Vec::with_capacity(self.pending_storage.len());
+        for mut req in self.pending_storage.drain(..) {
+            let staged = completed
+                .as_ref()
+                .is_some_and(|completed| completed.staged.contains(&req.request_id));
+            let timed_out = matches!(self.storage_prefetch, StoragePrefetchPolicy::Timeout { .. })
+                && req
+                    .ready_at
+                    .is_some_and(|deadline| deadline <= current_time);
+            if staged || timed_out {
+                if timed_out && !staged {
+                    self.kv_cache_manager.cancel_staging(&req.request_id);
+                }
+                if timed_out && !staged {
+                    req.storage_prefetch_abandoned = true;
+                }
+                req.ready_at = None;
+                req.num_cached_tokens = 0;
+                self.waiting.push_front(req);
+            } else {
+                still_staging.push(req);
+            }
+        }
+        self.pending_storage = still_staging;
+
+        // Outlook prefetches use the same staged path, but never become
+        // runnable requests: after each store leg, start the next one or the
+        // final HBM load.
+        let pending_prefetch_storage = std::mem::take(&mut self.pending_prefetch_storage);
+        for probe in pending_prefetch_storage {
+            let staged = completed
+                .as_ref()
+                .is_some_and(|completed| completed.staged.contains(&probe.request_id));
+            if !staged {
+                self.pending_prefetch_storage.push(probe);
+                continue;
+            }
+            let lookup = self.kv_cache_manager.peek_prefix_cache(&probe);
+            if lookup.needs_promotion() {
+                self.start_prefetch_leg(probe, lookup, current_time);
+            }
+        }
+
         // Landed prefetches: publish and free (hittable, keeping their
         // outlook order); the rest wait on.
         let mut still_flying = Vec::with_capacity(self.prefetches.len());
         for mut req in self.prefetches.drain(..) {
             if let Some(landed_blocks) = completed
                 .as_ref()
-                .and_then(|completed| completed.get(&req.request_id))
+                .and_then(|completed| completed.hbm.get(&req.request_id))
                 .copied()
             {
                 let cached_blocks = self
@@ -401,6 +540,24 @@ impl Scheduler {
             idx += 1;
         }
 
+        // HiCache best-effort storage prefetching runs only while the request
+        // is genuinely queued. Once an admission slot and token budget exist,
+        // stop its unfinished stage and let the normal lookup use whatever
+        // closer prefix has already landed.
+        if decision.num_preempted == 0
+            && token_budget > 0
+            && self.running.len() < self.config.max_num_seqs as usize
+            && matches!(self.storage_prefetch, StoragePrefetchPolicy::BestEffort {})
+            && !self.pending_storage.is_empty()
+        {
+            let mut request = self.pending_storage.remove(0);
+            self.kv_cache_manager.cancel_staging(&request.request_id);
+            request.ready_at = None;
+            request.num_cached_tokens = 0;
+            request.storage_prefetch_abandoned = true;
+            self.waiting.push_front(request);
+        }
+
         // Phase 2: admit WAITING requests (only if nothing was preempted:
         // preemption means KV is full, so admitting would just be preempted
         // again).
@@ -453,6 +610,9 @@ impl Scheduler {
                 }
 
                 let mut lookup = self.kv_cache_manager.peek_prefix_cache(request);
+                if request.storage_prefetch_abandoned {
+                    self.kv_cache_manager.discard_unstaged_sources(&mut lookup);
+                }
                 // Fetch or recompute the tier-held part: recomputing
                 // shrinks the lookup to the HBM + in-flight prefix (the
                 // tier keeps its copy).
@@ -471,6 +631,25 @@ impl Scheduler {
                         .for_each(|b| *b = 0);
                 }
                 let cached_tokens = self.usable_cached_tokens(request, lookup.total_cached_tokens);
+
+                // HiCache stages an external-store hit into the next closer
+                // store before allocating any destination HBM. Re-run the
+                // lookup after the stage lands; a hierarchy with more than
+                // three levels repeats this one level at a time.
+                if lookup.needs_promotion() && self.kv_cache_manager.needs_staging(&lookup) {
+                    let request = self.waiting.remove(selected_idx).unwrap();
+                    match self.park_on_storage_stage(request, &lookup, cached_tokens, current_time)
+                    {
+                        None => continue,
+                        Some(request) => {
+                            self.waiting.insert(selected_idx, request);
+                            // The source changed between lookup and submit.
+                            // Re-run lookup rather than falling through with
+                            // the stale result.
+                            continue;
+                        }
+                    }
+                }
 
                 // If part of the prefix lives in a slower tier (or is in
                 // flight for another request), kick off / join an async
@@ -522,7 +701,9 @@ impl Scheduler {
                     // Its ready time is projected on demand (see
                     // `earliest_pending_ready`): the memory graph's drain
                     // event wakes the worker when the transfer completes.
-                    request.ready_at = None;
+                    request.load_started_at = (self.load_overlap == LoadOverlap::Layerwise
+                        && self.promote_fill.stages())
+                    .then_some(current_time);
                     self.pending_transfers.push(request);
                     continue;
                 }
@@ -598,6 +779,9 @@ impl Scheduler {
             self.kv_cache_manager.free_request(r);
             r.num_computed_tokens = 0;
             r.num_cached_tokens = 0;
+            r.load_overlap_credit = 0.0;
+            r.load_started_at = None;
+            r.storage_prefetch_abandoned = false;
             self.num_preemptions += 1;
         }
         self.kv_cache_manager.num_free_blocks() >= needed
@@ -718,6 +902,7 @@ impl Scheduler {
         self.num_preemptions += 1;
         self.kv_cache_manager.free_request(request);
         request.preempt();
+        request.storage_prefetch_abandoned = false;
     }
 
     /// Add a new request to the waiting queue.
@@ -732,12 +917,25 @@ impl Scheduler {
             self.rejected.push(request);
             return;
         }
+        let lookup = self.kv_cache_manager.peek_prefix_cache(&request);
+        let resident = lookup.hbm_tokens + lookup.in_flight_tokens;
+        let cached = self.usable_cached_tokens(&request, lookup.total_cached_tokens);
+        if !self.recompute_instead(&request, &lookup, resident)
+            && self.kv_cache_manager.needs_staging(&lookup)
+        {
+            let arrival = request.arrival_time;
+            match self.park_on_storage_stage(request, &lookup, cached, arrival) {
+                None => return,
+                Some(req) => request = req,
+            }
+        }
         self.waiting.push_back(request);
     }
 
     /// Record that running request `idx` computed `num_tokens` positions in
     /// the pass ending at `time`. Returns the output tokens it generated.
     pub fn record_progress(&mut self, idx: usize, num_tokens: u32, time: f64) -> u32 {
+        self.running[idx].load_overlap_credit = 0.0;
         self.running[idx].record_generated_tokens(num_tokens, time)
     }
 
@@ -791,7 +989,7 @@ impl Scheduler {
     /// Waiting requests, including requests parked on a KV transfer: they
     /// are still in the system, and the engine's idle check must see them.
     pub fn num_waiting(&self) -> usize {
-        self.waiting.len() + self.pending_transfers.len()
+        self.waiting.len() + self.pending_transfers.len() + self.pending_storage.len()
     }
 
     /// Prompt tokens still to be prefilled on this worker: every queued or
@@ -802,6 +1000,7 @@ impl Scheduler {
         let remaining = |r: &Request| r.prefill_len().saturating_sub(r.num_computed_tokens) as u64;
         self.waiting.iter().map(remaining).sum::<u64>()
             + self.pending_transfers.iter().map(remaining).sum::<u64>()
+            + self.pending_storage.iter().map(remaining).sum::<u64>()
             + self
                 .running
                 .iter()
@@ -816,6 +1015,11 @@ impl Scheduler {
         self.pending_transfers
             .iter()
             .map(|r| now + self.kv_cache_manager.estimate_remaining_time(&r.request_id))
+            .chain(self.pending_storage.iter().map(|r| {
+                let transfer = now + self.kv_cache_manager.estimate_remaining_time(&r.request_id);
+                r.ready_at
+                    .map_or(transfer, |deadline| deadline.min(transfer))
+            }))
             .min_by(f64::total_cmp)
     }
 
@@ -830,6 +1034,7 @@ impl Scheduler {
     /// Requests parked on an in-flight KV promotion.
     /// Blocks held by requests in each of this scheduler's queues
     /// `(running, waiting, parked, prefetches)` — for stall diagnostics.
+    /// Storage-staged requests are deliberately absent: they hold no HBM.
     pub fn held_blocks_by_queue(&self) -> (usize, usize, usize, usize) {
         let n = |v: &[Request]| v.iter().map(|r| r.kv_blocks.len()).sum::<usize>();
         (
@@ -949,6 +1154,12 @@ mod tests {
         scheduler.pending_transfers.clear();
 
         scheduler
+            .pending_storage
+            .push(create_test_request("storage", 16, 1));
+        assert!(scheduler.has_local_work_for_schedule(1.0));
+        scheduler.pending_storage.clear();
+
+        scheduler
             .rejected
             .push(create_test_request("rejected", 16, 1));
         assert!(scheduler.has_local_work_for_schedule(1.0));
@@ -1005,6 +1216,113 @@ mod tests {
         probe.prompt_block_hashes = vec![prefix_hash];
         assert!(mgr.num_tiers() == 1 && mgr.peek_prefix_cache(&probe).needs_promotion());
         (scheduler, prefix_hash)
+    }
+
+    /// Two external tiers with one cached block in the slower tier. The
+    /// stage takes one second and the final host-to-HBM leg half a second.
+    fn hicache_scheduler(policy: StoragePrefetchPolicy) -> (Scheduler, u32, u64) {
+        let config = Config::test_default();
+        let block_size = config.scheduler.block_size;
+        let per_block = config.model.kv_storage_bytes(block_size);
+        let kv = kv_manager(&config, 4 * per_block, true).with_private_tiers(&[
+            ("host_ram", 16 * per_block, 2.0 * per_block as f64),
+            ("nvme", 16 * per_block, per_block as f64),
+        ]);
+        let scheduler = scheduler_from(config, kv).with_hicache(
+            PromoteFill::Through,
+            policy,
+            LoadOverlap::None,
+        );
+        let prefix = 0xCAFE_u64;
+        scheduler.kv_cache_manager.plant_in_tier_path(1, &[prefix]);
+        (scheduler, block_size, prefix)
+    }
+
+    #[test]
+    fn hicache_stages_storage_without_reserving_hbm_then_loads_from_host() {
+        let (mut scheduler, block_size, prefix) =
+            hicache_scheduler(StoragePrefetchPolicy::WaitComplete {});
+        let free = scheduler.kv_cache_manager.num_free_blocks();
+        let mut req = create_test_request("req", 2 * block_size, 1);
+        req.prompt_block_hashes = vec![prefix, 0xBEEF];
+        scheduler.add_request(req);
+
+        assert_eq!(scheduler.pending_storage.len(), 1);
+        assert!(scheduler.pending_transfers.is_empty());
+        assert_eq!(scheduler.kv_cache_manager.num_free_blocks(), free);
+        assert_eq!(scheduler.held_blocks_by_queue(), (0, 0, 0, 0));
+
+        let stage_done = scheduler.earliest_pending_ready(0.0).unwrap();
+        assert!((stage_done - 1.0).abs() < 1e-9);
+        assert!(scheduler.schedule(stage_done / 2.0).batch.is_empty());
+        let decision = scheduler.schedule(stage_done + 1e-9);
+        assert!(decision.batch.is_empty());
+        assert!(scheduler.pending_storage.is_empty());
+        assert_eq!(scheduler.pending_transfers.len(), 1);
+        assert_eq!(scheduler.kv_cache_manager.num_free_blocks(), free - 1);
+
+        let hbm_done = scheduler.earliest_pending_ready(stage_done + 1e-9).unwrap();
+        assert!((hbm_done - 1.5).abs() < 1e-6);
+        let decision = scheduler.schedule(hbm_done + 1e-9);
+        assert_eq!(decision.batch.len(), 1);
+        assert_eq!(decision.batch[0].num_tokens, block_size);
+        assert_eq!(scheduler.running[0].num_computed_tokens, block_size);
+    }
+
+    #[test]
+    fn hicache_best_effort_and_timeout_abandon_deeper_storage() {
+        for (policy, stop_at) in [
+            (StoragePrefetchPolicy::BestEffort {}, 0.0),
+            (StoragePrefetchPolicy::Timeout { seconds: 0.25 }, 0.25),
+        ] {
+            let (mut scheduler, block_size, prefix) = hicache_scheduler(policy);
+            let mut req = create_test_request("req", 2 * block_size, 1);
+            req.prompt_block_hashes = vec![prefix, 0xBEEF];
+            scheduler.add_request(req);
+            assert_eq!(scheduler.pending_storage.len(), 1);
+
+            let decision = scheduler.schedule(stop_at);
+            assert!(scheduler.pending_storage.is_empty());
+            assert!(scheduler.pending_transfers.is_empty());
+            assert_eq!(decision.batch.len(), 1);
+            assert_eq!(
+                decision.batch[0].num_tokens,
+                2 * block_size,
+                "the incomplete storage suffix is recomputed"
+            );
+        }
+    }
+
+    #[test]
+    fn outlook_prefetch_uses_the_same_staged_path() {
+        let (mut scheduler, block_size, prefix) =
+            hicache_scheduler(StoragePrefetchPolicy::WaitComplete {});
+        let free = scheduler.kv_cache_manager.num_free_blocks();
+        scheduler.prefetch_plans.push(PrefetchPlan {
+            fire_at: 0.0,
+            hashes: vec![prefix],
+            tokens: block_size,
+            id: "pf:staged".into(),
+        });
+
+        scheduler.schedule(0.0);
+        assert_eq!(scheduler.pending_prefetch_storage.len(), 1);
+        assert!(scheduler.prefetches.is_empty());
+        assert_eq!(scheduler.kv_cache_manager.num_free_blocks(), free);
+
+        scheduler.schedule(1.0 + 1e-9);
+        assert!(scheduler.pending_prefetch_storage.is_empty());
+        assert_eq!(scheduler.prefetches.len(), 1);
+        assert_eq!(scheduler.kv_cache_manager.num_free_blocks(), free - 1);
+
+        scheduler.schedule(1.5 + 2e-9);
+        assert!(scheduler.prefetches.is_empty());
+        assert!(scheduler.kv_cache_manager.hbm_contains(prefix));
+        assert_eq!(scheduler.kv_cache_manager.num_free_blocks(), free);
+        assert_eq!(
+            scheduler.kv_cache_manager.prefix_cache_stats().prefetches,
+            1
+        );
     }
 
     #[test]
