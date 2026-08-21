@@ -1139,7 +1139,7 @@ impl Engine {
         req.worker = Some(self.topology.pools[pool_id].workers[worker_idx].global_id as u32);
         self.topology.pools[pool_id].workers[worker_idx]
             .scheduler
-            .add_request(req);
+            .add_request_at(req, self.current_time);
         self.maybe_wake_worker(pool_id, worker_idx, self.current_time);
     }
 

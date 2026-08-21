@@ -201,7 +201,9 @@ impl Scheduler {
         lookup: PrefixCacheLookup,
         now: f64,
     ) -> bool {
-        let cached = lookup.total_cached_tokens.min(probe.num_prompt_tokens - 1);
+        let cached = lookup
+            .total_cached_tokens
+            .min(probe.num_prompt_tokens.saturating_sub(1));
         if self.kv_cache_manager.needs_staging(&lookup) {
             if !self
                 .kv_cache_manager
@@ -317,10 +319,11 @@ impl Scheduler {
             return Some(request);
         }
         request.num_cached_tokens = cached_tokens;
-        request.ready_at = match self.storage_prefetch {
-            StoragePrefetchPolicy::Timeout { seconds } => Some(current_time + seconds),
-            _ => None,
-        };
+        if let StoragePrefetchPolicy::Timeout { seconds } = self.storage_prefetch {
+            request.ready_at.get_or_insert(current_time + seconds);
+        } else {
+            request.ready_at = None;
+        }
         self.pending_storage.push(request);
         None
     }
@@ -335,6 +338,21 @@ impl Scheduler {
     /// transfers split each tier's bandwidth equally, so adding more in-flight
     /// promotions slows everyone down.
     fn promote_finished_transfers(&mut self, current_time: f64) {
+        // A timeout applies to the whole staged load, not separately to each
+        // storage leg. Cancel expired flows before advancing the shared graph
+        // so a completion observed after its deadline cannot become usable.
+        let expired: Vec<String> = self
+            .pending_storage
+            .iter()
+            .filter(|req| {
+                req.ready_at
+                    .is_some_and(|deadline| deadline <= current_time)
+            })
+            .map(|req| req.request_id.clone())
+            .collect();
+        for request_id in expired {
+            self.kv_cache_manager.cancel_staging(&request_id);
+        }
         let completed = self.kv_cache_manager.advance_transfers(current_time);
         let mut still_pending = Vec::with_capacity(self.pending_transfers.len());
         for mut req in self.pending_transfers.drain(..) {
@@ -384,14 +402,13 @@ impl Scheduler {
                 && req
                     .ready_at
                     .is_some_and(|deadline| deadline <= current_time);
-            if staged || timed_out {
-                if timed_out && !staged {
-                    self.kv_cache_manager.cancel_staging(&req.request_id);
-                }
-                if timed_out && !staged {
-                    req.storage_prefetch_abandoned = true;
-                }
+            if timed_out {
+                req.storage_prefetch_abandoned = true;
                 req.ready_at = None;
+                req.num_cached_tokens = 0;
+                self.waiting.push_front(req);
+            } else if staged {
+                self.kv_cache_manager.accept_staging(&req.request_id);
                 req.num_cached_tokens = 0;
                 self.waiting.push_front(req);
             } else {
@@ -412,9 +429,15 @@ impl Scheduler {
                 self.pending_prefetch_storage.push(probe);
                 continue;
             }
+            self.kv_cache_manager.accept_staging(&probe.request_id);
             let lookup = self.kv_cache_manager.peek_prefix_cache(&probe);
-            if lookup.needs_promotion() {
-                self.start_prefetch_leg(probe, lookup, current_time);
+            if !lookup.needs_promotion() {
+                self.kv_cache_manager.cancel_staging(&probe.request_id);
+                continue;
+            }
+            let request_id = probe.request_id.clone();
+            if !self.start_prefetch_leg(probe, lookup, current_time) {
+                self.kv_cache_manager.cancel_staging(&request_id);
             }
         }
 
@@ -905,8 +928,9 @@ impl Scheduler {
         request.storage_prefetch_abandoned = false;
     }
 
-    /// Add a new request to the waiting queue.
-    pub fn add_request(&mut self, mut request: Request) {
+    /// Add a new request to the waiting queue at the scheduler's current
+    /// time. `request.arrival_time` remains the latency-accounting origin.
+    pub fn add_request_at(&mut self, mut request: Request, current_time: f64) {
         // A context that can never fit in this worker's KV cache would
         // wait forever (admitted, preempted, re-queued): refuse it now.
         let needed = self
@@ -923,13 +947,18 @@ impl Scheduler {
         if !self.recompute_instead(&request, &lookup, resident)
             && self.kv_cache_manager.needs_staging(&lookup)
         {
-            let arrival = request.arrival_time;
-            match self.park_on_storage_stage(request, &lookup, cached, arrival) {
+            match self.park_on_storage_stage(request, &lookup, cached, current_time) {
                 None => return,
                 Some(req) => request = req,
             }
         }
         self.waiting.push_back(request);
+    }
+
+    /// Add a request whose delivery time is its declared arrival time.
+    pub fn add_request(&mut self, request: Request) {
+        let arrival = request.arrival_time;
+        self.add_request_at(request, arrival);
     }
 
     /// Record that running request `idx` computed `num_tokens` positions in
@@ -1238,6 +1267,27 @@ mod tests {
         (scheduler, block_size, prefix)
     }
 
+    /// Three external tiers, so a deepest hit takes two store-to-store legs
+    /// before its final HBM load.
+    fn deep_hicache_scheduler(policy: StoragePrefetchPolicy) -> (Scheduler, u32, u64) {
+        let config = Config::test_default();
+        let block_size = config.scheduler.block_size;
+        let per_block = config.model.kv_storage_bytes(block_size);
+        let kv = kv_manager(&config, 4 * per_block, true).with_private_tiers(&[
+            ("host_ram", 16 * per_block, 4.0 * per_block as f64),
+            ("local_ssd", 16 * per_block, 2.0 * per_block as f64),
+            ("remote_store", 16 * per_block, per_block as f64),
+        ]);
+        let scheduler = scheduler_from(config, kv).with_hicache(
+            PromoteFill::Through,
+            policy,
+            LoadOverlap::None,
+        );
+        let prefix = 0xD00D_u64;
+        scheduler.kv_cache_manager.plant_in_tier_path(2, &[prefix]);
+        (scheduler, block_size, prefix)
+    }
+
     #[test]
     fn hicache_stages_storage_without_reserving_hbm_then_loads_from_host() {
         let (mut scheduler, block_size, prefix) =
@@ -1273,7 +1323,9 @@ mod tests {
     fn hicache_best_effort_and_timeout_abandon_deeper_storage() {
         for (policy, stop_at) in [
             (StoragePrefetchPolicy::BestEffort {}, 0.0),
-            (StoragePrefetchPolicy::Timeout { seconds: 0.25 }, 0.25),
+            // Reaping after the storage flow would otherwise have landed
+            // still rejects it because the deadline expired first.
+            (StoragePrefetchPolicy::Timeout { seconds: 0.25 }, 1.0),
         ] {
             let (mut scheduler, block_size, prefix) = hicache_scheduler(policy);
             let mut req = create_test_request("req", 2 * block_size, 1);
@@ -1291,6 +1343,36 @@ mod tests {
                 "the incomplete storage suffix is recomputed"
             );
         }
+    }
+
+    #[test]
+    fn hicache_timeout_deadline_covers_the_whole_staged_load() {
+        let (mut scheduler, block_size, prefix) =
+            deep_hicache_scheduler(StoragePrefetchPolicy::Timeout { seconds: 1.25 });
+        let mut req = create_test_request("req", 2 * block_size, 1);
+        req.prompt_block_hashes = vec![prefix, 0xBEEF];
+        scheduler.add_request(req);
+
+        scheduler.schedule(1.0 + 1e-9);
+        assert_eq!(scheduler.pending_storage.len(), 1, "second leg started");
+        assert_eq!(scheduler.pending_storage[0].ready_at, Some(1.25));
+
+        let decision = scheduler.schedule(1.25);
+        assert!(scheduler.pending_storage.is_empty());
+        assert_eq!(decision.batch.len(), 1);
+        assert_eq!(decision.batch[0].num_tokens, 2 * block_size);
+    }
+
+    #[test]
+    fn hicache_late_delivery_starts_storage_at_delivery_time() {
+        let (mut scheduler, block_size, prefix) =
+            hicache_scheduler(StoragePrefetchPolicy::WaitComplete {});
+        let mut req = create_test_request("late", 2 * block_size, 1);
+        req.prompt_block_hashes = vec![prefix, 0xBEEF];
+        scheduler.add_request_at(req, 10.0);
+
+        assert_eq!(scheduler.pending_storage.len(), 1);
+        assert!((scheduler.earliest_pending_ready(10.0).unwrap() - 11.0).abs() < 1e-9);
     }
 
     #[test]

@@ -996,16 +996,25 @@ impl KVCacheManager {
         true
     }
 
-    /// Abandon the outstanding stage flows for `request_id`. Fully landed
-    /// earlier stages remain cached; incomplete destination ranges disappear.
+    /// Mark the latest completed stage leg as observed before its deadline.
+    pub fn accept_staging(&mut self, request_id: &str) {
+        if let Some((graph, _)) = &self.memory {
+            graph.lock().unwrap().accept_staged_batch(request_id);
+        }
+    }
+
+    /// Abandon the outstanding stage flows for `request_id`. Through mode
+    /// retains accepted earlier legs; buffer mode drops all intermediate
+    /// copies, and either mode drops a completed but unaccepted late leg.
     pub fn cancel_staging(&mut self, request_id: &str) {
-        if let (Some((graph, _)), Some(ids)) =
-            (&self.memory, self.staging_transfer_ids.remove(request_id))
-        {
+        if let Some((graph, _)) = &self.memory {
             let mut graph = graph.lock().unwrap();
-            for id in ids {
-                graph.cancel_stage_promotion(&id);
+            if let Some(ids) = self.staging_transfer_ids.remove(request_id) {
+                for id in ids {
+                    graph.cancel_stage_promotion(&id);
+                }
             }
+            graph.cancel_staged_batch(request_id);
             graph.settle_source_pins();
         }
         self.staging_active.remove(request_id);
@@ -1237,7 +1246,10 @@ impl KVCacheManager {
             Some((g, w)) => {
                 let mut g = g.lock().unwrap();
                 if let Some(ids) = self.staging_transfer_ids.get(leader) {
-                    return ids.iter().map(|id| g.estimate_remaining(id)).sum();
+                    return ids
+                        .iter()
+                        .map(|id| g.estimate_remaining(id))
+                        .fold(0.0_f64, f64::max);
                 }
                 if !self.leader_active_tiers.contains_key(leader) {
                     return 0.0;
@@ -1314,7 +1326,7 @@ pub(crate) fn path_spans(path: &Path, upto: u32) -> Vec<Span> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{EvictionPolicy, WritePolicy};
+    use crate::config::{EvictionPolicy, PromoteFill, WritePolicy};
 
     fn create_test_request(id: &str, prompt_tokens: u32) -> Request {
         Request::new(id.to_string(), 0, 0.0, prompt_tokens, 50)
@@ -1699,6 +1711,39 @@ mod tests {
         assert!((g.flows().bytes_submitted_write - 2.0 * 1600.0).abs() < 1e-9);
         assert!(g.holds_hash(0, 1) && g.holds_hash(0, 2));
         assert!(!g.holds_hash(0, 5) && !g.holds_hash(0, 6));
+    }
+
+    #[test]
+    fn staged_remaining_time_is_the_slowest_parallel_flow() {
+        let graph = MemoryGraph::private_with(
+            1,
+            &[("t0", 100, 10.0), ("t1", 100, 5.0), ("t2", 100, 2.0)],
+            1,
+            Arc::new(|t| 100 * t as u64),
+        )
+        .with_promote_fill(PromoteFill::Through)
+        .shared_handle();
+        let mut manager = KVCacheManager::new(1_000, 1, |t| 100 * t as u64, 0, true)
+            .with_memory(graph.clone(), 0);
+        manager.plant_in_tier_path(1, &[1]);
+        manager.plant_in_tier_path(2, &[1, 2]);
+        let mut request = create_test_request("parallel", 3);
+        request.prompt_block_hashes = vec![1, 2, 3];
+        let lookup = manager.peek_prefix_cache(&request);
+        assert!(manager.start_staging("parallel".into(), &lookup, 0.0));
+
+        let (slowest, sum) = {
+            let ids = &manager.staging_transfer_ids["parallel"];
+            assert_eq!(ids.len(), 2);
+            let mut graph = graph.lock().unwrap();
+            let remaining: Vec<f64> = ids.iter().map(|id| graph.estimate_remaining(id)).collect();
+            (
+                remaining.iter().copied().fold(0.0_f64, f64::max),
+                remaining.iter().sum::<f64>(),
+            )
+        };
+        assert!(sum > slowest);
+        assert!((manager.estimate_remaining_time("parallel") - slowest).abs() < 1e-9);
     }
 }
 

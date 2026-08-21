@@ -129,6 +129,14 @@ struct PendingStageFill {
     entries: Vec<Span>,
 }
 
+#[derive(Debug, Clone)]
+struct LandedStageFill {
+    store: StoreId,
+    span: Span,
+    /// Set once the scheduler observes this leg before its deadline.
+    accepted: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum VertexKey {
     Gpu(WorkerId),
@@ -189,11 +197,12 @@ pub struct MemoryGraph {
     /// Store reads in flight, used to refresh and account only the concrete
     /// source rather than every inclusive copy of the range.
     pending_reads: HashMap<String, (StoreId, Vec<Span>)>,
-    /// Intermediate copies created for `promote_fill = "buffer"`, released
-    /// once that request's HBM load has landed.
-    buffered_fills: HashMap<String, Vec<(StoreId, Span)>>,
-    /// Buffer copies whose first consumer completed while another transfer
-    /// still had the same range pinned.
+    /// Store copies created by completed stage legs. Tracking whether the
+    /// scheduler accepted each leg lets a timeout discard a copy that landed
+    /// before another worker advanced this shared graph.
+    landed_stage_fills: HashMap<String, Vec<LandedStageFill>>,
+    /// Transient stage copies whose cleanup was deferred while another
+    /// transfer still had the same range pinned.
     pending_buffer_cleanup: Vec<(StoreId, Span)>,
     /// Source ranges held resident until their promotion flow drains.
     pending_pins: HashMap<String, PendingPin>,
@@ -248,7 +257,7 @@ impl MemoryGraph {
             pending_writes: HashMap::new(),
             pending_stage_fills: HashMap::new(),
             pending_reads: HashMap::new(),
-            buffered_fills: HashMap::new(),
+            landed_stage_fills: HashMap::new(),
             pending_buffer_cleanup: Vec::new(),
             pending_pins: HashMap::new(),
             wake_workers: HashSet::new(),
@@ -1077,15 +1086,8 @@ impl MemoryGraph {
         self.cascade_batch(next, evicted);
     }
 
-    /// A request's final HBM load landed. Store-source reads were accounted
-    /// when their flows drained; this only releases transient intermediate
-    /// copies used by `promote_fill = "buffer"`.
-    pub fn promoted_batch(&mut self, _worker: WorkerId, request: &str, _spans: &[Span]) {
-        if self.promote_fill != PromoteFill::Buffer {
-            return;
-        }
-        let mut entries = std::mem::take(&mut self.pending_buffer_cleanup);
-        entries.extend(self.buffered_fills.remove(request).unwrap_or_default());
+    fn cleanup_stage_entries(&mut self, mut entries: Vec<(StoreId, Span)>) {
+        entries.extend(std::mem::take(&mut self.pending_buffer_cleanup));
         let mut radix = self.radix.lock().unwrap();
         for (store, span) in entries {
             if radix.store_span_pinned(store, span) {
@@ -1095,6 +1097,49 @@ impl MemoryGraph {
                 radix.prune_if_empty(span.node);
             }
         }
+    }
+
+    /// The scheduler observed the latest stage leg before its deadline.
+    pub fn accept_staged_batch(&mut self, request: &str) {
+        if let Some(entries) = self.landed_stage_fills.get_mut(request) {
+            for entry in entries {
+                entry.accepted = true;
+            }
+        }
+    }
+
+    /// Abandon a staged load. Buffer mode drops every intermediate copy;
+    /// through mode retains earlier accepted legs but drops a late leg that
+    /// landed before another worker advanced this shared graph.
+    pub fn cancel_staged_batch(&mut self, request: &str) {
+        let entries = self
+            .landed_stage_fills
+            .remove(request)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|entry| self.promote_fill == PromoteFill::Buffer || !entry.accepted)
+            .map(|entry| (entry.store, entry.span))
+            .collect();
+        self.cleanup_stage_entries(entries);
+    }
+
+    /// A request's final HBM load landed. Store-source reads were accounted
+    /// when their flows drained; this only releases transient intermediate
+    /// copies used by `promote_fill = "buffer"` and ends stage tracking for
+    /// retained through copies.
+    pub fn promoted_batch(&mut self, _worker: WorkerId, request: &str, _spans: &[Span]) {
+        let entries = self.landed_stage_fills.remove(request).unwrap_or_default();
+        let cleanup = if self.promote_fill == PromoteFill::Buffer {
+            entries
+                .into_iter()
+                .map(|entry| (entry.store, entry.span))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        // Even a retained through completion may be the last pin blocking
+        // cleanup queued by a different abandoned request.
+        self.cleanup_stage_entries(cleanup);
     }
 
     /// Remove `span` from whichever of `worker`'s tiers hold it.
@@ -1647,12 +1692,14 @@ impl MemoryGraph {
                         .bytes_written
                         .saturating_add(radix.span_bytes(span));
                 }
-                if self.promote_fill == PromoteFill::Buffer {
-                    self.buffered_fills
-                        .entry(fill.request)
-                        .or_default()
-                        .extend(fill.entries.iter().map(|&span| (fill.destination, span)));
-                }
+                self.landed_stage_fills
+                    .entry(fill.request)
+                    .or_default()
+                    .extend(fill.entries.iter().map(|&span| LandedStageFill {
+                        store: fill.destination,
+                        span,
+                        accepted: false,
+                    }));
                 self.wake_workers.insert(fill.worker);
             }
             if let Some((store, spans)) = self.pending_reads.remove(id) {
@@ -2565,6 +2612,47 @@ bandwidth = 900
         g.promoted_batch(0, "buffer", &[s7]);
         assert!(!store_contains(&g, 0, 7));
         assert!(store_contains(&g, 1, 7), "the backing copy remains");
+    }
+
+    #[test]
+    fn abandoning_buffer_fill_drops_completed_intermediate_legs() {
+        let mut g = two_tier_private(WritePolicy::WriteBack {}, EvictionPolicy::Lru {})
+            .with_promote_fill(PromoteFill::Buffer);
+        let s7 = sp(&g, 7);
+        g.plant(0, 1, s7);
+        let lower = TierSource::Store(g.tiers[0][1].store);
+        g.submit_stage_promotion(0, 1, "buffer", lower, &[s7], 0.0)
+            .unwrap();
+        g.advance(20.0);
+        g.accept_staged_batch("buffer");
+        assert!(store_contains(&g, 0, 7));
+
+        g.cancel_staged_batch("buffer");
+        assert!(!store_contains(&g, 0, 7));
+        assert!(store_contains(&g, 1, 7), "the backing copy remains");
+    }
+
+    #[test]
+    fn late_through_fill_is_dropped_but_an_accepted_leg_is_retained() {
+        let build = || {
+            let mut g = two_tier_private(WritePolicy::WriteBack {}, EvictionPolicy::Lru {});
+            let span = sp(&g, 7);
+            g.plant(0, 1, span);
+            let lower = TierSource::Store(g.tiers[0][1].store);
+            g.submit_stage_promotion(0, 1, "through", lower, &[span], 0.0)
+                .unwrap();
+            g.advance(20.0);
+            (g, span)
+        };
+
+        let (mut late, _) = build();
+        late.cancel_staged_batch("through");
+        assert_eq!(tier_holding(&late, 0, 7), Some(1));
+
+        let (mut accepted, _) = build();
+        accepted.accept_staged_batch("through");
+        accepted.cancel_staged_batch("through");
+        assert_eq!(tier_holding(&accepted, 0, 7), Some(0));
     }
 
     #[test]
