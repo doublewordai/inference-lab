@@ -69,6 +69,7 @@ fn cost(
         ep: tp,
         dp_attention: true,
         moe_overlap: overlap,
+        megakernel: None,
     };
     // B=400 at the capped 32k TraceLab context occupies about 38 GB/GPU in
     // the simulator's KV layout, above the campaign's 20 GB HBM allowance.

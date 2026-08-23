@@ -103,6 +103,7 @@ fn main() {
                             ep: n,
                             dp_attention: true,
                             moe_overlap,
+                            megakernel: None,
                         };
                         let mut engine = ComputeEngine::new(hardware, parallel, model.clone());
                         if place == "grace" {
@@ -135,6 +136,7 @@ fn main() {
         ep: 16,
         dp_attention: true,
         moe_overlap: MoeOverlap::Serial,
+        megakernel: None,
     };
     let cost = ComputeEngine::new(hardware, parallel, model).step_cost(&refs, &vec![1; 512]);
     eprintln!(
