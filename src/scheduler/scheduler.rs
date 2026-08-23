@@ -2,6 +2,7 @@ use super::{decision::ScheduleDecision, decision::ScheduledSeq, policy::Scheduli
 use crate::config::{
     LoadOverlap, PrefetchPolicy, PromoteFill, SchedulerConfig, SourcePolicy, StoragePrefetchPolicy,
 };
+use crate::kv_cache::manager::StageStart;
 use crate::kv_cache::{KVCacheManager, PrefixCacheLookup};
 use crate::request::Request;
 use ordered_float::OrderedFloat;
@@ -708,15 +709,48 @@ impl Scheduler {
                 // lookup after the stage lands; a hierarchy with more than
                 // three levels repeats this one level at a time.
                 if lookup.needs_promotion() && self.kv_cache_manager.needs_staging(&lookup) {
-                    let request = self.waiting.remove(selected_idx).unwrap();
-                    match self.park_on_storage_stage(request, &lookup, cached_tokens, current_time)
-                    {
-                        None => continue,
-                        Some(request) => {
+                    match self.kv_cache_manager.staging_outcome(&lookup) {
+                        StageStart::Started => {
+                            let request = self.waiting.remove(selected_idx).unwrap();
+                            match self.park_on_storage_stage(
+                                request,
+                                &lookup,
+                                cached_tokens,
+                                current_time,
+                            ) {
+                                None => continue,
+                                Some(request) => {
+                                    self.waiting.insert(selected_idx, request);
+                                    // The source changed between lookup and
+                                    // submit. Re-run lookup rather than
+                                    // falling through with the stale result.
+                                    continue;
+                                }
+                            }
+                        }
+                        StageStart::Blocked => {
+                            // The destination store can hold the stage but is
+                            // currently full of pinned blocks. A stage
+                            // completion / consumption will free the room.
+                            // Keep the request at the head of the queue and
+                            // stop admitting this pass; a later schedule pass
+                            // (driven by the landing or a consumption)
+                            // retries it. Do NOT `continue` here: that would
+                            // re-select the same head request and spin on the
+                            // same full store.
+                            break;
+                        }
+                        StageStart::Impossible => {
+                            // The external prefix is larger than the
+                            // destination store can ever hold. Fall back to
+                            // recomputing the external suffix instead of
+                            // parking forever: mark the stage abandoned so
+                            // the next pass truncates the lookup to the
+                            // HBM-reachable prefix and promotes / recomputes
+                            // from there.
+                            let mut request = self.waiting.remove(selected_idx).unwrap();
+                            request.storage_prefetch_abandoned = true;
                             self.waiting.insert(selected_idx, request);
-                            // The source changed between lookup and submit.
-                            // Re-run lookup rather than falling through with
-                            // the stale result.
                             continue;
                         }
                     }
@@ -1057,9 +1091,24 @@ impl Scheduler {
         if !self.recompute_instead(&request, &lookup, resident)
             && self.kv_cache_manager.needs_staging(&lookup)
         {
-            match self.park_on_storage_stage(request, &lookup, cached, current_time) {
-                None => return,
-                Some(req) => request = req,
+            match self.kv_cache_manager.staging_outcome(&lookup) {
+                StageStart::Started => {
+                    match self.park_on_storage_stage(request, &lookup, cached, current_time) {
+                        None => return,
+                        Some(req) => request = req,
+                    }
+                }
+                StageStart::Blocked => {
+                    // Destination is currently full of pinned blocks; it fits
+                    // once a completion frees room. Keep the request in
+                    // `waiting` and let admission retry it.
+                }
+                StageStart::Impossible => {
+                    // Prefix larger than the destination store: fall back to
+                    // recomputing the external suffix rather than parking
+                    // forever.
+                    request.storage_prefetch_abandoned = true;
+                }
             }
         }
         self.waiting.push_back(request);

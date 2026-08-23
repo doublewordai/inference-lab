@@ -126,6 +126,21 @@ impl std::ops::AddAssign for PrefixCacheStats {
     }
 }
 
+/// The result of trying to start a lookup's managed storage stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StageStart {
+    /// At least one stage leg is running.
+    Started,
+    /// No leg could start because a destination store is currently full of
+    /// pinned blocks; it would fit once those clear, so keep the request
+    /// parked and retry later.
+    Blocked,
+    /// A destination store can never hold its prefix (larger than the
+    /// store); the request must fall back to direct promotion / recompute
+    /// rather than park forever.
+    Impossible,
+}
+
 /// Manages KV cache blocks for one worker.
 ///
 /// Capacity and occupancy are counted in blocks. A block is the content KV
@@ -945,6 +960,38 @@ impl KVCacheManager {
     /// `lookup`. The request holds no HBM while these flows run. A later
     /// lookup sees the newly landed closer copy and either stages again or
     /// starts the final HBM load.
+    /// Whether the storage stages implied by `lookup` could start now.
+    /// `managed` staging is best-effort over every needed leg; the worst
+    /// classification (`Impossible` > `Blocked` > `Started`) wins.
+    pub fn staging_outcome(&self, lookup: &PrefixCacheLookup) -> StageStart {
+        let Some((graph, worker)) = &self.memory else {
+            return StageStart::Started;
+        };
+        let graph = graph.lock().unwrap();
+        let mut outcome = StageStart::Started;
+        for item in &lookup.tier_spans {
+            let cap = graph.stage_capacity(
+                *worker,
+                item.tier,
+                item.source,
+                std::slice::from_ref(&item.span),
+            );
+            match cap {
+                crate::kv_cache::graph::StageCapacity::Fits => {}
+                crate::kv_cache::graph::StageCapacity::Blocked => {
+                    if outcome != StageStart::Impossible {
+                        outcome = StageStart::Blocked;
+                    }
+                }
+                crate::kv_cache::graph::StageCapacity::Impossible => {
+                    outcome = StageStart::Impossible;
+                    break;
+                }
+            }
+        }
+        outcome
+    }
+
     pub fn start_staging(
         &mut self,
         request_id: String,

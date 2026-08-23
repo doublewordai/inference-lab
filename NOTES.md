@@ -75,3 +75,21 @@ Running log of established facts, decisions, and open questions.
   asserting the OLD buggy behaviour). All 253+ tests pass.
 - STILL TODO: scheduler-level "impossible to fit → fall back" handling; wake
   test; capacity-serialisation test; oversized-prefix test; verify repro.
+
+## Scheduler side: Blocked / Impossible staging outcomes
+
+- radix.rs/graph.rs: `MemoryGraph::StageCapacity` enum + `stage_capacity(...)`
+  drives admission: Fits / Blocked (fits later, retry) / Impossible
+  (prefix > store, fall back). `KVCacheManager::staging_outcome(&lookup)` folds
+  all needed legs to the worst classification.
+- scheduler.rs admission: Blocked -> keep request at head and `break` (do not
+  `continue`, which would re-select the same head and spin on the full store);
+  retried on the next schedule pass. Impossible -> mark
+  `storage_prefetch_abandoned` so the next pass truncates the lookup to the
+  HBM-reachable prefix (recompute the external suffix). `add_request_at`
+  mirrors both.
+- Tests (graph.rs): `concurrent_stages_into_a_full_store_serialise_rather_than_thrash`
+  (Blocked then Fits after consumption) and
+  `a_stage_larger_than_the_destination_store_falls_back_not_park_for_ever`
+  (Impossible). Both pass; each would fail/not-compile without stage_capacity.
+- fmt/clippy clean; 255 tests pass.

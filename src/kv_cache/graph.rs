@@ -155,6 +155,21 @@ struct Hop {
 }
 
 /// The topology's KV memory beyond HBM.
+///
+/// Stage admission against destination-store capacity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StageCapacity {
+    /// The destination can hold the whole stage right now.
+    Fits,
+    /// It currently cannot (other stages / pins hold the store), but
+    /// would once those complete; parking to retry later is sound.
+    Blocked,
+    /// The prefix is larger than the destination store can ever hold;
+    /// it must fall back (promote direct or recompute) or park forever.
+    Impossible,
+}
+
+/// The topology's KV memory beyond HBM.
 #[derive(Debug)]
 pub struct MemoryGraph {
     /// The KV tree every store's ranges live in (shared with the workers'
@@ -1335,6 +1350,52 @@ impl MemoryGraph {
                 .is_some_and(|tiers| tiers.iter().any(|t| !t.is_peer_hbm()))
     }
 
+    /// One group's staging capacity check against its destination store.
+    ///
+    /// Whether staging `spans` from `tier` into its next closer store fits
+    /// now, and whether it can ever fit. Drives admission so a stage is not
+    /// submitted when capacity is tight, and so an oversized prefix falls
+    /// back instead of parking forever.
+    pub fn stage_capacity(
+        &self,
+        worker: WorkerId,
+        tier: usize,
+        source: TierSource,
+        spans: &[Span],
+    ) -> StageCapacity {
+        if !self.can_stage_source(worker, tier, source) {
+            return StageCapacity::Fits;
+        }
+        let TierSource::Store(_source_store) = source else {
+            return StageCapacity::Fits;
+        };
+        let Some(destination_tier) = self.tiers[worker][..tier]
+            .iter()
+            .rposition(|t| !t.is_peer_hbm())
+        else {
+            return StageCapacity::Fits;
+        };
+        let destination = self.tiers[worker][destination_tier].store;
+        let radix = self.radix.lock().unwrap();
+        let mut need = 0u32;
+        for &span in spans {
+            for missing in radix.store_missing(destination, span) {
+                need += missing.len();
+            }
+        }
+        let capacity = radix.store_capacity_blocks(destination) as u64;
+        let available = radix.store_available_for_stage(destination);
+        if need == 0 {
+            StageCapacity::Fits
+        } else if need as u64 > capacity {
+            StageCapacity::Impossible
+        } else if need as u64 <= available {
+            StageCapacity::Fits
+        } else {
+            StageCapacity::Blocked
+        }
+    }
+
     /// Stage a concrete store hit into the next closer real store. The
     /// destination ranges are inserted as arriving now, become resident only
     /// when the flow drains, and consume that store's real capacity. Returns
@@ -1494,7 +1555,10 @@ impl MemoryGraph {
                     radix.prune_if_empty(span.node);
                 }
             }
-            self.radix.lock().unwrap().trim_store_after_unpin(fill.destination);
+            self.radix
+                .lock()
+                .unwrap()
+                .trim_store_after_unpin(fill.destination);
         }
         self.release_pending_pin(id);
     }
@@ -2733,6 +2797,69 @@ bandwidth = 900
         // landed stage copy: it is pinned until the request consumes it.
         g.plant(0, 0, replacement);
         assert!(store_contains(&g, 0, 7), "landed stage copy survives");
+    }
+
+    #[test]
+    fn concurrent_stages_into_a_full_store_serialise_rather_than_thrash() {
+        // Tier 0 (capacity 1 block) is the destination host store; tier 1 is
+        // the far source store. Two requests A and B both need a stage into
+        // tier 0, which can hold only one of them at a time (pinned).
+        let mut g = MemoryGraph::private_with(
+            1,
+            &[("t0", 1, 10.0), ("t1", 4, 5.0)],
+            1,
+            Arc::new(|t| 100 * t as u64),
+        )
+        .with_promote_fill(PromoteFill::Through);
+        let (a, b) = (sp(&g, 7), sp(&g, 8));
+        g.plant(0, 1, a);
+        g.plant(0, 1, b);
+        let lower = TierSource::Store(g.tiers[0][1].store);
+
+        // A starts and pins its destination block, filling the store.
+        g.submit_stage_promotion(0, 1, "A", lower, &[a], 0.0)
+            .unwrap();
+        assert_eq!(
+            g.stage_capacity(0, 1, lower, &[b]),
+            StageCapacity::Blocked,
+            "B must not evict A's pinned, in-flight stage in the full store"
+        );
+
+        // A lands and its final HBM load consumes it, releasing the pin; now
+        // B's stage fits.
+        g.advance(20.0);
+        let host = TierSource::Store(g.tiers[0][0].store);
+        g.submit_source_promotion(0, 0, "A", host, 100, &[a], None, 20.0);
+        g.advance(30.0);
+        g.promoted_batch(0, "A", &[a]);
+        assert_eq!(
+            g.stage_capacity(0, 1, lower, &[b]),
+            StageCapacity::Fits,
+            "the store serialises: B starts only once A has been consumed"
+        );
+    }
+
+    #[test]
+    fn a_stage_larger_than_the_destination_store_falls_back_not_park_for_ever() {
+        // A single stage of two blocks into a one-block host store can never
+        // fit: it must be reported Impossible so the scheduler falls back
+        // (recompute the external suffix) instead of parking forever.
+        let mut g = MemoryGraph::private_with(
+            1,
+            &[("t0", 1, 10.0), ("t1", 4, 5.0)],
+            1,
+            Arc::new(|t| 100 * t as u64),
+        )
+        .with_promote_fill(PromoteFill::Through);
+        let (a, b) = (sp(&g, 7), sp(&g, 8));
+        g.plant(0, 1, a);
+        g.plant(0, 1, b);
+        let lower = TierSource::Store(g.tiers[0][1].store);
+        assert_eq!(
+            g.stage_capacity(0, 1, lower, &[a, b]),
+            StageCapacity::Impossible,
+            "an oversized prefix can never fit and must fall back"
+        );
     }
 
     #[test]
