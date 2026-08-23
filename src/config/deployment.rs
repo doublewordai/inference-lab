@@ -32,7 +32,10 @@
 //! across them, and `[decode_router]` (default: `[router]`) the policy that
 //! spreads hand-offs across a disaggregated decode pool (see
 //! [`super::router`]). `[memory]` (shared, or per entry) picks which of the
-//! hardware's stores hold evicted KV (see [`super::memory`]).
+//! hardware's stores hold evicted KV (see [`super::memory`]). `[prefill]`
+//! (shared, or per entry) adds a prefill pool in front of the entry, which
+//! then describes the decode pool of a disaggregated topology (see
+//! [`super::PrefillSpec`]).
 //!
 //! [`ModelConfig::deployment`] resolves one entry into a [`Deployment`]: the
 //! model on that hardware, with no workload. A [`Deployment`] plus a
@@ -48,8 +51,8 @@ use toml::{Table, Value};
 
 use super::{
     hardware_ref, model_ref, ClusterSpec, Config, FaultConfig, HardwareConfig, MemoryConfig,
-    ModelSpec, ParallelConfig, RouterConfig, SchedulerConfig, SpeculativeConfig, TimeCorrection,
-    WorkloadConfig,
+    ModelSpec, ParallelConfig, PrefillSpec, RouterConfig, SchedulerConfig, SpeculativeConfig,
+    TimeCorrection, WorkloadConfig,
 };
 
 /// A model on one hardware: everything a simulation needs except the
@@ -76,6 +79,11 @@ pub struct Deployment {
     /// KV tiers beyond HBM, chosen from the hardware's `[memory]` stores.
     #[serde(default)]
     pub memory: MemoryConfig,
+    /// Disaggregated prefill/decode: the prefill pool. When set, this
+    /// deployment's hardware, parallel layout, replicas and memory describe
+    /// the decode pool (see [`PrefillSpec`]).
+    #[serde(default)]
+    pub prefill: Option<PrefillSpec>,
     /// Optional step-time calibration against a measured engine
     /// (`t = alpha × t_roofline + beta`); absent = pure roofline.
     #[serde(default)]
@@ -157,6 +165,9 @@ struct HardwareEntry {
     /// Replaces the shared `[memory]` block for this hardware.
     #[serde(default)]
     memory: Option<Table>,
+    /// Replaces the shared `[prefill]` block for this hardware.
+    #[serde(default)]
+    prefill: Option<Table>,
     /// Step-time calibration for this hardware (`{ alpha, beta }`).
     #[serde(default)]
     time_correction: Option<Table>,
@@ -177,6 +188,8 @@ pub struct ModelConfig {
     decode_router: Option<Table>,
     #[serde(default)]
     memory: Option<Table>,
+    #[serde(default)]
+    prefill: Option<Table>,
     #[serde(default)]
     fault: Option<Table>,
     hardware: BTreeMap<String, HardwareEntry>,
@@ -262,6 +275,9 @@ impl ModelConfig {
         if let Some(memory) = entry.memory.as_ref().or(self.memory.as_ref()) {
             merged.insert("memory".into(), Value::Table(memory.clone()));
         }
+        if let Some(prefill) = entry.prefill.as_ref().or(self.prefill.as_ref()) {
+            merged.insert("prefill".into(), Value::Table(prefill.clone()));
+        }
         if let Some(tc) = &entry.time_correction {
             merged.insert("time_correction".into(), Value::Table(tc.clone()));
         }
@@ -274,6 +290,22 @@ impl ModelConfig {
             .cluster()
             .validate()
             .map_err(|e| DeploymentError(format!("[hardware.{name}]: {e}")))?;
+        if let Some(p) = &deployment.prefill {
+            ClusterSpec {
+                hardware: p
+                    .hardware
+                    .clone()
+                    .unwrap_or_else(|| deployment.hardware.clone()),
+                parallel: p
+                    .parallel
+                    .clone()
+                    .unwrap_or_else(|| deployment.parallel.clone()),
+                num_workers: p.replicas.max(1),
+                memory: p.memory.clone(),
+            }
+            .validate()
+            .map_err(|e| DeploymentError(format!("[hardware.{name}] prefill: {e}")))?;
+        }
         if let Some(tc) = &deployment.time_correction {
             tc.validate()
                 .map_err(|e| DeploymentError(format!("[hardware.{name}]: {e}")))?;
@@ -419,6 +451,62 @@ memory_capacity = 80000000000
             cfg.deployment(Some("custom")).unwrap().hardware.name,
             "Custom"
         );
+    }
+
+    #[test]
+    fn prefill_block_makes_the_entry_the_decode_pool() {
+        let src = FILE.replace(
+            "[hardware.b200]\ntp = 4\nreplicas = 4",
+            "[prefill]\nreplicas = 2\nparallel = { tp = 2 }\nmemory = { tiers = [\"grace_dram\"] }\n\n[hardware.b200]\ntp = 4\nreplicas = 4\n\n[hardware.b200.prefill]\nhardware = \"gh200\"\nkv_link_bw = 1e11",
+        );
+        let cfg = ModelConfig::from_toml(&src).unwrap();
+        // Shared block: the prefill pool defaults its hardware to the entry's.
+        let gh = cfg.deployment(Some("gh200")).unwrap();
+        let p = gh.prefill.as_ref().unwrap();
+        assert!(p.hardware.is_none());
+        assert_eq!(p.replicas, 2);
+        assert_eq!(p.parallel.as_ref().unwrap().tp, 2);
+        assert_eq!(p.memory.tiers, vec!["grace_dram".to_string()]);
+        let disagg = gh.with_workload(workload()).disagg().unwrap();
+        assert_eq!(disagg.prefill.num_workers, 2);
+        assert_eq!(disagg.prefill.parallel.tp, 2);
+        assert_eq!(disagg.decode.num_workers, 1);
+        assert_eq!(disagg.decode.parallel.tp, 4);
+        assert_eq!(disagg.decode.memory.tiers, Vec::<String>::new());
+        // Per-entry block replaces the shared one.
+        let b = cfg.deployment(Some("b200")).unwrap();
+        let p = b.prefill.as_ref().unwrap();
+        assert_eq!(p.hardware.as_ref().unwrap().name, "GH200");
+        assert_eq!(p.replicas, 1);
+        assert_eq!(p.kv_link_bw, Some(1e11));
+        let disagg = b.with_workload(workload()).disagg().unwrap();
+        assert_eq!(disagg.decode.num_workers, 4);
+        // No block: aggregated.
+        let cfg = ModelConfig::from_toml(FILE).unwrap();
+        assert!(cfg
+            .deployment(Some("b200"))
+            .unwrap()
+            .with_workload(workload())
+            .disagg()
+            .is_none());
+    }
+
+    fn workload() -> WorkloadConfig {
+        toml::from_str(
+            r#"
+arrival_pattern = "poisson"
+arrival_rate = 1.0
+num_requests = 1
+seed = 1
+[input_len_dist]
+type = "fixed"
+value = 8
+[output_len_dist]
+type = "fixed"
+value = 8
+"#,
+        )
+        .unwrap()
     }
 
     #[test]

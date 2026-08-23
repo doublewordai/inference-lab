@@ -402,9 +402,14 @@ impl MemoryGraph {
             let policies = selection.policies();
             let template = cluster.hardware.memory.as_ref();
             selection.validate(template)?;
-            g.backup = policies.backup;
-            g.hit_refresh = policies.hit_refresh;
-            g.promote_fill = policies.promote_fill;
+            // Graph-wide policies come from the pools that have tiers; a
+            // tier-less pool (a disaggregated decode pool, say) has nothing
+            // to say about them.
+            if !selection.tiers.is_empty() {
+                g.backup = policies.backup;
+                g.hit_refresh = policies.hit_refresh;
+                g.promote_fill = policies.promote_fill;
+            }
             // Under DP-attention every rank of a replica is its own worker
             // in the graph: one GPU, its own port into the node's stores.
             let (num_workers, tp) = cluster.graph_workers();

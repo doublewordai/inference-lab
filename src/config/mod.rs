@@ -54,6 +54,13 @@ pub(crate) fn hardware_ref<'de, D: Deserializer<'de>>(d: D) -> Result<HardwareCo
     Ok(hw)
 }
 
+/// `hardware_ref` for an optional field.
+pub(crate) fn opt_hardware_ref<'de, D: Deserializer<'de>>(
+    d: D,
+) -> Result<Option<HardwareConfig>, D::Error> {
+    hardware_ref(d).map(Some)
+}
+
 /// Deserialise a model spec given as a catalog name or an inline table.
 pub(crate) fn model_ref<'de, D: Deserializer<'de>>(d: D) -> Result<ModelSpec, D::Error> {
     let spec = match NameOrInline::<ModelSpec>::deserialize(d)? {
@@ -62,6 +69,33 @@ pub(crate) fn model_ref<'de, D: Deserializer<'de>>(d: D) -> Result<ModelSpec, D:
     };
     spec.validate().map_err(de::Error::custom)?;
     Ok(spec)
+}
+
+/// The prefill pool of a disaggregated topology (`[prefill]`). When a
+/// config carries one, its own hardware, parallel layout, replicas and
+/// memory describe the **decode** pool; arrivals enter the prefill pool,
+/// are prefilled there, and hand their KV to a decoder over the network.
+/// `router` fronts the prefill pool and `decode_router` the decode pool.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrefillSpec {
+    /// Catalog name or inline table. Defaults to the deployment's hardware.
+    #[serde(default, deserialize_with = "opt_hardware_ref")]
+    pub hardware: Option<HardwareConfig>,
+    /// Defaults to the deployment's parallel layout.
+    #[serde(default)]
+    pub parallel: Option<ParallelConfig>,
+    /// Prefill workers. Defaults to 1.
+    #[serde(default = "default_replicas")]
+    pub replicas: u32,
+    /// KV tiers on the prefill side, chosen from its hardware's `[memory]`
+    /// stores. Defaults to none: prefill keeps prefixes in HBM only.
+    #[serde(default)]
+    pub memory: MemoryConfig,
+    /// Capacity of the network core carrying hand-offs, bytes/s, shared by
+    /// every transfer in flight. Unset: the NICs alone bound them.
+    #[serde(default)]
+    pub kv_link_bw: Option<f64>,
 }
 
 /// A runnable simulation: one deployment plus one workload. Built from a
@@ -93,6 +127,10 @@ pub struct Config {
     /// KV tiers beyond HBM, chosen from the hardware's `[memory]` stores.
     #[serde(default)]
     pub memory: MemoryConfig,
+    /// Disaggregated prefill/decode: the prefill pool. When set, the fields
+    /// above describe the decode pool (see [`PrefillSpec`]).
+    #[serde(default)]
+    pub prefill: Option<PrefillSpec>,
     /// Optional step-time calibration against a measured engine
     /// (`t = alpha × t_roofline + beta`); absent = pure roofline.
     #[serde(default)]
@@ -145,6 +183,7 @@ impl Config {
             router,
             decode_router,
             memory,
+            prefill,
             time_correction,
             speculative,
             fault,
@@ -158,6 +197,7 @@ impl Config {
             router,
             decode_router,
             memory,
+            prefill,
             time_correction,
             workload,
             speculative,
@@ -192,6 +232,24 @@ impl Config {
             num_workers: self.replicas.max(1),
             memory: self.memory.clone(),
         }
+    }
+
+    /// The disaggregated topology this config describes, when it carries a
+    /// `[prefill]` block: that block as the prefill pool (hardware and
+    /// parallel layout defaulting to the deployment's) and [`Config::cluster`]
+    /// as the decode pool.
+    pub fn disagg(&self) -> Option<DisaggTopology> {
+        let p = self.prefill.as_ref()?;
+        Some(DisaggTopology {
+            prefill: ClusterSpec {
+                hardware: p.hardware.clone().unwrap_or_else(|| self.hardware.clone()),
+                parallel: p.parallel.clone().unwrap_or_else(|| self.parallel.clone()),
+                num_workers: p.replicas.max(1),
+                memory: p.memory.clone(),
+            },
+            decode: self.cluster(),
+            kv_link_bw: p.kv_link_bw,
+        })
     }
 
     /// Get a default configuration for testing: a 7B-class bf16 dense model
@@ -279,6 +337,7 @@ impl Config {
             router: RouterConfig::default(),
             decode_router: None,
             memory: MemoryConfig::default(),
+            prefill: None,
             time_correction: None,
             workload,
             speculative: None,
