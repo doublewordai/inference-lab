@@ -1189,6 +1189,11 @@ impl Scheduler {
         &self.waiting
     }
 
+    /// Requests parked on an external-store staging read.
+    pub fn pending_storage(&self) -> &[Request] {
+        &self.pending_storage
+    }
+
     pub fn pending_transfers(&self) -> &[Request] {
         &self.pending_transfers
     }

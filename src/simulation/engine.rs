@@ -751,8 +751,24 @@ impl Engine {
                         mgr.blocks_for_context(r.planned_positions())
                     )
                 });
+                let staging = s.pending_storage();
+                let first_staging = staging.first().map(|r| {
+                    format!(
+                        "{}(cached {}, ready_at {:?}, abandoned {}, lookups {:?})",
+                        r.request_id,
+                        r.num_cached_tokens,
+                        r.ready_at,
+                        r.storage_prefetch_abandoned,
+                        r.lookup.as_ref().map(|l| l.lookups)
+                    )
+                });
                 let (held, refs, free) = mgr.ref_summary();
                 let by_queue = s.held_blocks_by_queue();
+                out.push_str(&format!(
+                    "\n  staging {}: [0] {:?}",
+                    staging.len(),
+                    first_staging
+                ));
                 out.push_str(&format!(
                     "\n  refs: {held} blocks referenced ({refs} refs), {free} free; held by (running, waiting, parked, prefetches) = {by_queue:?}"
                 ));

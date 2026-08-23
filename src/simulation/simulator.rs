@@ -244,6 +244,25 @@ impl Simulator {
                 ));
             }
 
+            if let Some(at) = std::env::var("INFERENCE_LAB_DUMP_AT")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+            {
+                if self.engine.current_time() >= at {
+                    eprintln!(
+                        "dump at t={:.3}: {} running, {} waiting, next event {:?}{}",
+                        self.engine.current_time(),
+                        self.engine.aggregate_running(),
+                        self.engine.aggregate_waiting(),
+                        self.engine.next_event_time(),
+                        self.engine.describe_stuck_workers()
+                    );
+                    if let Some(m) = self.engine.memory_metrics() {
+                        eprintln!("{}", serde_json::to_string_pretty(&m).unwrap_or_default());
+                    }
+                    std::process::exit(3);
+                }
+            }
             let outcome = self.engine.step()?;
             if let Some(iter) = &outcome.iteration {
                 self.handle_iteration(iter);
