@@ -5,7 +5,7 @@
 //! traffic flows through one HBM, so weight bytes for each precision plus KV
 //! bytes (charged to the attention stream) all share the same bandwidth.
 
-use crate::config::{HardwareConfig, ModelSpec, ParallelConfig, Precision};
+use crate::config::{HardwareConfig, ModelSpec, MoeOverlap, ParallelConfig, Precision};
 use crate::request::Request;
 
 #[derive(Clone)]
@@ -13,6 +13,8 @@ pub struct ComputeEngine {
     hardware: HardwareConfig,
     parallel: ParallelConfig,
     model: ModelSpec,
+    /// Per-GPU bandwidth of an active-KV store. `None` means KV is in HBM.
+    kv_memory_bandwidth: Option<f64>,
     block_size: u32,
     enable_cascade_attention: bool,
 }
@@ -21,13 +23,38 @@ pub struct ComputeEngine {
 #[derive(Default, Clone, Copy)]
 struct StreamAcc {
     flops: f64,
+    /// Total bytes in the historical accumulator. Keeping this alongside the
+    /// split preserves bit-for-bit default arithmetic when KV remains in HBM.
     bytes: f64,
+    /// Bytes read through HBM (weights and fixed per-sequence state).
+    hbm_bytes: f64,
+    /// Attention KV bytes, read through HBM unless an active tier is set.
+    kv_bytes: f64,
+    /// Routed-expert subset of `flops` / `hbm_bytes`, split out only when
+    /// hidden overlap is selected.
+    routed_flops: f64,
+    routed_hbm_bytes: f64,
 }
 
 impl StreamAcc {
     fn is_empty(&self) -> bool {
         self.flops == 0.0 && self.bytes == 0.0
     }
+}
+
+#[derive(Default, Clone, Copy)]
+struct CollectiveCost {
+    /// Historical single serial accumulator, retained so the default path's
+    /// floating-point operation order stays byte-identical.
+    serial_total: f64,
+    /// Collectives other than routed MoE dispatch/combine.
+    other: f64,
+    /// Existing serial time for routed MoE dispatch/combine.
+    moe_serial: f64,
+    /// Bandwidth-only part eligible to overlap with expert execution.
+    moe_wire: f64,
+    /// Dispatch/combine call floors that remain exposed.
+    moe_latency: f64,
 }
 
 /// Per-precision work for one step, indexed by [`Precision::index`].
@@ -41,6 +68,11 @@ pub struct StepCost {
     pub time: f64,
     /// Bytes moved HBM -> SM (weights of every stream plus KV reads).
     pub bytes: f64,
+    /// Non-KV portion of `bytes` read through HBM.
+    pub hbm_bytes: f64,
+    /// Portion of `bytes` belonging to attention KV. This additionally uses
+    /// HBM unless an active-KV tier is configured.
+    pub kv_bytes: f64,
     /// FLOPs across all streams.
     pub flops: f64,
     /// Time the FLOPs alone would take at each stream's peak rate, summed.
@@ -53,6 +85,7 @@ impl ComputeEngine {
             hardware,
             parallel,
             model,
+            kv_memory_bandwidth: None,
             block_size: 0,
             enable_cascade_attention: false,
         }
@@ -66,6 +99,24 @@ impl ComputeEngine {
 
     fn aggregate_memory_bandwidth(&self) -> f64 {
         self.hardware.memory_bandwidth * self.parallel.tp as f64
+    }
+
+    fn aggregate_kv_memory_bandwidth(&self) -> f64 {
+        self.kv_memory_bandwidth
+            .unwrap_or(self.hardware.memory_bandwidth)
+            * self.parallel.tp as f64
+    }
+
+    /// Place active KV outside HBM and price its reads at `bandwidth` per
+    /// GPU. Cluster configuration derives this from the active store's
+    /// direct GPU link.
+    pub fn with_kv_memory_bandwidth(mut self, bandwidth: f64) -> Self {
+        assert!(
+            bandwidth.is_finite() && bandwidth > 0.0,
+            "active-KV bandwidth must be finite and positive"
+        );
+        self.kv_memory_bandwidth = Some(bandwidth);
+        self
     }
 
     /// Aggregate bf16 FLOP rate (the precision the drafter heads stream at),
@@ -99,13 +150,13 @@ impl ComputeEngine {
     ///   rank, so dispatch and combine all-to-alls over the `ep` group, each
     ///   rank moving its `tokens / ep` share of the routed activations
     ///   (`experts_per_tok` copies of the hidden vector).
-    fn collective_time(&self, total_tokens: u32) -> f64 {
+    fn collective_cost(&self, total_tokens: u32) -> CollectiveCost {
         let Some(fabric) = &self.hardware.fabric else {
-            return 0.0;
+            return CollectiveCost::default();
         };
         let tp = self.parallel.tp;
         if tp <= 1 {
-            return 0.0;
+            return CollectiveCost::default();
         }
         let ep = self.parallel.ep;
         let dpa = self.parallel.dp_attention;
@@ -120,20 +171,41 @@ impl ComputeEngine {
             layers as f64 * t
         };
 
-        let mut total = 0.0;
+        let mut cost = CollectiveCost::default();
         if !dpa {
-            total += self.model.num_layers() as f64 * fabric.allreduce_time(tp, hidden);
+            let t = self.model.num_layers() as f64 * fabric.allreduce_time(tp, hidden);
+            cost.other += t;
+            cost.serial_total += t;
         }
-        total += ffn_exchange(self.model.dense_ffn_layers());
+        let dense = ffn_exchange(self.model.dense_ffn_layers());
+        cost.other += dense;
+        cost.serial_total += dense;
         if ep > 1 && dpa {
             for r in self.model.weights.iter().filter_map(|w| w.routing) {
-                let per_rank = tokens / ep as f64 * r.experts_per_tok as f64 * hidden / tokens;
-                total += 2.0 * r.moe_layers as f64 * fabric.alltoall_time(ep, per_rank);
+                let per_rank = if tokens == 0.0 {
+                    0.0
+                } else {
+                    tokens / ep as f64 * r.experts_per_tok as f64 * hidden / tokens
+                };
+                let calls = 2.0 * r.moe_layers as f64;
+                let serial = 2.0 * r.moe_layers as f64 * fabric.alltoall_time(ep, per_rank);
+                cost.moe_serial += serial;
+                cost.serial_total += serial;
+                let (latency, wire) = fabric.alltoall_latency_and_wire_time(ep, per_rank);
+                cost.moe_latency += calls * latency;
+                cost.moe_wire += calls * wire;
             }
         } else {
-            total += ffn_exchange(self.model.moe_layers());
+            let moe = ffn_exchange(self.model.moe_layers());
+            cost.other += moe;
+            cost.serial_total += moe;
         }
-        total
+        cost
+    }
+
+    #[cfg(test)]
+    fn collective_time(&self, total_tokens: u32) -> f64 {
+        self.collective_cost(total_tokens).serial_total
     }
 
     /// Enable cascade attention modeling. When a scheduled batch shares a
@@ -154,19 +226,36 @@ impl ComputeEngine {
         let mut streams: Streams = [StreamAcc::default(); Precision::COUNT];
         let total_tokens: u32 = tokens_per_request.iter().sum();
 
+        // Preserve the historical per-precision accumulation order for the
+        // default serial/HBM path. Routed work is then marked separately so
+        // hidden-overlap pricing can isolate the expert kernel.
         for (prec, fpt) in self.model.matmul_flops_per_token_by_prec() {
             streams[prec.index()].flops += total_tokens as f64 * fpt as f64;
         }
-        // Weight bytes per forward pass, also per precision. For MoE this grows
-        // with the step's token count (coupon-collector expert loading).
-        for (prec, b) in self.model.weight_bytes_per_step_by_prec(total_tokens) {
-            streams[prec.index()].bytes += b as f64;
+        for (prec, bytes) in self.model.weight_bytes_per_step_by_prec(total_tokens) {
+            streams[prec.index()].bytes += bytes as f64;
+            streams[prec.index()].hbm_bytes += bytes as f64;
+        }
+        for weight in self
+            .model
+            .weights
+            .iter()
+            .filter(|weight| weight.routing.is_some())
+        {
+            let idx = weight.precision.index();
+            let flops = total_tokens as f64 * (2 * weight.active_params) as f64;
+            let bytes = (weight.params_read_per_step(total_tokens) as f64
+                * weight.bytes_per_value()) as u64 as f64;
+            streams[idx].routed_flops += flops;
+            streams[idx].routed_hbm_bytes += bytes;
         }
         // DP-attention: every rank holds and reads the full attention
         // projections, so the replica reads them tp times per step.
         if self.parallel.dp_attention && self.parallel.tp > 1 {
-            streams[self.model.projection_precision().index()].bytes +=
-                (self.parallel.tp - 1) as f64 * self.model.attention_weight_bytes() as f64;
+            let bytes = (self.parallel.tp - 1) as f64 * self.model.attention_weight_bytes() as f64;
+            let stream = &mut streams[self.model.projection_precision().index()];
+            stream.bytes += bytes;
+            stream.hbm_bytes += bytes;
         }
 
         let attn_idx = self.model.attention_precision.index();
@@ -178,9 +267,11 @@ impl ComputeEngine {
         } else {
             0
         };
-        streams[attn_idx].bytes +=
-            self.model
-                .kv_bytes_read_per_decode_step(shared_prefix_tokens) as f64;
+        let shared_kv = self
+            .model
+            .kv_bytes_read_per_decode_step(shared_prefix_tokens) as f64;
+        streams[attn_idx].bytes += shared_kv;
+        streams[attn_idx].kv_bytes += shared_kv;
 
         // Fixed per-sequence state (Mamba / GatedDeltaNet) is read once per
         // sequence per step, independent of context length.
@@ -202,8 +293,12 @@ impl ComputeEngine {
             }
 
             let unshared = mean_context.saturating_sub(shared_prefix_tokens);
-            streams[attn_idx].bytes +=
-                self.model.kv_bytes_read_per_decode_step(unshared) as f64 + state_bytes;
+            let kv_bytes = self.model.kv_bytes_read_per_decode_step(unshared) as f64;
+            // This is deliberately one addition, matching the pre-split
+            // accumulator and therefore its floating-point result.
+            streams[attn_idx].bytes += kv_bytes + state_bytes;
+            streams[attn_idx].kv_bytes += kv_bytes;
+            streams[attn_idx].hbm_bytes += state_bytes;
         }
 
         streams
@@ -218,6 +313,8 @@ impl ComputeEngine {
             return StepCost {
                 time: 0.0,
                 bytes: 0.0,
+                hbm_bytes: 0.0,
+                kv_bytes: 0.0,
                 flops: 0.0,
                 compute_time: 0.0,
             };
@@ -225,13 +322,20 @@ impl ComputeEngine {
         let total_tokens: u32 = tokens_per_request.iter().sum();
         let streams = self.assemble_streams(batch_requests, tokens_per_request);
         let bw = self.aggregate_memory_bandwidth();
+        let kv_bw = self.aggregate_kv_memory_bandwidth();
+        let collectives = self.collective_cost(total_tokens);
+        let hide_moe =
+            self.parallel.moe_overlap == MoeOverlap::Hidden && collectives.moe_serial > 0.0;
 
         let mut cost = StepCost {
             time: 0.0,
             bytes: 0.0,
+            hbm_bytes: 0.0,
+            kv_bytes: 0.0,
             flops: 0.0,
             compute_time: 0.0,
         };
+        let mut routed_kernel_time = 0.0;
         for (i, acc) in streams.iter().enumerate() {
             if acc.is_empty() {
                 continue;
@@ -244,13 +348,33 @@ impl ComputeEngine {
                 )
             });
             let compute_time = acc.flops / rate;
-            let memory_time = acc.bytes / bw;
-            cost.time += compute_time.max(memory_time);
+            let memory_time = if self.kv_memory_bandwidth.is_some() {
+                acc.hbm_bytes / bw + acc.kv_bytes / kv_bw
+            } else {
+                acc.bytes / bw
+            };
+            if hide_moe {
+                let base_compute = (acc.flops - acc.routed_flops).max(0.0) / rate;
+                let base_memory =
+                    (acc.hbm_bytes - acc.routed_hbm_bytes).max(0.0) / bw + acc.kv_bytes / kv_bw;
+                cost.time += base_compute.max(base_memory);
+                routed_kernel_time += (acc.routed_flops / rate).max(acc.routed_hbm_bytes / bw);
+            } else {
+                cost.time += compute_time.max(memory_time);
+            }
             cost.compute_time += compute_time;
+            cost.hbm_bytes += acc.hbm_bytes;
+            cost.kv_bytes += acc.kv_bytes;
             cost.bytes += acc.bytes;
             cost.flops += acc.flops;
         }
-        cost.time += self.collective_time(total_tokens);
+        if hide_moe {
+            cost.time += collectives.other
+                + routed_kernel_time.max(collectives.moe_wire)
+                + collectives.moe_latency;
+        } else {
+            cost.time += collectives.serial_total;
+        }
         cost
     }
 
@@ -270,7 +394,8 @@ impl ComputeEngine {
         }
         let state_bytes = self.model.per_sequence_state_bytes() as f64;
         let mut compute = 0.0;
-        let mut bytes = 0.0;
+        let mut kv_bytes = 0.0;
+        let mut hbm_bytes = 0.0;
         for (req, &num_new) in batch_requests.iter().zip(tokens_per_request) {
             // Same causal accounting as `assemble_streams`, each precision's
             // FLOPs at its own rate.
@@ -281,9 +406,14 @@ impl ComputeEngine {
             {
                 compute += flops / self.hardware.flop_rate(prec).unwrap_or(f64::INFINITY);
             }
-            bytes += self.model.kv_bytes_read_per_decode_step(mean_context) as f64 + state_bytes;
+            kv_bytes += self.model.kv_bytes_read_per_decode_step(mean_context) as f64;
+            hbm_bytes += state_bytes;
         }
-        compute.max(bytes / self.hardware.memory_bandwidth)
+        let memory = match self.kv_memory_bandwidth {
+            Some(kv_bw) => hbm_bytes / self.hardware.memory_bandwidth + kv_bytes / kv_bw,
+            None => (hbm_bytes + kv_bytes) / self.hardware.memory_bandwidth,
+        };
+        compute.max(memory)
     }
 
     /// Wall time of a step (see [`ComputeEngine::step_cost`]).
@@ -310,7 +440,13 @@ impl ComputeEngine {
         if actual_time <= 0.0 {
             return 0.0;
         }
-        (cost.bytes / self.aggregate_memory_bandwidth() / actual_time).min(1.0)
+        let memory_time = if self.kv_memory_bandwidth.is_some() {
+            cost.hbm_bytes / self.aggregate_memory_bandwidth()
+                + cost.kv_bytes / self.aggregate_kv_memory_bandwidth()
+        } else {
+            cost.bytes / self.aggregate_memory_bandwidth()
+        };
+        (memory_time / actual_time).min(1.0)
     }
 
     /// Bandwidth-roofline KV-read time delta between the batch's actual KV
@@ -323,7 +459,7 @@ impl ComputeEngine {
     /// conservative lower-bound correction: it prices only the bandwidth of
     /// the KV delta at peak, not attention-kernel shape effects.
     pub fn kv_read_seq_delta_seconds(&self, batch_requests: &[&Request], ref_seq_len: u32) -> f64 {
-        let bw = self.aggregate_memory_bandwidth();
+        let bw = self.aggregate_kv_memory_bandwidth();
         let ref_bytes = self.model.kv_bytes_read_per_decode_step(ref_seq_len) as f64;
         batch_requests
             .iter()
@@ -447,6 +583,98 @@ mod tests {
         let allreduce = 1e-6 + 2.0 * 3.0 / 4.0 * hidden / 1e12;
         assert_eq!(ep4.collective_time(1024), ep1.collective_time(1024));
         assert!((ep4.collective_time(1024) - 64.0 * allreduce).abs() < 1e-12);
+    }
+
+    #[test]
+    fn hidden_moe_overlap_hides_wire_but_not_call_latency() {
+        use crate::config::{FabricConfig, FabricLink, LayerClass, Routing, WeightStream};
+
+        let hardware = HardwareConfig {
+            name: "test".into(),
+            flops_fp4: None,
+            flops_fp8: Some(1e30),
+            flops_bf16: Some(1e30),
+            flops_fp16: None,
+            memory_bandwidth: 1e9,
+            memory_capacity: 1_000_000,
+            memory: None,
+            fabric: Some(FabricConfig {
+                gpus_per_node: 4,
+                scale_up: FabricLink {
+                    bandwidth: 1e12,
+                    latency: 5e-6,
+                    in_network_reduction: false,
+                },
+                scale_out: Some(FabricLink {
+                    bandwidth: 1e5,
+                    latency: 50e-6,
+                    in_network_reduction: false,
+                }),
+            }),
+        };
+        let model = ModelSpec {
+            name: "moe".into(),
+            hidden_dim: 16,
+            max_seq_len: 1024,
+            attention_precision: Precision::Bf16,
+            activation_bytes: 2,
+            weights: vec![WeightStream {
+                precision: Precision::Fp8,
+                active_params: 1_000,
+                resident_params: 8_000,
+                routing: Some(Routing {
+                    routed_experts: 8,
+                    experts_per_tok: 1,
+                    moe_layers: 1,
+                }),
+            }],
+            layers: vec![LayerClass::Linear {
+                count: 1,
+                state_bytes: 0,
+            }],
+        };
+        let parallel = ParallelConfig {
+            tp: 8,
+            ep: 8,
+            dp_attention: true,
+            moe_overlap: MoeOverlap::Serial,
+        };
+        let request = Request::new("r".into(), 0, 0.0, 8, 1);
+        let serial = ComputeEngine::new(hardware.clone(), parallel.clone(), model.clone())
+            .step_cost(&[&request], &[8]);
+        let mut hidden_parallel = parallel;
+        hidden_parallel.moe_overlap = MoeOverlap::Hidden;
+        let hidden = ComputeEngine::new(hardware, hidden_parallel, model.clone())
+            .step_cost(&[&request], &[8]);
+
+        let routed_kernel = model.weight_bytes_per_step_by_prec(8)[0].1 as f64 / (8.0 * 1e9);
+        let per_rank_bytes = 8.0 / 8.0 * 16.0 * 2.0;
+        let wire_per_call = (8.0 - 4.0) / 8.0 * per_rank_bytes / 1e5;
+        let serial_expected = routed_kernel + 2.0 * (50e-6 + wire_per_call);
+        let hidden_expected = routed_kernel.max(2.0 * wire_per_call) + 2.0 * 50e-6;
+        assert!((serial.time - serial_expected).abs() < 1e-12);
+        assert!((hidden.time - hidden_expected).abs() < 1e-12);
+        assert!(hidden.time < serial.time);
+    }
+
+    #[test]
+    fn active_kv_bandwidth_prices_kv_reads_without_moving_weight_reads() {
+        let model = crate::catalog::model("glm-5.2-fp8").unwrap();
+        let hardware = crate::catalog::hardware("gh200").unwrap();
+        let parallel = ParallelConfig::default();
+        let hbm = ComputeEngine::new(hardware.clone(), parallel.clone(), model.clone());
+        let grace =
+            ComputeEngine::new(hardware.clone(), parallel, model).with_kv_memory_bandwidth(4.5e11);
+        let request = create_test_request("r", 65_536, 1);
+        let hbm_cost = hbm.step_cost(&[&request], &[1]);
+        let grace_cost = grace.step_cost(&[&request], &[1]);
+
+        assert_eq!(hbm_cost.hbm_bytes, grace_cost.hbm_bytes);
+        assert_eq!(hbm_cost.kv_bytes, grace_cost.kv_bytes);
+        assert!(grace_cost.time > hbm_cost.time);
+        let hbm_delta = hbm.kv_read_seq_delta_seconds(&[&request], 0);
+        let grace_delta = grace.kv_read_seq_delta_seconds(&[&request], 0);
+        assert!((grace_delta / hbm_delta - hardware.memory_bandwidth / 4.5e11).abs() < 1e-9);
     }
 
     fn create_test_request(id: &str, computed: u32, prompt: u32) -> Request {
@@ -588,6 +816,8 @@ mod tests {
         let cost = StepCost {
             time: 0.0,
             bytes: 1e12,
+            hbm_bytes: 1e12,
+            kv_bytes: 0.0,
             flops: 0.0,
             compute_time: 0.0,
         };

@@ -189,7 +189,7 @@ pub fn expected_distinct_experts(num_experts: u32, draws: f64) -> f64 {
 }
 
 impl WeightStream {
-    fn bytes_per_value(&self) -> f64 {
+    pub(crate) fn bytes_per_value(&self) -> f64 {
         self.precision.bytes_per_value()
     }
 
@@ -201,7 +201,7 @@ impl WeightStream {
     /// resident; per-routed-expert params `w` and always-resident shared
     /// params are recovered from the active (`k·w + shared`) and resident
     /// (`E·w + shared`) footprints.
-    fn params_read_per_step(&self, num_tokens: u32) -> u64 {
+    pub(crate) fn params_read_per_step(&self, num_tokens: u32) -> u64 {
         let Some(r) = self.routing else {
             return self.active_params;
         };

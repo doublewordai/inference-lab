@@ -4,6 +4,20 @@ fn default_dim() -> u32 {
     1
 }
 
+/// Whether routed-expert communication is serial with expert execution or
+/// its bandwidth portion can hide behind the routed expert kernel. The
+/// collective call latency is always exposed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MoeOverlap {
+    /// Existing behavior: dispatch, expert execution, and combine are serial.
+    #[default]
+    Serial,
+    /// Dispatch/combine wire time overlaps the routed expert kernel; only the
+    /// larger is on the critical path, followed by the call latency floors.
+    Hidden,
+}
+
 /// How one replica of the model is laid out across its GPUs.
 ///
 /// * `tp` — the replica's world size. Its GPUs pool FLOP rate, HBM bandwidth
@@ -38,6 +52,10 @@ pub struct ParallelConfig {
     /// Data-parallel attention over the `tp` ranks. Defaults to false.
     #[serde(default)]
     pub dp_attention: bool,
+    /// Routed-expert communication overlap policy. Defaults to `serial` so
+    /// existing configs retain byte-identical outputs.
+    #[serde(default)]
+    pub moe_overlap: MoeOverlap,
 }
 
 impl Default for ParallelConfig {
@@ -46,6 +64,7 @@ impl Default for ParallelConfig {
             tp: 1,
             ep: 1,
             dp_attention: false,
+            moe_overlap: MoeOverlap::Serial,
         }
     }
 }

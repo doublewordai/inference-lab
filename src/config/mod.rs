@@ -19,7 +19,7 @@ pub use memory::{
 pub use model::{
     expected_distinct_experts, History, Indexer, LayerClass, ModelSpec, Routing, WeightStream,
 };
-pub use parallel::ParallelConfig;
+pub use parallel::{MoeOverlap, ParallelConfig};
 pub use router::RouterConfig;
 pub use scheduler::SchedulerConfig;
 pub use speculative::{

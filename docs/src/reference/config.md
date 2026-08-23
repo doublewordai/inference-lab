@@ -62,6 +62,8 @@ hardware preset unless `spec` says otherwise.
 | `tp` | U32 | 1 | Replica world size: its GPUs pool FLOP rate, HBM bandwidth and memory; weights are sharded across them; each layer's output is all-reduced twice (after attention, after the FFN) |
 | `ep` | U32 | 1 | Experts sharded across `ep` of the ranks (divides `tp`). With TP attention every rank holds every token, so the MoE output is still combined by the FFN all-reduce (vLLM `--enable-expert-parallel`); under `dp_attention` the MoE layers dispatch + combine with all-to-alls over the `ep` group instead |
 | `dp_attention` | Bool | false | Attention runs data-parallel over the `tp` ranks (sglang `--enable-dp-attention`): the attention projections are replicated (`tp×` resident and read per step), a sequence's KV lives on one rank, no attention all-reduce; the TP-sharded FFN gathers the ranks' tokens with an all-gather and returns them with a reduce-scatter (with `ep > 1`, DeepEP-style dispatch + combine all-to-alls). **Each rank is its own worker**: its own scheduler and KV cache over its GPU's HBM (`1/tp` of the replica's), its own port into the node's `[memory]` stores; `[scheduler]` limits apply per rank. The `[router]` routes flat over ranks — the placement decision a DP-aware front end (Dynamo's `(worker, dp_rank)` endpoints) makes. The ranks step in lockstep as one group: the step is priced on the replica-wide roofline over the union batch plus the attention skew, the slowest rank's own-GPU attention time over the mean rank's (the ranks meet at every layer's FFN collective). Speculative decoding is not modelled with rank groups |
+| `moe_overlap` | String | `serial` | Routed MoE dispatch/combine overlap: `serial` adds both all-to-alls to the expert kernel; `hidden` prices the routed part as `max(expert kernel, wire time) + dispatch/combine call floors`. Only the bandwidth portion hides; dense and attention collectives remain serial |
+| `scale_out_latency` | Float | preset | Override the named hardware preset's `fabric.scale_out.latency`, in seconds per collective call. This changes the scale-out floor without copying the whole hardware table |
 | `replicas` | U32 | 1 | Identical workers of this deployment (each a `tp`-GPU replica with its own scheduler and KV cache; `tp` rank workers each under `dp_attention`) behind the router |
 | `spec` | String or Table | the entry name | Another catalog preset, or an inline hardware table (fields below) |
 | `scheduler` | Table | `{}` | Keys merged over the shared `[scheduler]` for this entry |
@@ -79,7 +81,9 @@ all-reduce; under `dp_attention`, dense FFN or MoE with `ep = 1` → an
 all-gather + reduce-scatter, MoE with `ep > 1` → dispatch and combine
 all-to-alls over `ep`, each rank moving its `tokens / ep` share of
 `experts_per_tok` hidden vectors. Expert reads and FLOPs are taken as
-balanced across ranks; there is no overlap of collectives with compute.
+balanced across ranks. `moe_overlap = "hidden"` overlaps only the routed
+expert kernel with dispatch/combine wire time; its call latency floors and
+every other collective stay exposed. The default remains fully serial.
 
 ### Hardware spec
 
@@ -273,6 +277,8 @@ can promote. A worker wider than a node pools the node stores it spans.
 
 ```toml
 [memory]
+active_tier = "grace_dram"                    # active KV here instead of HBM
+active_bandwidth = 420e9                       # optional measured bytes/s/GPU
 tiers = ["peer_hbm", "host_dram", "nvme"] # peer_hbm is declared by b200
 preset = "reactive"                            # reactive | oracle (optional bundle)
 source = { policy = "promote" }                # promote | min_time
@@ -292,8 +298,10 @@ host_dram = 1.0e12          # bytes per instance given to KV
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
+| `active_tier` | String | unset (HBM) | Place active KV in this capacity-bearing, per-GPU hardware store and read it directly over its GPU link on every attention step. This is not a spill cache: the scheduler uses its capacity instead of HBM's KV remainder, and no promotion occurs. It cannot also appear in `tiers`. The current direct-placement contract requires `per = "gpu"` and a direct GPU-to-store link (for example GH200 `grace_dram` over C2C) |
+| `active_bandwidth` | Float | direct-link bandwidth | Optional measured per-GPU read bandwidth for `active_tier`, in bytes/s; must be finite and positive |
 | `tiers` | Array | `[]` | Tier names from the hardware's `[memory]`, closest first. Each must be reachable from a GPU over the hardware's links. `peer_hbm` consults same-node sibling HBM and has no capacity or write step |
-| `capacity` | Table | full | Per-store cap on bytes per instance |
+| `capacity` | Table | full | Per-store cap on bytes per instance for a spill tier or `active_tier` |
 | `preset` | String | unset | A named policy bundle; any field set explicitly overrides the preset's choice. `reactive`: `promote` / `lru` / `selective` (`min_hits` 1) / `lru` / `none` / backed-first — decides only from what has already happened, as shipped stacks do. `oracle`: `min_time` / `outlook` / `live` / `outlook` / `outlook` / backed-first — reads every session's announced re-entry. Both use staged `through` reads, wait for storage prefetch, and overlap the final load layer-wise. The preset covers KV movement only: on a pool with several workers or DP-attention ranks, pair it with a `[router]` that sends a re-entry to the worker holding (or prefetching) its prefix — `kv_aware` or `prefix_affinity` — or its evictions and prefetches serve arrivals that land elsewhere |
 | `source` | Table | `promote` | Where a re-entry's tier-held prefix comes from: `promote` — fetch it (a hit is a hit); `min_time` — fetch it only if the transfer, at the fetch path's current fair share, beats recomputing those tokens at the worker's roofline; otherwise recompute (the tier keeps its copy) |
 | `hbm_eviction` | Table | `lru` | Which free HBM block is recycled first: `lru` — least recently freed; `outlook` — blocks with no announced re-entry first (LRU among them), then the farthest re-entry first, each sequence tail first |

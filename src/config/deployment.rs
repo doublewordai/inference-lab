@@ -139,6 +139,13 @@ struct HardwareEntry {
     ep: Option<u32>,
     #[serde(default)]
     dp_attention: Option<bool>,
+    /// Routed-expert communication overlap policy.
+    #[serde(default)]
+    moe_overlap: Option<Value>,
+    /// Override the named hardware preset's scale-out per-call latency, in
+    /// seconds, without restating the whole hardware spec.
+    #[serde(default)]
+    scale_out_latency: Option<f64>,
     /// Identical replicas of this deployment. Defaults to 1.
     #[serde(default)]
     replicas: Option<u32>,
@@ -238,6 +245,9 @@ impl ModelConfig {
         if let Some(dp) = entry.dp_attention {
             parallel.insert("dp_attention".into(), Value::Boolean(dp));
         }
+        if let Some(overlap) = &entry.moe_overlap {
+            parallel.insert("moe_overlap".into(), overlap.clone());
+        }
         merged.insert("parallel".into(), Value::Table(parallel));
         merged.insert("model".into(), self.model.clone());
         let mut scheduler = self.scheduler.clone();
@@ -268,8 +278,26 @@ impl ModelConfig {
         if let Some(fault) = &self.fault {
             merged.insert("fault".into(), Value::Table(fault.clone()));
         }
-        let deployment = Deployment::deserialize(Value::Table(merged))
+        let mut deployment = Deployment::deserialize(Value::Table(merged))
             .map_err(|e| DeploymentError(format!("[hardware.{name}]: {e}")))?;
+        if let Some(latency) = entry.scale_out_latency {
+            if !latency.is_finite() || latency < 0.0 {
+                return Err(DeploymentError(format!(
+                    "[hardware.{name}]: scale_out_latency must be finite and >= 0 (got {latency})"
+                )));
+            }
+            let fabric = deployment.hardware.fabric.as_mut().ok_or_else(|| {
+                DeploymentError(format!(
+                    "[hardware.{name}]: scale_out_latency needs a [fabric] block"
+                ))
+            })?;
+            let scale_out = fabric.scale_out.as_mut().ok_or_else(|| {
+                DeploymentError(format!(
+                    "[hardware.{name}]: scale_out_latency needs fabric.scale_out"
+                ))
+            })?;
+            scale_out.latency = latency;
+        }
         deployment
             .cluster()
             .validate()
@@ -315,6 +343,8 @@ replicas = 4
 
 [hardware.gh200]
 tp = 4
+moe_overlap = "hidden"
+scale_out_latency = 0.00065
 scheduler = { max_num_batched_tokens = 4096 }
 router = { policy = "prefix_affinity", max_load_ratio = 1.5 }
 time_correction = { alpha = 1.5, beta = 0.002 }
@@ -367,6 +397,11 @@ alpha = 0.5
             RouterConfig::KvAwareDecode { load_weight: 64.0 }
         );
         assert_eq!(gh.hardware.name, "GH200");
+        assert_eq!(gh.parallel.moe_overlap, crate::config::MoeOverlap::Hidden);
+        assert_eq!(
+            gh.hardware.fabric.unwrap().scale_out.unwrap().latency,
+            0.00065
+        );
         assert_eq!(gh.scheduler.max_num_batched_tokens, 4096);
         assert_eq!(gh.scheduler.max_num_seqs, 256);
         assert_eq!(gh.speculative.as_ref().unwrap().gamma, 2);
