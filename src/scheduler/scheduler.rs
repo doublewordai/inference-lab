@@ -741,6 +741,21 @@ impl Scheduler {
                         .kv_cache_manager
                         .can_grow_to(request, request.num_prompt_tokens)
                     {
+                        // Nothing runs and nothing is in flight, so no block
+                        // will free itself: the HBM is held by other waiting
+                        // requests' landed promotions. Give those up (tier
+                        // copies stay) from the back of the queue until this
+                        // one fits — the rule the resident path applies below.
+                        let need = self
+                            .kv_cache_manager
+                            .blocks_for_context(request.num_prompt_tokens)
+                            .saturating_sub(request.kv_blocks.len() + request.aux_blocks.len());
+                        if self.running.is_empty()
+                            && self.pending_transfers.is_empty()
+                            && self.release_waiting_kv(selected_idx, need)
+                        {
+                            continue;
+                        }
                         break;
                     }
                     let mut request = self.waiting.remove(selected_idx).unwrap();
@@ -1735,6 +1750,99 @@ mod tests {
         assert_eq!(d.completed.len(), 1);
         assert_eq!(s.pending_transfers.len(), 1);
         assert_eq!(s.pending_transfers[0].request_id, "x2");
+    }
+
+    #[test]
+    fn a_promotion_at_the_head_takes_back_kv_held_by_waiting_promotions() {
+        // HBM of 4 blocks, one private tier. `run` (1-block prompt, long
+        // output) is running and grows to 3 blocks; `held` (prompt [0x10, 0x11, 0x12],
+        // P in the tier) promotes 0x10 while its prompt still fits, lands, and
+        // waits holding its first block because the other two do not fit. Then `old`
+        // returns to the head of the queue the way a preempted request does:
+        // no blocks, its prefix [A] in the tier (write-through), ahead of
+        // `held`. `run` completes. `old` needs 4 blocks with 3 free; nothing
+        // runs and nothing is in flight, so no block will free itself: it
+        // takes back `held`'s landing block and promotes, rather than stall.
+        let config = Config::test_default();
+        let bs = config.scheduler.block_size;
+        let per_block = config.model.kv_storage_bytes(bs);
+        let kv = kv_manager(&config, 4 * per_block, true).with_private_tiers(&[(
+            "host_ram",
+            10 * 1024 * 1024 * 1024,
+            per_block as f64,
+        )]);
+        let mut s = scheduler_from(config, kv);
+        s.kv_cache_manager.plant_in_tier(0, 0xA);
+        s.kv_cache_manager.plant_in_tier(0, 0x10);
+        s.add_request(create_test_request("run", 1, 3 * bs));
+        let d = s.schedule(0.0);
+        assert_eq!(running_ids(&s), vec!["run"]);
+        apply(&mut s, &d, 0.5);
+        let mut held = create_test_request("held", bs * 3, 1);
+        held.prompt_block_hashes = vec![0x10, 0x11, 0x12];
+        s.add_request(held);
+        let d = s.schedule(1.0);
+        assert_eq!(
+            s.pending_transfers.len(),
+            1,
+            "3 free ≥ 3-block prompt: promote"
+        );
+        let ready = s.earliest_pending_ready(1.0).unwrap();
+        let mut t = 1.0;
+        let mut d = d;
+        while s.kv_cache_manager.num_free_blocks() > 0 {
+            apply(&mut s, &d, t);
+            t += 1e-3;
+            d = s.schedule(t);
+            assert!(t < ready, "run fills the free blocks before 0x10 lands");
+        }
+        apply(&mut s, &d, ready);
+        let d = s.schedule(ready + 1e-9);
+        assert_eq!(s.waiting().len(), 1);
+        assert_eq!(
+            s.waiting()[0].kv_blocks.len(),
+            1,
+            "held landed its first block, cannot run"
+        );
+        assert_eq!(s.kv_cache_manager.num_free_blocks(), 0);
+        // `old` returns to the head with no blocks and its prefix in the tier.
+        let mut old = create_test_request("old", bs * 4, 1);
+        old.prompt_block_hashes = vec![0xA, 0xB, 0xC, 0xD];
+        old.arrival_time = 0.0;
+        s.waiting.push_front(old);
+        // `run` finishes its output and frees its 3 blocks.
+        let mut t = ready + 1e-9;
+        let mut d = d;
+        while running_ids(&s) == vec!["run"] {
+            apply(&mut s, &d, t);
+            t += 1e-3;
+            d = s.schedule(t);
+            assert!(t < ready + 10.0, "run completes");
+        }
+        assert!(
+            s.pending_transfers.iter().any(|r| r.request_id == "old"),
+            "old took back held's landing block and promoted A (pending {:?}, running {:?})",
+            s.pending_transfers
+                .iter()
+                .map(|r| r.request_id.clone())
+                .collect::<Vec<_>>(),
+            running_ids(&s)
+        );
+        assert_eq!(s.num_preemptions(), 1, "held gave up its landing block");
+        // Both complete: A lands, old runs; held re-promotes or recomputes.
+        let mut done = Vec::new();
+        while done.len() < 2 {
+            let next = match s.earliest_pending_ready(t) {
+                Some(r) if r > t => r,
+                _ => t + 1e-3,
+            };
+            apply(&mut s, &d, next);
+            t = next;
+            d = s.schedule(t + 1e-9);
+            done.extend(d.completed.iter().map(|c| c.request_id.clone()));
+            assert!(t < ready + 60.0, "no stall: done {done:?}");
+        }
+        assert_eq!(done.len(), 2);
     }
 
     #[test]
