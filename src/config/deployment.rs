@@ -142,6 +142,9 @@ struct HardwareEntry {
     /// Routed-expert communication overlap policy.
     #[serde(default)]
     moe_overlap: Option<Value>,
+    /// Fill/drain + epilogue parameters when `moe_overlap = "megakernel"`.
+    #[serde(default)]
+    megakernel: Option<Value>,
     /// Override the named hardware preset's scale-out per-call latency, in
     /// seconds, without restating the whole hardware spec.
     #[serde(default)]
@@ -248,6 +251,9 @@ impl ModelConfig {
         if let Some(overlap) = &entry.moe_overlap {
             parallel.insert("moe_overlap".into(), overlap.clone());
         }
+        if let Some(megakernel) = &entry.megakernel {
+            parallel.insert("megakernel".into(), megakernel.clone());
+        }
         merged.insert("parallel".into(), Value::Table(parallel));
         merged.insert("model".into(), self.model.clone());
         let mut scheduler = self.scheduler.clone();
@@ -298,6 +304,10 @@ impl ModelConfig {
             })?;
             scale_out.latency = latency;
         }
+        deployment
+            .parallel
+            .validate()
+            .map_err(|e| DeploymentError(format!("[hardware.{name}]: {e}")))?;
         deployment
             .cluster()
             .validate()
@@ -496,5 +506,50 @@ memory_capacity = 80000000000
         let cfg = ModelConfig::from_toml(&src).unwrap();
         let e = cfg.deployment(Some("gh200")).unwrap_err().to_string();
         assert!(e.contains("bogus"), "{e}");
+    }
+
+    const MEGA_FILE: &str = r#"
+model = "glm-5.2-fp8"
+
+[scheduler]
+max_num_batched_tokens = 8192
+max_num_seqs = 256
+policy = "priority"
+enable_chunked_prefill = true
+block_size = 64
+
+[hardware.gh200]
+spec = "gh200"
+tp = 16
+ep = 16
+dp_attention = true
+moe_overlap = "megakernel"
+megakernel = { signal_latency = 1e-6, epilogue = 5e-6, comm_sm_fraction = 0.25 }
+"#;
+
+    #[test]
+    fn megakernel_entry_resolves_and_validates() {
+        let cfg = ModelConfig::from_toml(MEGA_FILE).unwrap();
+        let gh = cfg.deployment(Some("gh200")).unwrap();
+        assert_eq!(
+            gh.parallel.moe_overlap,
+            crate::config::MoeOverlap::Megakernel
+        );
+        let m = gh.parallel.megakernel.unwrap();
+        assert_eq!(m.signal_latency, 1e-6);
+        assert_eq!(m.epilogue, 5e-6);
+        assert_eq!(m.comm_sm_fraction, 0.25);
+    }
+
+    #[test]
+    fn megakernel_entry_without_params_is_rejected() {
+        let src = MEGA_FILE
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("megakernel ="))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let cfg = ModelConfig::from_toml(&src).unwrap();
+        let e = cfg.deployment(Some("gh200")).unwrap_err().to_string();
+        assert!(e.contains("megakernel"), "{e}");
     }
 }

@@ -324,8 +324,23 @@ impl ComputeEngine {
         let bw = self.aggregate_memory_bandwidth();
         let kv_bw = self.aggregate_kv_memory_bandwidth();
         let collectives = self.collective_cost(total_tokens);
-        let hide_moe =
-            self.parallel.moe_overlap == MoeOverlap::Hidden && collectives.moe_serial > 0.0;
+        // Both overlap modes hide the dispatch/combine wire behind the expert
+        // kernel; they differ only in the exposed per-layer floor added below.
+        let overlap_moe = matches!(
+            self.parallel.moe_overlap,
+            MoeOverlap::Hidden | MoeOverlap::Megakernel
+        ) && collectives.moe_serial > 0.0;
+        // A megakernel steals SMs from the expert GEMM (comm-CTA fraction) and
+        // replaces the collective call floor with a fill/drain + epilogue.
+        let mega = if self.parallel.moe_overlap == MoeOverlap::Megakernel {
+            Some(self.parallel.megakernel.expect(
+                "moe_overlap = megakernel requires megakernel params \
+                 (validated at config load)",
+            ))
+        } else {
+            None
+        };
+        let gemm_rate_scale = mega.map_or(1.0, |p| 1.0 - p.comm_sm_fraction);
 
         let mut cost = StepCost {
             time: 0.0,
@@ -353,12 +368,13 @@ impl ComputeEngine {
             } else {
                 acc.bytes / bw
             };
-            if hide_moe {
+            if overlap_moe {
                 let base_compute = (acc.flops - acc.routed_flops).max(0.0) / rate;
                 let base_memory =
                     (acc.hbm_bytes - acc.routed_hbm_bytes).max(0.0) / bw + acc.kv_bytes / kv_bw;
                 cost.time += base_compute.max(base_memory);
-                routed_kernel_time += (acc.routed_flops / rate).max(acc.routed_hbm_bytes / bw);
+                routed_kernel_time +=
+                    (acc.routed_flops / (rate * gemm_rate_scale)).max(acc.routed_hbm_bytes / bw);
             } else {
                 cost.time += compute_time.max(memory_time);
             }
@@ -368,14 +384,63 @@ impl ComputeEngine {
             cost.bytes += acc.bytes;
             cost.flops += acc.flops;
         }
-        if hide_moe {
-            cost.time += collectives.other
-                + routed_kernel_time.max(collectives.moe_wire)
-                + collectives.moe_latency;
+        if overlap_moe {
+            let moe_floor = match mega {
+                // Fill + drain (two signals) plus an epilogue per fused MoE
+                // layer, in place of the exposed collective call floors.
+                Some(p) => self.model.moe_layers() as f64 * (2.0 * p.signal_latency + p.epilogue),
+                None => collectives.moe_latency,
+            };
+            cost.time +=
+                collectives.other + routed_kernel_time.max(collectives.moe_wire) + moe_floor;
         } else {
             cost.time += collectives.serial_total;
         }
         cost
+    }
+
+    /// The routed-MoE dispatch/combine collective components for a step of
+    /// `total_tokens` tokens: `(serial_total, wire, exposed_call_latency)` in
+    /// seconds, summed over the routed layers. `serial_total` is the whole
+    /// dispatch+combine time on the critical path in `Serial`; `wire` is the
+    /// bandwidth part that hides behind the expert kernel in `Hidden` /
+    /// `Megakernel`; `exposed_call_latency` is the collective call floor that
+    /// stays exposed in `Hidden`. All zero without a routed stream and fabric.
+    /// Exposed so lane-scale analyses can price a fused layer per MoE layer.
+    pub fn moe_collective_seconds(&self, total_tokens: u32) -> (f64, f64, f64) {
+        let c = self.collective_cost(total_tokens);
+        (c.moe_serial, c.moe_wire, c.moe_latency)
+    }
+
+    /// Routed-expert kernel time for the batch: `max(expert GEMM FLOPs /
+    /// (rate·(1−comm_sm_fraction)), expert weight-read bytes / bandwidth)`
+    /// summed over precision streams — the term dispatch/combine overlaps in
+    /// `Hidden` / `Megakernel`. At the decode knee this is the weight read
+    /// (batch-independent, the megakernel's floor). `comm_sm_fraction` (in
+    /// `[0, 1)`) models the GEMM SMs a comm-CTA partition removes; pass 0 for
+    /// the un-partitioned rate. Zero without a routed stream.
+    pub fn routed_kernel_seconds(
+        &self,
+        batch_requests: &[&Request],
+        tokens_per_request: &[u32],
+        comm_sm_fraction: f64,
+    ) -> f64 {
+        assert!(
+            (0.0..1.0).contains(&comm_sm_fraction),
+            "comm_sm_fraction must be in [0, 1)"
+        );
+        let bw = self.aggregate_memory_bandwidth();
+        let scale = 1.0 - comm_sm_fraction;
+        let streams = self.assemble_streams(batch_requests, tokens_per_request);
+        streams
+            .iter()
+            .enumerate()
+            .filter(|(_, acc)| acc.routed_flops != 0.0 || acc.routed_hbm_bytes != 0.0)
+            .map(|(i, acc)| {
+                let rate = self.aggregate_flop_rate(Precision::ALL[i]).unwrap();
+                (acc.routed_flops / (rate * scale)).max(acc.routed_hbm_bytes / bw)
+            })
+            .sum()
     }
 
     /// Roofline time of the batch's attention alone (score/AV FLOPs, KV and
@@ -638,6 +703,7 @@ mod tests {
             ep: 8,
             dp_attention: true,
             moe_overlap: MoeOverlap::Serial,
+            megakernel: None,
         };
         let request = Request::new("r".into(), 0, 0.0, 8, 1);
         let serial = ComputeEngine::new(hardware.clone(), parallel.clone(), model.clone())
@@ -655,6 +721,201 @@ mod tests {
         assert!((serial.time - serial_expected).abs() < 1e-12);
         assert!((hidden.time - hidden_expected).abs() < 1e-12);
         assert!(hidden.time < serial.time);
+    }
+
+    /// The megakernel mode hides the wire like `Hidden` but replaces the
+    /// exposed collective call floor with a per-MoE-layer fill/drain + epilogue
+    /// (`moe_layers × (2·signal + epilogue)`). With `signal = scale_out.latency`
+    /// and `epilogue = 0` it collapses onto `Hidden` (one MoE layer, two calls
+    /// per layer); a smaller signal is strictly faster.
+    #[test]
+    fn megakernel_replaces_call_floor_with_fill_drain() {
+        use crate::config::{
+            FabricConfig, FabricLink, LayerClass, MegakernelParams, Routing, WeightStream,
+        };
+
+        let hardware = HardwareConfig {
+            name: "test".into(),
+            flops_fp4: None,
+            flops_fp8: Some(1e30),
+            flops_bf16: Some(1e30),
+            flops_fp16: None,
+            memory_bandwidth: 1e9,
+            memory_capacity: 1_000_000,
+            memory: None,
+            fabric: Some(FabricConfig {
+                gpus_per_node: 4,
+                scale_up: FabricLink {
+                    bandwidth: 1e12,
+                    latency: 5e-6,
+                    in_network_reduction: false,
+                },
+                scale_out: Some(FabricLink {
+                    bandwidth: 1e5,
+                    latency: 50e-6,
+                    in_network_reduction: false,
+                }),
+            }),
+        };
+        let model = ModelSpec {
+            name: "moe".into(),
+            hidden_dim: 16,
+            max_seq_len: 1024,
+            attention_precision: Precision::Bf16,
+            activation_bytes: 2,
+            weights: vec![WeightStream {
+                precision: Precision::Fp8,
+                active_params: 1_000,
+                resident_params: 8_000,
+                routing: Some(Routing {
+                    routed_experts: 8,
+                    experts_per_tok: 1,
+                    moe_layers: 1,
+                }),
+            }],
+            layers: vec![LayerClass::Linear {
+                count: 1,
+                state_bytes: 0,
+            }],
+        };
+        let base = ParallelConfig {
+            tp: 8,
+            ep: 8,
+            dp_attention: true,
+            moe_overlap: MoeOverlap::Hidden,
+            megakernel: None,
+        };
+        let request = Request::new("r".into(), 0, 0.0, 8, 1);
+        let hidden = ComputeEngine::new(hardware.clone(), base.clone(), model.clone())
+            .step_cost(&[&request], &[8]);
+
+        // signal = call floor, no epilogue → exactly Hidden.
+        let matched = ParallelConfig {
+            moe_overlap: MoeOverlap::Megakernel,
+            megakernel: Some(MegakernelParams {
+                signal_latency: 50e-6,
+                epilogue: 0.0,
+                comm_sm_fraction: 0.0,
+            }),
+            ..base.clone()
+        };
+        let mega_matched = ComputeEngine::new(hardware.clone(), matched, model.clone())
+            .step_cost(&[&request], &[8]);
+        assert!(
+            (mega_matched.time - hidden.time).abs() < 1e-15,
+            "{mega_matched:?} {hidden:?}"
+        );
+
+        // Smaller signal + small epilogue → cheaper than Hidden by the floor
+        // delta: hidden floor 2×50µs=100µs vs mega 1×(2×1µs+2µs)=4µs.
+        let fast = ParallelConfig {
+            moe_overlap: MoeOverlap::Megakernel,
+            megakernel: Some(MegakernelParams {
+                signal_latency: 1e-6,
+                epilogue: 2e-6,
+                comm_sm_fraction: 0.0,
+            }),
+            ..base.clone()
+        };
+        let mega_fast = ComputeEngine::new(hardware, fast, model).step_cost(&[&request], &[8]);
+        assert!((hidden.time - mega_fast.time - (100e-6 - 4e-6)).abs() < 1e-15);
+        assert!(mega_fast.time < hidden.time);
+    }
+
+    /// The public MoE accessors reconstruct the closed form, and
+    /// `comm_sm_fraction` reduces the routed kernel time only when the expert
+    /// GEMM is compute-bound (weight-read-bound decode is unchanged).
+    #[test]
+    fn moe_accessors_and_comm_sm_fraction() {
+        use crate::config::{FabricConfig, FabricLink, LayerClass, Routing, WeightStream};
+
+        let fabric = FabricConfig {
+            gpus_per_node: 4,
+            scale_up: FabricLink {
+                bandwidth: 1e12,
+                latency: 5e-6,
+                in_network_reduction: false,
+            },
+            scale_out: Some(FabricLink {
+                bandwidth: 1e5,
+                latency: 50e-6,
+                in_network_reduction: false,
+            }),
+        };
+        // Weight-read-bound routed stream (huge FLOP rate, small bandwidth).
+        let mem_bound_hw = HardwareConfig {
+            name: "mem".into(),
+            flops_fp4: None,
+            flops_fp8: Some(1e30),
+            flops_bf16: Some(1e30),
+            flops_fp16: None,
+            memory_bandwidth: 1e9,
+            memory_capacity: 1_000_000,
+            memory: None,
+            fabric: Some(fabric),
+        };
+        let model = ModelSpec {
+            name: "moe".into(),
+            hidden_dim: 16,
+            max_seq_len: 1024,
+            attention_precision: Precision::Bf16,
+            activation_bytes: 2,
+            weights: vec![WeightStream {
+                precision: Precision::Fp8,
+                active_params: 1_000,
+                resident_params: 8_000,
+                routing: Some(Routing {
+                    routed_experts: 8,
+                    experts_per_tok: 1,
+                    moe_layers: 1,
+                }),
+            }],
+            layers: vec![LayerClass::Linear {
+                count: 1,
+                state_bytes: 0,
+            }],
+        };
+        let parallel = ParallelConfig {
+            tp: 8,
+            ep: 8,
+            dp_attention: true,
+            moe_overlap: MoeOverlap::Hidden,
+            megakernel: None,
+        };
+        let req = Request::new("r".into(), 0, 0.0, 8, 1);
+        let eng = ComputeEngine::new(mem_bound_hw, parallel.clone(), model.clone());
+
+        // moe_collective_seconds: serial = wire + latency of two calls.
+        let (serial, wire, latency) = eng.moe_collective_seconds(8);
+        let per_rank_bytes = 8.0 / 8.0 * 16.0 * 2.0;
+        let wire_per_call = (8.0 - 4.0) / 8.0 * per_rank_bytes / 1e5;
+        assert!((wire - 2.0 * wire_per_call).abs() < 1e-15);
+        assert!((latency - 2.0 * 50e-6).abs() < 1e-15);
+        assert!((serial - (wire + latency)).abs() < 1e-15);
+
+        // routed_kernel_seconds: weight read, unaffected by comm_sm_fraction.
+        let wr = model.weight_bytes_per_step_by_prec(8)[0].1 as f64 / (8.0 * 1e9);
+        assert!((eng.routed_kernel_seconds(&[&req], &[8], 0.0) - wr).abs() < 1e-18);
+        assert!((eng.routed_kernel_seconds(&[&req], &[8], 0.5) - wr).abs() < 1e-18);
+
+        // Compute-bound routed stream (tiny FLOP rate): halving the GEMM rate
+        // via comm_sm_fraction doubles the routed kernel time.
+        let compute_bound_hw = HardwareConfig {
+            name: "cmp".into(),
+            flops_fp4: None,
+            flops_fp8: Some(1e3),
+            flops_bf16: Some(1e3),
+            flops_fp16: None,
+            memory_bandwidth: 1e30,
+            memory_capacity: 1_000_000,
+            memory: None,
+            fabric: Some(fabric),
+        };
+        let eng2 = ComputeEngine::new(compute_bound_hw, parallel, model);
+        let full = eng2.routed_kernel_seconds(&[&req], &[8], 0.0);
+        let half = eng2.routed_kernel_seconds(&[&req], &[8], 0.5);
+        assert!(full > 0.0);
+        assert!((half - 2.0 * full).abs() < 1e-18, "{half} {full}");
     }
 
     #[test]
