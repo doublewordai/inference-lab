@@ -623,7 +623,11 @@ impl Scheduler {
                     let need = self.kv_cache_manager.blocks_for_context(
                         self.waiting[self.select_next_waiting_request()].num_prompt_tokens,
                     );
-                    if committed + need > (bs.high * cap) as usize {
+                    // Always keep one request making progress: a working set
+                    // larger than the watermark (or the whole cache) must
+                    // still run alone, or it starves forever. The gate only
+                    // holds a request when something is already resident.
+                    if committed > 0 && committed + need > (bs.high * cap) as usize {
                         self.gated = true;
                         break;
                     }
@@ -2332,6 +2336,30 @@ mod tests {
             0,
             "the gate holds, it does not evict"
         );
+    }
+
+    #[test]
+    fn balance_set_still_runs_a_request_larger_than_the_watermark() {
+        // A request whose prompt alone exceeds high*C must still run (alone),
+        // not starve: the gate keeps one request making progress.
+        let mut config = Config::test_default();
+        config.scheduler.kv_cache_capacity = 100_000_000;
+        config.scheduler.balance_set = Some(crate::config::BalanceSet {
+            high: 0.5,
+            low: 0.4,
+        });
+        let kv = kv_manager(&config, config.scheduler.kv_cache_capacity, false);
+        let mut scheduler = scheduler_from(config, kv);
+        let total = scheduler.kv_cache_manager().total_blocks();
+        let toks = ((total * 80) / 100 * 16) as u32; // 80% > 50% watermark
+        scheduler.add_request(create_test_request("big", toks, 4));
+        let d = scheduler.schedule(0.0);
+        assert_eq!(
+            d.batch.len(),
+            1,
+            "an over-watermark request runs alone, not starves"
+        );
+        assert_eq!(scheduler.num_running(), 1);
     }
 
     #[test]
