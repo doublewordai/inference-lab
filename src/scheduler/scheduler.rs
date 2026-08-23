@@ -77,6 +77,11 @@ pub struct Scheduler {
     /// Requests refused at submission, handed back as completed on the
     /// next pass.
     rejected: Vec<Request>,
+
+    /// Balance-set admission control state: `true` while admission is held
+    /// because the running working set is above the high watermark, until it
+    /// falls back below the low watermark (hysteresis).
+    gated: bool,
 }
 
 /// `(request, from, tokens) -> seconds`.
@@ -104,6 +109,7 @@ impl Scheduler {
             pending_prefetch_storage: Vec::new(),
             next_prefetch_seq: 0,
             rejected: Vec::new(),
+            gated: false,
         }
     }
 
@@ -581,6 +587,19 @@ impl Scheduler {
             self.waiting.push_front(request);
         }
 
+        // Balance-set hysteresis: cross into the held state at the high
+        // watermark, leave it only once the running working set drains below
+        // the low watermark. Evaluated once per pass, before admission.
+        if let Some(bs) = self.config.balance_set {
+            let cap = self.kv_cache_manager.total_blocks() as f64;
+            let committed = self.committed_working_set_blocks() as f64;
+            if self.gated && committed < bs.low_or_high() * cap {
+                self.gated = false;
+            } else if !self.gated && committed >= bs.high * cap {
+                self.gated = true;
+            }
+        }
+
         // Phase 2: admit WAITING requests (only if nothing was preempted:
         // preemption means KV is full, so admitting would just be preempted
         // again).
@@ -588,6 +607,26 @@ impl Scheduler {
             while !self.waiting.is_empty() && token_budget > 0 {
                 if self.running.len() >= self.config.max_num_seqs as usize {
                     break;
+                }
+
+                // Balance set: hold the queue while gated, and never let an
+                // admission push the running working set past the high
+                // watermark. The held request keeps its arrival time, so its
+                // wait is charged to its latency — the cost of not
+                // overcommitting.
+                if let Some(bs) = self.config.balance_set {
+                    if self.gated {
+                        break;
+                    }
+                    let cap = self.kv_cache_manager.total_blocks() as f64;
+                    let committed = self.committed_working_set_blocks();
+                    let need = self.kv_cache_manager.blocks_for_context(
+                        self.waiting[self.select_next_waiting_request()].num_prompt_tokens,
+                    );
+                    if committed + need > (bs.high * cap) as usize {
+                        self.gated = true;
+                        break;
+                    }
                 }
 
                 let selected_idx = self.select_next_waiting_request();
@@ -864,6 +903,21 @@ impl Scheduler {
             .kv_cache_manager
             .blocks_for_context(request.total_tokens());
         running_peak + new_peak <= self.kv_cache_manager.total_blocks()
+    }
+
+    /// Blocks pinned by the resident working set of running requests — their
+    /// current context (computed positions, at least the prompt). The
+    /// balance set caps this so the recyclable remainder stays populated
+    /// with recently-idle sessions' cached prefixes instead of being
+    /// thrashed.
+    fn committed_working_set_blocks(&self) -> usize {
+        self.running
+            .iter()
+            .map(|r| {
+                self.kv_cache_manager
+                    .blocks_for_context(r.num_computed_tokens.max(r.num_prompt_tokens))
+            })
+            .sum()
     }
 
     /// Index into `waiting` of the request the policy admits next.
@@ -2241,6 +2295,83 @@ mod tests {
         );
         assert_eq!(scheduler.num_running(), 1);
         assert_eq!(scheduler.num_waiting(), 1);
+    }
+
+    #[test]
+    fn balance_set_caps_running_working_set_and_holds_the_rest() {
+        // Three 60%-of-cache requests. Under a balance set with high=0.6 the
+        // running working set may not exceed 60%, so exactly one runs and the
+        // rest are held in the queue (not admitted-and-preempted).
+        let mut config = Config::test_default();
+        config.scheduler.kv_cache_capacity = 100_000_000;
+        config.scheduler.balance_set = Some(crate::config::BalanceSet {
+            high: 0.6,
+            low: 0.5,
+        });
+        let kv = kv_manager(&config, config.scheduler.kv_cache_capacity, false);
+        let mut scheduler = scheduler_from(config, kv);
+        let total = scheduler.kv_cache_manager().total_blocks();
+        let toks = ((total * 60) / 100 * 16) as u32; // ~60% of cache as prompt
+        for i in 0..3 {
+            scheduler.add_request(create_test_request(&format!("r{i}"), toks, 4));
+        }
+        let d = scheduler.schedule(0.0);
+        assert_eq!(
+            d.batch.len(),
+            1,
+            "only one 60% request fits under the 60% cap"
+        );
+        assert_eq!(scheduler.num_running(), 1);
+        assert_eq!(
+            scheduler.num_waiting(),
+            2,
+            "the rest are held, not preempted"
+        );
+        assert_eq!(
+            scheduler.num_preemptions(),
+            0,
+            "the gate holds, it does not evict"
+        );
+    }
+
+    #[test]
+    fn balance_set_admits_when_uncapped_would_overcommit() {
+        // Without the gate the same three requests admit and preempt; with a
+        // generous high=0.95 gate they still admit (the gate only bites when
+        // the working set is near capacity).
+        let build = |bs: Option<crate::config::BalanceSet>| {
+            let mut config = Config::test_default();
+            config.scheduler.kv_cache_capacity = 100_000_000;
+            config.scheduler.balance_set = bs;
+            let kv = kv_manager(&config, config.scheduler.kv_cache_capacity, false);
+            scheduler_from(config, kv)
+        };
+        let mut s = build(None);
+        let total = s.kv_cache_manager().total_blocks();
+        let toks = ((total * 20) / 100 * 16) as u32; // ~20% each: three fit
+        for i in 0..3 {
+            s.add_request(create_test_request(&format!("r{i}"), toks, 4));
+        }
+        let d = s.schedule(0.0);
+        assert_eq!(
+            d.batch.len(),
+            3,
+            "overcommit admits all three small requests"
+        );
+
+        let mut s = build(Some(crate::config::BalanceSet {
+            high: 0.95,
+            low: 0.9,
+        }));
+        for i in 0..3 {
+            s.add_request(create_test_request(&format!("r{i}"), toks, 4));
+        }
+        let d = s.schedule(0.0);
+        assert_eq!(
+            d.batch.len(),
+            3,
+            "a generous gate still admits all three (60% < 95%)"
+        );
     }
 
     #[test]

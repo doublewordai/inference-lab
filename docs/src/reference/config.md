@@ -234,6 +234,7 @@ each with the derivation of its numbers from the HF config in its header.
 | `kv_cache_capacity` | U64 | 0 | Explicit KV cache bytes across the TP group; 0 derives it from `gpu_memory_utilization` |
 | `max_model_len` | U32 | model's `max_seq_len` | Serving-time context limit (only the chunked-prefill threshold default depends on it) |
 | `enable_preemption_free` | Bool | false | Admit only what can grow to `prompt + max_output` without preemption |
+| `balance_set` | Table | unset | Balance-set admission control (Denning's medium-term scheduler): `{ high, low }` as fractions of KV capacity. Admission stops when the running working set (resident context of running requests) reaches `high` and resumes only once it falls below `low` (hysteresis; `low` defaults to `high`). Holds the overflow in the queue instead of admitting-and-evicting, so recently-idle sessions' cached prefixes survive in the reserved `1 − high` headroom. Absent = overcommit (today's behaviour) |
 | `enable_cascade_attention` | Bool | false | Load a batch's shared prompt prefix once per iteration |
 
 ---

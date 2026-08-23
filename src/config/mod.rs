@@ -21,7 +21,7 @@ pub use model::{
 };
 pub use parallel::ParallelConfig;
 pub use router::RouterConfig;
-pub use scheduler::SchedulerConfig;
+pub use scheduler::{BalanceSet, SchedulerConfig};
 pub use speculative::{
     AcceptanceModel, DrafterCost, GammaPolicy, MeasuredCostConfig, SpeculativeConfig,
     SwitchConstraints, TraceBank, TraceRound,
@@ -248,6 +248,7 @@ impl Config {
             max_model_len: None,
             enable_preemption_free: false,
             enable_cascade_attention: false,
+            balance_set: None,
         };
         scheduler.set_default_prefill_threshold(model.max_seq_len);
 

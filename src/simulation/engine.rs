@@ -107,6 +107,9 @@ impl Worker {
         // that grows for life: full-context layers, compressed history);
         // sliding windows and per-sequence state ride in auxiliary blocks.
         let policies = cluster.memory.policies();
+        if let Some(bs) = scheduler_config.balance_set {
+            bs.validate()?;
+        }
         let mut kv_cache_manager =
             KVCacheManager::for_model(kv_capacity, scheduler_config.block_size, &model, true)
                 .with_hbm_eviction(policies.hbm_eviction);

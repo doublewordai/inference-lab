@@ -215,6 +215,7 @@ mod tests {
             policy: SchedulingPolicy::FCFS,
             enable_preemption_free: false,
             enable_cascade_attention: false,
+            balance_set: None,
         };
         let cluster = ClusterSpec {
             hardware,
