@@ -256,6 +256,11 @@ struct StoreMeta {
     /// store range is skipped wholesale by eviction; this can temporarily
     /// leave the store over capacity until the reader drains.
     pins: BTreeMap<(NodeId, u32, u32), u32>,
+    /// Total blocks protected by `pins`. Tracked alongside the pin map so
+    /// stage admission can ask how much room a store has left without
+    /// touching the LRU. A conservative sum of protected spans (overlapping
+    /// pins double-count, which only nudges the gate slightly conservative).
+    pinned_blocks: u32,
     /// Changes whenever held content is removed or evicted.
     source_version: u64,
 }
@@ -537,6 +542,7 @@ impl Radix {
             seq: 0,
             eviction,
             pins: BTreeMap::new(),
+            pinned_blocks: 0,
             source_version: 0,
         });
         self.stores.len() - 1
@@ -552,6 +558,19 @@ impl Radix {
 
     pub fn store_capacity_blocks(&self, s: StoreId) -> u32 {
         self.stores[s].capacity
+    }
+
+    /// Blocks protected in `s` (in-flight or retained stage copies and
+    /// in-flight source pins): eviction and stage admission skip them.
+    pub fn store_pinned_blocks(&self, s: StoreId) -> u32 {
+        self.stores[s].pinned_blocks
+    }
+
+    /// Room store `s` has left for a new stage after guarding everything
+    /// currently pinned: new stage blocks may only displace unpinned
+    /// resident blocks, so at most `capacity - pinned_blocks` fit.
+    pub fn store_available_for_stage(&self, s: StoreId) -> u64 {
+        (self.stores[s].capacity).saturating_sub(self.stores[s].pinned_blocks) as u64
     }
 
     fn w(&self, w: WorkerId) -> &WorkerMeta {
@@ -1724,6 +1743,7 @@ impl Radix {
                     .pins
                     .entry((span.node, span.start, span.end))
                     .or_insert(0) += 1;
+                self.stores[s].pinned_blocks += span.len();
             }
         }
     }
@@ -1749,6 +1769,8 @@ impl Radix {
                     if *n == 0 {
                         self.stores[s].pins.remove(&key);
                     }
+                    self.stores[s].pinned_blocks =
+                        self.stores[s].pinned_blocks.saturating_sub(span.len());
                 }
                 Vec::new()
             }

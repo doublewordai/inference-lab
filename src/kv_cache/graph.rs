@@ -30,7 +30,7 @@
 //! The graph is shared by the topology's workers behind a mutex; the
 //! engine is single-threaded, so the lock only serialises.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use super::flows::{EdgeId, Flows, Owner};
@@ -1104,6 +1104,26 @@ impl MemoryGraph {
         }
     }
 
+    /// Release the destination-store pins a stage holds on `entries`
+    /// (landed stage fills). This returns the copies to ordinary LRU
+    /// eviction and lets a store finish any capacity trim the released
+    /// pins unblocked.
+    fn release_stage_pins(&mut self, entries: &[LandedStageFill]) {
+        let mut by_store: BTreeMap<StoreId, Vec<Span>> = BTreeMap::new();
+        for entry in entries {
+            by_store.entry(entry.store).or_default().push(entry.span);
+        }
+        for (store, spans) in by_store {
+            {
+                let mut radix = self.radix.lock().unwrap();
+                for &span in &spans {
+                    radix.unpin_source(TierSource::Store(store), span);
+                }
+            }
+            self.radix.lock().unwrap().trim_store_after_unpin(store);
+        }
+    }
+
     /// The scheduler observed the latest stage leg before its deadline.
     pub fn accept_staged_batch(&mut self, request: &str) {
         if let Some(entries) = self.landed_stage_fills.get_mut(request) {
@@ -1117,23 +1137,27 @@ impl MemoryGraph {
     /// through mode retains earlier accepted legs but drops a late leg that
     /// landed before another worker advanced this shared graph.
     pub fn cancel_staged_batch(&mut self, request: &str) {
-        let entries = self
-            .landed_stage_fills
-            .remove(request)
-            .unwrap_or_default()
+        let entries = self.landed_stage_fills.remove(request).unwrap_or_default();
+        // Every tracked leg is untracked here: release its destination pin
+        // (through retains the copy as ordinary LRU; buffer drops it).
+        self.release_stage_pins(&entries);
+        let dropped: Vec<_> = entries
             .into_iter()
             .filter(|entry| self.promote_fill == PromoteFill::Buffer || !entry.accepted)
             .map(|entry| (entry.store, entry.span))
             .collect();
-        self.cleanup_stage_entries(entries);
+        self.cleanup_stage_entries(dropped);
     }
 
     /// A request's final HBM load landed. Store-source reads were accounted
-    /// when their flows drained; this only releases transient intermediate
-    /// copies used by `promote_fill = "buffer"` and ends stage tracking for
-    /// retained through copies.
+    /// when their flows drained; this releases the landed stage copies' pins
+    /// (through mode keeps the intermediate copy, now plain LRU; buffer mode
+    /// drops it) and ends stage tracking for the retained through copies.
     pub fn promoted_batch(&mut self, _worker: WorkerId, request: &str, _spans: &[Span]) {
         let entries = self.landed_stage_fills.remove(request).unwrap_or_default();
+        // Consumed by the final HBM load: release the pins now so the copies
+        // return to normal LRU eviction.
+        self.release_stage_pins(&entries);
         let cleanup = if self.promote_fill == PromoteFill::Buffer {
             entries
                 .into_iter()
@@ -1362,15 +1386,34 @@ impl MemoryGraph {
         let mut evicted = Vec::new();
         {
             let mut radix = self.radix.lock().unwrap();
+            // Collect destination blocks this stage will insert.
+            let mut missing_blocks = Vec::new();
+            let mut need = 0u32;
             for &span in spans {
                 for missing in radix.store_missing(destination, span) {
                     if missing.is_empty() {
                         continue;
                     }
-                    total = total.saturating_add(radix.span_bytes(missing));
-                    entries.push(missing);
-                    evicted.extend(radix.store_insert(destination, missing, Some(id.clone()), now));
+                    need += missing.len();
+                    missing_blocks.push(missing);
                 }
+            }
+            // Capacity gate: a stage may only displace unpinned resident
+            // blocks, never another stage's in-flight or landed (pinned)
+            // blocks, nor an in-flight reader's source pin. So the store
+            // can absorb at most `capacity - pinned` new blocks.
+            if need as u64 > radix.store_available_for_stage(destination) {
+                return None;
+            }
+            for missing in missing_blocks {
+                total = total.saturating_add(radix.span_bytes(missing));
+                entries.push(missing);
+                evicted.extend(radix.store_insert(destination, missing, Some(id.clone()), now));
+                // Pin the destination copy for the stage's whole lifetime
+                // (in flight and after landing) so a competing stage or an
+                // in-flight write cannot evict it before the request's
+                // final load consumes it.
+                radix.pin_source(TierSource::Store(destination), missing);
             }
         }
         if entries.is_empty() {
@@ -1441,11 +1484,17 @@ impl MemoryGraph {
         self.flows.cancel(id);
         self.pending_reads.remove(id);
         if let Some(fill) = self.pending_stage_fills.remove(id) {
-            let mut radix = self.radix.lock().unwrap();
-            for span in fill.entries {
-                radix.store_remove(fill.destination, span);
-                radix.prune_if_empty(span.node);
+            {
+                let mut radix = self.radix.lock().unwrap();
+                for span in &fill.entries {
+                    radix.unpin_source(TierSource::Store(fill.destination), *span);
+                }
+                for span in &fill.entries {
+                    radix.store_remove(fill.destination, *span);
+                    radix.prune_if_empty(span.node);
+                }
             }
+            self.radix.lock().unwrap().trim_store_after_unpin(fill.destination);
         }
         self.release_pending_pin(id);
     }
@@ -2661,7 +2710,7 @@ bandwidth = 900
     }
 
     #[test]
-    fn an_evicted_stage_destination_still_completes_and_wakes_its_request() {
+    fn a_landed_stage_copy_survives_a_competing_write_until_it_is_consumed() {
         let mut g = MemoryGraph::private_with(
             1,
             &[("t0", 1, 10.0), ("t1", 4, 5.0)],
@@ -2674,13 +2723,16 @@ bandwidth = 900
         let id = g
             .submit_stage_promotion(0, 1, "request", source, &[staged], 0.0)
             .unwrap();
-        g.plant(0, 0, replacement);
-        assert!(!store_contains(&g, 0, 7));
-
         let done = g.advance(20.0);
         assert!(done.iter().any(|(_, completed)| completed == &id));
+        assert!(store_contains(&g, 0, 7), "stage landed in the closer store");
         assert_eq!(g.stores()[1].bytes_read, 100);
         assert!(store_contains(&g, 1, 7));
+
+        // A competing write into the same (full) store must not evict the
+        // landed stage copy: it is pinned until the request consumes it.
+        g.plant(0, 0, replacement);
+        assert!(store_contains(&g, 0, 7), "landed stage copy survives");
     }
 
     #[test]
