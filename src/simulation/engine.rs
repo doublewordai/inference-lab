@@ -742,13 +742,21 @@ impl Engine {
                     )
                 });
                 let first_waiting = s.waiting().front().map(|r| {
+                    let l = mgr.peek_prefix_cache(r);
                     format!(
-                        "{}(prompt {}, computed {}, blocks {}, needs {} blocks)",
+                        "{}(prompt {}, computed {}, blocks {}, needs {} blocks; lookup: cached {}, hbm {}, in_flight {}, promote {:?}, needs_staging {}, abandoned {}, ready_at {:?})",
                         r.request_id,
                         r.num_prompt_tokens,
                         r.num_computed_tokens,
                         r.kv_blocks.len(),
-                        mgr.blocks_for_context(r.planned_positions())
+                        mgr.blocks_for_context(r.planned_positions()),
+                        l.total_cached_tokens,
+                        l.hbm_tokens,
+                        l.in_flight_tokens,
+                        l.promote_tokens_per_tier,
+                        mgr.needs_staging(&l),
+                        r.storage_prefetch_abandoned,
+                        r.ready_at,
                     )
                 });
                 let staging = s.pending_storage();
@@ -1687,6 +1695,11 @@ impl Engine {
             self.topology.pools[sp].workers[si]
                 .scheduler
                 .release_handed_off(&mut req);
+            // Those blocks may be what its queue was waiting for; nothing
+            // else wakes it (the next arrival would, some time later).
+            if self.topology.pools[sp].workers[si].scheduler.num_waiting() > 0 {
+                self.maybe_wake_worker(sp, si, now);
+            }
             req.handoff_done_time = Some(now);
             // The first token travels with the KV: the decode side emits it
             // on receipt (Dynamo / sglang PD), so that is when the client
