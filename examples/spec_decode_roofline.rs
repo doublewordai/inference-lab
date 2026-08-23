@@ -61,6 +61,7 @@ fn topology() -> Topology {
         policy: SchedulingPolicy::FCFS,
         enable_preemption_free: false,
         enable_cascade_attention: false,
+        balance_set: None,
     };
     Topology::aggregated(cluster, common::deepseek_v4_flash(), sched).expect("topo")
 }

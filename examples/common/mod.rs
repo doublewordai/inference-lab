@@ -57,11 +57,13 @@ pub fn closed_loop_config(
             policy: SchedulingPolicy::FCFS,
             enable_preemption_free: true,
             enable_cascade_attention: false,
+            balance_set: None,
         },
         replicas: 1,
         router: Default::default(),
         decode_router: None,
         memory: Default::default(),
+        prefill: None,
         time_correction: None,
         workload: WorkloadConfig {
             dataset_path: None,

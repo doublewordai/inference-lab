@@ -30,6 +30,7 @@ fn run_for_batch(num_concurrent: usize, share_prefix: bool) -> Vec<f64> {
         max_model_len: None,
         enable_preemption_free: false,
         enable_cascade_attention: false,
+        balance_set: None,
     };
     let config_model = model.clone();
     let config_scheduler = scheduler_cfg.clone();
