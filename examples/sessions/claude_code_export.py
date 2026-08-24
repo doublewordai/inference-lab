@@ -264,20 +264,39 @@ def main():
         gaps, ctx, news, outs, steps_per = [], [], [], [], []
         by_kind_new = defaultdict(list)
         by_kind_gap = defaultdict(list)
+        # Observed-serving anchor (a property of the *recorded* serving):
+        # request wall time W = trigger entry -> last stream write. W = fixed
+        # overhead (TTFT-equivalent: queue + prefill + network) + output *
+        # TPOT, so the small-output median gives the overhead and the
+        # overhead-corrected slope over long outputs gives TPOT.
+        walls, wall_out, compact_post = [], [], []
         for _, _, rs in kept:
             steps_per.append(len(rs))
-            prev_end = None
+            prev_end = prev_input = None
             for r in rs:
                 kind = r["kind"] or "unknown"
                 if prev_end is not None:
                     g = max(r["trigger_ts"] - prev_end, 0.0)
                     gaps.append(g)
                     by_kind_gap[kind].append(g)
+                w = r["t_end"] - r["trigger_ts"]
+                if 0 < w < 3600 and r["output"] > 0:
+                    walls.append(w)
+                    wall_out.append(r["output"])
+                if prev_input is not None and r["input"] < prev_input - 50_000:
+                    compact_post.append(r["input"])
                 prev_end = r["t_end"]
+                prev_input = r["input"]
                 ctx.append(r["input"])
                 news.append(r["new"])
                 outs.append(r["output"])
                 by_kind_new[kind].append(r["new"])
+        small_wall = [w for w, o in zip(walls, wall_out) if o <= 50]
+        ttft0 = percentiles(small_wall)["p50"] if small_wall else None
+        tpot = None
+        if ttft0 is not None:
+            slopes = [(w - ttft0) / o for w, o in zip(walls, wall_out) if o >= 1000]
+            tpot = percentiles(slopes) if slopes else None
         with open(args.characterize, "w") as f:
             json.dump({
                 "source": args.root,
@@ -300,6 +319,15 @@ def main():
                 },
                 "per_session": {
                     "requests_per_session": percentiles(steps_per),
+                },
+                "observed_serving": {
+                    "request_wall_s": percentiles(walls),
+                    "fixed_overhead_s_small_output": percentiles(small_wall),
+                    "tpot_s_overhead_corrected_out_ge_1000": tpot,
+                },
+                "compactions": {
+                    "events_ctx_drop_gt_50k": len(compact_post),
+                    "post_drop_context_tokens": percentiles(compact_post),
                 },
             }, f, indent=1)
     return 0
