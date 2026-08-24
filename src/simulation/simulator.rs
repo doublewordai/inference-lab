@@ -92,14 +92,18 @@ impl Simulator {
     /// `num_requests`, the dataset is counted and the config's `num_requests`
     /// filled in (see [`Simulator::config`]).
     pub fn new(mut config: Config, tokenizer: Option<BatchTokenizerFn>) -> Result<Self, String> {
-        // The single-cluster `Config` describes one pool of workers. For
-        // disagg topologies, callers build a [`Topology`] directly via
-        // `Topology::from_disagg` and drive an `Engine` themselves.
-        let topology = Topology::aggregated(
-            config.cluster(),
-            config.model.clone(),
-            config.scheduler.clone(),
-        )?
+        // One pool of workers, or — with a `[prefill]` block — a prefill
+        // pool in front of the config's own pool, which then decodes.
+        let topology = match config.disagg() {
+            Some(disagg) => {
+                Topology::from_disagg(&disagg, config.model.clone(), config.scheduler.clone())?
+            }
+            None => Topology::aggregated(
+                config.cluster(),
+                config.model.clone(),
+                config.scheduler.clone(),
+            )?,
+        }
         .with_routers(&config.router, config.decode_router());
 
         if config.workload.dataset_path.is_some() && config.workload.sessions_path.is_some() {
@@ -240,6 +244,25 @@ impl Simulator {
                 ));
             }
 
+            if let Some(at) = std::env::var("INFERENCE_LAB_DUMP_AT")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+            {
+                if self.engine.current_time() >= at {
+                    eprintln!(
+                        "dump at t={:.3}: {} running, {} waiting, next event {:?}{}",
+                        self.engine.current_time(),
+                        self.engine.aggregate_running(),
+                        self.engine.aggregate_waiting(),
+                        self.engine.next_event_time(),
+                        self.engine.describe_stuck_workers()
+                    );
+                    if let Some(m) = self.engine.memory_metrics() {
+                        eprintln!("{}", serde_json::to_string_pretty(&m).unwrap_or_default());
+                    }
+                    std::process::exit(3);
+                }
+            }
             let outcome = self.engine.step()?;
             if let Some(iter) = &outcome.iteration {
                 self.handle_iteration(iter);
@@ -438,6 +461,25 @@ mod tests {
         let summary = simulator.summary();
         assert_eq!(summary.requests.completed, summary.requests.total);
         assert_eq!(summary.requests.completed, 10);
+    }
+
+    #[test]
+    fn prefill_block_runs_a_disaggregated_topology() {
+        let mut config = create_minimal_test_config();
+        config.hardware = crate::catalog::hardware("b200").unwrap();
+        config.parallel.tp = 1;
+        config.replicas = 2;
+        config.prefill = Some(crate::config::PrefillSpec {
+            replicas: 1,
+            ..Default::default()
+        });
+        let mut simulator = Simulator::new(config, None).unwrap();
+        simulator.run_with_callback(|_| {}).unwrap();
+        let summary = simulator.summary();
+        assert_eq!(summary.requests.completed, 10);
+        let handoff = summary.handoff.expect("disagg runs report hand-offs");
+        assert_eq!(handoff.transfers, 10);
+        assert!(summary.decode_router.is_some());
     }
 
     #[test]

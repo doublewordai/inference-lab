@@ -61,6 +61,7 @@ fn scheduler() -> SchedulerConfig {
         policy: SchedulingPolicy::FCFS,
         enable_preemption_free: true,
         enable_cascade_attention: false,
+        balance_set: None,
     }
 }
 

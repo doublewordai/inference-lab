@@ -2,10 +2,28 @@ use super::{decision::ScheduleDecision, decision::ScheduledSeq, policy::Scheduli
 use crate::config::{
     LoadOverlap, PrefetchPolicy, PromoteFill, SchedulerConfig, SourcePolicy, StoragePrefetchPolicy,
 };
+use crate::kv_cache::manager::StageStart;
 use crate::kv_cache::{KVCacheManager, PrefixCacheLookup};
 use crate::request::Request;
 use ordered_float::OrderedFloat;
 use std::collections::VecDeque;
+
+/// What became of a request offered to the staged-read path. Every arm
+/// that hands the request back must change some admission input before the
+/// caller retries it, or hold it without retrying this pass — retrying on
+/// unchanged state livelocks the admission loop.
+enum StagePark {
+    /// A stage started; the request is parked on `pending_storage`.
+    Parked,
+    /// Staging does not apply; continue normal admission with the request.
+    Proceed(Request),
+    /// Capacity-gated (or waiting on an arriving copy): hold the request
+    /// in `waiting` and stop admitting until a later pass.
+    Blocked(Request),
+    /// The stage can never start: abandon the storage prefetch so the next
+    /// pass truncates the lookup to the reachable prefix and recomputes.
+    Fallback(Request),
+}
 
 /// A prefix to pull back into HBM ahead of its announced re-entry.
 #[derive(Debug, Clone)]
@@ -77,6 +95,11 @@ pub struct Scheduler {
     /// Requests refused at submission, handed back as completed on the
     /// next pass.
     rejected: Vec<Request>,
+
+    /// Balance-set admission control state: `true` while admission is held
+    /// because the running working set is above the high watermark, until it
+    /// falls back below the low watermark (hysteresis).
+    gated: bool,
 }
 
 /// `(request, from, tokens) -> seconds`.
@@ -104,6 +127,7 @@ impl Scheduler {
             pending_prefetch_storage: Vec::new(),
             next_prefetch_seq: 0,
             rejected: Vec::new(),
+            gated: false,
         }
     }
 
@@ -205,9 +229,11 @@ impl Scheduler {
             .total_cached_tokens
             .min(probe.num_prompt_tokens.saturating_sub(1));
         if self.kv_cache_manager.needs_staging(&lookup) {
-            if !self
+            // A synthetic prefetch is best-effort: any denial just drops it.
+            if self
                 .kv_cache_manager
                 .start_staging(probe.request_id.clone(), &lookup, now)
+                != StageStart::Started
             {
                 return false;
             }
@@ -307,16 +333,22 @@ impl Scheduler {
         lookup: &PrefixCacheLookup,
         cached_tokens: u32,
         current_time: f64,
-    ) -> Option<Request> {
-        if !self.promote_fill.stages()
-            || !self.kv_cache_manager.needs_staging(lookup)
-            || !self.kv_cache_manager.start_staging(
-                request.request_id.clone(),
-                lookup,
-                current_time,
-            )
+    ) -> StagePark {
+        if !self.promote_fill.stages() || !self.kv_cache_manager.needs_staging(lookup) {
+            return StagePark::Proceed(request);
+        }
+        match self
+            .kv_cache_manager
+            .start_staging(request.request_id.clone(), lookup, current_time)
         {
-            return Some(request);
+            StageStart::Started => {}
+            // Nothing can move until a stage completion or consumption
+            // frees pinned room (or lands the arriving copy). Both re-run
+            // a schedule pass, which retries the request.
+            StageStart::Blocked | StageStart::AlreadyStaged => {
+                return StagePark::Blocked(request);
+            }
+            StageStart::Impossible => return StagePark::Fallback(request),
         }
         request.num_cached_tokens = cached_tokens;
         if let StoragePrefetchPolicy::Timeout { seconds } = self.storage_prefetch {
@@ -325,7 +357,7 @@ impl Scheduler {
             request.ready_at = None;
         }
         self.pending_storage.push(request);
-        None
+        StagePark::Parked
     }
 
     /// Promote any pending KV-transfer requests whose transfer has finished
@@ -377,6 +409,11 @@ impl Scheduler {
                         .map_or(0.0, |started| (current_time - started).max(0.0));
                 }
                 req.load_started_at = None;
+                if let Some(l) = req.lookup.as_mut() {
+                    if l.promote_land.is_none() {
+                        l.promote_land = Some(current_time);
+                    }
+                }
                 req.ready_at = None;
                 req.num_computed_tokens = req.num_cached_tokens;
                 // Its prefix is hot and its landing blocks are held: admit
@@ -581,6 +618,19 @@ impl Scheduler {
             self.waiting.push_front(request);
         }
 
+        // Balance-set hysteresis: cross into the held state at the high
+        // watermark, leave it only once the running working set drains below
+        // the low watermark. Evaluated once per pass, before admission.
+        if let Some(bs) = self.config.balance_set {
+            let cap = self.kv_cache_manager.total_blocks() as f64;
+            let committed = self.committed_working_set_blocks() as f64;
+            if self.gated && committed < bs.low_or_high() * cap {
+                self.gated = false;
+            } else if !self.gated && committed >= bs.high * cap {
+                self.gated = true;
+            }
+        }
+
         // Phase 2: admit WAITING requests (only if nothing was preempted:
         // preemption means KV is full, so admitting would just be preempted
         // again).
@@ -588,6 +638,30 @@ impl Scheduler {
             while !self.waiting.is_empty() && token_budget > 0 {
                 if self.running.len() >= self.config.max_num_seqs as usize {
                     break;
+                }
+
+                // Balance set: hold the queue while gated, and never let an
+                // admission push the running working set past the high
+                // watermark. The held request keeps its arrival time, so its
+                // wait is charged to its latency — the cost of not
+                // overcommitting.
+                if let Some(bs) = self.config.balance_set {
+                    if self.gated {
+                        break;
+                    }
+                    let cap = self.kv_cache_manager.total_blocks() as f64;
+                    let committed = self.committed_working_set_blocks();
+                    let need = self.kv_cache_manager.blocks_for_context(
+                        self.waiting[self.select_next_waiting_request()].num_prompt_tokens,
+                    );
+                    // Always keep one request making progress: a working set
+                    // larger than the watermark (or the whole cache) must
+                    // still run alone, or it starves forever. The gate only
+                    // holds a request when something is already resident.
+                    if committed > 0 && committed + need > (bs.high * cap) as usize {
+                        self.gated = true;
+                        break;
+                    }
                 }
 
                 let selected_idx = self.select_next_waiting_request();
@@ -663,12 +737,34 @@ impl Scheduler {
                     let request = self.waiting.remove(selected_idx).unwrap();
                     match self.park_on_storage_stage(request, &lookup, cached_tokens, current_time)
                     {
-                        None => continue,
-                        Some(request) => {
+                        StagePark::Parked => continue,
+                        StagePark::Proceed(request) => {
                             self.waiting.insert(selected_idx, request);
                             // The source changed between lookup and submit.
                             // Re-run lookup rather than falling through with
                             // the stale result.
+                            continue;
+                        }
+                        StagePark::Blocked(request) => {
+                            // The destination store is full of pinned blocks
+                            // (or the copy is arriving from another request's
+                            // stage). A stage completion / consumption frees
+                            // the room and re-runs a schedule pass, which
+                            // retries this request. Do NOT `continue` here:
+                            // nothing about the store can change within this
+                            // pass, so re-selecting the same head spins
+                            // forever.
+                            self.waiting.insert(selected_idx, request);
+                            break;
+                        }
+                        StagePark::Fallback(mut request) => {
+                            // The external prefix can never be staged. Mark
+                            // the prefetch abandoned so the next iteration
+                            // truncates the lookup to the reachable prefix
+                            // and recomputes the external suffix — a changed
+                            // input, so the retry terminates.
+                            request.storage_prefetch_abandoned = true;
+                            self.waiting.insert(selected_idx, request);
                             continue;
                         }
                     }
@@ -693,11 +789,45 @@ impl Scheduler {
                         .kv_cache_manager
                         .can_grow_to(request, request.num_prompt_tokens)
                     {
+                        // Nothing runs and nothing is in flight, so no block
+                        // will free itself: the HBM is held by other waiting
+                        // requests' landed promotions. Give those up (tier
+                        // copies stay) from the back of the queue until this
+                        // one fits — the rule the resident path applies below.
+                        let need = self
+                            .kv_cache_manager
+                            .blocks_for_context(request.num_prompt_tokens)
+                            .saturating_sub(request.kv_blocks.len() + request.aux_blocks.len());
+                        if self.running.is_empty()
+                            && self.pending_transfers.is_empty()
+                            && self.release_waiting_kv(selected_idx, need)
+                        {
+                            continue;
+                        }
                         break;
                     }
                     let mut request = self.waiting.remove(selected_idx).unwrap();
                     self.kv_cache_manager.record_prefix_lookup(&lookup);
                     request.num_cached_tokens = cached_tokens;
+                    let tier_tokens: u32 = lookup.promote_tokens_per_tier.iter().sum();
+                    match request.lookup.as_mut() {
+                        Some(l) => {
+                            l.lookups += 1;
+                            if l.promote_start.is_none() {
+                                l.promote_start = Some(current_time);
+                            }
+                        }
+                        None => {
+                            request.lookup = Some(crate::request::LookupRecord {
+                                at: current_time,
+                                hbm_tokens: resident.min(cached_tokens),
+                                tier_tokens,
+                                promote_start: Some(current_time),
+                                promote_land: None,
+                                lookups: 1,
+                            })
+                        }
+                    }
                     // A request back from an earlier promotion already holds
                     // (and has computed) that prefix; reserve only the
                     // positions beyond it — a sibling on a node-shared tier
@@ -770,6 +900,19 @@ impl Scheduler {
                     self.kv_cache_manager.record_prefix_lookup(&lookup);
                 }
                 request.num_cached_tokens = cached_tokens;
+                match request.lookup.as_mut() {
+                    Some(l) => l.lookups += 1,
+                    None => {
+                        request.lookup = Some(crate::request::LookupRecord {
+                            at: current_time,
+                            hbm_tokens: cached_tokens,
+                            tier_tokens: 0,
+                            promote_start: None,
+                            promote_land: None,
+                            lookups: 1,
+                        })
+                    }
+                }
                 request.num_computed_tokens = cached_tokens;
                 self.kv_cache_manager
                     .allocate_blocks(&mut request, tokens_to_schedule)
@@ -866,6 +1009,21 @@ impl Scheduler {
         running_peak + new_peak <= self.kv_cache_manager.total_blocks()
     }
 
+    /// Blocks pinned by the resident working set of running requests — their
+    /// current context (computed positions, at least the prompt). The
+    /// balance set caps this so the recyclable remainder stays populated
+    /// with recently-idle sessions' cached prefixes instead of being
+    /// thrashed.
+    fn committed_working_set_blocks(&self) -> usize {
+        self.running
+            .iter()
+            .map(|r| {
+                self.kv_cache_manager
+                    .blocks_for_context(r.num_computed_tokens.max(r.num_prompt_tokens))
+            })
+            .sum()
+    }
+
     /// Index into `waiting` of the request the policy admits next.
     fn select_next_waiting_request(&self) -> usize {
         let pick = |key: &dyn Fn(&Request) -> u64, longest: bool| -> usize {
@@ -948,8 +1106,20 @@ impl Scheduler {
             && self.kv_cache_manager.needs_staging(&lookup)
         {
             match self.park_on_storage_stage(request, &lookup, cached, current_time) {
-                None => return,
-                Some(req) => request = req,
+                StagePark::Parked => return,
+                StagePark::Proceed(req) | StagePark::Blocked(req) => {
+                    // Blocked: the destination store is full of pinned
+                    // blocks; a completion frees room and admission
+                    // retries it from `waiting`.
+                    request = req;
+                }
+                StagePark::Fallback(req) => {
+                    // Prefix larger than the destination store: fall back to
+                    // recomputing the external suffix rather than parking
+                    // forever.
+                    request = req;
+                    request.storage_prefetch_abandoned = true;
+                }
             }
         }
         self.waiting.push_back(request);
@@ -1077,6 +1247,11 @@ impl Scheduler {
     /// The waiting queue (admission order), excluding parked requests.
     pub fn waiting(&self) -> &VecDeque<Request> {
         &self.waiting
+    }
+
+    /// Requests parked on an external-store staging read.
+    pub fn pending_storage(&self) -> &[Request] {
+        &self.pending_storage
     }
 
     pub fn pending_transfers(&self) -> &[Request] {
@@ -1640,6 +1815,99 @@ mod tests {
         assert_eq!(d.completed.len(), 1);
         assert_eq!(s.pending_transfers.len(), 1);
         assert_eq!(s.pending_transfers[0].request_id, "x2");
+    }
+
+    #[test]
+    fn a_promotion_at_the_head_takes_back_kv_held_by_waiting_promotions() {
+        // HBM of 4 blocks, one private tier. `run` (1-block prompt, long
+        // output) is running and grows to 3 blocks; `held` (prompt [0x10, 0x11, 0x12],
+        // P in the tier) promotes 0x10 while its prompt still fits, lands, and
+        // waits holding its first block because the other two do not fit. Then `old`
+        // returns to the head of the queue the way a preempted request does:
+        // no blocks, its prefix [A] in the tier (write-through), ahead of
+        // `held`. `run` completes. `old` needs 4 blocks with 3 free; nothing
+        // runs and nothing is in flight, so no block will free itself: it
+        // takes back `held`'s landing block and promotes, rather than stall.
+        let config = Config::test_default();
+        let bs = config.scheduler.block_size;
+        let per_block = config.model.kv_storage_bytes(bs);
+        let kv = kv_manager(&config, 4 * per_block, true).with_private_tiers(&[(
+            "host_ram",
+            10 * 1024 * 1024 * 1024,
+            per_block as f64,
+        )]);
+        let mut s = scheduler_from(config, kv);
+        s.kv_cache_manager.plant_in_tier(0, 0xA);
+        s.kv_cache_manager.plant_in_tier(0, 0x10);
+        s.add_request(create_test_request("run", 1, 3 * bs));
+        let d = s.schedule(0.0);
+        assert_eq!(running_ids(&s), vec!["run"]);
+        apply(&mut s, &d, 0.5);
+        let mut held = create_test_request("held", bs * 3, 1);
+        held.prompt_block_hashes = vec![0x10, 0x11, 0x12];
+        s.add_request(held);
+        let d = s.schedule(1.0);
+        assert_eq!(
+            s.pending_transfers.len(),
+            1,
+            "3 free ≥ 3-block prompt: promote"
+        );
+        let ready = s.earliest_pending_ready(1.0).unwrap();
+        let mut t = 1.0;
+        let mut d = d;
+        while s.kv_cache_manager.num_free_blocks() > 0 {
+            apply(&mut s, &d, t);
+            t += 1e-3;
+            d = s.schedule(t);
+            assert!(t < ready, "run fills the free blocks before 0x10 lands");
+        }
+        apply(&mut s, &d, ready);
+        let d = s.schedule(ready + 1e-9);
+        assert_eq!(s.waiting().len(), 1);
+        assert_eq!(
+            s.waiting()[0].kv_blocks.len(),
+            1,
+            "held landed its first block, cannot run"
+        );
+        assert_eq!(s.kv_cache_manager.num_free_blocks(), 0);
+        // `old` returns to the head with no blocks and its prefix in the tier.
+        let mut old = create_test_request("old", bs * 4, 1);
+        old.prompt_block_hashes = vec![0xA, 0xB, 0xC, 0xD];
+        old.arrival_time = 0.0;
+        s.waiting.push_front(old);
+        // `run` finishes its output and frees its 3 blocks.
+        let mut t = ready + 1e-9;
+        let mut d = d;
+        while running_ids(&s) == vec!["run"] {
+            apply(&mut s, &d, t);
+            t += 1e-3;
+            d = s.schedule(t);
+            assert!(t < ready + 10.0, "run completes");
+        }
+        assert!(
+            s.pending_transfers.iter().any(|r| r.request_id == "old"),
+            "old took back held's landing block and promoted A (pending {:?}, running {:?})",
+            s.pending_transfers
+                .iter()
+                .map(|r| r.request_id.clone())
+                .collect::<Vec<_>>(),
+            running_ids(&s)
+        );
+        assert_eq!(s.num_preemptions(), 1, "held gave up its landing block");
+        // Both complete: A lands, old runs; held re-promotes or recomputes.
+        let mut done = Vec::new();
+        while done.len() < 2 {
+            let next = match s.earliest_pending_ready(t) {
+                Some(r) if r > t => r,
+                _ => t + 1e-3,
+            };
+            apply(&mut s, &d, next);
+            t = next;
+            d = s.schedule(t + 1e-9);
+            done.extend(d.completed.iter().map(|c| c.request_id.clone()));
+            assert!(t < ready + 60.0, "no stall: done {done:?}");
+        }
+        assert_eq!(done.len(), 2);
     }
 
     #[test]
@@ -2241,6 +2509,107 @@ mod tests {
         );
         assert_eq!(scheduler.num_running(), 1);
         assert_eq!(scheduler.num_waiting(), 1);
+    }
+
+    #[test]
+    fn balance_set_caps_running_working_set_and_holds_the_rest() {
+        // Three 60%-of-cache requests. Under a balance set with high=0.6 the
+        // running working set may not exceed 60%, so exactly one runs and the
+        // rest are held in the queue (not admitted-and-preempted).
+        let mut config = Config::test_default();
+        config.scheduler.kv_cache_capacity = 100_000_000;
+        config.scheduler.balance_set = Some(crate::config::BalanceSet {
+            high: 0.6,
+            low: 0.5,
+        });
+        let kv = kv_manager(&config, config.scheduler.kv_cache_capacity, false);
+        let mut scheduler = scheduler_from(config, kv);
+        let total = scheduler.kv_cache_manager().total_blocks();
+        let toks = ((total * 60) / 100 * 16) as u32; // ~60% of cache as prompt
+        for i in 0..3 {
+            scheduler.add_request(create_test_request(&format!("r{i}"), toks, 4));
+        }
+        let d = scheduler.schedule(0.0);
+        assert_eq!(
+            d.batch.len(),
+            1,
+            "only one 60% request fits under the 60% cap"
+        );
+        assert_eq!(scheduler.num_running(), 1);
+        assert_eq!(
+            scheduler.num_waiting(),
+            2,
+            "the rest are held, not preempted"
+        );
+        assert_eq!(
+            scheduler.num_preemptions(),
+            0,
+            "the gate holds, it does not evict"
+        );
+    }
+
+    #[test]
+    fn balance_set_still_runs_a_request_larger_than_the_watermark() {
+        // A request whose prompt alone exceeds high*C must still run (alone),
+        // not starve: the gate keeps one request making progress.
+        let mut config = Config::test_default();
+        config.scheduler.kv_cache_capacity = 100_000_000;
+        config.scheduler.balance_set = Some(crate::config::BalanceSet {
+            high: 0.5,
+            low: 0.4,
+        });
+        let kv = kv_manager(&config, config.scheduler.kv_cache_capacity, false);
+        let mut scheduler = scheduler_from(config, kv);
+        let total = scheduler.kv_cache_manager().total_blocks();
+        let toks = ((total * 80) / 100 * 16) as u32; // 80% > 50% watermark
+        scheduler.add_request(create_test_request("big", toks, 4));
+        let d = scheduler.schedule(0.0);
+        assert_eq!(
+            d.batch.len(),
+            1,
+            "an over-watermark request runs alone, not starves"
+        );
+        assert_eq!(scheduler.num_running(), 1);
+    }
+
+    #[test]
+    fn balance_set_admits_when_uncapped_would_overcommit() {
+        // Without the gate the same three requests admit and preempt; with a
+        // generous high=0.95 gate they still admit (the gate only bites when
+        // the working set is near capacity).
+        let build = |bs: Option<crate::config::BalanceSet>| {
+            let mut config = Config::test_default();
+            config.scheduler.kv_cache_capacity = 100_000_000;
+            config.scheduler.balance_set = bs;
+            let kv = kv_manager(&config, config.scheduler.kv_cache_capacity, false);
+            scheduler_from(config, kv)
+        };
+        let mut s = build(None);
+        let total = s.kv_cache_manager().total_blocks();
+        let toks = ((total * 20) / 100 * 16) as u32; // ~20% each: three fit
+        for i in 0..3 {
+            s.add_request(create_test_request(&format!("r{i}"), toks, 4));
+        }
+        let d = s.schedule(0.0);
+        assert_eq!(
+            d.batch.len(),
+            3,
+            "overcommit admits all three small requests"
+        );
+
+        let mut s = build(Some(crate::config::BalanceSet {
+            high: 0.95,
+            low: 0.9,
+        }));
+        for i in 0..3 {
+            s.add_request(create_test_request(&format!("r{i}"), toks, 4));
+        }
+        let d = s.schedule(0.0);
+        assert_eq!(
+            d.batch.len(),
+            3,
+            "a generous gate still admits all three (60% < 95%)"
+        );
     }
 
     #[test]

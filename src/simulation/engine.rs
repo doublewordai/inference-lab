@@ -50,6 +50,9 @@ pub struct RequestTiming {
     pub num_preemptions: u32,
     /// Refused at submission (context larger than the worker's KV cache).
     pub rejected: bool,
+    /// The prefix lookup that fixed `num_cached_tokens` (see
+    /// [`crate::request::LookupRecord`]).
+    pub lookup: Option<crate::request::LookupRecord>,
 }
 
 impl RequestTiming {
@@ -107,6 +110,9 @@ impl Worker {
         // that grows for life: full-context layers, compressed history);
         // sliding windows and per-sequence state ride in auxiliary blocks.
         let policies = cluster.memory.policies();
+        if let Some(bs) = scheduler_config.balance_set {
+            bs.validate()?;
+        }
         let mut kv_cache_manager =
             KVCacheManager::for_model(kv_capacity, scheduler_config.block_size, &model, true)
                 .with_hbm_eviction(policies.hbm_eviction);
@@ -736,17 +742,41 @@ impl Engine {
                     )
                 });
                 let first_waiting = s.waiting().front().map(|r| {
+                    let l = mgr.peek_prefix_cache(r);
                     format!(
-                        "{}(prompt {}, computed {}, blocks {}, needs {} blocks)",
+                        "{}(prompt {}, computed {}, blocks {}, needs {} blocks; lookup: cached {}, hbm {}, in_flight {}, promote {:?}, needs_staging {}, abandoned {}, ready_at {:?})",
                         r.request_id,
                         r.num_prompt_tokens,
                         r.num_computed_tokens,
                         r.kv_blocks.len(),
-                        mgr.blocks_for_context(r.planned_positions())
+                        mgr.blocks_for_context(r.planned_positions()),
+                        l.total_cached_tokens,
+                        l.hbm_tokens,
+                        l.in_flight_tokens,
+                        l.promote_tokens_per_tier,
+                        mgr.needs_staging(&l),
+                        r.storage_prefetch_abandoned,
+                        r.ready_at,
+                    )
+                });
+                let staging = s.pending_storage();
+                let first_staging = staging.first().map(|r| {
+                    format!(
+                        "{}(cached {}, ready_at {:?}, abandoned {}, lookups {:?})",
+                        r.request_id,
+                        r.num_cached_tokens,
+                        r.ready_at,
+                        r.storage_prefetch_abandoned,
+                        r.lookup.as_ref().map(|l| l.lookups)
                     )
                 });
                 let (held, refs, free) = mgr.ref_summary();
                 let by_queue = s.held_blocks_by_queue();
+                out.push_str(&format!(
+                    "\n  staging {}: [0] {:?}",
+                    staging.len(),
+                    first_staging
+                ));
                 out.push_str(&format!(
                     "\n  refs: {held} blocks referenced ({refs} refs), {free} free; held by (running, waiting, parked, prefetches) = {by_queue:?}"
                 ));
@@ -1665,6 +1695,11 @@ impl Engine {
             self.topology.pools[sp].workers[si]
                 .scheduler
                 .release_handed_off(&mut req);
+            // Those blocks may be what its queue was waiting for; nothing
+            // else wakes it (the next arrival would, some time later).
+            if self.topology.pools[sp].workers[si].scheduler.num_waiting() > 0 {
+                self.maybe_wake_worker(sp, si, now);
+            }
             req.handoff_done_time = Some(now);
             // The first token travels with the KV: the decode side emits it
             // on receipt (Dynamo / sglang PD), so that is when the client
@@ -1695,6 +1730,7 @@ impl Engine {
             worker: req.worker,
             num_preemptions: req.num_preemptions,
             rejected: req.rejected,
+            lookup: req.lookup,
         }
     }
 }

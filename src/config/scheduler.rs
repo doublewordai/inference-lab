@@ -58,6 +58,57 @@ pub struct SchedulerConfig {
     /// batch instead of once per request, reducing memory bandwidth.
     #[serde(default)]
     pub enable_cascade_attention: bool,
+
+    /// Balance-set admission control (Denning's medium-term scheduler): cap
+    /// the resident working set of admitted (running) requests to a fraction
+    /// of KV capacity, holding the rest in the queue, so recently-idle
+    /// sessions' cached prefixes survive in the reserved headroom instead of
+    /// being thrashed. Absent = overcommit (admit-and-evict, today's
+    /// behaviour).
+    #[serde(default)]
+    pub balance_set: Option<BalanceSet>,
+}
+
+/// Watermarks for [`SchedulerConfig::balance_set`], as fractions of KV
+/// capacity. Admission stops when the running working set reaches `high` and
+/// resumes only once it falls below `low` (hysteresis).
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BalanceSet {
+    /// Stop admitting when the running working set reaches this fraction of
+    /// KV capacity.
+    pub high: f64,
+    /// Resume admitting once it falls back below this fraction. `0` (default)
+    /// means use `high` (no hysteresis band).
+    #[serde(default)]
+    pub low: f64,
+}
+
+impl BalanceSet {
+    /// The resume watermark, defaulting to `high` when unset.
+    pub fn low_or_high(&self) -> f64 {
+        if self.low > 0.0 {
+            self.low
+        } else {
+            self.high
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if !(self.high > 0.0 && self.high <= 1.0) {
+            return Err(format!(
+                "[scheduler] balance_set.high must be in (0, 1], got {}",
+                self.high
+            ));
+        }
+        if self.low < 0.0 || self.low > self.high {
+            return Err(format!(
+                "[scheduler] balance_set.low must be in [0, high], got {}",
+                self.low
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn default_max_num_partial_prefills() -> u32 {

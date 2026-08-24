@@ -215,6 +215,7 @@ mod tests {
             policy: SchedulingPolicy::FCFS,
             enable_preemption_free: false,
             enable_cascade_attention: false,
+            balance_set: None,
         };
         let cluster = ClusterSpec {
             hardware,
@@ -619,6 +620,49 @@ bandwidth = 1e12
                 st[1].per_worker
             );
         }
+    }
+
+    #[test]
+    fn a_drained_handoff_wakes_the_prefill_worker_whose_queue_waited_on_its_kv() {
+        // One prefill worker whose KV holds 1.5 prompts; two prompts arrive
+        // together and nothing arrives after them. r0 prefills and hands off
+        // over a slow link, holding its KV on the prefill worker until the
+        // transfer drains; r1 waits for those blocks. No arrival follows to
+        // re-run the prefill scheduler, so the drain itself must wake it.
+        let (mut cluster, model, mut sched) = small_dense_parts();
+        sched.block_size = 16;
+        sched.kv_cache_capacity = 48 * model.kv_storage_bytes(sched.block_size);
+        let mut decode = cluster.clone();
+        decode.num_workers = 2;
+        cluster.num_workers = 1;
+        let topo = DisaggTopology {
+            prefill: cluster,
+            decode,
+            kv_link_bw: Some(1e6),
+        };
+        let mut engine = Engine::new(
+            Topology::from_disagg(&topo, model, sched)
+                .unwrap()
+                .with_routers(
+                    &RouterConfig::LeastLoaded {},
+                    &RouterConfig::KvAwareDecode { load_weight: 64.0 },
+                ),
+        );
+        for i in 0..2u64 {
+            let mut r = Request::new(format!("r{i}"), 0, 0.0, 512, 8);
+            r.prompt_block_hashes = (1..=32).map(|b| 100_000 * (i + 1) + b).collect();
+            engine.submit(r);
+        }
+        let timings = run_until(&mut engine, 2);
+        assert!(engine.is_idle(), "work left after both completions");
+        let t0 = timings.iter().find(|t| t.request_id == "r0").unwrap();
+        let t1 = timings.iter().find(|t| t.request_id == "r1").unwrap();
+        assert!(
+            t1.prefill_done_time > t0.handoff_done_time,
+            "r1 prefilled only once r0's hand-off released its KV: r1 prefill {} vs r0 hand-off {}",
+            t1.prefill_done_time,
+            t0.handoff_done_time
+        );
     }
 
     #[test]

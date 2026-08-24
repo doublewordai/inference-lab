@@ -30,7 +30,7 @@
 //! The graph is shared by the topology's workers behind a mutex; the
 //! engine is single-threaded, so the lock only serialises.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use super::flows::{EdgeId, Flows, Owner};
@@ -152,6 +152,24 @@ struct Hop {
     to: VertexId,
     edge: EdgeId,
     latency: f64,
+}
+
+/// Why a stage submission did not start. Submission itself is the only
+/// capacity check: a separate pre-check can disagree with the submit gate
+/// (per-span versus whole-group need) and livelock admission on a verdict
+/// the submit then refuses.
+/// Ordered by severity: `Impossible` > `Blocked` > `AlreadyStaged`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum StageDenied {
+    /// Every destination span is already resident or arriving; there is
+    /// nothing to move. Wait for the arriving copy to land.
+    AlreadyStaged,
+    /// The destination store cannot take the stage without evicting
+    /// pinned blocks; it fits once those clear, so retry on a later pass.
+    Blocked,
+    /// The stage can never start (prefix larger than the destination
+    /// store, or no usable path); fall back rather than park forever.
+    Impossible,
 }
 
 /// The topology's KV memory beyond HBM.
@@ -402,9 +420,14 @@ impl MemoryGraph {
             let policies = selection.policies();
             let template = cluster.hardware.memory.as_ref();
             selection.validate(template)?;
-            g.backup = policies.backup;
-            g.hit_refresh = policies.hit_refresh;
-            g.promote_fill = policies.promote_fill;
+            // Graph-wide policies come from the pools that have tiers; a
+            // tier-less pool (a disaggregated decode pool, say) has nothing
+            // to say about them.
+            if !selection.tiers.is_empty() {
+                g.backup = policies.backup;
+                g.hit_refresh = policies.hit_refresh;
+                g.promote_fill = policies.promote_fill;
+            }
             // Under DP-attention every rank of a replica is its own worker
             // in the graph: one GPU, its own port into the node's stores.
             let (num_workers, tp) = cluster.graph_workers();
@@ -1099,6 +1122,26 @@ impl MemoryGraph {
         }
     }
 
+    /// Release the destination-store pins a stage holds on `entries`
+    /// (landed stage fills). This returns the copies to ordinary LRU
+    /// eviction and lets a store finish any capacity trim the released
+    /// pins unblocked.
+    fn release_stage_pins(&mut self, entries: &[LandedStageFill]) {
+        let mut by_store: BTreeMap<StoreId, Vec<Span>> = BTreeMap::new();
+        for entry in entries {
+            by_store.entry(entry.store).or_default().push(entry.span);
+        }
+        for (store, spans) in by_store {
+            {
+                let mut radix = self.radix.lock().unwrap();
+                for &span in &spans {
+                    radix.unpin_source(TierSource::Store(store), span);
+                }
+            }
+            self.radix.lock().unwrap().trim_store_after_unpin(store);
+        }
+    }
+
     /// The scheduler observed the latest stage leg before its deadline.
     pub fn accept_staged_batch(&mut self, request: &str) {
         if let Some(entries) = self.landed_stage_fills.get_mut(request) {
@@ -1112,23 +1155,27 @@ impl MemoryGraph {
     /// through mode retains earlier accepted legs but drops a late leg that
     /// landed before another worker advanced this shared graph.
     pub fn cancel_staged_batch(&mut self, request: &str) {
-        let entries = self
-            .landed_stage_fills
-            .remove(request)
-            .unwrap_or_default()
+        let entries = self.landed_stage_fills.remove(request).unwrap_or_default();
+        // Every tracked leg is untracked here: release its destination pin
+        // (through retains the copy as ordinary LRU; buffer drops it).
+        self.release_stage_pins(&entries);
+        let dropped: Vec<_> = entries
             .into_iter()
             .filter(|entry| self.promote_fill == PromoteFill::Buffer || !entry.accepted)
             .map(|entry| (entry.store, entry.span))
             .collect();
-        self.cleanup_stage_entries(entries);
+        self.cleanup_stage_entries(dropped);
     }
 
     /// A request's final HBM load landed. Store-source reads were accounted
-    /// when their flows drained; this only releases transient intermediate
-    /// copies used by `promote_fill = "buffer"` and ends stage tracking for
-    /// retained through copies.
+    /// when their flows drained; this releases the landed stage copies' pins
+    /// (through mode keeps the intermediate copy, now plain LRU; buffer mode
+    /// drops it) and ends stage tracking for the retained through copies.
     pub fn promoted_batch(&mut self, _worker: WorkerId, request: &str, _spans: &[Span]) {
         let entries = self.landed_stage_fills.remove(request).unwrap_or_default();
+        // Consumed by the final HBM load: release the pins now so the copies
+        // return to normal LRU eviction.
+        self.release_stage_pins(&entries);
         let cleanup = if self.promote_fill == PromoteFill::Buffer {
             entries
                 .into_iter()
@@ -1308,8 +1355,9 @@ impl MemoryGraph {
 
     /// Stage a concrete store hit into the next closer real store. The
     /// destination ranges are inserted as arriving now, become resident only
-    /// when the flow drains, and consume that store's real capacity. Returns
-    /// `None` when no closer store exists or it already holds every span.
+    /// when the flow drains, and consume that store's real capacity. This is
+    /// also the only capacity check: the returned `StageDenied` is the
+    /// admission verdict, and a denial mutates nothing.
     #[allow(clippy::too_many_arguments)]
     pub fn submit_stage_promotion(
         &mut self,
@@ -1319,23 +1367,25 @@ impl MemoryGraph {
         source: TierSource,
         spans: &[Span],
         now: f64,
-    ) -> Option<String> {
+    ) -> Result<String, StageDenied> {
         if !self.can_stage_source(worker, tier, source) {
-            return None;
+            return Err(StageDenied::Impossible);
         }
         let TierSource::Store(source) = source else {
-            return None;
+            return Err(StageDenied::Impossible);
         };
         let destination_tier = self.tiers[worker][..tier]
             .iter()
-            .rposition(|t| !t.is_peer_hbm())?;
+            .rposition(|t| !t.is_peer_hbm())
+            .ok_or(StageDenied::Impossible)?;
         let destination = self.tiers[worker][destination_tier].store;
         if source == destination {
-            return None;
+            return Err(StageDenied::Impossible);
         }
 
-        let mut path =
-            self.shortest_path(self.stores[source].vertex, self.stores[destination].vertex)?;
+        let mut path = self
+            .shortest_path(self.stores[source].vertex, self.stores[destination].vertex)
+            .ok_or(StageDenied::Impossible)?;
         if let Some(edge) = self.stores[source].throughput_edge {
             path.edges.insert(0, edge);
         }
@@ -1357,20 +1407,43 @@ impl MemoryGraph {
         let mut evicted = Vec::new();
         {
             let mut radix = self.radix.lock().unwrap();
+            // Collect destination blocks this stage will insert.
+            let mut missing_blocks = Vec::new();
+            let mut need = 0u32;
             for &span in spans {
                 for missing in radix.store_missing(destination, span) {
                     if missing.is_empty() {
                         continue;
                     }
-                    total = total.saturating_add(radix.span_bytes(missing));
-                    entries.push(missing);
-                    evicted.extend(radix.store_insert(destination, missing, Some(id.clone()), now));
+                    need += missing.len();
+                    missing_blocks.push(missing);
                 }
             }
+            if need == 0 {
+                return Err(StageDenied::AlreadyStaged);
+            }
+            if need as u64 > radix.store_capacity_blocks(destination) as u64 {
+                return Err(StageDenied::Impossible);
+            }
+            // Capacity gate: a stage may only displace unpinned resident
+            // blocks, never another stage's in-flight or landed (pinned)
+            // blocks, nor an in-flight reader's source pin. So the store
+            // can absorb at most `capacity - pinned` new blocks.
+            if need as u64 > radix.store_available_for_stage(destination) {
+                return Err(StageDenied::Blocked);
+            }
+            for missing in missing_blocks {
+                total = total.saturating_add(radix.span_bytes(missing));
+                entries.push(missing);
+                evicted.extend(radix.store_insert(destination, missing, Some(id.clone()), now));
+                // Pin the destination copy for the stage's whole lifetime
+                // (in flight and after landing) so a competing stage or an
+                // in-flight write cannot evict it before the request's
+                // final load consumes it.
+                radix.pin_source(TierSource::Store(destination), missing);
+            }
         }
-        if entries.is_empty() {
-            return None;
-        }
+        debug_assert!(!entries.is_empty(), "need > 0 guarantees entries");
         self.pending_stage_fills.insert(
             id.clone(),
             PendingStageFill {
@@ -1384,7 +1457,20 @@ impl MemoryGraph {
         );
         self.cascade_batch(destination, evicted);
         if !self.pending_stage_fills.contains_key(&id) {
-            return None;
+            // The cascade tore down this stage's own arriving blocks (its
+            // pins make this unreachable today). Undo the destination pins
+            // so the denial leaves no state behind.
+            {
+                let mut radix = self.radix.lock().unwrap();
+                for &span in &entries {
+                    radix.unpin_source(TierSource::Store(destination), span);
+                }
+            }
+            self.radix
+                .lock()
+                .unwrap()
+                .trim_store_after_unpin(destination);
+            return Err(StageDenied::Blocked);
         }
 
         let mut wait = 0.0_f64;
@@ -1426,7 +1512,7 @@ impl MemoryGraph {
             transfer_bandwidth,
             now,
         );
-        Some(id)
+        Ok(id)
     }
 
     /// Cancel an in-flight storage-to-closer-tier stage. Bytes already moved
@@ -1436,11 +1522,20 @@ impl MemoryGraph {
         self.flows.cancel(id);
         self.pending_reads.remove(id);
         if let Some(fill) = self.pending_stage_fills.remove(id) {
-            let mut radix = self.radix.lock().unwrap();
-            for span in fill.entries {
-                radix.store_remove(fill.destination, span);
-                radix.prune_if_empty(span.node);
+            {
+                let mut radix = self.radix.lock().unwrap();
+                for span in &fill.entries {
+                    radix.unpin_source(TierSource::Store(fill.destination), *span);
+                }
+                for span in &fill.entries {
+                    radix.store_remove(fill.destination, *span);
+                    radix.prune_if_empty(span.node);
+                }
             }
+            self.radix
+                .lock()
+                .unwrap()
+                .trim_store_after_unpin(fill.destination);
         }
         self.release_pending_pin(id);
     }
@@ -2656,7 +2751,7 @@ bandwidth = 900
     }
 
     #[test]
-    fn an_evicted_stage_destination_still_completes_and_wakes_its_request() {
+    fn a_landed_stage_copy_survives_a_competing_write_until_it_is_consumed() {
         let mut g = MemoryGraph::private_with(
             1,
             &[("t0", 1, 10.0), ("t1", 4, 5.0)],
@@ -2669,13 +2764,127 @@ bandwidth = 900
         let id = g
             .submit_stage_promotion(0, 1, "request", source, &[staged], 0.0)
             .unwrap();
-        g.plant(0, 0, replacement);
-        assert!(!store_contains(&g, 0, 7));
-
         let done = g.advance(20.0);
         assert!(done.iter().any(|(_, completed)| completed == &id));
+        assert!(store_contains(&g, 0, 7), "stage landed in the closer store");
         assert_eq!(g.stores()[1].bytes_read, 100);
         assert!(store_contains(&g, 1, 7));
+
+        // A competing write into the same (full) store must not evict the
+        // landed stage copy: it is pinned until the request consumes it.
+        g.plant(0, 0, replacement);
+        assert!(store_contains(&g, 0, 7), "landed stage copy survives");
+    }
+
+    #[test]
+    fn concurrent_stages_into_a_full_store_serialise_rather_than_thrash() {
+        // Tier 0 (capacity 1 block) is the destination host store; tier 1 is
+        // the far source store. Two requests A and B both need a stage into
+        // tier 0, which can hold only one of them at a time (pinned).
+        let mut g = MemoryGraph::private_with(
+            1,
+            &[("t0", 1, 10.0), ("t1", 4, 5.0)],
+            1,
+            Arc::new(|t| 100 * t as u64),
+        )
+        .with_promote_fill(PromoteFill::Through);
+        let (a, b) = (sp(&g, 7), sp(&g, 8));
+        g.plant(0, 1, a);
+        g.plant(0, 1, b);
+        let lower = TierSource::Store(g.tiers[0][1].store);
+
+        // A starts and pins its destination block, filling the store.
+        g.submit_stage_promotion(0, 1, "A", lower, &[a], 0.0)
+            .unwrap();
+        assert_eq!(
+            g.submit_stage_promotion(0, 1, "B", lower, &[b], 0.0),
+            Err(StageDenied::Blocked),
+            "B must not evict A's pinned, in-flight stage in the full store"
+        );
+        assert!(!store_contains(&g, 0, 8), "a denied stage inserts nothing");
+
+        // A lands and its final HBM load consumes it, releasing the pin; now
+        // B's stage fits.
+        g.advance(20.0);
+        let host = TierSource::Store(g.tiers[0][0].store);
+        g.submit_source_promotion(0, 0, "A", host, 100, &[a], None, 20.0);
+        g.advance(30.0);
+        g.promoted_batch(0, "A", &[a]);
+        g.submit_stage_promotion(0, 1, "B", lower, &[b], 30.0)
+            .expect("the store serialises: B starts only once A has been consumed");
+    }
+
+    #[test]
+    fn spans_that_fit_alone_but_not_together_are_blocked_not_started() {
+        // Destination capacity 2, one block pinned by A's stage: each of B's
+        // two spans fits alone (1 <= 1 available) but the whole submission
+        // does not (2 > 1). The pre-fix per-span check said Fits while the
+        // submit gate refused, and admission respun on the disagreement
+        // forever. The submit verdict is the only check now: Blocked, and
+        // nothing is inserted.
+        let mut g = MemoryGraph::private_with(
+            1,
+            &[("t0", 2, 10.0), ("t1", 8, 5.0)],
+            1,
+            Arc::new(|t| 100 * t as u64),
+        )
+        .with_promote_fill(PromoteFill::Through);
+        let (a, b1, b2) = (sp(&g, 7), sp(&g, 8), sp(&g, 9));
+        g.plant(0, 1, a);
+        g.plant(0, 1, b1);
+        g.plant(0, 1, b2);
+        let lower = TierSource::Store(g.tiers[0][1].store);
+        g.submit_stage_promotion(0, 1, "A", lower, &[a], 0.0)
+            .unwrap();
+        assert_eq!(
+            g.submit_stage_promotion(0, 1, "B", lower, &[b1, b2], 0.0),
+            Err(StageDenied::Blocked),
+        );
+        assert!(!store_contains(&g, 0, 8));
+        assert!(!store_contains(&g, 0, 9), "no partial insertion either");
+    }
+
+    #[test]
+    fn a_stage_whose_copy_is_already_arriving_is_already_staged_not_started() {
+        // B shares A's prefix; A's stage is in flight, so B has nothing to
+        // move. The pre-fix per-span check called need == 0 Fits, the submit
+        // then found nothing to insert, and admission respun on the
+        // disagreement forever — with sim time frozen, since the landing
+        // that would resolve it could never be processed.
+        let mut g = two_tier_private(WritePolicy::WriteBack {}, EvictionPolicy::Lru {})
+            .with_promote_fill(PromoteFill::Through);
+        let shared = sp(&g, 7);
+        g.plant(0, 1, shared);
+        let lower = TierSource::Store(g.tiers[0][1].store);
+        g.submit_stage_promotion(0, 1, "A", lower, &[shared], 0.0)
+            .unwrap();
+        assert_eq!(
+            g.submit_stage_promotion(0, 1, "B", lower, &[shared], 0.0),
+            Err(StageDenied::AlreadyStaged),
+        );
+    }
+
+    #[test]
+    fn a_stage_larger_than_the_destination_store_falls_back_not_park_for_ever() {
+        // A single stage of two blocks into a one-block host store can never
+        // fit: it must be reported Impossible so the scheduler falls back
+        // (recompute the external suffix) instead of parking forever.
+        let mut g = MemoryGraph::private_with(
+            1,
+            &[("t0", 1, 10.0), ("t1", 4, 5.0)],
+            1,
+            Arc::new(|t| 100 * t as u64),
+        )
+        .with_promote_fill(PromoteFill::Through);
+        let (a, b) = (sp(&g, 7), sp(&g, 8));
+        g.plant(0, 1, a);
+        g.plant(0, 1, b);
+        let lower = TierSource::Store(g.tiers[0][1].store);
+        assert_eq!(
+            g.submit_stage_promotion(0, 1, "request", lower, &[a, b], 0.0),
+            Err(StageDenied::Impossible),
+            "an oversized prefix can never fit and must fall back"
+        );
     }
 
     #[test]

@@ -14,6 +14,7 @@ model = "deepseek-v4-flash"    # catalog preset, or an inline [model] table
 [router]                       # optional: how requests spread over replicas
 [decode_router]                # optional: disagg decode pool (defaults to [router])
 [memory]                       # optional: KV tiers beyond HBM, from the hardware's stores
+[prefill]                      # optional: a prefill pool; the entry then decodes (disaggregated)
 [fault]                        # optional: serve-mode static fault injection
 
 [hardware.b200]                # one entry per hardware the model runs on
@@ -40,7 +41,7 @@ runs one; `--hardware` may be omitted when the file has one entry. In Rust,
 (model on hardware) and `.with_workload(WorkloadConfig::from_file(..))` a
 `Config`. The WASM API takes that resolved `Config` as JSON: `hardware`,
 `parallel`, `model`, `scheduler`, `workload`, optional `replicas`, `router`,
-`decode_router`, `memory`, `speculative`.
+`decode_router`, `memory`, `prefill`, `speculative`.
 
 ## Catalog presets
 
@@ -69,6 +70,7 @@ hardware preset unless `spec` says otherwise.
 | `router` | Table | shared `[router]` | Replaces the shared block for this entry |
 | `decode_router` | Table | shared `[decode_router]` | Replaces the shared block for this entry |
 | `memory` | Table | shared `[memory]` | Replaces the shared block for this entry |
+| `prefill` | Table | shared `[prefill]` | Replaces the shared block for this entry |
 | `time_correction` | Table | unset | Step-time calibration against a measured engine: `{ alpha = 1.0, beta = 0.0 }` prices every roofline step at `alpha × t + beta` seconds (`alpha` = kernel-efficiency gap, `beta` = fixed per-iteration cost). Unset = pure roofline. Never applied on top of a measured step-cost table |
 
 Collectives are priced on the hardware's `[fabric]` (below) and added
@@ -234,6 +236,7 @@ each with the derivation of its numbers from the HF config in its header.
 | `kv_cache_capacity` | U64 | 0 | Explicit KV cache bytes across the TP group; 0 derives it from `gpu_memory_utilization` |
 | `max_model_len` | U32 | model's `max_seq_len` | Serving-time context limit (only the chunked-prefill threshold default depends on it) |
 | `enable_preemption_free` | Bool | false | Admit only what can grow to `prompt + max_output` without preemption |
+| `balance_set` | Table | unset | Balance-set admission control (Denning's medium-term scheduler): `{ high, low }` as fractions of KV capacity. Admission stops when the running working set (resident context of running requests) reaches `high` and resumes only once it falls below `low` (hysteresis; `low` defaults to `high`). Holds the overflow in the queue instead of admitting-and-evicting, so recently-idle sessions' cached prefixes survive in the reserved `1 − high` headroom. Absent = overcommit (today's behaviour) |
 | `enable_cascade_attention` | Bool | false | Load a batch's shared prompt prefix once per iteration |
 
 ---
@@ -332,6 +335,18 @@ sharing every traversed edge with whatever else is in flight. These legs hold
 no HBM. The final closest-store-to-GPU leg reserves the request's landing
 blocks; direct mode instead reserves them for its one source-to-GPU transfer.
 
+A staged leg is admission-controlled against its destination store, the way
+HiCache bounds a storage prefetch by host-pool free space: it starts only if
+the store can take its blocks by evicting nothing that is pinned, and on
+start it pins its destination copy — in flight and after landing — until the
+request's final HBM load consumes it (or the stage is cancelled, times out,
+or is abandoned). A request whose stage does not fit yet holds at the head
+of its worker's queue until a stage completion or consumption frees pinned
+room; one whose external prefix exceeds the destination store outright
+abandons the prefetch and recomputes the external suffix. Under
+`storage_prefetch = timeout`, the deadline starts when the stage starts, not
+while it waits for room.
+
 `pin` is set on each hardware store entry. Staged reads always protect their
 store source until that leg drains. On a direct read, `pin = true` prevents
 the source from being recycled; with `pin = false`, completion lands only the
@@ -346,6 +361,40 @@ promoted, pin stalls, partial landings, and promotions that waited on a
 write. The `prefix_cache` section counts
 lookups recomputed instead of fetched (`min_time`) and prefetches started
 (`prefetch = outlook`), with their tokens.
+
+## [prefill]
+
+Optional. A disaggregated topology: this block is the prefill pool, and
+the hardware entry — its hardware, `tp`/`ep`/`dp_attention`, `replicas`
+and `[memory]` — becomes the decode pool. Arrivals enter the prefill pool
+through `[router]`, prefill there against that pool's HBM and `[prefill]
+memory` tiers, and hand their KV to a decoder chosen by `[decode_router]`
+over the network: the prefill worker's `nic` link, the core, the decode
+worker's `nic`. The first token rides with the hand-off. KV moves one way:
+a decoder's HBM shortens later hand-offs of the same prefix, but nothing
+flows back to the prefill side, so a re-entry whose prefix exists only in
+decode HBM is recomputed by prefill. A `per = "cluster"` store named in
+both pools' `tiers` is the one shared tier.
+
+```toml
+[prefill]
+replicas = 2                       # prefill workers
+parallel = { tp = 8, dp_attention = true }
+memory = { tiers = ["host_dram", "nvme"], preset = "reactive", backup = "on_land" }
+kv_link_bw = 4e11                  # optional core cap, bytes/s
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `hardware` | String or Table | the entry's hardware | Catalog preset or inline hardware table for the prefill pool |
+| `parallel` | Table | the entry's `tp`/`ep`/`dp_attention` | Parallel layout of a prefill worker |
+| `replicas` | U32 | 1 | Prefill workers behind `[router]` |
+| `memory` | Table | `{}` | KV tiers on the prefill side, from its hardware's stores (same keys as `[memory]`). Absent: prefill keeps prefixes in HBM only |
+| `kv_link_bw` | F64 | unset | Capacity of the network core between the pools, bytes/s, shared by every hand-off in flight. Unset: the NICs alone bound them; an error when the hardware has no network links either |
+
+`backup`, `hit_refresh` and `promote_fill` are graph-wide and taken from
+the pools that have tiers. `[scheduler]` (including `balance_set`) applies
+to both pools.
 
 ## [router] and [decode_router]
 

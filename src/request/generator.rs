@@ -516,6 +516,7 @@ mod tests {
             worker: None,
             num_preemptions: 0,
             rejected: false,
+            lookup: None,
         }
     }
 
@@ -535,6 +536,7 @@ mod tests {
             worker: None,
             num_preemptions: 0,
             rejected: false,
+            lookup: None,
         }
     }
 

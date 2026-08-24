@@ -1,5 +1,5 @@
 use super::flows::Owner;
-use super::graph::{promotion_request, MemoryGraph, SharedMemoryGraph, WorkerId};
+use super::graph::{promotion_request, MemoryGraph, SharedMemoryGraph, StageDenied, WorkerId};
 use super::radix::{
     HbmLookup, KvBytesFn, Path, Radix, SharedRadix, Span, TierSource, TierSourceRange, TierSpan,
 };
@@ -124,6 +124,26 @@ impl std::ops::AddAssign for PrefixCacheStats {
         self.hit_size_sum += o.hit_size_sum;
         self.lookups += o.lookups;
     }
+}
+
+/// The result of trying to start a lookup's storage stages. Submission is
+/// the only capacity check, so this verdict cannot disagree with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StageStart {
+    /// At least one stage leg is running.
+    Started,
+    /// Nothing to move: every destination copy is already resident or
+    /// arriving (another request's stage covers this prefix). Wait for
+    /// the landing, which re-runs the lookup.
+    AlreadyStaged,
+    /// No leg could start because a destination store is currently full of
+    /// pinned blocks; it would fit once those clear, so keep the request
+    /// queued and retry later.
+    Blocked,
+    /// A destination store can never hold its prefix (larger than the
+    /// store); the request must fall back to direct promotion / recompute
+    /// rather than park forever.
+    Impossible,
 }
 
 /// Manages KV cache blocks for one worker.
@@ -945,14 +965,18 @@ impl KVCacheManager {
     /// `lookup`. The request holds no HBM while these flows run. A later
     /// lookup sees the newly landed closer copy and either stages again or
     /// starts the final HBM load.
+    ///
+    /// The submit gate is the admission verdict: when no leg starts, the
+    /// worst denial (`Impossible` > `Blocked` > `AlreadyStaged`) says how
+    /// the scheduler should treat the request.
     pub fn start_staging(
         &mut self,
         request_id: String,
         lookup: &PrefixCacheLookup,
         current_time: f64,
-    ) -> bool {
+    ) -> StageStart {
         let Some((graph, worker)) = &self.memory else {
-            return false;
+            return StageStart::Impossible;
         };
         let mut groups: Vec<PromotionGroup> = Vec::new();
         for item in &lookup.tier_spans {
@@ -972,11 +996,12 @@ impl KVCacheManager {
         }
         let mut graph = graph.lock().unwrap();
         let mut ids = Vec::new();
+        let mut denied: Option<StageDenied> = None;
         for group in groups {
             if !graph.can_stage_source(*worker, group.tier, group.source) {
                 continue;
             }
-            if let Some(id) = graph.submit_stage_promotion(
+            match graph.submit_stage_promotion(
                 *worker,
                 group.tier,
                 &request_id,
@@ -984,16 +1009,23 @@ impl KVCacheManager {
                 &group.spans,
                 current_time,
             ) {
-                ids.push(id);
+                Ok(id) => ids.push(id),
+                Err(d) => denied = Some(denied.map_or(d, |prev| prev.max(d))),
             }
         }
         if ids.is_empty() {
-            return false;
+            // No stageable group at all means the lookup cannot make
+            // progress through staging; fall back rather than park.
+            return match denied {
+                None | Some(StageDenied::Impossible) => StageStart::Impossible,
+                Some(StageDenied::Blocked) => StageStart::Blocked,
+                Some(StageDenied::AlreadyStaged) => StageStart::AlreadyStaged,
+            };
         }
         self.staging_active
             .insert(request_id.clone(), ids.len() as u32);
         self.staging_transfer_ids.insert(request_id, ids);
-        true
+        StageStart::Started
     }
 
     /// Mark the latest completed stage leg as observed before its deadline.
@@ -1730,7 +1762,10 @@ mod tests {
         let mut request = create_test_request("parallel", 3);
         request.prompt_block_hashes = vec![1, 2, 3];
         let lookup = manager.peek_prefix_cache(&request);
-        assert!(manager.start_staging("parallel".into(), &lookup, 0.0));
+        assert_eq!(
+            manager.start_staging("parallel".into(), &lookup, 0.0),
+            StageStart::Started
+        );
 
         let (slowest, sum) = {
             let ids = &manager.staging_transfer_ids["parallel"];
