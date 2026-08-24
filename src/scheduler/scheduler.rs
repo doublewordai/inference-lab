@@ -8,6 +8,23 @@ use crate::request::Request;
 use ordered_float::OrderedFloat;
 use std::collections::VecDeque;
 
+/// What became of a request offered to the staged-read path. Every arm
+/// that hands the request back must change some admission input before the
+/// caller retries it, or hold it without retrying this pass — retrying on
+/// unchanged state livelocks the admission loop.
+enum StagePark {
+    /// A stage started; the request is parked on `pending_storage`.
+    Parked,
+    /// Staging does not apply; continue normal admission with the request.
+    Proceed(Request),
+    /// Capacity-gated (or waiting on an arriving copy): hold the request
+    /// in `waiting` and stop admitting until a later pass.
+    Blocked(Request),
+    /// The stage can never start: abandon the storage prefetch so the next
+    /// pass truncates the lookup to the reachable prefix and recomputes.
+    Fallback(Request),
+}
+
 /// A prefix to pull back into HBM ahead of its announced re-entry.
 #[derive(Debug, Clone)]
 struct PrefetchPlan {
@@ -212,9 +229,11 @@ impl Scheduler {
             .total_cached_tokens
             .min(probe.num_prompt_tokens.saturating_sub(1));
         if self.kv_cache_manager.needs_staging(&lookup) {
-            if !self
+            // A synthetic prefetch is best-effort: any denial just drops it.
+            if self
                 .kv_cache_manager
                 .start_staging(probe.request_id.clone(), &lookup, now)
+                != StageStart::Started
             {
                 return false;
             }
@@ -314,16 +333,22 @@ impl Scheduler {
         lookup: &PrefixCacheLookup,
         cached_tokens: u32,
         current_time: f64,
-    ) -> Option<Request> {
-        if !self.promote_fill.stages()
-            || !self.kv_cache_manager.needs_staging(lookup)
-            || !self.kv_cache_manager.start_staging(
-                request.request_id.clone(),
-                lookup,
-                current_time,
-            )
+    ) -> StagePark {
+        if !self.promote_fill.stages() || !self.kv_cache_manager.needs_staging(lookup) {
+            return StagePark::Proceed(request);
+        }
+        match self
+            .kv_cache_manager
+            .start_staging(request.request_id.clone(), lookup, current_time)
         {
-            return Some(request);
+            StageStart::Started => {}
+            // Nothing can move until a stage completion or consumption
+            // frees pinned room (or lands the arriving copy). Both re-run
+            // a schedule pass, which retries the request.
+            StageStart::Blocked | StageStart::AlreadyStaged => {
+                return StagePark::Blocked(request);
+            }
+            StageStart::Impossible => return StagePark::Fallback(request),
         }
         request.num_cached_tokens = cached_tokens;
         if let StoragePrefetchPolicy::Timeout { seconds } = self.storage_prefetch {
@@ -332,7 +357,7 @@ impl Scheduler {
             request.ready_at = None;
         }
         self.pending_storage.push(request);
-        None
+        StagePark::Parked
     }
 
     /// Promote any pending KV-transfer requests whose transfer has finished
@@ -709,46 +734,35 @@ impl Scheduler {
                 // lookup after the stage lands; a hierarchy with more than
                 // three levels repeats this one level at a time.
                 if lookup.needs_promotion() && self.kv_cache_manager.needs_staging(&lookup) {
-                    match self.kv_cache_manager.staging_outcome(&lookup) {
-                        StageStart::Started => {
-                            let request = self.waiting.remove(selected_idx).unwrap();
-                            match self.park_on_storage_stage(
-                                request,
-                                &lookup,
-                                cached_tokens,
-                                current_time,
-                            ) {
-                                None => continue,
-                                Some(request) => {
-                                    self.waiting.insert(selected_idx, request);
-                                    // The source changed between lookup and
-                                    // submit. Re-run lookup rather than
-                                    // falling through with the stale result.
-                                    continue;
-                                }
-                            }
+                    let request = self.waiting.remove(selected_idx).unwrap();
+                    match self.park_on_storage_stage(request, &lookup, cached_tokens, current_time)
+                    {
+                        StagePark::Parked => continue,
+                        StagePark::Proceed(request) => {
+                            self.waiting.insert(selected_idx, request);
+                            // The source changed between lookup and submit.
+                            // Re-run lookup rather than falling through with
+                            // the stale result.
+                            continue;
                         }
-                        StageStart::Blocked => {
-                            // The destination store can hold the stage but is
-                            // currently full of pinned blocks. A stage
-                            // completion / consumption will free the room.
-                            // Keep the request at the head of the queue and
-                            // stop admitting this pass; a later schedule pass
-                            // (driven by the landing or a consumption)
-                            // retries it. Do NOT `continue` here: that would
-                            // re-select the same head request and spin on the
-                            // same full store.
+                        StagePark::Blocked(request) => {
+                            // The destination store is full of pinned blocks
+                            // (or the copy is arriving from another request's
+                            // stage). A stage completion / consumption frees
+                            // the room and re-runs a schedule pass, which
+                            // retries this request. Do NOT `continue` here:
+                            // nothing about the store can change within this
+                            // pass, so re-selecting the same head spins
+                            // forever.
+                            self.waiting.insert(selected_idx, request);
                             break;
                         }
-                        StageStart::Impossible => {
-                            // The external prefix is larger than the
-                            // destination store can ever hold. Fall back to
-                            // recomputing the external suffix instead of
-                            // parking forever: mark the stage abandoned so
-                            // the next pass truncates the lookup to the
-                            // HBM-reachable prefix and promotes / recomputes
-                            // from there.
-                            let mut request = self.waiting.remove(selected_idx).unwrap();
+                        StagePark::Fallback(mut request) => {
+                            // The external prefix can never be staged. Mark
+                            // the prefetch abandoned so the next iteration
+                            // truncates the lookup to the reachable prefix
+                            // and recomputes the external suffix — a changed
+                            // input, so the retry terminates.
                             request.storage_prefetch_abandoned = true;
                             self.waiting.insert(selected_idx, request);
                             continue;
@@ -1091,22 +1105,19 @@ impl Scheduler {
         if !self.recompute_instead(&request, &lookup, resident)
             && self.kv_cache_manager.needs_staging(&lookup)
         {
-            match self.kv_cache_manager.staging_outcome(&lookup) {
-                StageStart::Started => {
-                    match self.park_on_storage_stage(request, &lookup, cached, current_time) {
-                        None => return,
-                        Some(req) => request = req,
-                    }
+            match self.park_on_storage_stage(request, &lookup, cached, current_time) {
+                StagePark::Parked => return,
+                StagePark::Proceed(req) | StagePark::Blocked(req) => {
+                    // Blocked: the destination store is full of pinned
+                    // blocks; a completion frees room and admission
+                    // retries it from `waiting`.
+                    request = req;
                 }
-                StageStart::Blocked => {
-                    // Destination is currently full of pinned blocks; it fits
-                    // once a completion frees room. Keep the request in
-                    // `waiting` and let admission retry it.
-                }
-                StageStart::Impossible => {
+                StagePark::Fallback(req) => {
                     // Prefix larger than the destination store: fall back to
                     // recomputing the external suffix rather than parking
                     // forever.
+                    request = req;
                     request.storage_prefetch_abandoned = true;
                 }
             }

@@ -154,18 +154,21 @@ struct Hop {
     latency: f64,
 }
 
-/// The topology's KV memory beyond HBM.
-///
-/// Stage admission against destination-store capacity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StageCapacity {
-    /// The destination can hold the whole stage right now.
-    Fits,
-    /// It currently cannot (other stages / pins hold the store), but
-    /// would once those complete; parking to retry later is sound.
+/// Why a stage submission did not start. Submission itself is the only
+/// capacity check: a separate pre-check can disagree with the submit gate
+/// (per-span versus whole-group need) and livelock admission on a verdict
+/// the submit then refuses.
+/// Ordered by severity: `Impossible` > `Blocked` > `AlreadyStaged`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum StageDenied {
+    /// Every destination span is already resident or arriving; there is
+    /// nothing to move. Wait for the arriving copy to land.
+    AlreadyStaged,
+    /// The destination store cannot take the stage without evicting
+    /// pinned blocks; it fits once those clear, so retry on a later pass.
     Blocked,
-    /// The prefix is larger than the destination store can ever hold;
-    /// it must fall back (promote direct or recompute) or park forever.
+    /// The stage can never start (prefix larger than the destination
+    /// store, or no usable path); fall back rather than park forever.
     Impossible,
 }
 
@@ -1350,56 +1353,11 @@ impl MemoryGraph {
                 .is_some_and(|tiers| tiers.iter().any(|t| !t.is_peer_hbm()))
     }
 
-    /// One group's staging capacity check against its destination store.
-    ///
-    /// Whether staging `spans` from `tier` into its next closer store fits
-    /// now, and whether it can ever fit. Drives admission so a stage is not
-    /// submitted when capacity is tight, and so an oversized prefix falls
-    /// back instead of parking forever.
-    pub fn stage_capacity(
-        &self,
-        worker: WorkerId,
-        tier: usize,
-        source: TierSource,
-        spans: &[Span],
-    ) -> StageCapacity {
-        if !self.can_stage_source(worker, tier, source) {
-            return StageCapacity::Fits;
-        }
-        let TierSource::Store(_source_store) = source else {
-            return StageCapacity::Fits;
-        };
-        let Some(destination_tier) = self.tiers[worker][..tier]
-            .iter()
-            .rposition(|t| !t.is_peer_hbm())
-        else {
-            return StageCapacity::Fits;
-        };
-        let destination = self.tiers[worker][destination_tier].store;
-        let radix = self.radix.lock().unwrap();
-        let mut need = 0u32;
-        for &span in spans {
-            for missing in radix.store_missing(destination, span) {
-                need += missing.len();
-            }
-        }
-        let capacity = radix.store_capacity_blocks(destination) as u64;
-        let available = radix.store_available_for_stage(destination);
-        if need == 0 {
-            StageCapacity::Fits
-        } else if need as u64 > capacity {
-            StageCapacity::Impossible
-        } else if need as u64 <= available {
-            StageCapacity::Fits
-        } else {
-            StageCapacity::Blocked
-        }
-    }
-
     /// Stage a concrete store hit into the next closer real store. The
     /// destination ranges are inserted as arriving now, become resident only
-    /// when the flow drains, and consume that store's real capacity. Returns
-    /// `None` when no closer store exists or it already holds every span.
+    /// when the flow drains, and consume that store's real capacity. This is
+    /// also the only capacity check: the returned `StageDenied` is the
+    /// admission verdict, and a denial mutates nothing.
     #[allow(clippy::too_many_arguments)]
     pub fn submit_stage_promotion(
         &mut self,
@@ -1409,23 +1367,25 @@ impl MemoryGraph {
         source: TierSource,
         spans: &[Span],
         now: f64,
-    ) -> Option<String> {
+    ) -> Result<String, StageDenied> {
         if !self.can_stage_source(worker, tier, source) {
-            return None;
+            return Err(StageDenied::Impossible);
         }
         let TierSource::Store(source) = source else {
-            return None;
+            return Err(StageDenied::Impossible);
         };
         let destination_tier = self.tiers[worker][..tier]
             .iter()
-            .rposition(|t| !t.is_peer_hbm())?;
+            .rposition(|t| !t.is_peer_hbm())
+            .ok_or(StageDenied::Impossible)?;
         let destination = self.tiers[worker][destination_tier].store;
         if source == destination {
-            return None;
+            return Err(StageDenied::Impossible);
         }
 
-        let mut path =
-            self.shortest_path(self.stores[source].vertex, self.stores[destination].vertex)?;
+        let mut path = self
+            .shortest_path(self.stores[source].vertex, self.stores[destination].vertex)
+            .ok_or(StageDenied::Impossible)?;
         if let Some(edge) = self.stores[source].throughput_edge {
             path.edges.insert(0, edge);
         }
@@ -1459,12 +1419,18 @@ impl MemoryGraph {
                     missing_blocks.push(missing);
                 }
             }
+            if need == 0 {
+                return Err(StageDenied::AlreadyStaged);
+            }
+            if need as u64 > radix.store_capacity_blocks(destination) as u64 {
+                return Err(StageDenied::Impossible);
+            }
             // Capacity gate: a stage may only displace unpinned resident
             // blocks, never another stage's in-flight or landed (pinned)
             // blocks, nor an in-flight reader's source pin. So the store
             // can absorb at most `capacity - pinned` new blocks.
             if need as u64 > radix.store_available_for_stage(destination) {
-                return None;
+                return Err(StageDenied::Blocked);
             }
             for missing in missing_blocks {
                 total = total.saturating_add(radix.span_bytes(missing));
@@ -1477,9 +1443,7 @@ impl MemoryGraph {
                 radix.pin_source(TierSource::Store(destination), missing);
             }
         }
-        if entries.is_empty() {
-            return None;
-        }
+        debug_assert!(!entries.is_empty(), "need > 0 guarantees entries");
         self.pending_stage_fills.insert(
             id.clone(),
             PendingStageFill {
@@ -1493,7 +1457,20 @@ impl MemoryGraph {
         );
         self.cascade_batch(destination, evicted);
         if !self.pending_stage_fills.contains_key(&id) {
-            return None;
+            // The cascade tore down this stage's own arriving blocks (its
+            // pins make this unreachable today). Undo the destination pins
+            // so the denial leaves no state behind.
+            {
+                let mut radix = self.radix.lock().unwrap();
+                for &span in &entries {
+                    radix.unpin_source(TierSource::Store(destination), span);
+                }
+            }
+            self.radix
+                .lock()
+                .unwrap()
+                .trim_store_after_unpin(destination);
+            return Err(StageDenied::Blocked);
         }
 
         let mut wait = 0.0_f64;
@@ -1535,7 +1512,7 @@ impl MemoryGraph {
             transfer_bandwidth,
             now,
         );
-        Some(id)
+        Ok(id)
     }
 
     /// Cancel an in-flight storage-to-closer-tier stage. Bytes already moved
@@ -2820,10 +2797,11 @@ bandwidth = 900
         g.submit_stage_promotion(0, 1, "A", lower, &[a], 0.0)
             .unwrap();
         assert_eq!(
-            g.stage_capacity(0, 1, lower, &[b]),
-            StageCapacity::Blocked,
+            g.submit_stage_promotion(0, 1, "B", lower, &[b], 0.0),
+            Err(StageDenied::Blocked),
             "B must not evict A's pinned, in-flight stage in the full store"
         );
+        assert!(!store_contains(&g, 0, 8), "a denied stage inserts nothing");
 
         // A lands and its final HBM load consumes it, releasing the pin; now
         // B's stage fits.
@@ -2832,10 +2810,57 @@ bandwidth = 900
         g.submit_source_promotion(0, 0, "A", host, 100, &[a], None, 20.0);
         g.advance(30.0);
         g.promoted_batch(0, "A", &[a]);
+        g.submit_stage_promotion(0, 1, "B", lower, &[b], 30.0)
+            .expect("the store serialises: B starts only once A has been consumed");
+    }
+
+    #[test]
+    fn spans_that_fit_alone_but_not_together_are_blocked_not_started() {
+        // Destination capacity 2, one block pinned by A's stage: each of B's
+        // two spans fits alone (1 <= 1 available) but the whole submission
+        // does not (2 > 1). The pre-fix per-span check said Fits while the
+        // submit gate refused, and admission respun on the disagreement
+        // forever. The submit verdict is the only check now: Blocked, and
+        // nothing is inserted.
+        let mut g = MemoryGraph::private_with(
+            1,
+            &[("t0", 2, 10.0), ("t1", 8, 5.0)],
+            1,
+            Arc::new(|t| 100 * t as u64),
+        )
+        .with_promote_fill(PromoteFill::Through);
+        let (a, b1, b2) = (sp(&g, 7), sp(&g, 8), sp(&g, 9));
+        g.plant(0, 1, a);
+        g.plant(0, 1, b1);
+        g.plant(0, 1, b2);
+        let lower = TierSource::Store(g.tiers[0][1].store);
+        g.submit_stage_promotion(0, 1, "A", lower, &[a], 0.0)
+            .unwrap();
         assert_eq!(
-            g.stage_capacity(0, 1, lower, &[b]),
-            StageCapacity::Fits,
-            "the store serialises: B starts only once A has been consumed"
+            g.submit_stage_promotion(0, 1, "B", lower, &[b1, b2], 0.0),
+            Err(StageDenied::Blocked),
+        );
+        assert!(!store_contains(&g, 0, 8));
+        assert!(!store_contains(&g, 0, 9), "no partial insertion either");
+    }
+
+    #[test]
+    fn a_stage_whose_copy_is_already_arriving_is_already_staged_not_started() {
+        // B shares A's prefix; A's stage is in flight, so B has nothing to
+        // move. The pre-fix per-span check called need == 0 Fits, the submit
+        // then found nothing to insert, and admission respun on the
+        // disagreement forever — with sim time frozen, since the landing
+        // that would resolve it could never be processed.
+        let mut g = two_tier_private(WritePolicy::WriteBack {}, EvictionPolicy::Lru {})
+            .with_promote_fill(PromoteFill::Through);
+        let shared = sp(&g, 7);
+        g.plant(0, 1, shared);
+        let lower = TierSource::Store(g.tiers[0][1].store);
+        g.submit_stage_promotion(0, 1, "A", lower, &[shared], 0.0)
+            .unwrap();
+        assert_eq!(
+            g.submit_stage_promotion(0, 1, "B", lower, &[shared], 0.0),
+            Err(StageDenied::AlreadyStaged),
         );
     }
 
@@ -2856,8 +2881,8 @@ bandwidth = 900
         g.plant(0, 1, b);
         let lower = TierSource::Store(g.tiers[0][1].store);
         assert_eq!(
-            g.stage_capacity(0, 1, lower, &[a, b]),
-            StageCapacity::Impossible,
+            g.submit_stage_promotion(0, 1, "request", lower, &[a, b], 0.0),
+            Err(StageDenied::Impossible),
             "an oversized prefix can never fit and must fall back"
         );
     }

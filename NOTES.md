@@ -93,3 +93,46 @@ Running log of established facts, decisions, and open questions.
   `a_stage_larger_than_the_destination_store_falls_back_not_park_for_ever`
   (Impossible). Both pass; each would fail/not-compile without stage_capacity.
 - fmt/clippy clean; 255 tests pass.
+
+## The "30x slowdown" was an admission livelock (fixed 2026-08-24)
+
+- Measured: both this branch and cd02843 reach sim t=795 in ~0.7 s wall.
+  There was NO steady-state slowdown; at t≈800 the branch wedged with sim
+  time frozen — `Scheduler::schedule` never returned (which is also why
+  `INFERENCE_LAB_DUMP_AT=810` never fired at any timeout).
+- Cause: `staging_outcome` (pre-check) and `submit_stage_promotion` (gate)
+  could disagree. The pre-check classified per-span (Fits if each span fits
+  alone) and called `need == 0` Fits; the submit gated on the whole group's
+  need and returned None for nothing-to-move. Fits verdict + refused submit →
+  reinsert + `continue` → same head, unchanged state → infinite respin.
+  Two concrete triggers: (a) a group whose spans fit individually but not
+  together; (b) a request whose prefix is already arriving via another
+  request's stage (need == 0), which can never resolve because the landing
+  event is behind the stuck schedule pass.
+- Fix: submission is the only classifier. `submit_stage_promotion` returns
+  `Result<String, StageDenied>` (`AlreadyStaged` | `Blocked` | `Impossible`,
+  denial mutates nothing); `start_staging` folds groups into `StageStart`
+  (`Started` | worst denial); the scheduler's `StagePark` arms each either
+  change an admission input before retrying (Fallback sets the abandon flag)
+  or hold without retrying this pass (Blocked/AlreadyStaged → break).
+  `staging_outcome`/`stage_capacity` deleted.
+- Second cost, exposed once unwedged: `store_range_pinned` scanned every pin
+  in the store per eviction candidate (~45% of the run: BTreeMap iter + the
+  scan). Now range-restricted to the candidate's node:
+  `pins.range((node,0,0)..(node,end,0))`.
+- Verified: repro completes 25,264.8 s simulated in 33.8 s wall (cd02843:
+  25,267.3 s in 32.5 s). host_dram evictions 47.5M vs 62.5M, dead bytes
+  11.4 TB vs 70.5 TB, NVMe read 127.9 TB vs 173.5 TB. 259 tests, fmt/clippy
+  clean. New graph tests: `spans_that_fit_alone_but_not_together_are_blocked_
+  not_started`, `a_stage_whose_copy_is_already_arriving_is_already_staged_
+  not_started`; the two ported capacity tests now assert submit outcomes.
+- Healthy cell (`sweep/disagg/nvme-p1-l0.06`, timeout 60 s): the banked
+  reference reproduces bit-identically from `inference-lab-disagg3`
+  (cd02843), so all deltas under the fixed binary are the gate+pinning
+  semantics, not noise: peak_transfers_in_flight 601→402, prefix misses
+  −10.3%, TTFT mean −17%, per_token mean +24%, preemptions 145→186,
+  handoff bytes −3.2%. Outputs in `sweep/disagg-verify/` (originals
+  untouched). Exact invariance is unattainable: this cell holds host DRAM
+  at 100%, so the gate engages by design (HiCache bounds prefetch by host
+  free space). Whether to re-run the disagg ladder on the fixed binary is
+  Fergus's call.

@@ -2720,8 +2720,8 @@ impl Radix {
     fn store_range_pinned(&self, s: StoreId, node: NodeId, start: u32, end: u32) -> bool {
         self.stores[s]
             .pins
-            .iter()
-            .any(|(&(n, a, b), &count)| count > 0 && n == node && a < end && start < b)
+            .range((node, 0, 0)..(node, end, 0))
+            .any(|(&(_, _, b), &count)| count > 0 && start < b)
     }
 
     /// Evict until `s` meets its capacity, skipping every range protected by

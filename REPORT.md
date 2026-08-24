@@ -1,28 +1,41 @@
-# Branch state: fix/staged-read-gating (2026-08-23, closed out by supervisor)
+# Branch state: fix/staged-read-gating (2026-08-24, verified)
 
-Written by the supervising session after stopping the pi agent (Fergus's
-call: bank what's good, stop the run).
+## Committed
 
-## Committed (both by the agent, suite green: 255 tests, clippy/fmt clean)
+- `1f357d6` (agent) gate staged reads on destination-store capacity + pin
+  landed stage copies until consumed (releases on consume/abandon/abort).
+  Also corrected a test that asserted the old buggy behaviour.
+- `f441685` (agent) scheduler: Blocked stages stay parked; Impossible
+  prefixes (can never fit) fall back instead of parking forever.
+- `0509760` close-out docs (REPORT/NOTES/LANE) at the point the run stopped.
+- (2026-08-24) fix: submission is the only staging classifier. The
+  "regression" the close-out reported was not a slowdown but an admission
+  livelock: `staging_outcome` (per-span, and `need == 0` → Fits) could say
+  Fits where `submit_stage_promotion` (whole-group gate) refused, and the
+  scheduler respun on the disagreement with sim time frozen inside one
+  `schedule` pass. `submit_stage_promotion` now returns
+  `Result<String, StageDenied>` (AlreadyStaged | Blocked | Impossible; a
+  denial mutates nothing), `start_staging` folds groups into `StageStart`,
+  and the scheduler either changes an admission input before retrying or
+  holds the head without retrying this pass. Also range-restricted
+  `store_range_pinned` to the candidate's node (was a full-store pin scan,
+  ~45% of the unwedged run). Details in NOTES.md.
 
-- `1f357d6` gate staged reads on destination-store capacity + pin landed
-  stage copies until consumed (releases on consume/abandon/abort). Also
-  corrected a test that asserted the old buggy behaviour.
-- `f441685` scheduler: Blocked stages stay parked; Impossible prefixes
-  (can never fit) fall back instead of parking forever.
+## Verified (LANE.md item 6)
 
-## NOT verified — known regression, do not merge as-is
-
-The capped wait_complete repro
-(`~/scratch/kv-policy-eval/sweep/repro-staging/nvme-p1-l0.08`) completes in
-32 s wall on the pre-gating binary (`sweep/inference-lab-disagg3`, commit
-`cd02843`); on this branch it reaches only t≈800 s of 25,200 s in 45 s wall
-(~30× slower) and times out at 300 s. Direction is right (the livelock the
-gate targets is real — see LANE.md + LANE-CORRECTION.md), the implementation
-churns: suspect the gate/park/retry cycle re-evaluates parked stages every
-scheduler pass, or the pin/trim bookkeeping. Needs a performance pass and
-then the LANE.md verification steps (repro at 21783c6 semantics, healthy-cell
-numbers unchanged vs `sweep/disagg/nvme-p1-l0.06`).
+- Repro (`sweep/repro-staging/nvme-p1-l0.08`): completes 25,264.8 s
+  simulated in 33.8 s wall vs cd02843's 25,267.3 s in 32.5 s. host_dram
+  evictions 47.5M (cd02843: 62.5M), dead bytes 11.4 TB (70.5 TB), NVMe
+  read 127.9 TB (173.5 TB).
+- Suite: 259 tests green (two new livelock-regression tests), fmt/clippy
+  clean; `docs/src/reference/config.md` updated with the gating semantics.
+- Healthy cell (`sweep/disagg/nvme-p1-l0.06`, timeout 60 s): NOT identical,
+  and cannot be — the banked reference reproduces bit-identically from
+  cd02843, and this cell holds host DRAM at 100%, so the gate engages.
+  Deltas under the fixed binary (outputs in `sweep/disagg-verify/`,
+  originals untouched): peak_transfers_in_flight 601→402, prefix misses
+  −10.3%, TTFT mean −17%, per_token mean +24%, preemptions 145→186.
+  Re-running the disagg ladder on the fixed binary is Fergus's call.
 
 ## Session notes
 

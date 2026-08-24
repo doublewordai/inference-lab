@@ -335,6 +335,18 @@ sharing every traversed edge with whatever else is in flight. These legs hold
 no HBM. The final closest-store-to-GPU leg reserves the request's landing
 blocks; direct mode instead reserves them for its one source-to-GPU transfer.
 
+A staged leg is admission-controlled against its destination store, the way
+HiCache bounds a storage prefetch by host-pool free space: it starts only if
+the store can take its blocks by evicting nothing that is pinned, and on
+start it pins its destination copy — in flight and after landing — until the
+request's final HBM load consumes it (or the stage is cancelled, times out,
+or is abandoned). A request whose stage does not fit yet holds at the head
+of its worker's queue until a stage completion or consumption frees pinned
+room; one whose external prefix exceeds the destination store outright
+abandons the prefetch and recomputes the external suffix. Under
+`storage_prefetch = timeout`, the deadline starts when the stage starts, not
+while it waits for room.
+
 `pin` is set on each hardware store entry. Staged reads always protect their
 store source until that leg drains. On a direct read, `pin = true` prevents
 the source from being recycled; with `pin = false`, completion lands only the
