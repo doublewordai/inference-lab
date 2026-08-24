@@ -167,6 +167,37 @@ fn main() {
         );
     }
 
+    // ---- Table 2b: lane P bench point (c256 over 16 ranks, ~1.4k prompt + ~0.5k
+    // generated, HBM KV); eager floor ≈ M's eager per-call dispatch+combine
+    // (1923+296 µs → ~2.2 ms/phase-equivalent), graphs 853 µs ----
+    let bp_batch = 256_usize;
+    let bp_ctx = vec![1_900_u32; bp_batch];
+    let bp_reqs = requests(&bp_ctx);
+    let bp_refs: Vec<&Request> = bp_reqs.iter().collect();
+    for latency_us in [2_200_u32, 853, 196, 100] {
+        let eng = engine(hardware(latency_us), MoeOverlap::Serial, None);
+        for gamma in GAMMAS {
+            let step = step_time(&eng, &bp_refs, bp_batch, gamma, layers);
+            for alpha in [0.60_f64, 0.70, 0.80, 0.90] {
+                if gamma == 0 && alpha != 0.60 {
+                    continue;
+                }
+                let committed = if gamma == 0 {
+                    1.0
+                } else {
+                    expected_committed(gamma, alpha)
+                };
+                let a = if gamma == 0 { 1.0 } else { alpha };
+                println!(
+                    "benchpoint,serial,{latency_us},{bp_batch},{gamma},{a:.2},{:.2},{committed:.4},{:.3},{:.1}",
+                    bp_batch as f64 * (gamma + 1) as f64 * 8.0 / 256.0,
+                    step * 1e3,
+                    bp_batch as f64 * committed / (16.0 * step)
+                );
+            }
+        }
+    }
+
     // ---- Table 3: batch sweep — where does spec stop paying? ----
     // Spec pays at batch B iff tps(γ, α, B) > tps(0, B). Committed uses the
     // mid acceptance α=0.80; crossover reported as the spec:no-spec ratio.
