@@ -14,7 +14,10 @@ instead: `inference-lab sim [OPTIONS]` takes the options below and
 `--config` (a model config or a directory of them), `--hardware` (models
 without that entry are skipped) and an optional `--workload`, whose
 `output_len_dist` samples each response's length; without one responses run
-to their `max_tokens`.
+to their `max_tokens`. `--max-waiting <N>` bounds the waiting queue so the
+server refuses arrivals past it with HTTP 529 (0, the default, queues without
+limit); it and `max_num_seqs` are retunable on a running server through
+`POST /control/capacity` — see [Saturation and Capacity](./saturation.md).
 
 ## Options
 

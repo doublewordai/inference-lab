@@ -807,6 +807,31 @@ impl Engine {
             .sum()
     }
 
+    /// Retune the per-worker concurrency cap across every pool: the
+    /// serve-mode scale up/down. Admission reads the cap live, so this
+    /// takes effect from each worker's next iteration and never evicts an
+    /// already-running request (see [`Scheduler::set_max_num_seqs`]).
+    pub fn set_max_num_seqs(&mut self, max_num_seqs: u32) {
+        for pool in &mut self.topology.pools {
+            for worker in &mut pool.workers {
+                worker.scheduler.set_max_num_seqs(max_num_seqs);
+            }
+        }
+    }
+
+    /// The concurrency cap of the first worker. Every worker in a topology
+    /// is built from the same `SchedulerConfig`, and `set_max_num_seqs`
+    /// writes all of them, so this is the topology-wide value.
+    pub fn max_num_seqs(&self) -> u32 {
+        self.topology
+            .pools
+            .iter()
+            .flat_map(|p| &p.workers)
+            .map(|w| w.scheduler.max_num_seqs())
+            .next()
+            .unwrap_or(0)
+    }
+
     /// Sum of `waiting` across all pools.
     pub fn aggregate_waiting(&self) -> usize {
         self.topology

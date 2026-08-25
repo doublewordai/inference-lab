@@ -309,6 +309,45 @@ pub struct ModelEntry {
     pub owned_by: &'static str,
 }
 
+// --- Runtime capacity control ---
+
+/// Body of `POST /control/capacity`. Every field is optional: `model`
+/// defaults to every loaded model, and each knob is left alone when absent,
+/// so one knob can be turned without restating the other.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapacityUpdate {
+    /// Which model to retune. Absent = all of them.
+    #[serde(default)]
+    pub model: Option<String>,
+
+    /// New waiting-queue bound. `0` disables saturation rejection, which is
+    /// how this knob is normally used: not to tune the queue length, but to
+    /// turn 529s on and off against a running server.
+    #[serde(default)]
+    pub max_waiting: Option<u32>,
+
+    /// New per-worker concurrency cap — the scale up/down. This is the knob
+    /// that changes how fast work actually drains, and so the offered load
+    /// at which the queue backs up. Must be at least 1.
+    #[serde(default)]
+    pub max_num_seqs: Option<u32>,
+}
+
+/// One model's capacity, as reported by `GET`/`POST /control/capacity`.
+#[derive(Debug, Serialize)]
+pub struct CapacityState {
+    pub model: String,
+    /// The waiting-queue bound; `0` means unbounded (no 529s).
+    pub max_waiting: u32,
+    /// The concurrency cap now in force.
+    pub max_num_seqs: u32,
+    /// Requests queued right now, against which `max_waiting` is compared.
+    pub waiting: usize,
+    /// Requests running right now.
+    pub running: usize,
+}
+
 // --- Engine communication ---
 
 pub struct EngineRequest {
