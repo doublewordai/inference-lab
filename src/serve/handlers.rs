@@ -913,21 +913,22 @@ async fn submit_engine_request(
     Ok((request_id, rx))
 }
 
-/// HTTP 529, which `http::StatusCode` has no associated constant for.
+/// HTTP 529 "overloaded", which `http::StatusCode` has no associated
+/// constant for.
 ///
-/// Deliberately distinct from the 503 above and from 429: 529 is the code a
+/// NOT 429, despite that code's "Too Many Requests" name: 529 is what a
 /// client-side concurrency controller keys on to mean "the engine has
-/// nowhere to put this", where 503 means the service is down and 429 means a
-/// quota or proxy limit — neither of which a client should answer by
-/// shedding load.
-fn too_many_requests() -> StatusCode {
+/// nowhere to put this", where 429 means a quota or proxy limit and 503
+/// (returned above on a closed engine channel) means the service is down.
+/// Neither of those is something a client should answer by shedding load.
+fn overloaded_status() -> StatusCode {
     StatusCode::from_u16(529).expect("529 is a valid status code")
 }
 
 /// The saturation refusal: the waiting queue is at its bound.
 fn queue_saturated(depth: usize, limit: u32) -> (StatusCode, Json<serde_json::Value>) {
     (
-        too_many_requests(),
+        overloaded_status(),
         Json(serde_json::json!({
             "error": {
                 "message": format!(

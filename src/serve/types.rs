@@ -342,7 +342,9 @@ pub struct CapacityState {
     pub max_waiting: u32,
     /// The concurrency cap now in force.
     pub max_num_seqs: u32,
-    /// Requests queued right now, against which `max_waiting` is compared.
+    /// The depth `max_waiting` is compared against: requests sitting in a
+    /// scheduler's waiting queue, plus those admitted but not yet stepped
+    /// into one. Not the scheduler queue length alone.
     pub waiting: usize,
     /// Requests running right now.
     pub running: usize,

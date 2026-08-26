@@ -28,24 +28,32 @@
 //! `observed + pending`: what the schedulers hold, plus what the handlers
 //! have admitted that the engine has not stepped yet.
 //!
-//! `pending` is also what makes the bound hold under concurrency. It is
-//! incremented by the admitting handler under a CAS, so N handlers racing at
-//! the bound serialize against each other instead of all reading the same
-//! stale depth and all being let through.
+//! Both counters live in ONE atomic word, and every mutation of either is a
+//! CAS on the whole word. That is what makes the bound exact:
+//!
+//! - Check-and-reserve is a single CAS, so a `publish` cannot land between a
+//!   handler reading the depth and taking its slot. Held as two atomics, a
+//!   handler could decide against a stale `observed` and admit past the bound.
+//! - A request moving from `pending` to `observed` is one write, so it is
+//!   never briefly counted twice or missed entirely.
 
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::Notify;
 
 /// Shared admission state for one model's engine.
 pub struct Capacity {
-    /// Queue depth as last published by the engine loop: the sum of every
-    /// worker's `num_waiting()`.
-    observed: AtomicUsize,
-
-    /// Requests admitted by a handler whose `Arrival` the engine has not
-    /// stepped yet. Counted toward the depth so a burst cannot slip past
-    /// the bound in the window before the engine catches up.
-    pending: AtomicUsize,
+    /// The queue depth, as `observed` in the high 32 bits and `pending` in
+    /// the low 32 (see [`pack`]).
+    ///
+    /// `observed` is what the engine loop last published: the sum of every
+    /// worker's `num_waiting()`. `pending` is what handlers have admitted
+    /// whose `Arrival` the engine has not stepped yet — counted toward the
+    /// depth so a burst cannot slip past the bound in the window before the
+    /// engine catches up.
+    ///
+    /// One word rather than two atomics so that check-and-reserve is a
+    /// single CAS; see the module docs.
+    depth: AtomicU64,
 
     /// Running requests, published for the control endpoint's benefit.
     running: AtomicUsize,
@@ -69,8 +77,7 @@ pub struct Capacity {
 impl Capacity {
     pub fn new(max_waiting: u32, max_num_seqs: u32) -> Self {
         Self {
-            observed: AtomicUsize::new(0),
-            pending: AtomicUsize::new(0),
+            depth: AtomicU64::new(0),
             running: AtomicUsize::new(0),
             max_waiting: AtomicU32::new(max_waiting),
             max_num_seqs: AtomicU32::new(max_num_seqs),
@@ -81,7 +88,8 @@ impl Capacity {
     /// Requests waiting: what the schedulers hold plus what has been
     /// admitted but not yet stepped into them.
     pub fn waiting(&self) -> usize {
-        self.observed.load(Ordering::Relaxed) + self.pending.load(Ordering::Relaxed)
+        let (observed, pending) = unpack(self.depth.load(Ordering::Relaxed));
+        observed as usize + pending as usize
     }
 
     pub fn running(&self) -> usize {
@@ -126,28 +134,33 @@ impl Capacity {
     ///
     /// `Err(depth)` is a refusal at `depth` waiting requests, and the caller
     /// must turn it into a 529 *before* any response begins.
+    ///
+    /// The bound is exact at the moment of admission: the depth is tested
+    /// and the slot taken in one CAS, so a concurrent [`Self::publish`]
+    /// cannot slip in between and let a request past. It says nothing about
+    /// later growth — a preemption returns a running request to a
+    /// scheduler's waiting queue, which can push the depth over the bound
+    /// with no admission involved. That is correct: the bound gates
+    /// admission, and an admitted request is never retroactively refused.
     pub fn try_admit(&self) -> Result<(), usize> {
+        // 0 = unbounded; the slot is still counted so the control endpoint
+        // and any later bound change both see a truthful depth.
         let limit = self.max_waiting.load(Ordering::Relaxed) as usize;
-        if limit == 0 {
-            // Unbounded: still counted, so the control endpoint and a later
-            // bound change both see a truthful depth.
-            self.pending.fetch_add(1, Ordering::Relaxed);
-            return Ok(());
-        }
-        let mut pending = self.pending.load(Ordering::Relaxed);
+        let mut word = self.depth.load(Ordering::Relaxed);
         loop {
-            let depth = self.observed.load(Ordering::Relaxed) + pending;
-            if depth >= limit {
+            let (observed, pending) = unpack(word);
+            let depth = observed as usize + pending as usize;
+            if limit != 0 && depth >= limit {
                 return Err(depth);
             }
-            match self.pending.compare_exchange_weak(
-                pending,
-                pending + 1,
+            match self.depth.compare_exchange_weak(
+                word,
+                pack(observed, pending.saturating_add(1)),
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
                 Ok(_) => return Ok(()),
-                Err(actual) => pending = actual,
+                Err(actual) => word = actual,
             }
         }
     }
@@ -155,34 +168,58 @@ impl Capacity {
     /// Give back a slot taken by [`Self::try_admit`] that never reached the
     /// engine.
     pub fn release(&self) {
-        self.release_n(1);
+        self.update_depth(None, 1);
     }
 
     /// Publish the engine's own view of its queues, and release the slots of
     /// `arrived` requests that have now landed in a scheduler's waiting
     /// queue.
     ///
-    /// Order is deliberate: `observed` is written first, so a handler racing
-    /// this can only ever *over*count the depth by the arrivals in flight,
-    /// never undercount it. Overcounting refuses one request that had room;
-    /// undercounting admits one past the bound, and the bound is the point.
+    /// Setting `observed` and dropping those `pending` slots is one write, so
+    /// an arrival in transit is never counted twice nor missed: a racing
+    /// handler sees it either as pending or as observed, and the depth does
+    /// not flinch as it crosses.
     pub fn publish(&self, waiting: usize, running: usize, arrived: usize) {
-        self.observed.store(waiting, Ordering::Relaxed);
         self.running.store(running, Ordering::Relaxed);
-        if arrived > 0 {
-            self.release_n(arrived);
-        }
+        self.update_depth(Some(saturate(waiting)), saturate(arrived));
     }
 
-    fn release_n(&self, n: usize) {
-        // Saturating: a release without a matching reservation would
-        // otherwise wrap to usize::MAX and refuse every subsequent request.
-        let _ = self
-            .pending
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |p| {
-                Some(p.saturating_sub(n))
-            });
+    /// CAS `depth`: set `observed` if given, and drop `release` pending
+    /// slots. Saturating, because a release without a matching reservation
+    /// would otherwise wrap and refuse every subsequent request.
+    fn update_depth(&self, observed: Option<u32>, release: u32) {
+        let mut word = self.depth.load(Ordering::Relaxed);
+        loop {
+            let (prev_observed, pending) = unpack(word);
+            let next = pack(
+                observed.unwrap_or(prev_observed),
+                pending.saturating_sub(release),
+            );
+            match self
+                .depth
+                .compare_exchange_weak(word, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => return,
+                Err(actual) => word = actual,
+            }
+        }
     }
+}
+
+/// `observed` in the high 32 bits, `pending` in the low 32.
+const fn pack(observed: u32, pending: u32) -> u64 {
+    ((observed as u64) << 32) | pending as u64
+}
+
+const fn unpack(word: u64) -> (u32, u32) {
+    ((word >> 32) as u32, word as u32)
+}
+
+/// Counters are `usize` at the call sites but half a word here. Clamping
+/// rather than truncating keeps a nonsensical value large instead of
+/// wrapping it small, which would read as an empty queue.
+fn saturate(n: usize) -> u32 {
+    n.min(u32::MAX as usize) as u32
 }
 
 #[cfg(test)]
@@ -266,6 +303,69 @@ mod tests {
         for _ in 0..100 {
             assert!(cap.try_admit().is_ok());
         }
+    }
+
+    /// Handlers racing at the bound must serialize: the reservation is a CAS,
+    /// so exactly `max_waiting` of them win however many are in flight.
+    #[test]
+    fn concurrent_admissions_stop_exactly_at_the_bound() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Arc;
+
+        let cap = Arc::new(Capacity::new(8, 128));
+        let wins = Arc::new(AtomicUsize::new(0));
+        let threads: Vec<_> = (0..32)
+            .map(|_| {
+                let (cap, wins) = (cap.clone(), wins.clone());
+                std::thread::spawn(move || {
+                    for _ in 0..64 {
+                        if cap.try_admit().is_ok() {
+                            wins.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(wins.load(Ordering::Relaxed), 8);
+        assert_eq!(cap.waiting(), 8);
+    }
+
+    /// Admission must test against the depth the engine last published, not
+    /// against pending alone — the queue can be full with nothing pending.
+    #[test]
+    fn admission_tests_against_the_published_depth() {
+        let cap = Capacity::new(4, 128);
+        cap.publish(4, 0, 0);
+        assert_eq!(cap.try_admit(), Err(4));
+
+        // One slot short of the bound: exactly one more gets in.
+        cap.publish(3, 0, 0);
+        assert!(cap.try_admit().is_ok());
+        assert_eq!(cap.try_admit(), Err(4));
+    }
+
+    /// A preemption returns a running request to a waiting queue, so the
+    /// depth can exceed the bound with no admission involved. That must not
+    /// wedge anything: admission simply stays shut until it drains back.
+    #[test]
+    fn depth_above_the_bound_is_tolerated_and_recovers() {
+        let cap = Capacity::new(4, 128);
+        cap.publish(9, 0, 0);
+        assert_eq!(cap.waiting(), 9);
+        assert_eq!(cap.try_admit(), Err(9));
+        cap.publish(2, 0, 0);
+        assert!(cap.try_admit().is_ok());
+    }
+
+    #[test]
+    fn depth_word_round_trips_both_counters() {
+        assert_eq!(unpack(pack(7, 3)), (7, 3));
+        assert_eq!(unpack(pack(0, u32::MAX)), (0, u32::MAX));
+        assert_eq!(unpack(pack(u32::MAX, 0)), (u32::MAX, 0));
+        assert_eq!(saturate(usize::MAX), u32::MAX);
     }
 
     #[test]
