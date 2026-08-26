@@ -75,6 +75,16 @@ struct ServeArgs {
     /// output and stall/abort connections at will.
     #[arg(long, default_value_t = false)]
     enable_directives: bool,
+
+    /// Refuse requests with HTTP 529 once this many are waiting, overriding
+    /// `max_waiting` in every model's [scheduler] config. 0 = unbounded (the
+    /// default), which queues without limit and never refuses — so a client
+    /// driving this server sees no backpressure at any load.
+    ///
+    /// Retunable on a running server via POST /control/capacity, alongside
+    /// `max_num_seqs`.
+    #[arg(long)]
+    max_waiting: Option<u32>,
 }
 
 #[derive(Parser, Debug)]
@@ -341,6 +351,7 @@ async fn main() {
                 args.port,
                 args.tokenizer,
                 args.enable_directives,
+                args.max_waiting,
             )
             .await
             {

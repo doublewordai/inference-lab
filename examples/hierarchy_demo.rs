@@ -20,6 +20,7 @@ fn run_for_batch(num_concurrent: usize, share_prefix: bool) -> Vec<f64> {
     let scheduler_cfg = SchedulerConfig {
         max_num_batched_tokens: 8192,
         max_num_seqs: 256,
+        max_waiting: 0,
         policy: SchedulingPolicy::FCFS,
         enable_chunked_prefill: true,
         long_prefill_token_threshold: 0,

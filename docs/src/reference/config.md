@@ -226,7 +226,8 @@ each with the derivation of its numbers from the HF config in its header.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `max_num_batched_tokens` | U32 | — | Token budget per iteration |
-| `max_num_seqs` | U32 | — | Running-request cap |
+| `max_num_seqs` | U32 | — | Running-request cap. In `serve` mode this is retunable at runtime — see [Saturation and capacity](./saturation.md) |
+| `max_waiting` | U32 | 0 | `serve` only: refuse arrivals with HTTP 529 once this many requests are waiting. 0 = unbounded (queue without limit, never refuse). See [Saturation and capacity](./saturation.md) |
 | `policy` | String | — | `fcfs`, `priority`, `sif`, `lif`, `sof`, `lof`, `stf`, `ltf` (`sjf` = `sof`) |
 | `enable_chunked_prefill` | Bool | — | Split long prefills across iterations |
 | `long_prefill_token_threshold` | U32 | 0 | Prefill chunk cap; 0 = no cap. Defaults to 4% of `max_seq_len` when `max_num_partial_prefills > 1` |

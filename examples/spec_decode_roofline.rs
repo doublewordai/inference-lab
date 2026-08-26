@@ -51,6 +51,7 @@ fn topology() -> Topology {
     let sched = SchedulerConfig {
         max_num_batched_tokens: 100_000_000, // lift token budget too
         max_num_seqs: 10_000_000,
+        max_waiting: 0,
         enable_chunked_prefill: false,
         long_prefill_token_threshold: 0,
         max_num_partial_prefills: 1,

@@ -1,3 +1,4 @@
+pub mod capacity;
 pub mod directive;
 pub mod engine;
 pub mod fault;
@@ -15,6 +16,7 @@ use tower::ServiceExt;
 use tower_http::cors::CorsLayer;
 
 use crate::config::{Deployment, WorkloadConfig};
+use capacity::Capacity;
 use engine::RealtimeEngine;
 use handlers::AppState;
 
@@ -25,6 +27,7 @@ pub async fn start_server(
     port: u16,
     tokenizer_path: Option<PathBuf>,
     enable_directives: bool,
+    max_waiting_override: Option<u32>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Load tokenizer if provided
     let tokenizer = if let Some(path) = tokenizer_path {
@@ -39,6 +42,7 @@ pub async fn start_server(
     let mut engines: HashMap<String, mpsc::Sender<types::EngineRequest>> = HashMap::new();
     let mut model_names: Vec<String> = Vec::new();
     let mut model_faults: HashMap<String, fault::FaultSpec> = HashMap::new();
+    let mut model_capacity: HashMap<String, Arc<Capacity>> = HashMap::new();
 
     for deployment in deployments {
         let model_name = deployment.model.name.clone();
@@ -60,18 +64,36 @@ pub async fn start_server(
         // Create engine channel
         let (engine_tx, engine_rx) = mpsc::channel::<types::EngineRequest>(256);
 
+        // Admission state, shared with the handlers. `--max-waiting`
+        // overrides the config bound for every model, so saturation
+        // rejection can be switched on without editing config files.
+        let max_waiting = max_waiting_override.unwrap_or(deployment.scheduler.max_waiting);
+        let capacity = Arc::new(Capacity::new(
+            max_waiting,
+            deployment.scheduler.max_num_seqs,
+        ));
+        if max_waiting > 0 {
+            println!(
+                "  Saturation rejection: 529 past {} waiting requests on {}",
+                max_waiting, model_name
+            );
+        }
+
         // Start the engine
-        let engine = RealtimeEngine::new(&deployment, workload.clone(), engine_rx)?;
+        let engine =
+            RealtimeEngine::new(&deployment, workload.clone(), engine_rx, capacity.clone())?;
         tokio::spawn(engine.run());
 
         println!("  Loaded model: {}", model_name);
         model_names.push(model_name.clone());
-        engines.insert(model_name, engine_tx);
+        engines.insert(model_name.clone(), engine_tx);
+        model_capacity.insert(model_name, capacity);
     }
 
     // Build app state
     let state = Arc::new(AppState {
         engines,
+        capacity: model_capacity,
         model_names: model_names.clone(),
         tokenizer,
         enable_directives,
@@ -87,6 +109,10 @@ pub async fn start_server(
         .route("/v1/models", get(handlers::list_models))
         .route("/v1/chat/completions", post(handlers::chat_completions))
         .route("/v1/completions", post(handlers::completions))
+        .route(
+            "/control/capacity",
+            get(handlers::get_capacity).post(handlers::set_capacity),
+        )
         .layer(CorsLayer::permissive())
         .with_state(state);
 

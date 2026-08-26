@@ -14,11 +14,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
+use super::capacity::Capacity;
 use super::fault;
 use super::types::*;
 
 pub struct AppState {
     pub engines: HashMap<String, mpsc::Sender<EngineRequest>>,
+    /// Per-model admission state: the waiting-queue bound that produces
+    /// 529s, the live concurrency cap, and the queue depth the engine loop
+    /// publishes. See [`super::capacity`].
+    pub capacity: HashMap<String, Arc<Capacity>>,
     pub model_names: Vec<String>,
     pub tokenizer: Option<Arc<tokenizers::Tokenizer>>,
     /// Honor echo-directives (serve::directive). Explicitly opt-in: a scripted-response
@@ -32,6 +37,100 @@ pub struct AppState {
 
 pub async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({"status": "ok"}))
+}
+
+/// `GET /control/capacity` — every model's bound, concurrency cap, and the
+/// queue depth those are measured against.
+pub async fn get_capacity(State(state): State<Arc<AppState>>) -> Json<Vec<CapacityState>> {
+    Json(capacity_report(&state, &state.model_names))
+}
+
+/// `POST /control/capacity` — retune a running server without restarting it.
+///
+/// A restart would drop every in-flight request, which destroys the
+/// before-and-after that a capacity-change experiment depends on; both knobs
+/// here take effect on live state instead. Lowering `max_num_seqs` drains
+/// rather than evicts (see [`crate::scheduler::Scheduler::set_max_num_seqs`]),
+/// and lowering `max_waiting` only affects requests that have not yet
+/// arrived — anything already queued keeps its place, since its status code
+/// is long since spent.
+pub async fn set_capacity(
+    State(state): State<Arc<AppState>>,
+    Json(update): Json<CapacityUpdate>,
+) -> Result<Json<Vec<CapacityState>>, (StatusCode, Json<serde_json::Value>)> {
+    if update.max_waiting.is_none() && update.max_num_seqs.is_none() {
+        return Err(bad_control_request(
+            "no change requested: set at least one of \"max_waiting\" or \"max_num_seqs\"",
+        ));
+    }
+    // A cap of 0 admits nothing, ever: the server would accept requests and
+    // then never schedule them, which is the stall this whole feature exists
+    // to avoid. `max_waiting: 0` is meaningful (unbounded) and allowed.
+    if update.max_num_seqs == Some(0) {
+        return Err(bad_control_request(
+            "\"max_num_seqs\" must be at least 1; a cap of 0 would stall every request",
+        ));
+    }
+
+    let targets: Vec<String> = match &update.model {
+        Some(model) => {
+            if !state.capacity.contains_key(model) {
+                return Err(model_not_found(&state, model));
+            }
+            vec![model.clone()]
+        }
+        None => state.model_names.clone(),
+    };
+
+    for model in &targets {
+        let Some(capacity) = state.capacity.get(model) else {
+            continue;
+        };
+        if let Some(max_waiting) = update.max_waiting {
+            capacity.set_max_waiting(max_waiting);
+        }
+        if let Some(max_num_seqs) = update.max_num_seqs {
+            capacity.set_max_num_seqs(max_num_seqs);
+        }
+        log::info!(
+            "control: {} max_waiting={} max_num_seqs={}",
+            model,
+            capacity.max_waiting(),
+            capacity.max_num_seqs()
+        );
+    }
+
+    Ok(Json(capacity_report(&state, &targets)))
+}
+
+/// Capacity for `models`, in `model_names` order so the report is stable.
+fn capacity_report(state: &AppState, models: &[String]) -> Vec<CapacityState> {
+    models
+        .iter()
+        .filter_map(|model| {
+            let capacity = state.capacity.get(model)?;
+            Some(CapacityState {
+                model: model.clone(),
+                max_waiting: capacity.max_waiting(),
+                max_num_seqs: capacity.max_num_seqs(),
+                waiting: capacity.waiting(),
+                running: capacity.running(),
+            })
+        })
+        .collect()
+}
+
+fn bad_control_request(message: &str) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({
+            "error": {
+                "message": message,
+                "type": "invalid_request_error",
+                "code": "invalid_capacity_update"
+            }
+        })),
+    )
 }
 
 pub async fn list_models(State(state): State<Arc<AppState>>) -> Json<ModelList> {
@@ -774,6 +873,21 @@ async fn submit_engine_request(
         .engines
         .get(model)
         .ok_or_else(|| model_not_found(state, model))?;
+    let capacity = state
+        .capacity
+        .get(model)
+        .ok_or_else(|| model_not_found(state, model))?;
+
+    // Saturation check. This is the ONLY place a request enters the engine,
+    // and it runs before the caller has built any response — the `?` here
+    // returns a bare status + envelope, so the 529 is carried on the status
+    // line rather than buried in a stream that already committed to 200.
+    // It is also unconditional: the refusal is immediate, never a park until
+    // some later timeout, which would consume a client slot and signal
+    // nothing about overload.
+    capacity
+        .try_admit()
+        .map_err(|depth| queue_saturated(depth, capacity.max_waiting()))?;
 
     let (tx, rx) = mpsc::channel::<TokenEvent>(64);
     let request_id = format!("{}-{}", request_prefix, uuid::Uuid::new_v4());
@@ -786,6 +900,10 @@ async fn submit_engine_request(
     };
 
     engine_tx.send(engine_req).await.map_err(|_| {
+        // The reservation `try_admit` took is the engine's to release once
+        // it steps the arrival; a request that never reached the engine has
+        // to give it back here or the depth ratchets up permanently.
+        capacity.release();
         (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({"error": "engine unavailable"})),
@@ -793,6 +911,35 @@ async fn submit_engine_request(
     })?;
 
     Ok((request_id, rx))
+}
+
+/// HTTP 529 "overloaded", which `http::StatusCode` has no associated
+/// constant for.
+///
+/// NOT 429, despite that code's "Too Many Requests" name: 529 is what a
+/// client-side concurrency controller keys on to mean "the engine has
+/// nowhere to put this", where 429 means a quota or proxy limit and 503
+/// (returned above on a closed engine channel) means the service is down.
+/// Neither of those is something a client should answer by shedding load.
+fn overloaded_status() -> StatusCode {
+    StatusCode::from_u16(529).expect("529 is a valid status code")
+}
+
+/// The saturation refusal: the waiting queue is at its bound.
+fn queue_saturated(depth: usize, limit: u32) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        overloaded_status(),
+        Json(serde_json::json!({
+            "error": {
+                "message": format!(
+                    "Server is at capacity: {} requests waiting (max_waiting = {}). Retry with reduced concurrency.",
+                    depth, limit
+                ),
+                "type": "overloaded_error",
+                "code": "queue_saturated"
+            }
+        })),
+    )
 }
 
 /// Simulated chat-template overhead applied to the reported chat prompt count (percent).
@@ -874,21 +1021,29 @@ mod tests {
     fn test_state(engine_tx: mpsc::Sender<EngineRequest>) -> Arc<AppState> {
         // Directives ON: the directive tests exercise the scripted path; engine-path tests
         // send no directive text, so the flag is inert for them.
-        Arc::new(AppState {
-            engines: HashMap::from([("test-model".to_string(), engine_tx)]),
-            model_names: vec!["test-model".to_string()],
-            tokenizer: None,
-            enable_directives: true,
-            model_faults: HashMap::new(),
-        })
+        test_state_with(engine_tx, true, 0)
     }
 
     fn test_state_directives_off(engine_tx: mpsc::Sender<EngineRequest>) -> Arc<AppState> {
+        test_state_with(engine_tx, false, 0)
+    }
+
+    /// `max_waiting = 0` is the unbounded default every pre-existing test
+    /// runs under, so their behaviour is untouched by the admission check.
+    fn test_state_with(
+        engine_tx: mpsc::Sender<EngineRequest>,
+        enable_directives: bool,
+        max_waiting: u32,
+    ) -> Arc<AppState> {
         Arc::new(AppState {
             engines: HashMap::from([("test-model".to_string(), engine_tx)]),
+            capacity: HashMap::from([(
+                "test-model".to_string(),
+                Arc::new(Capacity::new(max_waiting, 128)),
+            )]),
             model_names: vec!["test-model".to_string()],
             tokenizer: None,
-            enable_directives: false,
+            enable_directives,
             model_faults: HashMap::new(),
         })
     }
@@ -1073,6 +1228,267 @@ mod tests {
             prompt_text(&plain, None),
             prompt_text(&array.messages, None)
         );
+    }
+
+    // --- Saturation rejection (529) and runtime capacity ---
+
+    fn chat_body(stream: bool) -> ChatCompletionRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": stream,
+        }))
+        .unwrap()
+    }
+
+    /// Fill the queue to `max_waiting` and return the state, leaving the
+    /// engine channel undrained so nothing ever leaves the queue.
+    /// Every request here streams: the non-streaming path blocks on tokens
+    /// from an engine that is deliberately absent, while the streaming path
+    /// hands back its `Sse` immediately. Admission runs before either, so
+    /// the choice does not weaken what is being tested — and it is the
+    /// stronger case anyway, since a streaming response is exactly what a
+    /// late rejection would have already committed to.
+    async fn saturate(max_waiting: u32) -> (Arc<AppState>, mpsc::Receiver<EngineRequest>) {
+        let (engine_tx, engine_rx) = mpsc::channel::<EngineRequest>(256);
+        let state = test_state_with(engine_tx, false, max_waiting);
+        for _ in 0..max_waiting {
+            assert!(
+                chat_completions(
+                    State(state.clone()),
+                    None,
+                    HeaderMap::new(),
+                    Json(chat_body(true)),
+                )
+                .await
+                .is_ok(),
+                "requests under the bound must be admitted"
+            );
+        }
+        (state, engine_rx)
+    }
+
+    #[tokio::test]
+    async fn saturated_chat_request_is_refused_with_529() {
+        let (state, _engine_rx) = saturate(2).await;
+
+        // `let Err(..) else` rather than `expect_err`: the Ok type is an
+        // `impl IntoResponse`, which is not `Debug`.
+        let Err(err) =
+            chat_completions(State(state), None, HeaderMap::new(), Json(chat_body(true))).await
+        else {
+            panic!("past the bound the request must be refused");
+        };
+
+        assert_eq!(err.0.as_u16(), 529);
+        assert_eq!(err.1 .0["error"]["code"], "queue_saturated");
+        assert_eq!(err.1 .0["error"]["type"], "overloaded_error");
+    }
+
+    /// The failure mode this whole feature exists to avoid: a server that
+    /// admits the request, commits `200` plus streaming headers, and only
+    /// then discovers it cannot schedule it. By then the status code is
+    /// spent and nothing upstream can classify the failure as overload.
+    ///
+    /// Returning the error variant IS the proof: the handler never produced
+    /// a response at all, so no headers and no SSE frame can have been sent.
+    #[tokio::test]
+    async fn streaming_saturation_is_refused_before_any_response_is_built() {
+        let (state, _engine_rx) = saturate(1).await;
+
+        let result = chat_completions(State(state), None, HeaderMap::new(), Json(chat_body(true)))
+            .await
+            .map(|ok| ok.into_response());
+
+        match result {
+            Ok(response) => panic!(
+                "streaming request got a response ({}) instead of a refusal",
+                response.status()
+            ),
+            Err(err) => assert_eq!(err.0.as_u16(), 529),
+        }
+    }
+
+    #[tokio::test]
+    async fn saturated_completions_request_is_refused_with_529() {
+        let (engine_tx, _engine_rx) = mpsc::channel::<EngineRequest>(256);
+        let state = test_state_with(engine_tx, false, 1);
+
+        let streaming = || CompletionRequest {
+            stream: true,
+            ..completion_request(text_prompt("hi"))
+        };
+        assert!(completions(
+            State(state.clone()),
+            None,
+            HeaderMap::new(),
+            Json(streaming()),
+        )
+        .await
+        .is_ok());
+
+        let Err(err) = completions(State(state), None, HeaderMap::new(), Json(streaming())).await
+        else {
+            panic!("past the bound the request must be refused");
+        };
+        assert_eq!(err.0.as_u16(), 529);
+        assert_eq!(err.1 .0["error"]["code"], "queue_saturated");
+    }
+
+    /// With the bound unset the server behaves exactly as it did before:
+    /// unbounded queueing, no refusal at any depth.
+    #[tokio::test]
+    async fn unbounded_queue_never_refuses() {
+        let (engine_tx, _engine_rx) = mpsc::channel::<EngineRequest>(1024);
+        let state = test_state_with(engine_tx, false, 0);
+
+        for i in 0..500 {
+            assert!(
+                chat_completions(
+                    State(state.clone()),
+                    None,
+                    HeaderMap::new(),
+                    Json(chat_body(true)),
+                )
+                .await
+                .is_ok(),
+                "request {i} was refused with the bound unset"
+            );
+        }
+        assert_eq!(state.capacity["test-model"].waiting(), 500);
+    }
+
+    /// The queue must reopen as the engine drains it, or a client that
+    /// backed off would never be allowed to recover.
+    #[tokio::test]
+    async fn draining_the_queue_reopens_admission() {
+        let (state, _engine_rx) = saturate(2).await;
+        assert!(chat_completions(
+            State(state.clone()),
+            None,
+            HeaderMap::new(),
+            Json(chat_body(true))
+        )
+        .await
+        .is_err());
+
+        // The engine steps both arrivals and reports an empty queue.
+        state.capacity["test-model"].publish(0, 2, 2);
+
+        assert!(
+            chat_completions(State(state), None, HeaderMap::new(), Json(chat_body(true)))
+                .await
+                .is_ok()
+        );
+    }
+
+    /// The main way this knob is used: 529s off by default, switched on
+    /// against a running server, and switched back off — no restart, so
+    /// in-flight work is never dropped to change the setting.
+    #[tokio::test]
+    async fn max_waiting_can_be_toggled_at_runtime() {
+        let (engine_tx, _engine_rx) = mpsc::channel::<EngineRequest>(256);
+        let state = test_state_with(engine_tx, false, 0);
+        let send = |state: Arc<AppState>| async move {
+            chat_completions(State(state), None, HeaderMap::new(), Json(chat_body(true))).await
+        };
+
+        assert!(send(state.clone()).await.is_ok());
+        assert!(send(state.clone()).await.is_ok());
+
+        // Switch rejection ON at a bound the queue is already past.
+        let report = set_capacity(
+            State(state.clone()),
+            Json(serde_json::from_value(serde_json::json!({"max_waiting": 2})).unwrap()),
+        )
+        .await
+        .expect("update accepted");
+        assert_eq!(report.0[0].max_waiting, 2);
+        assert_eq!(report.0[0].waiting, 2);
+
+        let err = send(state.clone()).await.err().expect("now refusing");
+        assert_eq!(err.0.as_u16(), 529);
+
+        // And OFF again.
+        let report = set_capacity(
+            State(state.clone()),
+            Json(serde_json::from_value(serde_json::json!({"max_waiting": 0})).unwrap()),
+        )
+        .await
+        .expect("update accepted");
+        assert_eq!(report.0[0].max_waiting, 0);
+        assert!(send(state.clone()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn capacity_report_lists_the_live_knobs() {
+        let (engine_tx, _engine_rx) = mpsc::channel::<EngineRequest>(256);
+        let state = test_state_with(engine_tx, false, 4);
+        state.capacity["test-model"].publish(3, 7, 0);
+
+        let report = get_capacity(State(state)).await.0;
+        assert_eq!(report.len(), 1);
+        assert_eq!(report[0].model, "test-model");
+        assert_eq!(report[0].max_waiting, 4);
+        assert_eq!(report[0].max_num_seqs, 128);
+        assert_eq!(report[0].waiting, 3);
+        assert_eq!(report[0].running, 7);
+    }
+
+    #[tokio::test]
+    async fn capacity_update_sets_the_concurrency_cap() {
+        let (engine_tx, _engine_rx) = mpsc::channel::<EngineRequest>(256);
+        let state = test_state_with(engine_tx, false, 0);
+
+        let report = set_capacity(
+            State(state.clone()),
+            Json(serde_json::from_value(serde_json::json!({"max_num_seqs": 16})).unwrap()),
+        )
+        .await
+        .expect("update accepted");
+        assert_eq!(report.0[0].max_num_seqs, 16);
+        // Untouched knobs keep their value.
+        assert_eq!(report.0[0].max_waiting, 0);
+        assert_eq!(state.capacity["test-model"].max_num_seqs(), 16);
+    }
+
+    /// A cap of 0 would admit nothing ever — requests accepted and then
+    /// never scheduled, which is the stall the bound exists to replace.
+    #[tokio::test]
+    async fn capacity_update_rejects_a_zero_concurrency_cap() {
+        let (engine_tx, _engine_rx) = mpsc::channel::<EngineRequest>(256);
+        let state = test_state_with(engine_tx, false, 0);
+
+        let err = set_capacity(
+            State(state.clone()),
+            Json(serde_json::from_value(serde_json::json!({"max_num_seqs": 0})).unwrap()),
+        )
+        .await
+        .expect_err("a zero cap must be refused");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(state.capacity["test-model"].max_num_seqs(), 128);
+    }
+
+    #[tokio::test]
+    async fn capacity_update_rejects_an_empty_body_and_an_unknown_model() {
+        let (engine_tx, _engine_rx) = mpsc::channel::<EngineRequest>(256);
+        let state = test_state_with(engine_tx, false, 0);
+
+        let err = set_capacity(State(state.clone()), Json(CapacityUpdate::default()))
+            .await
+            .expect_err("an empty update must be refused");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+
+        let err = set_capacity(
+            State(state),
+            Json(
+                serde_json::from_value(serde_json::json!({"model": "nope", "max_waiting": 1}))
+                    .unwrap(),
+            ),
+        )
+        .await
+        .expect_err("an unknown model must be refused");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -1693,6 +2109,7 @@ mod tests {
     fn chat_prompt_count_includes_template_overhead() {
         let state = Arc::new(AppState {
             engines: HashMap::new(),
+            capacity: HashMap::new(),
             model_names: vec!["m".to_string()],
             tokenizer: None,
             enable_directives: false,
@@ -1720,6 +2137,7 @@ mod tests {
     async fn completions_returns_model_not_found_error() {
         let state = Arc::new(AppState {
             engines: HashMap::new(),
+            capacity: HashMap::new(),
             model_names: vec!["other-model".to_string()],
             tokenizer: None,
             enable_directives: false,
@@ -2554,6 +2972,7 @@ mod tests {
     fn prompt_token_estimation_supports_raw_text() {
         let state = AppState {
             engines: HashMap::new(),
+            capacity: HashMap::new(),
             model_names: Vec::new(),
             tokenizer: None,
             enable_directives: false,

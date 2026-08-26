@@ -10,6 +10,18 @@ pub struct SchedulerConfig {
     /// Maximum number of sequences that can run concurrently
     pub max_num_seqs: u32,
 
+    /// Bound on the waiting queue in `serve` mode. Once this many requests
+    /// are queued, further arrivals are refused with HTTP 529 instead of
+    /// being enqueued. `0` (the default) leaves the queue unbounded, which
+    /// is the historical behaviour.
+    ///
+    /// Only admission is bounded: the scheduler itself queues and preempts
+    /// exactly as before, and a `sim` run ignores this entirely (a trace's
+    /// arrivals are the experiment, so refusing them would change what is
+    /// being measured).
+    #[serde(default)]
+    pub max_waiting: u32,
+
     /// Scheduling policy: "fcfs", "priority", or a length-based variant.
     pub policy: SchedulingPolicy,
 

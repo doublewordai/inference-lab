@@ -205,6 +205,7 @@ mod tests {
         let sched = SchedulerConfig {
             max_num_batched_tokens: 8192,
             max_num_seqs: 256,
+            max_waiting: 0,
             enable_chunked_prefill: false,
             long_prefill_token_threshold: 0,
             max_num_partial_prefills: 1,
@@ -277,6 +278,91 @@ mod tests {
                 .expect("topo")
                 .with_router(router),
         )
+    }
+
+    /// The serve-mode capacity dial. `max_num_seqs` is read live on every
+    /// scheduling decision, so retuning it on a running engine changes how
+    /// many requests are admitted — which is what makes a scale up/down
+    /// observable as a change in drain rate rather than only in a config
+    /// file. Lowering it must never evict: over-cap requests run to
+    /// completion and the batch drains down.
+    #[test]
+    fn max_num_seqs_retunes_a_running_engine_without_dropping_work() {
+        let (cluster, model, mut sched) = small_dense_parts();
+        sched.max_num_seqs = 8;
+        let mut engine = Engine::new(Topology::aggregated(cluster, model, sched).expect("topo"));
+        assert_eq!(engine.max_num_seqs(), 8);
+
+        let n = 32;
+        for i in 0..n {
+            engine.submit(Request::new(format!("r{i}"), 0, 0.0, 64, 64));
+        }
+        // Let the batch fill to the original cap.
+        let mut peak = 0;
+        while engine.aggregate_running() < 8 {
+            engine.step().unwrap();
+            peak = peak.max(engine.aggregate_running());
+        }
+        assert_eq!(peak, 8, "should have filled to the configured cap");
+        assert!(engine.aggregate_waiting() > 0, "rest must be queued");
+
+        // Scale down mid-flight. Nothing is evicted, so `running` is still
+        // over the new cap right now; it must drain to it, not past it.
+        engine.set_max_num_seqs(2);
+        assert_eq!(engine.max_num_seqs(), 2);
+        assert!(engine.aggregate_running() > 2);
+
+        let mut completed = 0;
+        let mut seen_at_new_cap = false;
+        while completed < n {
+            let outcome = engine.step().unwrap();
+            completed += outcome.completions.len();
+            if engine.aggregate_running() <= 2 {
+                seen_at_new_cap = true;
+            }
+            if seen_at_new_cap {
+                assert!(
+                    engine.aggregate_running() <= 2,
+                    "admitted {} past the lowered cap",
+                    engine.aggregate_running()
+                );
+            }
+        }
+        // Every request still finished: the cap gates admission, not life.
+        assert_eq!(completed, n);
+    }
+
+    /// Scaling back up must let the batch refill, or a controller that
+    /// reduced its concurrency would never learn that capacity returned.
+    #[test]
+    fn max_num_seqs_scale_up_refills_the_batch() {
+        let (cluster, model, mut sched) = small_dense_parts();
+        sched.max_num_seqs = 2;
+        let mut engine = Engine::new(Topology::aggregated(cluster, model, sched).expect("topo"));
+
+        for i in 0..32 {
+            engine.submit(Request::new(format!("r{i}"), 0, 0.0, 64, 256));
+        }
+        while engine.aggregate_running() < 2 {
+            engine.step().unwrap();
+        }
+        // Held at the low cap with plenty queued behind it.
+        for _ in 0..20 {
+            engine.step().unwrap();
+            assert!(engine.aggregate_running() <= 2);
+        }
+        assert!(engine.aggregate_waiting() > 0);
+
+        engine.set_max_num_seqs(16);
+        let mut refilled = false;
+        for _ in 0..200 {
+            engine.step().unwrap();
+            if engine.aggregate_running() > 2 {
+                refilled = true;
+                break;
+            }
+        }
+        assert!(refilled, "batch never grew after the cap was raised");
     }
 
     #[test]

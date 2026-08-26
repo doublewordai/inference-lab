@@ -296,6 +296,7 @@ impl Config {
         let mut scheduler = SchedulerConfig {
             max_num_batched_tokens: 2048,
             max_num_seqs: 128,
+            max_waiting: 0,
             policy: SchedulingPolicy::FCFS,
             enable_chunked_prefill: true,
             long_prefill_token_threshold: 0,

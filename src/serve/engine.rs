@@ -3,6 +3,7 @@
 //! wall-time and forwards per-iter token generation back to HTTP clients.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
 
@@ -10,6 +11,7 @@ use crate::config::{Deployment, WorkloadConfig};
 use crate::request::Request;
 use crate::simulation::{Engine, StepKind, Topology};
 
+use super::capacity::Capacity;
 use super::types::{EngineRequest, TokenEvent};
 
 /// Also cycled by serve::fault for the deterministic partial output ahead of a death.
@@ -38,6 +40,12 @@ pub struct RealtimeEngine {
     /// first event we process. We use it to translate engine event-times
     /// back into `tokio::time::Instant`s for `sleep_until`.
     epoch: Option<tokio::time::Instant>,
+    /// Queue depth published to the HTTP handlers, and the control knobs
+    /// they write back. See [`super::capacity`].
+    capacity: Arc<Capacity>,
+    /// The concurrency cap currently written through to the schedulers, so a
+    /// control change is detected as a difference against `capacity`.
+    applied_max_num_seqs: u32,
 }
 
 impl RealtimeEngine {
@@ -45,6 +53,7 @@ impl RealtimeEngine {
         deployment: &Deployment,
         workload: Option<WorkloadConfig>,
         rx: mpsc::Receiver<EngineRequest>,
+        capacity: Arc<Capacity>,
     ) -> Result<Self, String> {
         let topology = Topology::aggregated(
             deployment.cluster(),
@@ -52,20 +61,32 @@ impl RealtimeEngine {
             deployment.scheduler.clone(),
         )?
         .with_routers(&deployment.router, deployment.decode_router());
+        let engine = Engine::new(topology);
+        let applied_max_num_seqs = engine.max_num_seqs();
         Ok(Self {
-            engine: Engine::new(topology),
+            engine,
             workload,
             rx,
             live_requests: HashMap::new(),
             epoch: None,
+            capacity,
+            applied_max_num_seqs,
         })
     }
 
     pub async fn run(mut self) {
         log::info!("RealtimeEngine started");
         self.epoch = Some(tokio::time::Instant::now());
+        self.publish_depth(0);
 
         loop {
+            // 0. Pick up any capacity knob turned since the last pass. Done
+            //    at the top of every iteration as well as on the `changed`
+            //    wakeup, so a knob turned while we were mid-step is still
+            //    applied at the next opportunity rather than waiting for a
+            //    second notification.
+            self.apply_capacity_controls();
+
             // 1. Drain any pending HTTP arrivals into the engine.
             loop {
                 match self.rx.try_recv() {
@@ -84,19 +105,25 @@ impl RealtimeEngine {
             }
 
             // 2. Decide what to do next: wait for the next sim event, OR for
-            //    a new HTTP request, whichever fires first. If nothing is in
-            //    flight at all, just block on the receiver.
+            //    a new HTTP request, OR for a capacity change, whichever
+            //    fires first. If nothing is in flight at all, just block.
             let next_ev = self.engine.next_event_time();
             match next_ev {
                 None => {
-                    // Engine fully idle. Block until a request arrives or
-                    // senders drop.
-                    match self.rx.recv().await {
-                        Some(req) => self.admit_request(req),
-                        None => {
-                            log::info!("RealtimeEngine shutting down: receiver closed");
-                            return;
-                        }
+                    // Engine fully idle. Block until a request arrives, a
+                    // knob turns, or senders drop.
+                    tokio::select! {
+                        biased;
+                        received = self.rx.recv() => match received {
+                            Some(req) => self.admit_request(req),
+                            None => {
+                                log::info!("RealtimeEngine shutting down: receiver closed");
+                                return;
+                            }
+                        },
+                        // Loop and re-evaluate; `apply_capacity_controls`
+                        // at the top of the next pass does the work.
+                        _ = self.capacity.changed() => {}
                     }
                 }
                 Some(t_sim) => {
@@ -107,13 +134,48 @@ impl RealtimeEngine {
                             self.admit_request(req);
                             // Loop and re-evaluate.
                         }
+                        _ = self.capacity.changed() => {}
                         _ = tokio::time::sleep_until(wake) => {
-                            self.advance_one_step().await;
+                            let arrived = self.advance_one_step().await;
+                            self.publish_depth(arrived);
                         }
                     }
                 }
             }
         }
+    }
+
+    /// Write a changed concurrency cap through to every scheduler.
+    ///
+    /// This is the serve-mode scale up/down: it changes how fast the engine
+    /// drains work, and so the offered load at which the queue backs up and
+    /// admission starts refusing. A cap of 0 would wedge the engine (nothing
+    /// could ever be admitted), so it is ignored here as well as rejected at
+    /// the control route.
+    fn apply_capacity_controls(&mut self) {
+        let desired = self.capacity.max_num_seqs();
+        if desired == 0 || desired == self.applied_max_num_seqs {
+            return;
+        }
+        log::info!(
+            "capacity: max_num_seqs {} -> {}",
+            self.applied_max_num_seqs,
+            desired
+        );
+        self.engine.set_max_num_seqs(desired);
+        self.applied_max_num_seqs = desired;
+    }
+
+    /// Publish the engine's queue depth for the admission check, handing
+    /// back the reservations of `arrived` requests that have now landed in a
+    /// scheduler's waiting queue and are therefore counted by
+    /// `aggregate_waiting`.
+    fn publish_depth(&self, arrived: usize) {
+        self.capacity.publish(
+            self.engine.aggregate_waiting(),
+            self.engine.aggregate_running(),
+            arrived,
+        );
     }
 
     /// Emit one engine step's token events to their HTTP clients.
@@ -125,14 +187,19 @@ impl RealtimeEngine {
     /// a mid-stream death). Blocking makes a slow reader back-pressure generation, which
     /// is what a real engine does; a client that has actually gone away closes the
     /// channel, and [`Self::deliver`] reports that so the request is dropped promptly.
-    async fn advance_one_step(&mut self) {
+    ///
+    /// Returns how many arrivals this step moved into a scheduler's waiting
+    /// queue (0 or 1) — the caller hands those admission reservations back
+    /// to [`Capacity`], which now counts them via `aggregate_waiting`.
+    async fn advance_one_step(&mut self) -> usize {
         let outcome = match self.engine.step() {
             Ok(o) => o,
             Err(e) => {
                 log::error!("engine step failed: {e}");
-                return;
+                return 0;
             }
         };
+        let arrived = usize::from(matches!(outcome.kind, StepKind::Arrival));
 
         if matches!(outcome.kind, StepKind::Iteration) {
             if let Some(iter) = outcome.iteration {
@@ -186,6 +253,8 @@ impl RealtimeEngine {
                     .await;
             }
         }
+
+        arrived
     }
 
     /// Send one event to a live request, waiting for room. Returns false (and forgets the

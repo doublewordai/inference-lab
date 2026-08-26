@@ -13,3 +13,4 @@
 - [CLI Reference](./reference/cli.md)
 - [Configuration File](./reference/config.md)
 - [Fault Injection](./reference/fault-injection.md)
+- [Saturation and Capacity](./reference/saturation.md)

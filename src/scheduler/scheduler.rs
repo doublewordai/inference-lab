@@ -1185,6 +1185,21 @@ impl Scheduler {
         self.running.len()
     }
 
+    /// The concurrency cap this scheduler admits up to.
+    pub fn max_num_seqs(&self) -> u32 {
+        self.config.max_num_seqs
+    }
+
+    /// Retune the concurrency cap on a live scheduler — the serve-mode
+    /// scale up/down. Admission reads `config.max_num_seqs` on every
+    /// scheduling decision, so a new value takes effect from the next
+    /// iteration. Lowering it below `running.len()` never evicts anyone:
+    /// the cap gates admission only, so the over-cap requests run to
+    /// completion and the batch drains down to the new size.
+    pub fn set_max_num_seqs(&mut self, max_num_seqs: u32) {
+        self.config.max_num_seqs = max_num_seqs;
+    }
+
     /// Waiting requests, including requests parked on a KV transfer: they
     /// are still in the system, and the engine's idle check must see them.
     pub fn num_waiting(&self) -> usize {

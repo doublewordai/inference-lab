@@ -47,6 +47,7 @@ pub fn closed_loop_config(
         scheduler: SchedulerConfig {
             max_num_batched_tokens,
             max_num_seqs: 32768,
+            max_waiting: 0,
             enable_chunked_prefill: true,
             long_prefill_token_threshold: 0,
             max_num_partial_prefills: 1,
