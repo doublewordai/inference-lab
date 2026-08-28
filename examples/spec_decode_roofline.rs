@@ -44,6 +44,7 @@ fn topology() -> Topology {
             tp: 1,
             ep: 1,
             dp_attention: false,
+            ..Default::default()
         },
         num_workers: 1,
         memory: Default::default(),
