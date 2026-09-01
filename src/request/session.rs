@@ -58,6 +58,14 @@ pub struct SessionSpec {
     pub steps: Vec<StepSpec>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SessionLifecycle {
+    pub started: u32,
+    pub completed: u32,
+    pub deadline_censored: u32,
+    pub active: u32,
+}
+
 impl SessionSpec {
     /// Read sessions from JSONL. Sessions with no steps are dropped.
     pub fn read_jsonl<R: BufRead>(reader: R) -> Result<Vec<SessionSpec>, String> {
@@ -103,6 +111,14 @@ pub struct SessionStep {
     pub gap: f64,
     /// Prompt tokens shared with the parent's context (0 for the first step).
     pub shared_tokens: u32,
+    /// Leading shared-prefix tokens whose KV was materialized by the parent
+    /// turn's prefill. The remaining `shared_tokens` originated in decode.
+    /// Both are block-aligned to the simulator's prefix-cache accounting.
+    pub shared_prefill_tokens: u32,
+    /// Shared-prefix tokens materialized by the parent turn's decoder.
+    /// Any remainder after `shared_prefill_tokens + shared_decode_tokens`
+    /// is inherited context from before this simulation (stationary start).
+    pub shared_decode_tokens: u32,
     pub kind: Option<String>,
     /// KV bytes the engine had written when the parent completed (set by the
     /// driver), and the bytes written between then and this request's
@@ -148,6 +164,10 @@ struct ActiveSession {
     hashes: Vec<u64>,
     /// Parent's context length in tokens (prompt + output).
     context_tokens: u32,
+    /// Leading blocks of the parent context materialized by its prefill.
+    /// Zero for inherited context of a stationary mid-trace start.
+    prefill_materialized_blocks: usize,
+    decode_materialized_blocks: usize,
 }
 
 /// Turns session specs into requests: starts sessions on demand, queues each
@@ -159,6 +179,10 @@ pub struct SessionSource {
     next_spec: usize,
     /// Sessions started so far; also the ordinal stamped on their requests.
     started: u32,
+    /// Sessions retired by completing their final trace step, or because the
+    /// next step would arrive after the workload deadline.
+    completed: u32,
+    deadline_censored: u32,
     active: HashMap<u32, ActiveSession>,
     /// Steps due: (arrival time, session ordinal), earliest first.
     pending: BinaryHeap<Reverse<(OrderedTime, u32)>>,
@@ -194,6 +218,8 @@ impl SessionSource {
             block_size: block_size.max(1),
             next_spec: 0,
             started: 0,
+            completed: 0,
+            deadline_censored: 0,
             active: HashMap::new(),
             pending: BinaryHeap::new(),
             // Fresh hashes are drawn from a counter; start high so they
@@ -258,6 +284,23 @@ impl SessionSource {
         self.active.len()
     }
 
+    pub fn num_completed(&self) -> u32 {
+        self.completed
+    }
+
+    pub fn num_deadline_censored(&self) -> u32 {
+        self.deadline_censored
+    }
+
+    pub fn lifecycle(&self) -> SessionLifecycle {
+        SessionLifecycle {
+            started: self.started,
+            completed: self.completed,
+            deadline_censored: self.deadline_censored,
+            active: self.active.len() as u32,
+        }
+    }
+
     /// Earliest queued step arrival, if any.
     pub fn peek_pending(&self) -> Option<f64> {
         self.pending.peek().map(|Reverse((t, _))| t.0)
@@ -313,6 +356,8 @@ impl SessionSource {
                 next_step: start_step,
                 hashes,
                 context_tokens,
+                prefill_materialized_blocks: 0,
+                decode_materialized_blocks: 0,
             },
         );
         self.issue_step(ordinal, arrival_time, 0.0)
@@ -353,12 +398,14 @@ impl SessionSource {
         let spec = &self.specs[active.spec_idx];
         if active.next_step >= spec.steps.len() {
             self.active.remove(&step.session);
+            self.completed += 1;
             return false;
         }
         let gap = spec.steps[active.next_step].gap.max(0.0);
         let arrival_time = completion_time + gap;
         if deadline.is_some_and(|limit| arrival_time > limit) {
             self.active.remove(&step.session);
+            self.deadline_censored += 1;
             return false;
         }
         self.pending
@@ -383,6 +430,10 @@ impl SessionSource {
             input.saturating_sub(step.new).min(active.context_tokens)
         };
         let shared_blocks = (shared_tokens / block_size) as usize;
+        let shared_prefill_blocks = shared_blocks.min(active.prefill_materialized_blocks);
+        let shared_decode_blocks = shared_blocks
+            .saturating_sub(shared_prefill_blocks)
+            .min(active.decode_materialized_blocks);
         let total_blocks = (input + output).div_ceil(block_size) as usize;
         let mut hashes = Vec::with_capacity(total_blocks);
         hashes.extend_from_slice(&active.hashes[..shared_blocks.min(active.hashes.len())]);
@@ -414,6 +465,8 @@ impl SessionSource {
             step: step_idx as u32,
             gap,
             shared_tokens: (shared_blocks as u32) * block_size,
+            shared_prefill_tokens: (shared_prefill_blocks as u32) * block_size,
+            shared_decode_tokens: (shared_decode_blocks as u32) * block_size,
             kind: step.kind.clone(),
             parent_bytes_written: None,
             reuse_distance_bytes: None,
@@ -425,6 +478,12 @@ impl SessionSource {
 
         active.hashes = hashes;
         active.context_tokens = input + output;
+        active.prefill_materialized_blocks =
+            (input.div_ceil(block_size) as usize).min(active.hashes.len());
+        active.decode_materialized_blocks = active
+            .hashes
+            .len()
+            .saturating_sub(active.prefill_materialized_blocks);
         active.next_step += 1;
         req
     }
@@ -482,6 +541,8 @@ mod tests {
         assert_eq!(first.prompt_block_hashes.len(), 8);
         let s0 = first.session.clone().unwrap();
         assert_eq!((s0.session, s0.step, s0.shared_tokens), (0, 0, 0));
+        assert_eq!(s0.shared_prefill_tokens, 0);
+        assert_eq!(s0.shared_decode_tokens, 0);
 
         assert!(src.next_due(100.0).is_none());
         assert!(src.on_step_complete(&s0, 10.0));
@@ -500,11 +561,15 @@ mod tests {
         assert_ne!(second.prompt_block_hashes[7], first.prompt_block_hashes[7]);
         let s1 = second.session.clone().unwrap();
         assert_eq!((s1.step, s1.gap, s1.shared_tokens), (1, 2.5, 112));
+        assert_eq!(s1.shared_prefill_tokens, 112);
+        assert_eq!(s1.shared_decode_tokens, 0);
 
         // Last step: completing it retires the session.
         assert!(!src.on_step_complete(&s1, 20.0));
         assert_eq!(src.num_active(), 0);
         assert!(src.peek_pending().is_none());
+        assert_eq!(src.num_completed(), 1);
+        assert_eq!(src.num_deadline_censored(), 0);
     }
 
     #[test]
@@ -516,6 +581,37 @@ mod tests {
         src.on_step_complete(first.session.as_ref().unwrap(), 1.0);
         let second = src.next_due(10.0).unwrap();
         assert_eq!(second.session.unwrap().shared_tokens, 112);
+    }
+
+    #[test]
+    fn shared_prefix_tracks_parent_prefill_and_decode_provenance() {
+        let specs = vec![SessionSpec {
+            id: "s".into(),
+            steps: vec![
+                StepSpec {
+                    input: 96,
+                    new: 96,
+                    output: 64,
+                    gap: 0.0,
+                    kind: None,
+                },
+                StepSpec {
+                    input: 160,
+                    new: 0,
+                    output: 1,
+                    gap: 1.0,
+                    kind: None,
+                },
+            ],
+        }];
+        let mut source = SessionSource::new(specs, 16);
+        let first = source.start_session(0.0);
+        source.on_step_complete(first.session.as_ref().unwrap(), 1.0);
+        let second = source.next_due(2.0).unwrap();
+        let step = second.session.unwrap();
+        assert_eq!(step.shared_tokens, 160);
+        assert_eq!(step.shared_prefill_tokens, 96);
+        assert_eq!(step.shared_decode_tokens, 64);
     }
 
     #[test]
@@ -551,10 +647,14 @@ mod tests {
         let seeded_step = seeded.session.as_ref().unwrap();
         assert_eq!((seeded_step.session, seeded_step.step), (0, 1));
         assert_eq!(seeded_step.shared_tokens, 112);
+        assert_eq!(seeded_step.shared_prefill_tokens, 0);
+        assert_eq!(seeded_step.shared_decode_tokens, 0);
         assert!(!seeded.prompt_block_hashes.is_empty());
         let normal_step = normal.session.as_ref().unwrap();
         assert_eq!((normal_step.session, normal_step.step), (1, 0));
         assert_eq!(normal_step.shared_tokens, 0);
+        assert_eq!(normal_step.shared_prefill_tokens, 0);
+        assert_eq!(normal_step.shared_decode_tokens, 0);
     }
 
     #[test]

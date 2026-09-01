@@ -432,7 +432,17 @@ topology) reports requests per replica and, for the KV-reading policies,
 how many decisions had a cached prefix on some replica, how many went to
 a holder, and how many went away from the longest holder. `handoff`
 reports transfers, bytes moved, and bytes skipped because the chosen
-decoder already held the prefix.
+decoder already held the prefix. For session workloads, `reusable_kv`
+reports the joint prefill/decode residency of reusable KV, derived hit,
+recompute and transfer fractions, a parent-prefill, parent-decode, and
+inherited-context split of prefiller misses, and per-decode-rank detail. Under
+same-rank session affinity, that split separates eviction-driven recomputation
+from decoder-output KV that was never written back. `hbm` reports capacity,
+resident prefix bytes, active/reserved bytes, and actual HBM eviction bytes per
+worker. `sessions` reports completed and deadline-censored sessions plus turns
+per started session; `simulation` records the arrival deadline snapshot and
+post-deadline drain; `work` separates logical prompt tokens from positions
+actually computed by prefill.
 
 ## [speculative]
 

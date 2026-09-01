@@ -5,7 +5,7 @@ use inference_lab::simulation::Simulator;
 use std::path::PathBuf;
 use std::time::Instant;
 
-const REQUEST_CSV_HEADER: &str = "arrival,completion,ttft,e2e,mean_tpot,prompt_toks,output_toks,cached_toks,preemptions,session,step,worker,gap,shared_toks,reuse_distance_bytes,reuse_touched_bytes,lookup_at,hbm_cached_toks,tier_cached_toks,promote_start,promote_land,lookups\n";
+const REQUEST_CSV_HEADER: &str = "arrival,completion,ttft,e2e,mean_tpot,prompt_toks,output_toks,cached_toks,decode_cached_toks,preemptions,session,step,worker,gap,shared_toks,reuse_distance_bytes,reuse_touched_bytes,lookup_at,hbm_cached_toks,tier_cached_toks,promote_start,promote_land,lookups\n";
 
 #[cfg(feature = "cli")]
 use tokenizers::Tokenizer;
@@ -122,8 +122,9 @@ struct SimArgs {
     output: Option<PathBuf>,
 
     /// Save per-request metrics to a CSV file (arrival, completion, ttft,
-    /// e2e, mean_tpot, prompt_toks, output_toks, cached_toks, preemptions, and
-    /// for session workloads session, step, worker, gap, shared_toks,
+    /// e2e, mean_tpot, prompt_toks, output_toks, cached_toks,
+    /// decode_cached_toks, preemptions, and for session workloads session, step,
+    /// worker, gap, shared_toks,
     /// reuse_distance_bytes, reuse_touched_bytes, and the prefix lookup that
     /// fixed cached_toks: lookup_at, hbm_cached_toks, tier_cached_toks,
     /// promote_start, promote_land, lookups); times in seconds
@@ -591,7 +592,7 @@ fn run_sim(args: SimArgs) {
 fn append_request_csv_row(out: &mut String, r: &inference_lab::metrics::RequestRow) {
     let opt = |v: Option<String>| v.unwrap_or_default();
     out.push_str(&format!(
-        "{:.4},{:.4},{:.5},{:.4},{:.6},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+        "{:.4},{:.4},{:.5},{:.4},{:.6},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
         r.arrival,
         r.completion,
         r.ttft,
@@ -600,6 +601,7 @@ fn append_request_csv_row(out: &mut String, r: &inference_lab::metrics::RequestR
         r.prompt_tokens,
         r.output_tokens,
         r.cached_tokens,
+        opt(r.decode_cached_tokens.map(|t| t.to_string())),
         r.num_preemptions,
         opt(r.session.map(|(s, _)| s.to_string())),
         opt(r.session.map(|(_, st)| st.to_string())),
@@ -958,7 +960,7 @@ mod tests {
     #[test]
     fn request_csv_places_worker_between_step_and_gap() {
         let header: Vec<_> = REQUEST_CSV_HEADER.trim_end().split(',').collect();
-        assert_eq!(&header[10..13], ["step", "worker", "gap"]);
+        assert_eq!(&header[11..14], ["step", "worker", "gap"]);
 
         let row = RequestRow {
             arrival: 1.0,
@@ -969,6 +971,7 @@ mod tests {
             prompt_tokens: 100,
             output_tokens: 20,
             cached_tokens: 64,
+            decode_cached_tokens: Some(32),
             num_preemptions: 0,
             session: Some((3, 4)),
             worker: Some(7),
@@ -988,7 +991,7 @@ mod tests {
         let mut csv = String::new();
         append_request_csv_row(&mut csv, &row);
         let fields: Vec<_> = csv.trim_end().split(',').collect();
-        assert_eq!(&fields[9..13], ["3", "4", "7", "1.250"]);
-        assert_eq!(&fields[16..22], ["1.5000", "64", "0", "", "", "1"]);
+        assert_eq!(&fields[10..14], ["3", "4", "7", "1.250"]);
+        assert_eq!(&fields[17..23], ["1.5000", "64", "0", "", "", "1"]);
     }
 }

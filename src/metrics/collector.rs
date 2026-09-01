@@ -1,10 +1,13 @@
 use super::distribution::{Distribution, RunningMean};
 use super::summary::{
-    HandoffMetrics, LatencyMetrics, LatencyStats, MemoryMetrics, MetricsSummary, Preemptions,
-    PrefixCacheMetrics, RequestCounts, RouterMetrics, ThroughputMetrics, Utilization,
+    CountStats, HandoffMetrics, HbmMetrics, LatencyMetrics, LatencyStats, MemoryMetrics,
+    MetricsSummary, Preemptions, PrefixCacheMetrics, RequestCounts, ReusableKvMetrics,
+    RouterMetrics, SessionMetrics, SimulationMetrics, ThroughputMetrics, Utilization, WorkMetrics,
 };
 use crate::kv_cache::PrefixCacheStats;
+use crate::request::SessionLifecycle;
 use crate::simulation::RequestTiming;
+use std::collections::HashMap;
 
 /// A latency measure: the samples plus, aligned with them, the simulated
 /// time each was observed (the completion of the request that produced it).
@@ -38,12 +41,15 @@ pub struct SeriesRef<'a> {
     pub timestamps: &'a [f64],
 }
 
-/// Views of the three latency series.
+/// Views of the latency series.
 #[derive(Debug, Clone, Copy)]
 pub struct LatencySamples<'a> {
     pub ttft: SeriesRef<'a>,
     pub e2e: SeriesRef<'a>,
     pub tpot: SeriesRef<'a>,
+    pub prefill: SeriesRef<'a>,
+    pub handoff: SeriesRef<'a>,
+    pub decode_ttft: SeriesRef<'a>,
 }
 
 /// Position up to which a consumer has already seen each series; use with
@@ -53,6 +59,9 @@ pub struct SampleCursor {
     ttft: usize,
     e2e: usize,
     tpot: usize,
+    prefill: usize,
+    handoff: usize,
+    decode_ttft: usize,
     input_lengths: usize,
     output_lengths: usize,
 }
@@ -70,6 +79,8 @@ pub struct RequestRow {
     pub output_tokens: u32,
     /// Prompt tokens served from the prefix cache.
     pub cached_tokens: u32,
+    /// Prompt-prefix tokens resident on the selected decoder at hand-off.
+    pub decode_cached_tokens: Option<u32>,
     pub num_preemptions: u32,
     /// Session workloads: (session ordinal, step), the gap since the parent's
     /// completion, and the KV bytes written into the caches between the
@@ -97,6 +108,9 @@ pub struct MetricsCollector {
     e2e: LatencySeries,
     /// Per-request mean TPOT (requests with more than one output token).
     tpot: LatencySeries,
+    prefill: LatencySeries,
+    handoff: LatencySeries,
+    decode_ttft: LatencySeries,
 
     total_input_tokens: u64,
     total_output_tokens: u64,
@@ -121,6 +135,16 @@ pub struct MetricsCollector {
     interval_tpot: RunningMean,
 
     pub request_rows: Vec<RequestRow>,
+    session_turns_completed: HashMap<u32, u64>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SummaryExtras {
+    pub work: WorkMetrics,
+    pub sessions: Option<SessionMetrics>,
+    pub simulation: SimulationMetrics,
+    pub reusable_kv: Option<ReusableKvMetrics>,
+    pub hbm: HbmMetrics,
 }
 
 impl MetricsCollector {
@@ -129,6 +153,9 @@ impl MetricsCollector {
             ttft: LatencySeries::default(),
             e2e: LatencySeries::default(),
             tpot: LatencySeries::default(),
+            prefill: LatencySeries::default(),
+            handoff: LatencySeries::default(),
+            decode_ttft: LatencySeries::default(),
             total_input_tokens: 0,
             total_output_tokens: 0,
             start_time,
@@ -144,6 +171,7 @@ impl MetricsCollector {
             interval_ttft: RunningMean::default(),
             interval_tpot: RunningMean::default(),
             request_rows: Vec::new(),
+            session_turns_completed: HashMap::new(),
         }
     }
 
@@ -158,6 +186,18 @@ impl MetricsCollector {
         let e2e = timing.e2e();
         self.ttft.push(ttft, observed_at);
         self.e2e.push(e2e, observed_at);
+        self.prefill.push(
+            (timing.prefill_done_time - timing.arrival_time).max(0.0),
+            observed_at,
+        );
+        self.handoff.push(
+            (timing.handoff_done_time - timing.prefill_done_time).max(0.0),
+            observed_at,
+        );
+        self.decode_ttft.push(
+            (timing.first_token_time - timing.handoff_done_time).max(0.0),
+            observed_at,
+        );
         self.interval_ttft.add(ttft);
         let mean_tpot = match timing.tpot() {
             Some(t) => {
@@ -181,6 +221,7 @@ impl MetricsCollector {
             prompt_tokens: timing.num_prompt_tokens,
             output_tokens: timing.num_output_tokens,
             cached_tokens: timing.num_cached_tokens,
+            decode_cached_tokens: timing.decode_cached_tokens,
             num_preemptions: timing.num_preemptions,
             session: timing.session.as_ref().map(|s| (s.session, s.step)),
             worker: timing.worker,
@@ -194,6 +235,12 @@ impl MetricsCollector {
         self.input_lengths.push(timing.num_prompt_tokens);
         self.output_lengths.push(timing.num_output_tokens);
         self.completed_requests += 1;
+        if let Some(step) = &timing.session {
+            *self
+                .session_turns_completed
+                .entry(step.session)
+                .or_default() += 1;
+        }
     }
 
     pub fn input_lengths(&self) -> &[u32] {
@@ -202,6 +249,71 @@ impl MetricsCollector {
 
     pub fn output_lengths(&self) -> &[u32] {
         &self.output_lengths
+    }
+
+    pub fn completed_prompt_tokens(&self) -> u64 {
+        self.total_input_tokens
+    }
+
+    pub fn completed_output_tokens(&self) -> u64 {
+        self.total_output_tokens
+    }
+
+    pub fn work_metrics(
+        &self,
+        prefill_tokens_computed: u64,
+        output_tokens_generated: u64,
+    ) -> WorkMetrics {
+        WorkMetrics {
+            completed_prompt_tokens: self.total_input_tokens,
+            completed_output_tokens: self.total_output_tokens,
+            prefill_tokens_computed,
+            output_tokens_generated,
+            prefill_tokens_per_output_token: if output_tokens_generated == 0 {
+                0.0
+            } else {
+                prefill_tokens_computed as f64 / output_tokens_generated as f64
+            },
+        }
+    }
+
+    pub fn session_metrics(&self, lifecycle: SessionLifecycle) -> SessionMetrics {
+        let mut distribution = Distribution::default();
+        let mut min = u64::MAX;
+        let mut max = 0;
+        let mut total = 0;
+        for session in 0..lifecycle.started {
+            let turns = self
+                .session_turns_completed
+                .get(&session)
+                .copied()
+                .unwrap_or(0);
+            distribution.push(turns as f64);
+            min = min.min(turns);
+            max = max.max(turns);
+            total += turns;
+        }
+        let count = CountStats {
+            min: if lifecycle.started == 0 { 0 } else { min },
+            mean: if lifecycle.started == 0 {
+                0.0
+            } else {
+                total as f64 / lifecycle.started as f64
+            },
+            p50: distribution.quantile(0.50),
+            p90: distribution.quantile(0.90),
+            p99: distribution.quantile(0.99),
+            max,
+        };
+        let classified = lifecycle.completed + lifecycle.deadline_censored;
+        SessionMetrics {
+            started: lifecycle.started as u64,
+            completed: lifecycle.completed as u64,
+            deadline_censored: lifecycle.deadline_censored as u64,
+            unfinished: lifecycle.started.saturating_sub(classified) as u64,
+            turns_completed: total,
+            turns_per_started_session: count,
+        }
     }
 
     /// All latency samples so far.
@@ -218,6 +330,18 @@ impl MetricsCollector {
             tpot: SeriesRef {
                 values: self.tpot.dist.values(),
                 timestamps: &self.tpot.timestamps,
+            },
+            prefill: SeriesRef {
+                values: self.prefill.dist.values(),
+                timestamps: &self.prefill.timestamps,
+            },
+            handoff: SeriesRef {
+                values: self.handoff.dist.values(),
+                timestamps: &self.handoff.timestamps,
+            },
+            decode_ttft: SeriesRef {
+                values: self.decode_ttft.dist.values(),
+                timestamps: &self.decode_ttft.timestamps,
             },
         }
     }
@@ -239,6 +363,9 @@ impl MetricsCollector {
             ttft: slice(all.ttft, cursor.ttft),
             e2e: slice(all.e2e, cursor.e2e),
             tpot: slice(all.tpot, cursor.tpot),
+            prefill: slice(all.prefill, cursor.prefill),
+            handoff: slice(all.handoff, cursor.handoff),
+            decode_ttft: slice(all.decode_ttft, cursor.decode_ttft),
         };
         let lengths = (
             &self.input_lengths[cursor.input_lengths..],
@@ -247,6 +374,9 @@ impl MetricsCollector {
         cursor.ttft = all.ttft.values.len();
         cursor.e2e = all.e2e.values.len();
         cursor.tpot = all.tpot.values.len();
+        cursor.prefill = all.prefill.values.len();
+        cursor.handoff = all.handoff.values.len();
+        cursor.decode_ttft = all.decode_ttft.values.len();
         cursor.input_lengths = self.input_lengths.len();
         cursor.output_lengths = self.output_lengths.len();
         (out, lengths)
@@ -293,6 +423,28 @@ impl MetricsCollector {
         handoff: Option<HandoffMetrics>,
         memory: Option<MemoryMetrics>,
     ) -> MetricsSummary {
+        self.compute_summary_with(
+            current_time,
+            prefix_cache,
+            router,
+            decode_router,
+            handoff,
+            memory,
+            SummaryExtras::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn compute_summary_with(
+        &mut self,
+        current_time: f64,
+        prefix_cache: PrefixCacheStats,
+        router: RouterMetrics,
+        decode_router: Option<RouterMetrics>,
+        handoff: Option<HandoffMetrics>,
+        memory: Option<MemoryMetrics>,
+        extras: SummaryExtras,
+    ) -> MetricsSummary {
         let elapsed = current_time - self.start_time;
         let per_sec = |n: f64| if elapsed > 0.0 { n / elapsed } else { 0.0 };
         MetricsSummary {
@@ -300,12 +452,16 @@ impl MetricsCollector {
                 ttft_ms: self.ttft.stats_ms(),
                 e2e_ms: self.e2e.stats_ms(),
                 per_token_ms: self.tpot.stats_ms(),
+                prefill_ms: self.prefill.stats_ms(),
+                handoff_ms: self.handoff.stats_ms(),
+                decode_ttft_ms: self.decode_ttft.stats_ms(),
             },
             throughput_metrics: ThroughputMetrics {
                 input_tokens_per_sec: per_sec(self.total_input_tokens as f64),
                 output_tokens_per_sec: per_sec(self.total_output_tokens as f64),
                 requests_per_sec: per_sec(self.completed_requests as f64),
             },
+            work: extras.work,
             utilization: Utilization {
                 avg_kv_cache_util: self.kv_cache_util.mean(),
                 avg_flops_util: self.flops_util.mean(),
@@ -324,6 +480,8 @@ impl MetricsCollector {
                 total: self.total_requests,
                 rejected: self.rejected_requests,
             },
+            sessions: extras.sessions,
+            simulation: extras.simulation,
             prefix_cache: PrefixCacheMetrics {
                 hits: prefix_cache.hits,
                 misses: prefix_cache.misses,
@@ -337,6 +495,8 @@ impl MetricsCollector {
             router,
             decode_router,
             handoff,
+            reusable_kv: extras.reusable_kv,
+            hbm: extras.hbm,
             memory,
         }
     }
@@ -365,6 +525,7 @@ mod tests {
             num_prompt_tokens: prompt,
             num_output_tokens: output,
             num_cached_tokens: 0,
+            decode_cached_tokens: None,
             session: None,
             worker: None,
             num_preemptions: preemptions,
@@ -390,9 +551,69 @@ mod tests {
         assert!((s.latency_metrics.ttft_ms.mean - 1000.0).abs() < 1e-9);
         assert!((s.latency_metrics.e2e_ms.mean - 4000.0).abs() < 1e-9);
         assert!((s.latency_metrics.per_token_ms.mean - 1500.0).abs() < 1e-9);
+        assert!((s.latency_metrics.prefill_ms.mean - 1000.0).abs() < 1e-9);
+        assert_eq!(s.latency_metrics.handoff_ms.mean, 0.0);
+        assert_eq!(s.latency_metrics.decode_ttft_ms.mean, 0.0);
         assert_eq!(s.requests.completed, 1);
         assert_eq!(m.request_rows.len(), 1);
         assert!((m.request_rows[0].mean_tpot - 1.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn disaggregated_ttft_is_split_into_prefill_handoff_and_decode_wait() {
+        let mut m = MetricsCollector::new(0.0);
+        let mut t = timing("a", 1.0, 4.0, 5.0, 100, 3, 0);
+        t.prefill_done_time = 2.0;
+        t.handoff_done_time = 3.0;
+        m.record_request_completion(&t);
+        let s = m.compute_summary(
+            5.0,
+            PrefixCacheStats::default(),
+            RouterMetrics::default(),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(s.latency_metrics.prefill_ms.mean, 1000.0);
+        assert_eq!(s.latency_metrics.handoff_ms.mean, 1000.0);
+        assert_eq!(s.latency_metrics.decode_ttft_ms.mean, 1000.0);
+        assert_eq!(s.latency_metrics.ttft_ms.mean, 3000.0);
+    }
+
+    #[test]
+    fn session_metrics_include_zero_turn_and_censored_sessions() {
+        let mut m = MetricsCollector::new(0.0);
+        for (id, session) in [("a", 0), ("b", 0), ("c", 1)] {
+            let mut t = timing(id, 0.0, 1.0, 2.0, 10, 2, 0);
+            t.session = Some(Box::new(crate::request::SessionStep {
+                session,
+                step: 0,
+                gap: 0.0,
+                shared_tokens: 0,
+                shared_prefill_tokens: 0,
+                shared_decode_tokens: 0,
+                kind: None,
+                parent_bytes_written: None,
+                reuse_distance_bytes: None,
+                parent_bytes_touched: None,
+                reuse_touched_bytes: None,
+                next_gap: None,
+                next_shared_tokens: 0,
+            }));
+            m.record_request_completion(&t);
+        }
+        let sessions = m.session_metrics(SessionLifecycle {
+            started: 3,
+            completed: 1,
+            deadline_censored: 1,
+            active: 1,
+        });
+        assert_eq!(sessions.turns_completed, 3);
+        assert_eq!(sessions.unfinished, 1);
+        assert_eq!(sessions.turns_per_started_session.min, 0);
+        assert_eq!(sessions.turns_per_started_session.mean, 1.0);
+        assert_eq!(sessions.turns_per_started_session.p50, 1.0);
+        assert_eq!(sessions.turns_per_started_session.max, 2);
     }
 
     #[test]

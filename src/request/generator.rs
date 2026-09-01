@@ -469,6 +469,14 @@ impl RequestGenerator {
     pub fn num_generated(&self) -> usize {
         self.requests_generated
     }
+
+    /// Session lifecycle counters, or `None` for synthetic/dataset sources.
+    pub fn session_lifecycle(&self) -> Option<super::SessionLifecycle> {
+        match &self.source {
+            Source::Sessions(source) => Some(source.lifecycle()),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -512,6 +520,7 @@ mod tests {
             num_prompt_tokens: 1,
             num_output_tokens: 1,
             num_cached_tokens: 0,
+            decode_cached_tokens: None,
             session: None,
             worker: None,
             num_preemptions: 0,
@@ -532,6 +541,7 @@ mod tests {
             num_prompt_tokens: req.num_prompt_tokens,
             num_output_tokens: req.target_output_tokens,
             num_cached_tokens: 0,
+            decode_cached_tokens: None,
             session: req.session.clone(),
             worker: None,
             num_preemptions: 0,
@@ -743,6 +753,11 @@ mod tests {
         assert!(generator.next_if_before(100.0).is_none());
         assert!(generator.peek_next_arrival_time().is_infinite());
         assert!(generator.is_finished());
+        let lifecycle = generator.session_lifecycle().unwrap();
+        assert_eq!(lifecycle.started, 1);
+        assert_eq!(lifecycle.completed, 0);
+        assert_eq!(lifecycle.deadline_censored, 1);
+        assert_eq!(lifecycle.active, 0);
     }
 
     #[test]

@@ -1610,6 +1610,8 @@ mod tests {
                 step: 0,
                 gap: 0.0,
                 shared_tokens: 0,
+                shared_prefill_tokens: 0,
+                shared_decode_tokens: 0,
                 kind: None,
                 parent_bytes_written: None,
                 reuse_distance_bytes: None,

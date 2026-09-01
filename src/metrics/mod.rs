@@ -2,10 +2,14 @@ pub mod collector;
 pub mod distribution;
 pub mod summary;
 
-pub use collector::{LatencySamples, MetricsCollector, RequestRow, SampleCursor, SeriesRef};
+pub use collector::{
+    LatencySamples, MetricsCollector, RequestRow, SampleCursor, SeriesRef, SummaryExtras,
+};
 pub use distribution::{Distribution, RunningMean};
 pub use summary::{
-    EdgeMetrics, HandoffMetrics, LatencyMetrics, LatencyStats, MemoryMetrics, MetricsSummary,
-    Preemptions, PrefixCacheMetrics, RequestCounts, RouterMetrics, StoreMetrics, ThroughputMetrics,
-    Utilization,
+    CountStats, DeadlineMetrics, EdgeMetrics, HandoffMetrics, HbmMetrics, HbmPoolMetrics,
+    HbmWorkerMetrics, KvAmount, LatencyMetrics, LatencyStats, MemoryMetrics, MetricsSummary,
+    Preemptions, PrefixCacheMetrics, RankReusableKvMetrics, RequestCounts, ReusableKvMetrics,
+    ReusableKvResidency, RouterMetrics, SessionMetrics, SessionPrefillWork, SimulationMetrics,
+    StoreMetrics, ThroughputMetrics, Utilization, WorkMetrics,
 };
