@@ -1,5 +1,65 @@
 # Changelog
 
+## [1.0.0](https://github.com/doublewordai/inference-lab/compare/inference-lab-v0.10.0...inference-lab-v1.0.0) (2026-09-01)
+
+
+### ⚠ BREAKING CHANGES
+
+* **memory:** KV movement policies (reactive | oracle), DP-attention ranks as workers, radix-tree KV state ([#103](https://github.com/doublewordai/inference-lab/issues/103))
+* **memory:** KV memory graph — stores, links, junctions, max-min paths; hand-offs on the graph ([#93](https://github.com/doublewordai/inference-lab/issues/93))
+* **catalog:** hardware presets b200-datasheet, gh200-120 and gh200-96 are gone (use b200 / gh200); b200 moves from 180 GiB / 7.7 TB/s to 192 GB / 8 TB/s, b300 to 288 GB, h100 to 80 GB.
+* ClusterSpec has no comms field; HardwareConfig gains fabric; multi-GPU deployments on fabric-less hardware are rejected; ep must divide tp; tp > 1 results move (collectives now cost).
+* config file format; Config::from_file removed; --workload required for sim.
+* configs reference catalog entries (hardware = "b200", model = "<slug>"), unknown fields are rejected, [simulation]/draft_cost_frac/SlidingWindowModel/Node removed, --output JSON is the nested MetricsSummary shape. Per-commit history on branch review/cleanup.
+
+### Features
+
+* collective fabric on hardware presets; tp/ep/dp-attention semantics; prod layouts in configs ([#80](https://github.com/doublewordai/inference-lab/issues/80)) ([37d6dbf](https://github.com/doublewordai/inference-lab/commit/37d6dbf04ba354bdfe0b65be20affa1c2a00b3c8))
+* disaggregated prefill topology, balance-set admission, staged-read capacity gating ([30cad0a](https://github.com/doublewordai/inference-lab/commit/30cad0ad6b1bd0f4c65ce42d40d23670e00ed516))
+* **memory:** backup = on_land forwards landed writes to the next tier ([#127](https://github.com/doublewordai/inference-lab/issues/127)) ([bf33b42](https://github.com/doublewordai/inference-lab/commit/bf33b426d1ddf38010fe8dbcac84fc30538cbfbe))
+* **memory:** hit_refresh = first_tier — an HBM prefix hit re-stamps the first tier's copy ([#129](https://github.com/doublewordai/inference-lab/issues/129)) ([80564e1](https://github.com/doublewordai/inference-lab/commit/80564e162b6bb4778dd2d8c54ad5189dc7898202))
+* **memory:** KV memory graph — stores, links, junctions, max-min paths; hand-offs on the graph ([#93](https://github.com/doublewordai/inference-lab/issues/93)) ([7929f77](https://github.com/doublewordai/inference-lab/commit/7929f77bcc467c1578a26c9a34e9c9d1a1ace397))
+* **memory:** KV movement policies (reactive | oracle), DP-attention ranks as workers, radix-tree KV state ([#103](https://github.com/doublewordai/inference-lab/issues/103)) ([10c4472](https://github.com/doublewordai/inference-lab/commit/10c4472871c427266572a83431b4a49ed0eafcae))
+* **memory:** model staged HiCache reads ([#132](https://github.com/doublewordai/inference-lab/issues/132)) ([24d4011](https://github.com/doublewordai/inference-lab/commit/24d4011273fd1be1413a38f262ae40353f2d5541))
+* **memory:** promote_fill = through — a promotion refills the tiers above its source ([#130](https://github.com/doublewordai/inference-lab/issues/130)) ([81117d4](https://github.com/doublewordai/inference-lab/commit/81117d40cb038c43ebd775cf5e18a6300f08194a))
+* **memory:** write policies, inclusive tiers, store eviction policies, memory metrics ([#96](https://github.com/doublewordai/inference-lab/issues/96)) ([37d5ba4](https://github.com/doublewordai/inference-lab/commit/37d5ba49bc7838cd66f9c93aa8ddfbbe200893b4))
+* **router:** pluggable request router across replicas; LRU KV block recycling; disagg hand-off fixes ([#90](https://github.com/doublewordai/inference-lab/issues/90)) ([11172e1](https://github.com/doublewordai/inference-lab/commit/11172e106192135adb3ce994f2b83a5fc63b52b0))
+* **serve:** reject with 529 when the waiting queue is saturated ([#136](https://github.com/doublewordai/inference-lab/issues/136)) ([2bcf189](https://github.com/doublewordai/inference-lab/commit/2bcf1895fa0f317aa922d8241a836709f895ec28))
+* **workload:** session workloads — re-entering request chains from a trace ([#89](https://github.com/doublewordai/inference-lab/issues/89)) ([0fbc6ae](https://github.com/doublewordai/inference-lab/commit/0fbc6ae4d5ced78f36a04a08a55b0ecb361c16b6))
+
+
+### Bug Fixes
+
+* closed-loop jitter stall, Docker build inputs, CI test workflow ([a2072e0](https://github.com/doublewordai/inference-lab/commit/a2072e0aa8804d040c22225f7d7e733d7ee119be))
+* **deps:** update rand to 0.10, rand_distr to 0.6, getrandom to 0.4 ([#36](https://github.com/doublewordai/inference-lab/issues/36)) ([eeb2b2b](https://github.com/doublewordai/inference-lab/commit/eeb2b2b3cdb829816505ee98a919ba326bbd1e7e))
+* **deps:** update rust crate tabled to 0.21 ([#92](https://github.com/doublewordai/inference-lab/issues/92)) ([4adc4f8](https://github.com/doublewordai/inference-lab/commit/4adc4f88c64c124a4be3aeb80d3e2bf00ea4cae0))
+* **deps:** update rust crate tokenizers to 0.23 ([#94](https://github.com/doublewordai/inference-lab/issues/94)) ([1ae6c91](https://github.com/doublewordai/inference-lab/commit/1ae6c917b6280c0c7edd74cd94d0144a4272549a))
+* **deps:** update rust crate tower-http to 0.7 ([#95](https://github.com/doublewordai/inference-lab/issues/95)) ([7d16268](https://github.com/doublewordai/inference-lab/commit/7d1626818958a85a6b845fc96a5dfa7ee408c6b6))
+* **engine:** EP with TP attention prices the FFN all-reduce, not all-to-alls ([#85](https://github.com/doublewordai/inference-lab/issues/85)) ([107b0c2](https://github.com/doublewordai/inference-lab/commit/107b0c22f04b89e4a8354b9a5af69f327b8bce22))
+* modelling review — causal prefill attention, absorbed MLA decode, hybrid-SWA prefix hits, admission rule, disagg TTFT, opt-in step calibration ([#100](https://github.com/doublewordai/inference-lab/issues/100)) ([1e87653](https://github.com/doublewordai/inference-lab/commit/1e876536c70a94856f72801be17740ce71a31130))
+* **model:** price DSA indexer scoring at its own precision ([#126](https://github.com/doublewordai/inference-lab/issues/126)) ([236c0c0](https://github.com/doublewordai/inference-lab/commit/236c0c0182cc33a8f37b0dedd17ffced951a9b6b))
+* **scheduler:** landed promotions must not starve running requests ([#119](https://github.com/doublewordai/inference-lab/issues/119)) ([0d50691](https://github.com/doublewordai/inference-lab/commit/0d506917a11b745fbdb23c3216ebbe58c3794362))
+
+
+### Performance Improvements
+
+* cache request radix leaves ([#113](https://github.com/doublewordai/inference-lab/issues/113)) ([77aa127](https://github.com/doublewordai/inference-lab/commit/77aa1270c51ff0107fb77c799ebd8b135f9777bf))
+* collect the time series only when asked ([#117](https://github.com/doublewordai/inference-lab/issues/117)) ([6d573c0](https://github.com/doublewordai/inference-lab/commit/6d573c0374f21af4bdc5803e51c67881734a4f9d))
+* optimize release builds and allocator ([#115](https://github.com/doublewordai/inference-lab/issues/115)) ([b584a96](https://github.com/doublewordai/inference-lab/commit/b584a96b5dff2fd93abd01331cf2052a74168d73))
+* resolve router prefixes once per arrival ([#110](https://github.com/doublewordai/inference-lab/issues/110)) ([a71757e](https://github.com/doublewordai/inference-lab/commit/a71757e9810445806db1ce23de5a6817e4e92cc2))
+* skip idle DP-attention ranks ([#108](https://github.com/doublewordai/inference-lab/issues/108)) ([9e7a396](https://github.com/doublewordai/inference-lab/commit/9e7a3961f0ca2e17990311146b4a47d39d404b00))
+
+
+### Miscellaneous Chores
+
+* **catalog:** one datasheet preset per GPU ([#88](https://github.com/doublewordai/inference-lab/issues/88)) ([0c87c33](https://github.com/doublewordai/inference-lab/commit/0c87c33b6ce69f9c4b36fa71b43ca9cd8733716a))
+
+
+### Code Refactoring
+
+* exact KV accounting, composable ModelSpec, shipped hardware/model catalog ([#74](https://github.com/doublewordai/inference-lab/issues/74)) ([7975527](https://github.com/doublewordai/inference-lab/commit/7975527ecd69868cdf19fe06c1942f5e195f6607))
+* one model config per deployment with [hardware.&lt;name&gt;] entries; workloads split out ([#77](https://github.com/doublewordai/inference-lab/issues/77)) ([1788006](https://github.com/doublewordai/inference-lab/commit/17880069ce408cd375a3f4ab8bd6640a54b22333))
+
 ## [0.10.0](https://github.com/doublewordai/inference-lab/compare/inference-lab-v0.9.0...inference-lab-v0.10.0) (2026-08-12)
 
 
