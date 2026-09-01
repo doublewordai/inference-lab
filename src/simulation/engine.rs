@@ -961,9 +961,7 @@ impl Engine {
             Roles::Aggregated { .. } => return None,
         };
         let mut total = ReusableKvStats::default();
-        let ranks = self
-            .topology
-            .pools[decode]
+        let ranks = self.topology.pools[decode]
             .workers
             .iter()
             .zip(&self.reusable_kv_by_decode_worker)
@@ -1086,7 +1084,6 @@ impl Engine {
         }
         total
     }
-
 
     /// Aggregate KV cache utilisation across pools, weighted by capacity.
     /// Returns 0.0 if no KV cache is configured anywhere.
@@ -2116,7 +2113,6 @@ mod tests {
 
         let inherited = classify_reusable_kv(&model, observe(125, 100, 0, 0, 0, 0));
         assert_eq!(inherited.prefiller_miss_unattributed.tokens, 100);
-
     }
 
     /// One replica of `tp` GPUs with a fabric, DP-attention on or off.
