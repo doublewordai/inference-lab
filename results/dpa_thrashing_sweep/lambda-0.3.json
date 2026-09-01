@@ -1,0 +1,296 @@
+[
+  {
+    "lambda_rank_sessions_s": 0.3,
+    "lambda_node_sessions_s": 2.4,
+    "seed": 42,
+    "duration_secs": 600.0,
+    "metrics": {
+      "latency_metrics": {
+        "ttft_ms": {
+          "min": 2.8777884639907825,
+          "mean": 30783.90664589153,
+          "p50": 983.77821683966,
+          "p90": 126559.19935880319,
+          "p99": 170526.04259644964
+        },
+        "e2e_ms": {
+          "min": 2.8777884639907825,
+          "mean": 37699.109850332665,
+          "p50": 7708.851835055533,
+          "p90": 132892.69976624634,
+          "p99": 175565.62679044172
+        },
+        "per_token_ms": {
+          "min": 2.9196377039087476,
+          "mean": 14.926575832452174,
+          "p50": 14.496881888452886,
+          "p90": 14.995115441880523,
+          "p99": 28.986772897808358
+        }
+      },
+      "throughput_metrics": {
+        "input_tokens_per_sec": 374684.9994507681,
+        "output_tokens_per_sec": 4721.243277455361,
+        "requests_per_sec": 8.842431744866932
+      },
+      "utilization": {
+        "avg_kv_cache_util": 0.09424296782218204,
+        "avg_flops_util": 0.027122138080427214,
+        "avg_bandwidth_util": 0.8217724330128733
+      },
+      "preemptions": {
+        "total": 3,
+        "per_request_mean": 0.000362406378352259
+      },
+      "requests": {
+        "completed": 8278,
+        "total": 8278,
+        "rejected": 0
+      },
+      "prefix_cache": {
+        "hits": 5116,
+        "misses": 3165,
+        "hit_rate": 0.6177997826349475,
+        "mean_hit_size": 26253.53266513706,
+        "recomputed": 0,
+        "recomputed_tokens": 0,
+        "prefetches": 0,
+        "prefetch_tokens": 0
+      },
+      "router": {
+        "policy": "session_affinity",
+        "per_replica": [
+          1007,
+          884,
+          877,
+          1224,
+          1034,
+          978,
+          1049,
+          1225
+        ],
+        "prefix_available": 0,
+        "prefix_routed": 0,
+        "prefix_forgone": 0
+      },
+      "decode_router": {
+        "policy": "session_affinity",
+        "per_replica": [
+          968,
+          862,
+          833,
+          1174,
+          991,
+          957,
+          1018,
+          1182
+        ],
+        "prefix_available": 0,
+        "prefix_routed": 0,
+        "prefix_forgone": 0
+      },
+      "handoff": {
+        "transfers": 7985,
+        "bytes": 8752819355136,
+        "bytes_skipped": 7411780091904
+      },
+      "memory": null
+    }
+  },
+  {
+    "lambda_rank_sessions_s": 0.3,
+    "lambda_node_sessions_s": 2.4,
+    "seed": 43,
+    "duration_secs": 600.0,
+    "metrics": {
+      "latency_metrics": {
+        "ttft_ms": {
+          "min": 7.347923615938612,
+          "mean": 43777.23456406044,
+          "p50": 1886.6315094525276,
+          "p90": 149803.8956759201,
+          "p99": 197586.12220426995
+        },
+        "e2e_ms": {
+          "min": 16.5959756943721,
+          "mean": 49799.078356519385,
+          "p50": 11050.05391862585,
+          "p90": 153766.47416893308,
+          "p99": 202284.5044043153
+        },
+        "per_token_ms": {
+          "min": 3.5548787136910667,
+          "mean": 18.81146670813369,
+          "p50": 14.246022796931806,
+          "p90": 14.946059789721543,
+          "p99": 56.431370065954624
+        }
+      },
+      "throughput_metrics": {
+        "input_tokens_per_sec": 381822.44382708054,
+        "output_tokens_per_sec": 4486.254878352602,
+        "requests_per_sec": 9.357380615153552
+      },
+      "utilization": {
+        "avg_kv_cache_util": 0.10962546012909377,
+        "avg_flops_util": 0.03419039070228334,
+        "avg_bandwidth_util": 0.8654265707761339
+      },
+      "preemptions": {
+        "total": 9,
+        "per_request_mean": 0.0011980830670926517
+      },
+      "requests": {
+        "completed": 7512,
+        "total": 7512,
+        "rejected": 0
+      },
+      "prefix_cache": {
+        "hits": 4101,
+        "misses": 3420,
+        "hit_rate": 0.545273234942162,
+        "mean_hit_size": 22211.029384390375,
+        "recomputed": 0,
+        "recomputed_tokens": 0,
+        "prefetches": 0,
+        "prefetch_tokens": 0
+      },
+      "router": {
+        "policy": "session_affinity",
+        "per_replica": [
+          1036,
+          1023,
+          880,
+          902,
+          976,
+          942,
+          1005,
+          748
+        ],
+        "prefix_available": 0,
+        "prefix_routed": 0,
+        "prefix_forgone": 0
+      },
+      "decode_router": {
+        "policy": "session_affinity",
+        "per_replica": [
+          1007,
+          983,
+          841,
+          871,
+          938,
+          922,
+          982,
+          696
+        ],
+        "prefix_available": 0,
+        "prefix_routed": 0,
+        "prefix_forgone": 0
+      },
+      "handoff": {
+        "transfers": 7240,
+        "bytes": 8191033930752,
+        "bytes_skipped": 5852772827136
+      },
+      "memory": null
+    }
+  },
+  {
+    "lambda_rank_sessions_s": 0.3,
+    "lambda_node_sessions_s": 2.4,
+    "seed": 44,
+    "duration_secs": 600.0,
+    "metrics": {
+      "latency_metrics": {
+        "ttft_ms": {
+          "min": 2.877788463997888,
+          "mean": 42671.43313546226,
+          "p50": 2677.2614072275755,
+          "p90": 148469.5876741652,
+          "p99": 193162.2239486733
+        },
+        "e2e_ms": {
+          "min": 2.877788463997888,
+          "mean": 48623.461767551606,
+          "p50": 10689.531856252528,
+          "p90": 151580.60127734803,
+          "p99": 198602.1647930083
+        },
+        "per_token_ms": {
+          "min": 2.8956104560000084,
+          "mean": 13.761420402538109,
+          "p50": 13.76367757895078,
+          "p90": 14.9438459387462,
+          "p99": 28.7978673951149
+        }
+      },
+      "throughput_metrics": {
+        "input_tokens_per_sec": 386102.52224623045,
+        "output_tokens_per_sec": 4546.308758641751,
+        "requests_per_sec": 9.432318002554918
+      },
+      "utilization": {
+        "avg_kv_cache_util": 0.11089848733413071,
+        "avg_flops_util": 0.033645371359287926,
+        "avg_bandwidth_util": 0.8659853061635693
+      },
+      "preemptions": {
+        "total": 4,
+        "per_request_mean": 0.0005188740433259826
+      },
+      "requests": {
+        "completed": 7709,
+        "total": 7709,
+        "rejected": 0
+      },
+      "prefix_cache": {
+        "hits": 4219,
+        "misses": 3494,
+        "hit_rate": 0.5469985738363802,
+        "mean_hit_size": 22393.843122001814,
+        "recomputed": 0,
+        "recomputed_tokens": 0,
+        "prefetches": 0,
+        "prefetch_tokens": 0
+      },
+      "router": {
+        "policy": "session_affinity",
+        "per_replica": [
+          979,
+          968,
+          812,
+          884,
+          1019,
+          1042,
+          1151,
+          854
+        ],
+        "prefix_available": 0,
+        "prefix_routed": 0,
+        "prefix_forgone": 0
+      },
+      "decode_router": {
+        "policy": "session_affinity",
+        "per_replica": [
+          928,
+          935,
+          786,
+          862,
+          976,
+          990,
+          1101,
+          828
+        ],
+        "prefix_available": 0,
+        "prefix_routed": 0,
+        "prefix_forgone": 0
+      },
+      "handoff": {
+        "transfers": 7406,
+        "bytes": 8428843471872,
+        "bytes_skipped": 5992914714624
+      },
+      "memory": null
+    }
+  }
+]

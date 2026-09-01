@@ -239,6 +239,12 @@ pub struct KVCacheManager {
     /// order, so an upper bound on the LRU stack distance in bytes.
     bytes_touched: u64,
 
+    /// HBM prefix-cache regions and blocks recycled to make room. These are
+    /// distinct from spillover-store evictions: they happen even in an
+    /// HBM-only deployment.
+    hbm_eviction_events: u64,
+    hbm_evicted_blocks: u64,
+
     hbm_eviction: HbmEviction,
     backed_first: bool,
 }
@@ -281,6 +287,8 @@ impl KVCacheManager {
             stats: PrefixCacheStats::default(),
             bytes_written: 0,
             bytes_touched: 0,
+            hbm_eviction_events: 0,
+            hbm_evicted_blocks: 0,
             hbm_eviction: HbmEviction::Lru {},
             backed_first: false,
         }
@@ -631,6 +639,8 @@ impl KVCacheManager {
         request.aux_blocks.extend(aux_new);
         self.bytes_written += got.fresh_blocks as u64 * self.bytes_per_block;
         self.bytes_touched += (got.fresh_blocks + got.hits_on_free) as u64 * self.bytes_per_block;
+        self.hbm_eviction_events += u64::from(!got.evicted.is_empty());
+        self.hbm_evicted_blocks += got.evicted.iter().map(|e| e.span.len() as u64).sum::<u64>();
         if let Some((g, w)) = &self.memory {
             let mut g = g.lock().unwrap();
             g.demote_batch(*w, &got.evicted);
@@ -720,6 +730,31 @@ impl KVCacheManager {
     /// Bytes written plus bytes of hits that pulled free blocks back into use.
     pub fn bytes_touched(&self) -> u64 {
         self.bytes_touched
+    }
+
+    /// Prefix-cache bytes resident in HBM, including free-but-reusable
+    /// blocks. This intentionally differs from [`Self::utilization`], which
+    /// counts only referenced or reserved blocks.
+    pub fn resident_prefix_bytes(&self) -> u64 {
+        self.radix.lock().unwrap().resident_blocks(self.worker) as u64 * self.bytes_per_block
+    }
+
+    pub fn active_or_reserved_bytes(&self) -> u64 {
+        self.total_blocks
+            .saturating_sub(self.num_free_blocks() as u32) as u64
+            * self.bytes_per_block
+    }
+
+    pub fn capacity_bytes(&self) -> u64 {
+        self.total_blocks as u64 * self.bytes_per_block
+    }
+
+    pub fn hbm_eviction_events(&self) -> u64 {
+        self.hbm_eviction_events
+    }
+
+    pub fn hbm_evicted_bytes(&self) -> u64 {
+        self.hbm_evicted_blocks * self.bytes_per_block
     }
 
     pub fn num_free_blocks(&self) -> usize {
@@ -1512,6 +1547,8 @@ mod tests {
         );
         assert!(m.hbm_contains(5) && m.hbm_contains(6));
         assert_eq!(m.num_free_blocks(), 3);
+        assert_eq!(m.hbm_eviction_events(), 1);
+        assert_eq!(m.hbm_evicted_bytes(), 3 * 1600);
     }
 
     #[test]

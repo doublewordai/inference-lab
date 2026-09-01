@@ -1,0 +1,10 @@
+starting 10.000-day run: lambda/rank=0.020000, lambda/node=0.160000, progress every 3600 simulated seconds, stop at waiting 1000 or 6 consecutive growing epochs
+  sim=  0.04d   0.42% wall=   2.6s speed=    1456x eta=   9.8m admitted=13163 completed=13132 running=31 waiting=0 waiting_min/max=0/4 active_sessions=151 output=2106.9 tok/s interval_p99_ttft=1.180s
+  sim=  0.08d   0.83% wall=   5.9s speed=    1071x eta=  13.3m admitted=32436 completed=32405 running=31 waiting=0 waiting_min/max=0/11 active_sessions=218 output=3127.6 tok/s interval_p99_ttft=3.040s
+  sim=  0.13d   1.25% wall=   9.7s speed=     957x eta=  14.9m admitted=52506 completed=52442 running=24 waiting=39 waiting_min/max=0/42 active_sessions=302 output=3217.1 tok/s interval_p99_ttft=58.546s
+  sim=  0.17d   1.67% wall=  13.8s speed=     886x eta=  16.0m admitted=73216 completed=73080 running=24 waiting=112 waiting_min/max=23/118 active_sessions=399 output=3110.0 tok/s interval_p99_ttft=131.851s
+  sim=  0.21d   2.08% wall=  17.7s speed=     907x eta=  15.5m admitted=89385 completed=89074 running=19 waiting=291 waiting_min/max=108/298 active_sessions=548 output=2505.1 tok/s interval_p99_ttft=258.871s
+  sim=  0.25d   2.50% wall=  21.3s speed=    1000x eta=  14.0m admitted=99765 completed=99158 running=15 waiting=591 waiting_min/max=284/593 active_sessions=809 output=1619.3 tok/s interval_p99_ttft=396.008s
+  sim=  0.29d   2.92% wall=  24.8s speed=    1028x eta=  13.6m admitted=108340 completed=107416 running=17 waiting=906 waiting_min/max=588/913 active_sessions=1112 output=1302.4 tok/s interval_p99_ttft=473.947s
+  sim=  0.31d   3.05% wall=  26.1s speed=     978x eta=  14.3m admitted=111307 completed=110290 running=16 waiting=1001 waiting_min/max=895/1001 active_sessions=1208 output=1360.4 tok/s interval_p99_ttft=496.718s
+  EARLY STOP: MaxWaiting { limit: 1000, observed: 1001 }

@@ -72,6 +72,11 @@ pub struct Request {
     /// Prefix tokens found in the KV cache at admission (set by the scheduler).
     pub num_cached_tokens: u32,
 
+    /// Disaggregated serving: prompt-prefix tokens already resident on the
+    /// selected decode worker when the prefill-to-decode hand-off began.
+    /// `None` until hand-off routing, and always `None` in aggregated mode.
+    pub decode_cached_tokens: Option<u32>,
+
     /// The prefix lookup that decided `num_cached_tokens`: when it happened
     /// and what it found where (diagnostics, `--request-csv`). Set on the
     /// first admission decision; later lookups (after a preemption or a
@@ -222,6 +227,7 @@ impl Request {
             num_computed_tokens: 0,
             num_output_tokens: 0,
             num_cached_tokens: 0,
+            decode_cached_tokens: None,
             lookup: None,
             prompt_block_hashes: Vec::new(),
             session: None,

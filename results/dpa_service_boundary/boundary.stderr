@@ -1,0 +1,12 @@
+   Compiling inference-lab v0.10.0 (/home/fergus/inference-lab)
+    Finished `release` profile [optimized + debuginfo] target(s) in 11.20s
+     Running `target/release/examples/dpa_service_boundary --json`
+lambda_rank=0.020000, lambda_node=0.160000
+  turnover at 2243.113s
+  SLO MET: 3011.2 output tok/s, cohort p99 TTFTs [1003.0, 1225.0, 2343.0, 2064.0, 2208.0, 3147.0, 4028.0, 3505.0, 4123.0, 3456.0, 5803.0, 8049.0]ms
+lambda_rank=0.025000, lambda_node=0.200000
+  turnover at 1796.621s
+  SLO BREACH: 3377.5 output tok/s, cohort p99 TTFTs [1357.0, 1744.0, 2299.0, 2413.0, 3214.0, 5693.0, 36708.0, 45918.0, 41298.0, 51524.0, 82222.0, 150354.0]ms
+lambda_rank=0.022500, lambda_node=0.180000
+  turnover at 1994.351s
+  SLO BREACH: 3314.1 output tok/s, cohort p99 TTFTs [1281.0, 1251.0, 2082.0, 2225.0, 2969.0, 3245.0, 4613.0, 5859.0, 4360.0, 5462.0, 5836.0, 66069.0]ms

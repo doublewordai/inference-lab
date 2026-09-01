@@ -8,6 +8,9 @@
 //! policy = "least_loaded"
 //!
 //! [router]
+//! policy = "session_affinity"                 # session ordinal modulo workers
+//!
+//! [router]
 //! policy = "prefix_affinity"
 //! max_load_ratio = 1.5                      # optional bounded-load cap
 //!
@@ -31,6 +34,10 @@ pub enum RouterConfig {
     /// Fewest requests in the system (running + waiting); ties by queued
     /// prefill tokens, then replica index.
     LeastLoaded {},
+    /// Keep every step of a session on `session ordinal % workers`.
+    /// Non-session requests fall back to round-robin. This is a deliberately
+    /// load-oblivious control for experiments that must hold routing fixed.
+    SessionAffinity {},
     /// The replica holding the longest cached prefix of the prompt. With no
     /// cached prefix anywhere, or when the holder's request count exceeds
     /// `max_load_ratio × mean`, falls back to `least_loaded`.
@@ -77,6 +84,7 @@ impl RouterConfig {
         match self {
             RouterConfig::RoundRobin {} => "round_robin",
             RouterConfig::LeastLoaded {} => "least_loaded",
+            RouterConfig::SessionAffinity {} => "session_affinity",
             RouterConfig::PrefixAffinity { .. } => "prefix_affinity",
             RouterConfig::KvAware { .. } => "kv_aware",
             RouterConfig::KvAwareDecode { .. } => "kv_aware_decode",
@@ -94,6 +102,8 @@ mod tests {
         assert_eq!(rr, RouterConfig::RoundRobin {});
         let ll: RouterConfig = toml::from_str("policy = \"least_loaded\"").unwrap();
         assert_eq!(ll, RouterConfig::LeastLoaded {});
+        let sa: RouterConfig = toml::from_str("policy = \"session_affinity\"").unwrap();
+        assert_eq!(sa, RouterConfig::SessionAffinity {});
         let pa: RouterConfig =
             toml::from_str("policy = \"prefix_affinity\"\nmax_load_ratio = 1.5").unwrap();
         assert_eq!(

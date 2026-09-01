@@ -1,0 +1,30 @@
+lambda_rank=0.015000, lambda_node=0.120000
+  turnover at 2989.508s
+  SLO MET: 2388.0 output tok/s, 600s-window p99 TTFTs [1024.0, 1036.0, 1479.0, 1057.0, 2164.0, 2219.0, 1986.0, 2684.0, 3394.0, 3461.0, 5636.0, 3202.0]ms
+lambda_rank=0.017500, lambda_node=0.140000
+  turnover at 2563.414s
+  SLO MET: 2694.6 output tok/s, 600s-window p99 TTFTs [822.0, 1095.0, 1654.0, 2203.0, 2217.0, 2361.0, 3075.0, 2533.0, 3496.0, 3542.0, 5030.0, 3087.0]ms
+lambda_rank=0.020000, lambda_node=0.160000
+  turnover at 2243.113s
+  SLO MET: 3011.2 output tok/s, 600s-window p99 TTFTs [1003.0, 1225.0, 2343.0, 2064.0, 2208.0, 3147.0, 4028.0, 3505.0, 4123.0, 3456.0, 5803.0, 8049.0]ms
+lambda_rank=0.021250, lambda_node=0.170000
+  turnover at 2111.753s
+  SLO BREACH: 3146.0 output tok/s, 600s-window p99 TTFTs [1111.0, 1421.0, 2337.0, 2332.0, 2961.0, 2956.0, 6202.0, 13614.0, 5565.0, 3913.0, 8767.0, 43418.0]ms
+lambda_rank=0.022500, lambda_node=0.180000
+  turnover at 1994.351s
+  SLO BREACH: 3314.1 output tok/s, 600s-window p99 TTFTs [1281.0, 1251.0, 2082.0, 2225.0, 2969.0, 3245.0, 4613.0, 5859.0, 4360.0, 5462.0, 5836.0, 66069.0]ms
+lambda_rank=0.023750, lambda_node=0.190000
+  turnover at 1890.963s
+  SLO BREACH: 3398.0 output tok/s, 600s-window p99 TTFTs [1285.0, 1565.0, 2181.0, 2478.0, 3498.0, 3773.0, 36610.0, 44937.0, 10927.0, 10014.0, 14641.0, 112799.0]ms
+lambda_rank=0.025000, lambda_node=0.200000
+  turnover at 1796.621s
+  SLO BREACH: 3377.5 output tok/s, 600s-window p99 TTFTs [1357.0, 1744.0, 2299.0, 2413.0, 3214.0, 5693.0, 36708.0, 45918.0, 41298.0, 51524.0, 82222.0, 150354.0]ms
+lambda_rank=0.027500, lambda_node=0.220000
+  turnover at 1696.288s
+  SLO BREACH: 3248.1 output tok/s, 600s-window p99 TTFTs [1479.0, 1953.0, 2591.0, 3084.0, 3494.0, 11983.0, 64820.0, 87447.0, 104772.0, 134891.0, 191620.0, 209624.0]ms
+lambda_rank=0.030000, lambda_node=0.240000
+  turnover at 1566.789s
+  SLO BREACH: 2982.7 output tok/s, 600s-window p99 TTFTs [1606.0, 2946.0, 3781.0, 3171.0, 7214.0, 55443.0, 99504.0, 149028.0, 183006.0, 217169.0, 231410.0, 255191.0]ms
+lambda_rank=0.040000, lambda_node=0.320000
+  turnover at 1312.045s
+  SLO BREACH: 2912.6 output tok/s, 600s-window p99 TTFTs [1548.0, 3835.0, 5926.0, 10149.0, 103036.0, 151308.0, 216007.0, 240353.0, 282043.0, 323640.0, 359105.0, 377822.0]ms
