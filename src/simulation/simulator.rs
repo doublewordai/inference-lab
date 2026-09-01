@@ -562,40 +562,40 @@ impl Simulator {
             .engine
             .reusable_kv_stats()
             .map(|(total, ranks, prefill_work)| {
-            let total = to_residency(total);
-            let output = self.total_decode_tokens;
-            ReusableKvMetrics {
-                prefill_work: SessionPrefillWork {
-                    new_prompt: to_amount(prefill_work.new_prompt),
-                    parent_prefill_recompute: to_amount(prefill_work.parent_prefill_recompute),
-                    parent_decode_recompute: to_amount(prefill_work.parent_decode_recompute),
-                    unattributed_recompute: to_amount(prefill_work.unattributed_recompute),
-                },
-                recomputed_reusable_tokens_per_output_token: if output == 0 {
-                    0.0
-                } else {
-                    (total.decoder_hit_prefill_miss.tokens
-                        + total.decoder_miss_prefill_miss.tokens) as f64
-                        / output as f64
-                },
-                transferred_reusable_bytes_per_output_token: if output == 0 {
-                    0.0
-                } else {
-                    (total.decoder_miss_prefill_hit.bytes
-                        + total.decoder_miss_prefill_miss.bytes) as f64
-                        / output as f64
-                },
-                total,
-                per_decode_rank: ranks
-                    .into_iter()
-                    .map(|rank| RankReusableKvMetrics {
-                        worker: rank.worker,
-                        rank: rank.rank,
-                        residency: to_residency(rank.stats),
-                    })
-                    .collect(),
-            }
-        });
+                let total = to_residency(total);
+                let output = self.total_decode_tokens;
+                ReusableKvMetrics {
+                    prefill_work: SessionPrefillWork {
+                        new_prompt: to_amount(prefill_work.new_prompt),
+                        parent_prefill_recompute: to_amount(prefill_work.parent_prefill_recompute),
+                        parent_decode_recompute: to_amount(prefill_work.parent_decode_recompute),
+                        unattributed_recompute: to_amount(prefill_work.unattributed_recompute),
+                    },
+                    recomputed_reusable_tokens_per_output_token: if output == 0 {
+                        0.0
+                    } else {
+                        (total.decoder_hit_prefill_miss.tokens
+                            + total.decoder_miss_prefill_miss.tokens) as f64
+                            / output as f64
+                    },
+                    transferred_reusable_bytes_per_output_token: if output == 0 {
+                        0.0
+                    } else {
+                        (total.decoder_miss_prefill_hit.bytes
+                            + total.decoder_miss_prefill_miss.bytes) as f64
+                            / output as f64
+                    },
+                    total,
+                    per_decode_rank: ranks
+                        .into_iter()
+                        .map(|rank| RankReusableKvMetrics {
+                            worker: rank.worker,
+                            rank: rank.rank,
+                            residency: to_residency(rank.stats),
+                        })
+                        .collect(),
+                }
+            });
         let hbm = HbmMetrics {
             pools: self
                 .engine
@@ -802,9 +802,7 @@ mod tests {
         config.workload.duration_secs = Some(1.0);
         let mut simulator = Simulator::new(config, None).unwrap();
 
-        simulator
-            .run_until_deadline_with_callback(|_| {})
-            .unwrap();
+        simulator.run_until_deadline_with_callback(|_| {}).unwrap();
 
         let summary = simulator.summary();
         assert_eq!(simulator.current_time(), 1.0);
@@ -872,7 +870,10 @@ mod tests {
         assert_eq!(deadline.at_secs, 100.0);
         assert_eq!(deadline.requests_admitted, 1);
         assert_eq!(deadline.requests_completed, 1);
-        assert_eq!(deadline.running + deadline.waiting + deadline.handoffs_in_flight, 0);
+        assert_eq!(
+            deadline.running + deadline.waiting + deadline.handoffs_in_flight,
+            0
+        );
         assert_eq!(
             deadline.output_tokens_per_sec,
             deadline.output_tokens_generated as f64 / 100.0
@@ -997,7 +998,10 @@ mod tests {
         let summary = simulator.summary();
         let reusable = summary.reusable_kv.unwrap().total;
         assert_eq!(reusable.requests, 2);
-        assert_eq!(reusable.decoder_hit_prefill_hit.tokens, reusable.reusable.tokens);
+        assert_eq!(
+            reusable.decoder_hit_prefill_hit.tokens,
+            reusable.reusable.tokens
+        );
         assert_eq!(reusable.decoder_hit_prefill_miss.tokens, 0);
         assert_eq!(reusable.decoder_miss_prefill_hit.tokens, 0);
         assert_eq!(reusable.decoder_miss_prefill_miss.tokens, 0);
