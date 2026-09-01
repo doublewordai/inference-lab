@@ -138,6 +138,7 @@ fn scheduler() -> SchedulerConfig {
         enable_preemption_free: false,
         enable_cascade_attention: false,
         balance_set: None,
+        max_waiting: 0,
     }
 }
 

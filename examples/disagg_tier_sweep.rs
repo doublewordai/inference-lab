@@ -49,6 +49,7 @@ fn scheduler() -> SchedulerConfig {
         enable_preemption_free: true,
         enable_cascade_attention: false,
         balance_set: None,
+        max_waiting: 0,
     }
 }
 
