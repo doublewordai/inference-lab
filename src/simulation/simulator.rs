@@ -5,16 +5,21 @@
 //! For real-time HTTP serving, see `crate::serve::engine` — same `Engine`,
 //! different driver.
 
-use super::engine::{Engine, IterationInfo, RequestTiming, StepKind, Topology};
+use super::engine::{
+    Engine, IterationInfo, KvAmountStats, RequestTiming, ReusableKvStats, StepKind, Topology,
+};
 use super::spec::DepthSample;
 use crate::config::Config;
 use crate::dataset::{BatchTokenizerFn, DatasetLoader};
 use crate::metrics::{
-    HandoffMetrics, LatencySamples, MetricsCollector, MetricsSummary, RequestRow, RouterMetrics,
-    SampleCursor,
+    DeadlineMetrics, HandoffMetrics, HbmMetrics, HbmPoolMetrics, HbmWorkerMetrics, KvAmount,
+    LatencySamples, MetricsCollector, MetricsSummary, RankReusableKvMetrics, RequestRow,
+    ReusableKvMetrics, ReusableKvResidency, RouterMetrics, SampleCursor, SessionPrefillWork,
+    SimulationMetrics, SummaryExtras,
 };
 use crate::request::{RequestGenerator, SessionSpec};
 use std::collections::HashMap;
+use std::ops::ControlFlow;
 
 /// One sample of the fixed-interval time series.
 #[derive(Debug, Clone)]
@@ -28,9 +33,9 @@ pub struct TimeSeriesPoint {
     pub num_prefilling: usize,
     pub num_decoding: usize,
     /// Prompt positions computed in the interval.
-    pub prefill_tokens: u32,
+    pub prefill_tokens: u64,
     /// Output tokens generated in the interval.
-    pub decode_tokens: u32,
+    pub decode_tokens: u64,
     pub input_throughput: f64,
     pub output_throughput: f64,
     /// Mean TTFT (ms) over requests completed in the interval; NaN if none.
@@ -73,8 +78,17 @@ pub struct Simulator {
     next_sample_time: f64,
 
     // Counters for accumulating tokens within a sample window.
-    window_prefill_tokens: u32,
-    window_decode_tokens: u32,
+    window_prefill_tokens: u64,
+    window_decode_tokens: u64,
+    total_prefill_tokens: u64,
+    total_decode_tokens: u64,
+    deadline_snapshot: Option<DeadlineMetrics>,
+
+    /// Intended arrival time of every request admitted to the engine. This
+    /// includes requests still running or waiting at a hard simulation
+    /// deadline, so finite-horizon analyses can report right-censoring rather
+    /// than silently dropping them.
+    admitted_arrival_times: Vec<f64>,
 
     /// Samples already delivered to the progress callback.
     sent: SampleCursor,
@@ -98,6 +112,7 @@ impl Simulator {
             Some(disagg) => {
                 Topology::from_disagg(&disagg, config.model.clone(), config.scheduler.clone())?
             }
+
             None => Topology::aggregated(
                 config.cluster(),
                 config.model.clone(),
@@ -158,6 +173,10 @@ impl Simulator {
             next_sample_time: 0.0,
             window_prefill_tokens: 0,
             window_decode_tokens: 0,
+            total_prefill_tokens: 0,
+            total_decode_tokens: 0,
+            deadline_snapshot: None,
+            admitted_arrival_times: Vec::new(),
             sent: SampleCursor::default(),
             bytes_at_completion: HashMap::new(),
         })
@@ -181,12 +200,15 @@ impl Simulator {
     /// engine. Returns the number of requests submitted.
     fn drain_arrivals(&mut self) -> usize {
         let mut n = 0;
-        // Closed-loop replenishment is keyed on completions, not on the
-        // generator's own clock; use current_time as a floor so those
-        // entries are visible once we reach their arrival time.
+        // Admit only work whose simulated arrival time has actually been
+        // reached. When idle, `maybe_skip_idle` advances to the next arrival
+        // and the caller drains again. Submitting one future arrival on every
+        // engine iteration would eventually pre-create an entire long-horizon
+        // workload and make admission/session snapshots include future work.
         let now = self.engine.current_time();
-        let bound = self.request_generator.peek_next_arrival_time().max(now) + 1e-9;
+        let bound = now + 1e-9;
         while let Some(mut req) = self.request_generator.next_if_before(bound) {
+            self.admitted_arrival_times.push(req.arrival_time);
             if let Some(step) = &mut req.session {
                 if let Some((written, touched)) = self
                     .bytes_at_completion
@@ -215,20 +237,140 @@ impl Simulator {
         }
     }
 
+    /// Capture the state after every event at or before the inclusive arrival
+    /// deadline, but before processing the first event strictly after it.
+    fn maybe_capture_deadline(&mut self) {
+        let Some(deadline) = self.config.workload.duration_secs else {
+            return;
+        };
+        if self.deadline_snapshot.is_some() || self.engine.current_time() > deadline {
+            return;
+        }
+        let no_engine_event_before_end = self
+            .engine
+            .next_event_time()
+            .is_none_or(|time| time > deadline);
+        let no_arrival_before_end = self.request_generator.is_finished()
+            || self.request_generator.peek_next_arrival_time() > deadline;
+        if !no_engine_event_before_end || !no_arrival_before_end {
+            return;
+        }
+        let running = self.engine.aggregate_running();
+        let prefilling = self.engine.aggregate_prefilling();
+        self.deadline_snapshot = Some(DeadlineMetrics {
+            at_secs: deadline,
+            requests_admitted: self.metrics.total_requests,
+            requests_completed: self.metrics.completed_requests,
+            output_tokens_generated: self.total_decode_tokens,
+            output_tokens_per_sec: if deadline > 0.0 {
+                self.total_decode_tokens as f64 / deadline
+            } else {
+                0.0
+            },
+            running: running as u64,
+            waiting: self.engine.aggregate_waiting() as u64,
+            handoffs_in_flight: self.engine.handoffs_in_flight() as u64,
+            prefilling: prefilling as u64,
+            decoding: running.saturating_sub(prefilling) as u64,
+        })
+    }
+
     pub fn run_with_callback<F>(&mut self, mut callback: F) -> Result<(), String>
     where
         F: FnMut(ProgressInfo),
     {
-        let mut last_callback_time = 0.0;
-        let callback_interval = 1.0;
+        self.run_with_callback_mode(
+            &mut |info| {
+                callback(info);
+                ControlFlow::Continue(())
+            },
+            false,
+            1.0,
+        )
+    }
 
+    /// Run until the configured workload deadline without draining work after
+    /// it. The final callback is an exact deadline snapshot: no engine event
+    /// or arrival remains at or before the deadline, and later work stays
+    /// right-censored.
+    pub fn run_until_deadline_with_callback<F>(&mut self, mut callback: F) -> Result<(), String>
+    where
+        F: FnMut(ProgressInfo),
+    {
+        if self.config.workload.duration_secs.is_none() {
+            return Err("run_until_deadline_with_callback requires workload.duration_secs".into());
+        }
+        self.run_with_callback_mode(
+            &mut |info| {
+                callback(info);
+                ControlFlow::Continue(())
+            },
+            true,
+            1.0,
+        )
+    }
+
+    /// Run toward the configured deadline, stopping immediately without a
+    /// drain when the callback returns [`ControlFlow::Break`].
+    pub fn run_until_deadline_with_control<F>(&mut self, mut callback: F) -> Result<(), String>
+    where
+        F: FnMut(ProgressInfo) -> ControlFlow<()>,
+    {
+        if self.config.workload.duration_secs.is_none() {
+            return Err("run_until_deadline_with_control requires workload.duration_secs".into());
+        }
+        self.run_with_callback_mode(&mut callback, true, 1.0)
+    }
+
+    /// Run toward the configured deadline with a caller-selected progress
+    /// callback interval. A coarser interval avoids repeatedly constructing a
+    /// full metrics summary in long simulations while preserving the exact
+    /// endpoint snapshot.
+    pub fn run_until_deadline_with_control_interval<F>(
+        &mut self,
+        callback_interval_secs: f64,
+        mut callback: F,
+    ) -> Result<(), String>
+    where
+        F: FnMut(ProgressInfo) -> ControlFlow<()>,
+    {
+        if self.config.workload.duration_secs.is_none() {
+            return Err(
+                "run_until_deadline_with_control_interval requires workload.duration_secs".into(),
+            );
+        }
+        if !callback_interval_secs.is_finite() || callback_interval_secs <= 0.0 {
+            return Err("callback interval must be positive and finite".into());
+        }
+        self.run_with_callback_mode(&mut callback, true, callback_interval_secs)
+    }
+
+    fn run_with_callback_mode<F>(
+        &mut self,
+        callback: &mut F,
+        stop_at_deadline: bool,
+        callback_interval: f64,
+    ) -> Result<(), String>
+    where
+        F: FnMut(ProgressInfo) -> ControlFlow<()>,
+    {
+        let mut last_callback_time = 0.0;
         loop {
             self.drain_arrivals();
             self.maybe_skip_idle();
+            self.drain_arrivals();
+            self.maybe_capture_deadline();
+
+            if stop_at_deadline && self.deadline_snapshot.is_some() {
+                self.engine
+                    .advance_to(self.config.workload.duration_secs.unwrap());
+                let _ = self.emit_progress(callback);
+                break;
+            }
 
             if self.engine.next_event_time().is_none() {
                 if self.should_terminate() {
-                    self.emit_progress(&mut callback);
+                    let _ = self.emit_progress(callback);
                     break;
                 }
                 // No pending event, no arrival to jump to, and work still in
@@ -308,12 +450,19 @@ impl Simulator {
             if matches!(outcome.kind, StepKind::Iteration)
                 && self.engine.current_time() - last_callback_time >= callback_interval
             {
-                self.emit_progress(&mut callback);
+                if self.emit_progress(callback).is_break() {
+                    return Ok(());
+                }
                 last_callback_time = self.engine.current_time();
             }
 
             if self.should_terminate() {
-                self.emit_progress(&mut callback);
+                // A finite request cap can drain the simulation before the
+                // arrival deadline. The state at the later deadline is then
+                // the same idle state, so materialize that snapshot before
+                // leaving the event loop.
+                self.maybe_capture_deadline();
+                let _ = self.emit_progress(callback);
                 break;
             }
         }
@@ -324,9 +473,11 @@ impl Simulator {
     fn handle_iteration(&mut self, iter: &IterationInfo) {
         for prog in &iter.progress {
             if prog.was_prefill {
-                self.window_prefill_tokens += prog.num_tokens;
+                self.window_prefill_tokens += prog.num_tokens as u64;
+                self.total_prefill_tokens += prog.num_tokens as u64;
             }
-            self.window_decode_tokens += prog.num_output;
+            self.window_decode_tokens += prog.num_output as u64;
+            self.total_decode_tokens += prog.num_output as u64;
         }
         self.metrics.record_iteration_metrics(
             self.engine.kv_cache_util(),
@@ -351,7 +502,10 @@ impl Simulator {
         }
     }
 
-    fn emit_progress<F: FnMut(ProgressInfo)>(&mut self, callback: &mut F) {
+    fn emit_progress<F>(&mut self, callback: &mut F) -> ControlFlow<()>
+    where
+        F: FnMut(ProgressInfo) -> ControlFlow<()>,
+    {
         let metrics = self.summary();
         let (latency_samples, (input_lengths, output_lengths)) =
             self.metrics.samples_since(&mut self.sent);
@@ -367,7 +521,7 @@ impl Simulator {
             latency_samples,
             input_lengths,
             output_lengths,
-        });
+        })
     }
 
     /// Metrics summary as of the current simulated time.
@@ -387,19 +541,144 @@ impl Simulator {
             }
         });
         let memory = self.engine.memory_metrics();
-        self.metrics.compute_summary(
+        let to_amount = |amount: KvAmountStats| KvAmount {
+            tokens: amount.tokens,
+            bytes: amount.bytes,
+        };
+        let to_residency = |stats: ReusableKvStats| {
+            ReusableKvResidency::from_cells(
+                stats.requests,
+                to_amount(stats.reusable),
+                to_amount(stats.both),
+                to_amount(stats.decoder_only),
+                to_amount(stats.prefill_only),
+                to_amount(stats.neither),
+                to_amount(stats.prefiller_miss_parent_prefill),
+                to_amount(stats.prefiller_miss_parent_decode),
+                to_amount(stats.prefiller_miss_unattributed),
+            )
+        };
+        let reusable_kv = self
+            .engine
+            .reusable_kv_stats()
+            .map(|(total, ranks, prefill_work)| {
+            let total = to_residency(total);
+            let output = self.total_decode_tokens;
+            ReusableKvMetrics {
+                prefill_work: SessionPrefillWork {
+                    new_prompt: to_amount(prefill_work.new_prompt),
+                    parent_prefill_recompute: to_amount(prefill_work.parent_prefill_recompute),
+                    parent_decode_recompute: to_amount(prefill_work.parent_decode_recompute),
+                    unattributed_recompute: to_amount(prefill_work.unattributed_recompute),
+                },
+                recomputed_reusable_tokens_per_output_token: if output == 0 {
+                    0.0
+                } else {
+                    (total.decoder_hit_prefill_miss.tokens
+                        + total.decoder_miss_prefill_miss.tokens) as f64
+                        / output as f64
+                },
+                transferred_reusable_bytes_per_output_token: if output == 0 {
+                    0.0
+                } else {
+                    (total.decoder_miss_prefill_hit.bytes
+                        + total.decoder_miss_prefill_miss.bytes) as f64
+                        / output as f64
+                },
+                total,
+                per_decode_rank: ranks
+                    .into_iter()
+                    .map(|rank| RankReusableKvMetrics {
+                        worker: rank.worker,
+                        rank: rank.rank,
+                        residency: to_residency(rank.stats),
+                    })
+                    .collect(),
+            }
+        });
+        let hbm = HbmMetrics {
+            pools: self
+                .engine
+                .hbm_pool_stats()
+                .into_iter()
+                .map(|pool| {
+                    let workers: Vec<_> = pool
+                        .workers
+                        .into_iter()
+                        .map(|worker| HbmWorkerMetrics {
+                            worker: worker.worker,
+                            rank: worker.rank,
+                            running: worker.running,
+                            waiting: worker.waiting,
+                            capacity_bytes: worker.capacity_bytes,
+                            resident_prefix_bytes: worker.resident_prefix_bytes,
+                            active_or_reserved_bytes: worker.active_or_reserved_bytes,
+                            eviction_events: worker.eviction_events,
+                            evicted_bytes: worker.evicted_bytes,
+                        })
+                        .collect();
+                    HbmPoolMetrics {
+                        role: pool.role,
+                        capacity_bytes: workers.iter().map(|w| w.capacity_bytes).sum(),
+                        resident_prefix_bytes: workers
+                            .iter()
+                            .map(|w| w.resident_prefix_bytes)
+                            .sum(),
+                        active_or_reserved_bytes: workers
+                            .iter()
+                            .map(|w| w.active_or_reserved_bytes)
+                            .sum(),
+                        eviction_events: workers.iter().map(|w| w.eviction_events).sum(),
+                        evicted_bytes: workers.iter().map(|w| w.evicted_bytes).sum(),
+                        workers,
+                    }
+                })
+                .collect(),
+        };
+        let sessions = self
+            .request_generator
+            .session_lifecycle()
+            .map(|lifecycle| self.metrics.session_metrics(lifecycle));
+        let end_time = self.engine.current_time();
+        let simulation = SimulationMetrics {
+            end_time_secs: end_time,
+            arrival_deadline_secs: self.config.workload.duration_secs,
+            drain_time_secs: self
+                .config
+                .workload
+                .duration_secs
+                .map_or(0.0, |deadline| (end_time - deadline).max(0.0)),
+            at_deadline: self.deadline_snapshot,
+        };
+        let extras = SummaryExtras {
+            work: self
+                .metrics
+                .work_metrics(self.total_prefill_tokens, self.total_decode_tokens),
+            sessions,
+            simulation,
+            reusable_kv,
+            hbm,
+        };
+        self.metrics.compute_summary_with(
             self.engine.current_time(),
             self.engine.aggregate_prefix_cache(),
             router,
             decode_router,
             handoff,
             memory,
+            extras,
         )
     }
 
     /// Per-request rows for the `--request-csv` dump.
     pub fn request_rows(&self) -> &[RequestRow] {
         &self.metrics.request_rows
+    }
+
+    /// Intended arrival times for all admitted requests, including work still
+    /// incomplete at a hard simulation deadline.
+    pub fn admitted_arrival_times(&self) -> &[f64] {
+        &self.admitted_arrival_times
     }
 
     /// Per-second speculative draft-depth series from the engine.
@@ -506,6 +785,98 @@ mod tests {
         assert_eq!(summary.requests.total, 1);
         assert_eq!(summary.requests.completed, 1);
         assert!(simulator.current_time() > 1.0);
+        let deadline = summary.simulation.at_deadline.unwrap();
+        assert_eq!(deadline.at_secs, 1.0);
+        assert_eq!(deadline.requests_admitted, 1);
+        assert_eq!(deadline.requests_completed, 0);
+        assert_eq!(deadline.running + deadline.waiting, 1);
+        assert!(summary.simulation.drain_time_secs > 0.0);
+    }
+
+    #[test]
+    fn deadline_run_stops_without_draining_and_retains_admission_times() {
+        let mut config = create_minimal_test_config();
+        config.workload.arrival_pattern = crate::config::ArrivalPattern::Uniform;
+        config.workload.arrival_rate = 1.0;
+        config.workload.num_requests = Some(100);
+        config.workload.duration_secs = Some(1.0);
+        let mut simulator = Simulator::new(config, None).unwrap();
+
+        simulator
+            .run_until_deadline_with_callback(|_| {})
+            .unwrap();
+
+        let summary = simulator.summary();
+        assert_eq!(simulator.current_time(), 1.0);
+        assert_eq!(summary.simulation.drain_time_secs, 0.0);
+        assert_eq!(simulator.admitted_arrival_times(), &[1.0]);
+        assert!(simulator.request_rows().is_empty());
+        let deadline = summary.simulation.at_deadline.unwrap();
+        assert_eq!(deadline.requests_admitted, 1);
+        assert_eq!(deadline.requests_completed, 0);
+        assert_eq!(deadline.running + deadline.waiting, 1);
+    }
+
+    #[test]
+    fn future_arrivals_are_admitted_only_after_the_clock_reaches_them() {
+        let mut config = create_minimal_test_config();
+        config.workload.arrival_pattern = crate::config::ArrivalPattern::Uniform;
+        config.workload.arrival_rate = 1.0;
+        config.workload.num_requests = Some(100);
+        config.workload.duration_secs = Some(100.0);
+        let mut simulator = Simulator::new(config, None).unwrap();
+
+        assert_eq!(simulator.current_time(), 0.0);
+        assert_eq!(simulator.drain_arrivals(), 0);
+        assert!(simulator.admitted_arrival_times().is_empty());
+
+        simulator.maybe_skip_idle();
+        assert_eq!(simulator.current_time(), 1.0);
+        assert_eq!(simulator.drain_arrivals(), 1);
+        assert_eq!(simulator.admitted_arrival_times(), &[1.0]);
+    }
+
+    #[test]
+    fn controlled_deadline_run_can_stop_early_without_draining() {
+        let mut config = create_minimal_test_config();
+        config.workload.arrival_pattern = crate::config::ArrivalPattern::Uniform;
+        config.workload.arrival_rate = 1.0;
+        config.workload.num_requests = Some(100);
+        config.workload.duration_secs = Some(100.0);
+        let mut simulator = Simulator::new(config, None).unwrap();
+
+        simulator
+            .run_until_deadline_with_control(|_| ControlFlow::Break(()))
+            .unwrap();
+
+        assert!(simulator.current_time() < 100.0);
+        let summary = simulator.summary();
+        assert_eq!(summary.simulation.drain_time_secs, 0.0);
+        assert!(summary.simulation.at_deadline.is_none());
+    }
+
+    #[test]
+    fn deadline_snapshot_is_reported_when_the_workload_drains_early() {
+        let mut config = create_minimal_test_config();
+        config.workload.arrival_pattern = crate::config::ArrivalPattern::Batched;
+        config.workload.num_requests = Some(1);
+        config.workload.duration_secs = Some(100.0);
+        let mut simulator = Simulator::new(config, None).unwrap();
+
+        simulator.run_with_callback(|_| {}).unwrap();
+
+        let summary = simulator.summary();
+        assert!(summary.simulation.end_time_secs < 100.0);
+        assert_eq!(summary.simulation.drain_time_secs, 0.0);
+        let deadline = summary.simulation.at_deadline.unwrap();
+        assert_eq!(deadline.at_secs, 100.0);
+        assert_eq!(deadline.requests_admitted, 1);
+        assert_eq!(deadline.requests_completed, 1);
+        assert_eq!(deadline.running + deadline.waiting + deadline.handoffs_in_flight, 0);
+        assert_eq!(
+            deadline.output_tokens_per_sec,
+            deadline.output_tokens_generated as f64 / 100.0
+        );
     }
 
     #[test]
@@ -547,7 +918,7 @@ mod tests {
             assert!(ts[i].time >= ts[i - 1].time);
         }
         // Every output token is counted exactly once across the windows.
-        let decode_total: u64 = ts.iter().map(|p| p.decode_tokens as u64).sum();
+        let decode_total: u64 = ts.iter().map(|p| p.decode_tokens).sum();
         let output_total: u64 = simulator.output_lengths().iter().map(|&x| x as u64).sum();
         assert_eq!(decode_total, output_total);
     }
@@ -588,13 +959,19 @@ mod tests {
         )
         .unwrap();
         let mut config = create_minimal_test_config();
+        config.hardware = crate::catalog::hardware("b200").unwrap();
+        config.parallel.tp = 1;
+        config.prefill = Some(crate::config::PrefillSpec {
+            replicas: 1,
+            ..Default::default()
+        });
         config.workload.sessions_path = Some(path.to_string_lossy().into_owned());
         config.workload.num_sessions = Some(1);
         config.workload.num_requests = None;
         config.workload.arrival_pattern = crate::config::ArrivalPattern::Batched;
         let mut simulator = Simulator::new(config, None).unwrap();
         simulator.run_with_callback(|_| {}).unwrap();
-        let rows = simulator.request_rows();
+        let rows = simulator.request_rows().to_vec();
         assert_eq!(rows.len(), 3);
         let bs = simulator.config().scheduler.block_size;
         let s0 = &rows[0];
@@ -607,6 +984,7 @@ mod tests {
         // 216 tokens shared, in whole blocks.
         assert_eq!(s1.shared_tokens, Some((216 / bs) * bs));
         assert_eq!(s1.cached_tokens, s1.shared_tokens.unwrap());
+        assert_eq!(s1.decode_cached_tokens, s1.shared_tokens);
         // Nothing else ran: nothing was written between the parent's
         // completion and this arrival.
         assert_eq!(s1.reuse_distance_bytes, Some(0));
@@ -614,7 +992,18 @@ mod tests {
         let s2 = &rows[2];
         assert_eq!(s2.shared_tokens, Some((276 / bs) * bs));
         assert_eq!(s2.cached_tokens, s2.shared_tokens.unwrap());
+        assert_eq!(s2.decode_cached_tokens, s2.shared_tokens);
         assert!((s2.arrival - (s1.completion + 0.5)).abs() < 1e-9);
+        let summary = simulator.summary();
+        let reusable = summary.reusable_kv.unwrap().total;
+        assert_eq!(reusable.requests, 2);
+        assert_eq!(reusable.decoder_hit_prefill_hit.tokens, reusable.reusable.tokens);
+        assert_eq!(reusable.decoder_hit_prefill_miss.tokens, 0);
+        assert_eq!(reusable.decoder_miss_prefill_hit.tokens, 0);
+        assert_eq!(reusable.decoder_miss_prefill_miss.tokens, 0);
+        let sessions = summary.sessions.unwrap();
+        assert_eq!((sessions.started, sessions.completed), (1, 1));
+        assert_eq!(sessions.turns_completed, 3);
         std::fs::remove_dir_all(&dir).ok();
     }
 

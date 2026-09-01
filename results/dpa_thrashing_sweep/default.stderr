@@ -1,0 +1,15 @@
+   Compiling inference-lab v0.10.0 (/home/fergus/inference-lab)
+    Finished `release` profile [optimized + debuginfo] target(s) in 11.75s
+     Running `target/release/examples/dpa_thrashing_sweep`
+lambda_rank=0.050, lambda_node=0.400, seed=42
+lambda_rank=0.100, lambda_node=0.800, seed=42
+lambda_rank=0.150, lambda_node=1.200, seed=42
+lambda_rank=0.200, lambda_node=1.600, seed=42
+lambda_rank=0.250, lambda_node=2.000, seed=42
+lambda_rank=0.300, lambda_node=2.400, seed=42
+lambda_rank=0.350, lambda_node=2.800, seed=42
+lambda_rank=0.400, lambda_node=3.200, seed=42
+lambda_rank=0.450, lambda_node=3.600, seed=42
+lambda_rank=0.500, lambda_node=4.000, seed=42
+lambda_rank=0.550, lambda_node=4.400, seed=42
+lambda_rank=0.600, lambda_node=4.800, seed=42

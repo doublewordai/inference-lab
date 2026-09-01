@@ -73,6 +73,7 @@ pub fn build_router(cfg: &RouterConfig) -> Box<dyn Router> {
     match cfg {
         RouterConfig::RoundRobin {} => Box::new(RoundRobin::default()),
         RouterConfig::LeastLoaded {} => Box::new(LeastLoaded),
+        RouterConfig::SessionAffinity {} => Box::new(SessionAffinity::default()),
         RouterConfig::PrefixAffinity { max_load_ratio } => Box::new(PrefixAffinity {
             max_load_ratio: *max_load_ratio,
         }),
@@ -119,6 +120,25 @@ fn least_loaded(workers: &[WorkerSignal]) -> usize {
 impl Router for LeastLoaded {
     fn route(&mut self, _req: &Request, workers: &[WorkerSignal]) -> usize {
         least_loaded(workers)
+    }
+}
+
+/// Deterministic, load-oblivious affinity for session experiments. Session
+/// ordinals are assigned monotonically by the generator, so modulo placement
+/// balances starts exactly while keeping every re-entry on the same worker.
+/// Synthetic and dataset requests use round-robin as a benign fallback.
+#[derive(Debug, Default)]
+pub struct SessionAffinity {
+    fallback: RoundRobin,
+}
+
+impl Router for SessionAffinity {
+    fn route(&mut self, req: &Request, workers: &[WorkerSignal]) -> usize {
+        let n = workers.len().max(1);
+        req.session.as_ref().map_or_else(
+            || self.fallback.route(req, workers),
+            |s| s.session as usize % n,
+        )
     }
 }
 
@@ -359,6 +379,33 @@ mod tests {
             sig(2, 1, 50, None),
         ];
         assert_eq!(r.route(&req(10), &ws), 2);
+    }
+
+    #[test]
+    fn session_affinity_is_sticky_and_balanced_by_session_ordinal() {
+        let workers = vec![sig(0, 0, 0, None); 3];
+        let mut router = SessionAffinity::default();
+        for session in 0..6 {
+            let mut request = req(10);
+            request.session = Some(Box::new(crate::request::SessionStep {
+                session,
+                step: 0,
+                gap: 0.0,
+                shared_tokens: 0,
+                shared_prefill_tokens: 0,
+                shared_decode_tokens: 0,
+                kind: None,
+                parent_bytes_written: None,
+                reuse_distance_bytes: None,
+                parent_bytes_touched: None,
+                reuse_touched_bytes: None,
+                next_gap: None,
+                next_shared_tokens: 0,
+            }));
+            assert_eq!(router.route(&request, &workers), session as usize % 3);
+            request.session.as_mut().unwrap().step = 9;
+            assert_eq!(router.route(&request, &workers), session as usize % 3);
+        }
     }
 
     #[test]

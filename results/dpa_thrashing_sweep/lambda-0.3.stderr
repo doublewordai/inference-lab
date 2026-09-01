@@ -1,0 +1,5 @@
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.06s
+     Running `target/release/examples/dpa_thrashing_sweep --lambda 0.3 --json`
+lambda_rank=0.300, lambda_node=2.400, seed=42
+lambda_rank=0.300, lambda_node=2.400, seed=43
+lambda_rank=0.300, lambda_node=2.400, seed=44

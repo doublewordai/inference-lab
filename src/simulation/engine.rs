@@ -42,6 +42,9 @@ pub struct RequestTiming {
     pub num_output_tokens: u32,
     /// Prompt tokens served from the prefix cache at admission.
     pub num_cached_tokens: u32,
+    /// Prompt-prefix tokens already resident on the selected decoder when
+    /// the hand-off began (`None` in aggregated mode).
+    pub decode_cached_tokens: Option<u32>,
     /// Session workloads: which step of which session this was.
     pub session: Option<Box<SessionStep>>,
     /// Memory-graph id of the worker that served the request.
@@ -598,6 +601,12 @@ pub struct Engine {
     /// Hand-off transfers started, bytes moved, and bytes skipped because
     /// the chosen decoder already held the prompt prefix.
     handoff_stats: HandoffStats,
+    /// Joint prefill/decode residency of reusable session prefixes, one
+    /// counter set per decode worker.
+    reusable_kv_by_decode_worker: Vec<ReusableKvStats>,
+    /// Unique prompt positions computed by the prefill pool, partitioned by
+    /// their role in the session turn.
+    session_prefill_work: SessionPrefillWorkStats,
     /// Per-pool (∑ batch·dt, ∑ dt) for time-weighted mean batch size.
     pool_batch_acc: Vec<(f64, f64)>,
     current_time: f64,
@@ -617,6 +626,10 @@ impl Engine {
             prefetch_armed.push(vec![None; pool.workers.len()]);
         }
         let pool_batch_acc = vec![(0.0_f64, 0.0_f64); topology.pools.len()];
+        let decode_workers = match topology.roles {
+            Roles::Disagg { decode, .. } => topology.pools[decode].workers.len(),
+            Roles::Aggregated { .. } => 0,
+        };
         Self {
             topology,
             events: BinaryHeap::new(),
@@ -627,6 +640,8 @@ impl Engine {
             worker_busy,
             prefetch_armed,
             handoff_stats: HandoffStats::default(),
+            reusable_kv_by_decode_worker: vec![ReusableKvStats::default(); decode_workers],
+            session_prefill_work: SessionPrefillWorkStats::default(),
             pool_batch_acc,
             current_time: 0.0,
             seq_counter: 0,
@@ -660,6 +675,37 @@ impl Engine {
         }
         self.spec = Some(SpecPlanner::new(cfg, seed)?);
         Ok(())
+    }
+
+    fn record_session_prefill_work(&mut self, req: &Request) {
+        let Some(step) = req.session.as_ref() else {
+            return;
+        };
+        let prompt = req.num_prompt_tokens;
+        let shared = step.shared_tokens.min(prompt);
+        let parent_prefill = step.shared_prefill_tokens.min(shared);
+        let parent_decode_end = parent_prefill
+            .saturating_add(step.shared_decode_tokens)
+            .min(shared);
+        let cached = req.num_cached_tokens.min(prompt);
+        let cached_inherited = cached.min(shared);
+        let amount = |start: u32, end: u32| KvAmountStats {
+            tokens: end.saturating_sub(start) as u64,
+            bytes: self
+                .topology
+                .model
+                .kv_storage_bytes(end)
+                .saturating_sub(self.topology.model.kv_storage_bytes(start)),
+        };
+        self.session_prefill_work += SessionPrefillWorkStats {
+            new_prompt: amount(cached.max(shared), prompt),
+            parent_prefill_recompute: amount(cached_inherited, parent_prefill),
+            parent_decode_recompute: amount(
+                cached_inherited.max(parent_prefill),
+                parent_decode_end,
+            ),
+            unattributed_recompute: amount(cached_inherited.max(parent_decode_end), shared),
+        };
     }
 
     pub fn current_time(&self) -> f64 {
@@ -898,6 +944,77 @@ impl Engine {
         self.handoff_stats
     }
 
+    pub fn handoffs_in_flight(&self) -> usize {
+        self.parked.len()
+    }
+
+    /// Joint reusable-prefix residency totals and per-decode-worker detail.
+    pub fn reusable_kv_stats(
+        &self,
+    ) -> Option<(
+        ReusableKvStats,
+        Vec<RankReusableKvStats>,
+        SessionPrefillWorkStats,
+    )> {
+        let decode = match self.topology.roles {
+            Roles::Disagg { decode, .. } => decode,
+            Roles::Aggregated { .. } => return None,
+        };
+        let mut total = ReusableKvStats::default();
+        let ranks = self
+            .topology
+            .pools[decode]
+            .workers
+            .iter()
+            .zip(&self.reusable_kv_by_decode_worker)
+            .map(|(worker, stats)| {
+                total += *stats;
+                RankReusableKvStats {
+                    worker: worker.global_id as u32,
+                    rank: worker.rank as u32,
+                    stats: *stats,
+                }
+            })
+            .collect();
+        Some((total, ranks, self.session_prefill_work))
+    }
+
+    /// HBM state and eviction accounting by topology pool and worker.
+    pub fn hbm_pool_stats(&self) -> Vec<HbmPoolStats> {
+        self.topology
+            .pools
+            .iter()
+            .enumerate()
+            .map(|(pool_id, pool)| {
+                let role = match self.topology.role_for_pool(pool_id) {
+                    PoolRole::Aggregated => "aggregated",
+                    PoolRole::DisaggPrefill => "prefill",
+                    PoolRole::DisaggDecode => "decode",
+                }
+                .to_string();
+                let workers = pool
+                    .workers
+                    .iter()
+                    .map(|worker| {
+                        let manager = worker.scheduler.kv_cache_manager();
+                        HbmWorkerStats {
+                            worker: worker.global_id as u32,
+                            rank: worker.rank as u32,
+                            running: worker.scheduler.num_running() as u64,
+                            waiting: worker.scheduler.num_waiting() as u64,
+                            capacity_bytes: manager.capacity_bytes(),
+                            resident_prefix_bytes: manager.resident_prefix_bytes(),
+                            active_or_reserved_bytes: manager.active_or_reserved_bytes(),
+                            eviction_events: manager.hbm_eviction_events(),
+                            evicted_bytes: manager.hbm_evicted_bytes(),
+                        }
+                    })
+                    .collect();
+                HbmPoolStats { role, workers }
+            })
+            .collect()
+    }
+
     /// The memory graph's stores and links over the run so far, `None`
     /// when no worker has tiers.
     pub fn memory_metrics(&self) -> Option<crate::metrics::MemoryMetrics> {
@@ -969,6 +1086,7 @@ impl Engine {
         }
         total
     }
+
 
     /// Aggregate KV cache utilisation across pools, weighted by capacity.
     /// Returns 0.0 if no KV cache is configured anywhere.
@@ -1233,6 +1351,9 @@ impl Engine {
         // so it fires first at that instant).
         let mut timings = Vec::with_capacity(outcome.completed.len());
         for req in outcome.completed {
+            if matches!(role, PoolRole::DisaggPrefill) {
+                self.record_session_prefill_work(&req);
+            }
             timings.push(self.finalise(req, now));
         }
         let handoff_time = outcome
@@ -1652,6 +1773,7 @@ impl Engine {
     /// has resident, and start it on the hand-off link. The request is
     /// delivered to that worker when the transfer drains.
     fn start_handoff(&mut self, mut req: Request) -> Result<(), String> {
+        self.record_session_prefill_work(&req);
         let prefill_done_at = self.current_time;
         req.prefill_done_time = Some(prefill_done_at);
         let decode = match self.topology.roles {
@@ -1664,6 +1786,29 @@ impl Engine {
             .kv_cache_manager()
             .hbm_prefix_tokens(&req.prompt_block_hashes)
             .min(req.num_computed_tokens);
+        req.decode_cached_tokens = Some(resident);
+        if let Some(step) = req.session.as_ref() {
+            let shared = step.shared_tokens.min(req.num_computed_tokens);
+            let parent_prefill = step.shared_prefill_tokens.min(shared);
+            let parent_decode = step.shared_decode_tokens.min(shared);
+            let prefill = req
+                .lookup
+                .map(|lookup| lookup.hbm_tokens + lookup.tier_tokens)
+                .unwrap_or(req.num_cached_tokens)
+                .min(req.num_computed_tokens);
+            let decoder = resident.min(shared);
+            self.reusable_kv_by_decode_worker[worker_idx] += classify_reusable_kv(
+                &self.topology.model,
+                ReusableKvObservation {
+                    prompt: req.num_computed_tokens,
+                    shared,
+                    prefill,
+                    decoder,
+                    parent_prefill,
+                    parent_decode,
+                },
+            );
+        }
         let full_bytes = self
             .topology
             .model
@@ -1751,6 +1896,7 @@ impl Engine {
             num_prompt_tokens: req.num_prompt_tokens,
             num_output_tokens: req.num_output_tokens,
             num_cached_tokens: req.num_cached_tokens,
+            decode_cached_tokens: req.decode_cached_tokens,
             session: req.session,
             worker: req.worker,
             num_preemptions: req.num_preemptions,
@@ -1771,6 +1917,140 @@ pub struct HandoffStats {
     pub bytes_skipped: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct KvAmountStats {
+    pub tokens: u64,
+    pub bytes: u64,
+}
+
+impl std::ops::AddAssign for KvAmountStats {
+    fn add_assign(&mut self, other: Self) {
+        self.tokens += other.tokens;
+        self.bytes += other.bytes;
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ReusableKvStats {
+    pub requests: u64,
+    pub reusable: KvAmountStats,
+    pub both: KvAmountStats,
+    pub decoder_only: KvAmountStats,
+    pub prefill_only: KvAmountStats,
+    pub neither: KvAmountStats,
+    pub prefiller_miss_parent_prefill: KvAmountStats,
+    pub prefiller_miss_parent_decode: KvAmountStats,
+    pub prefiller_miss_unattributed: KvAmountStats,
+}
+
+impl std::ops::AddAssign for ReusableKvStats {
+    fn add_assign(&mut self, other: Self) {
+        self.requests += other.requests;
+        self.reusable += other.reusable;
+        self.both += other.both;
+        self.decoder_only += other.decoder_only;
+        self.prefill_only += other.prefill_only;
+        self.neither += other.neither;
+        self.prefiller_miss_parent_prefill += other.prefiller_miss_parent_prefill;
+        self.prefiller_miss_parent_decode += other.prefiller_miss_parent_decode;
+        self.prefiller_miss_unattributed += other.prefiller_miss_unattributed;
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RankReusableKvStats {
+    pub worker: u32,
+    pub rank: u32,
+    pub stats: ReusableKvStats,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SessionPrefillWorkStats {
+    pub new_prompt: KvAmountStats,
+    pub parent_prefill_recompute: KvAmountStats,
+    pub parent_decode_recompute: KvAmountStats,
+    pub unattributed_recompute: KvAmountStats,
+}
+
+impl std::ops::AddAssign for SessionPrefillWorkStats {
+    fn add_assign(&mut self, other: Self) {
+        self.new_prompt += other.new_prompt;
+        self.parent_prefill_recompute += other.parent_prefill_recompute;
+        self.parent_decode_recompute += other.parent_decode_recompute;
+        self.unattributed_recompute += other.unattributed_recompute;
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HbmWorkerStats {
+    pub worker: u32,
+    pub rank: u32,
+    pub running: u64,
+    pub waiting: u64,
+    pub capacity_bytes: u64,
+    pub resident_prefix_bytes: u64,
+    pub active_or_reserved_bytes: u64,
+    pub eviction_events: u64,
+    pub evicted_bytes: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct HbmPoolStats {
+    pub role: String,
+    pub workers: Vec<HbmWorkerStats>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ReusableKvObservation {
+    prompt: u32,
+    shared: u32,
+    prefill: u32,
+    decoder: u32,
+    parent_prefill: u32,
+    parent_decode: u32,
+}
+
+fn classify_reusable_kv(model: &ModelSpec, observation: ReusableKvObservation) -> ReusableKvStats {
+    let ReusableKvObservation {
+        prompt,
+        shared,
+        prefill,
+        decoder,
+        parent_prefill,
+        parent_decode,
+    } = observation;
+    let prompt = prompt.max(shared);
+    let prefill_total = prefill.min(prompt);
+    let prefill = prefill_total.min(shared);
+    let decoder = decoder.min(shared);
+    let parent_prefill = parent_prefill.min(shared);
+    let parent_decode_end = parent_prefill.saturating_add(parent_decode).min(shared);
+    let lo = prefill.min(decoder);
+    let hi = prefill.max(decoder);
+    let amount = |start: u32, end: u32| KvAmountStats {
+        tokens: end.saturating_sub(start) as u64,
+        bytes: model
+            .kv_storage_bytes(end)
+            .saturating_sub(model.kv_storage_bytes(start)),
+    };
+    let mut stats = ReusableKvStats {
+        requests: u64::from(shared > 0),
+        reusable: amount(0, shared),
+        both: amount(0, lo),
+        neither: amount(hi, shared),
+        prefiller_miss_parent_prefill: amount(prefill, parent_prefill),
+        prefiller_miss_parent_decode: amount(prefill.max(parent_prefill), parent_decode_end),
+        prefiller_miss_unattributed: amount(prefill.max(parent_decode_end), shared),
+        ..Default::default()
+    };
+    if decoder > prefill {
+        stats.decoder_only = amount(lo, hi);
+    } else {
+        stats.prefill_only = amount(lo, hi);
+    }
+    stats
+}
+
 struct RunIterationOutcome {
     iteration: Option<IterationInfo>,
     completed: Vec<Request>,
@@ -1787,6 +2067,57 @@ struct RunIterationOutcome {
 mod tests {
     use super::*;
     use crate::config::{Config, FabricConfig, FabricLink};
+
+    #[test]
+    fn reusable_kv_classification_is_a_complete_joint_partition() {
+        let model = Config::test_default().model;
+        let observe = |prompt, shared, prefill, decoder, parent_prefill, parent_decode| {
+            ReusableKvObservation {
+                prompt,
+                shared,
+                prefill,
+                decoder,
+                parent_prefill,
+                parent_decode,
+            }
+        };
+        let p_longer = classify_reusable_kv(&model, observe(125, 100, 70, 40, 80, 20));
+        assert_eq!(p_longer.requests, 1);
+        assert_eq!(p_longer.reusable.tokens, 100);
+        assert_eq!(p_longer.both.tokens, 40);
+        assert_eq!(p_longer.prefill_only.tokens, 30);
+        assert_eq!(p_longer.decoder_only.tokens, 0);
+        assert_eq!(p_longer.neither.tokens, 30);
+        assert_eq!(p_longer.prefiller_miss_parent_prefill.tokens, 10);
+        assert_eq!(p_longer.prefiller_miss_parent_decode.tokens, 20);
+        assert_eq!(p_longer.prefiller_miss_unattributed.tokens, 0);
+        assert_eq!(
+            p_longer.reusable.bytes,
+            p_longer.both.bytes
+                + p_longer.prefill_only.bytes
+                + p_longer.decoder_only.bytes
+                + p_longer.neither.bytes
+        );
+        assert_eq!(
+            p_longer.decoder_only.bytes + p_longer.neither.bytes,
+            p_longer.prefiller_miss_parent_prefill.bytes
+                + p_longer.prefiller_miss_parent_decode.bytes
+                + p_longer.prefiller_miss_unattributed.bytes
+        );
+
+        let d_longer = classify_reusable_kv(&model, observe(125, 100, 30, 80, 60, 40));
+        assert_eq!(d_longer.both.tokens, 30);
+        assert_eq!(d_longer.decoder_only.tokens, 50);
+        assert_eq!(d_longer.prefill_only.tokens, 0);
+        assert_eq!(d_longer.neither.tokens, 20);
+        assert_eq!(d_longer.prefiller_miss_parent_prefill.tokens, 30);
+        assert_eq!(d_longer.prefiller_miss_parent_decode.tokens, 40);
+        assert_eq!(d_longer.prefiller_miss_unattributed.tokens, 0);
+
+        let inherited = classify_reusable_kv(&model, observe(125, 100, 0, 0, 0, 0));
+        assert_eq!(inherited.prefiller_miss_unattributed.tokens, 100);
+
+    }
 
     /// One replica of `tp` GPUs with a fabric, DP-attention on or off.
     fn cluster(tp: u32, dp_attention: bool) -> (ClusterSpec, ModelSpec, SchedulerConfig) {
