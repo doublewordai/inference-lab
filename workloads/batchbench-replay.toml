@@ -1,0 +1,16 @@
+# Replay a batchbench plans.jsonl manifest with its recorded trajectory starts,
+# per-turn gaps, token counts, resets, and prefix identities.
+
+replay_manifest_path = "plans.jsonl"
+
+# Required by the common workload schema; ignored for manifest replay.
+arrival_pattern = "poisson"
+seed = 42
+
+[input_len_dist]
+type = "fixed"
+value = 1
+
+[output_len_dist]
+type = "fixed"
+value = 1

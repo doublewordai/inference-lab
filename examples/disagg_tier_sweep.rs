@@ -6,8 +6,8 @@
 //!   3. prefill_ratio  — sweep prefill workers × tier config
 //!   4. load_sweep     — sweep session count, generous tiers
 //!
-//! All use disaggregated prefill/decode with GLM-5.2 on B200s, sessions
-//! from tracelab.jsonl.
+//! All use disaggregated prefill/decode with GLM-5.2 on B200s and trajectories
+//! from a Batchbench `plans.jsonl` manifest.
 //!
 //! Run: cargo run --release --example disagg_tier_sweep -- <experiment> [--json]
 
@@ -21,7 +21,7 @@ use inference_lab::config::{
     WorkloadConfig,
 };
 use inference_lab::metrics::{HandoffMetrics, MetricsCollector, MetricsSummary, RouterMetrics};
-use inference_lab::request::{RequestGenerator, SessionSpec};
+use inference_lab::request::{ReplayManifest, RequestGenerator};
 use inference_lab::scheduler::SchedulingPolicy;
 use inference_lab::simulation::{Engine, Topology};
 use rayon::prelude::*;
@@ -66,8 +66,8 @@ fn decode_cluster(num_workers: u32) -> ClusterSpec {
     }
 }
 
-fn load_sessions() -> Vec<SessionSpec> {
-    SessionSpec::load("data/sessions/tracelab.jsonl").expect("load tracelab sessions")
+fn load_manifests() -> Vec<ReplayManifest> {
+    ReplayManifest::load("plans.jsonl").expect("load Batchbench replay manifest")
 }
 
 #[derive(Clone)]
@@ -118,7 +118,7 @@ impl RunResult {
     }
 }
 
-fn run_one(cfg: &RunConfig, sessions: &[SessionSpec]) -> RunResult {
+fn run_one(cfg: &RunConfig, manifests: &[ReplayManifest]) -> RunResult {
     let hw = cfg.hardware_override.clone().unwrap_or_else(b200);
     let prefill = ClusterSpec {
         hardware: hw,
@@ -149,12 +149,10 @@ fn run_one(cfg: &RunConfig, sessions: &[SessionSpec]) -> RunResult {
 
     let workload = WorkloadConfig {
         dataset_path: None,
-        sessions_path: None,
-        num_sessions: Some(cfg.num_sessions),
-        stationary_start_sessions: Some((cfg.num_sessions / 2) as u32),
-        resample_sessions: true,
+        replay_manifest_path: None,
+        num_trajectories: Some(cfg.num_sessions),
         arrival_pattern: ArrivalPattern::Poisson,
-        arrival_rate: cfg.num_sessions as f64 / 60.0,
+        arrival_rate: 1.0,
         rate_schedule: None,
         num_concurrent_users: None,
         closed_loop_jitter_secs: None,
@@ -165,7 +163,8 @@ fn run_one(cfg: &RunConfig, sessions: &[SessionSpec]) -> RunResult {
         seed: 42,
     };
 
-    let mut gen = RequestGenerator::from_sessions(workload, sched.block_size, sessions.to_vec());
+    let mut gen =
+        RequestGenerator::from_replay_manifest(workload, sched.block_size, manifests.to_vec());
     let mut engine = Engine::new(topology);
     let mut metrics = MetricsCollector::new(0.0);
     let mut bytes_at_completion: HashMap<(u32, u32), (u64, u64)> = HashMap::new();
@@ -425,7 +424,7 @@ fn main() {
     let experiment = args.get(1).map(|s| s.as_str()).unwrap_or("all");
     let json_output = args.iter().any(|a| a == "--json");
 
-    let sessions = load_sessions();
+    let manifests = load_manifests();
 
     let configs: Vec<RunConfig> = match experiment {
         "tier_capacity" => experiment_tier_capacity(),
@@ -453,7 +452,7 @@ fn main() {
         .par_iter()
         .map(|cfg| {
             eprintln!("  {}", cfg.label);
-            run_one(cfg, &sessions)
+            run_one(cfg, &manifests)
         })
         .collect();
 

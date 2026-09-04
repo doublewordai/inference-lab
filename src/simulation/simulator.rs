@@ -17,7 +17,7 @@ use crate::metrics::{
     ReusableKvMetrics, ReusableKvResidency, RouterMetrics, SampleCursor, SessionPrefillWork,
     SimulationMetrics, SummaryExtras,
 };
-use crate::request::{RequestGenerator, SessionSpec};
+use crate::request::{ReplayManifest, RequestGenerator};
 use std::collections::HashMap;
 use std::ops::ControlFlow;
 
@@ -121,15 +121,16 @@ impl Simulator {
         }
         .with_routers(&config.router, config.decode_router());
 
-        if config.workload.dataset_path.is_some() && config.workload.sessions_path.is_some() {
-            return Err("workload sets both dataset_path and sessions_path".into());
+        if config.workload.dataset_path.is_some() && config.workload.replay_manifest_path.is_some()
+        {
+            return Err("workload sets both dataset_path and replay_manifest_path".into());
         }
-        let request_generator = if let Some(sessions_path) = &config.workload.sessions_path {
-            let sessions = SessionSpec::load(sessions_path)?;
-            RequestGenerator::from_sessions(
+        let request_generator = if let Some(replay_path) = &config.workload.replay_manifest_path {
+            let manifests = ReplayManifest::load(replay_path)?;
+            RequestGenerator::from_replay_manifest(
                 config.workload.clone(),
                 config.scheduler.block_size,
-                sessions,
+                manifests,
             )
         } else if let Some(dataset_path) = &config.workload.dataset_path {
             let tokenizer = tokenizer.ok_or_else(|| {
@@ -940,108 +941,73 @@ mod tests {
     }
 
     #[test]
-    fn session_re_entry_hits_its_parent_and_reports_a_reuse_distance() {
-        // One session of three steps on one worker: step 1 re-enters after
-        // step 0 with a 1 s gap and shares 200 tokens; step 2 shares 300.
-        // With enough KV both re-entries hit their whole shared prefix, and
-        // the reuse distance counts what step 0 wrote in between.
-        let dir = std::env::temp_dir().join(format!("il-sessions-{}", std::process::id()));
+    fn batchbench_manifest_runs_with_recorded_start_and_turn_delay() {
+        let dir = std::env::temp_dir().join(format!("il-batchbench-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("s.jsonl");
+        let path = dir.join("plans.jsonl");
         std::fs::write(
             &path,
             concat!(
-                r#"{"id":"s","steps":["#,
-                r#"{"input":200,"new":200,"output":16,"gap":0},"#,
-                r#"{"input":260,"new":44,"output":16,"gap":1.0},"#,
-                r#"{"input":330,"new":54,"output":8,"gap":0.5}]}"#,
+                r#"{"schema_version":2,"trajectory_id":"prod-1","start_after_ms":1250,"requests":["#,
+                r#"{"prompt_tokens":64,"output_tokens":16,"overhead_tokens":16,"delay_after_ms":200,"blocks":["#,
+                r#"{"seed":"system","tokens":32,"role":"system"},{"seed":"user","tokens":16,"role":"user"}]},"#,
+                r#"{"prompt_tokens":96,"output_tokens":8,"overhead_tokens":16,"blocks":["#,
+                r#"{"seed":"system","tokens":32,"role":"system"},{"seed":"user","tokens":16,"role":"user"},"#,
+                r#"{"seed":"reply","tokens":16,"role":"assistant","live":true},{"seed":"tool","tokens":16,"role":"tool"}]}]}"#,
                 "\n"
             ),
         )
         .unwrap();
         let mut config = create_minimal_test_config();
-        config.hardware = crate::catalog::hardware("b200").unwrap();
-        config.parallel.tp = 1;
-        config.prefill = Some(crate::config::PrefillSpec {
-            replicas: 1,
-            ..Default::default()
-        });
-        config.workload.sessions_path = Some(path.to_string_lossy().into_owned());
-        config.workload.num_sessions = Some(1);
+        config.workload.replay_manifest_path = Some(path.to_string_lossy().into_owned());
         config.workload.num_requests = None;
-        config.workload.arrival_pattern = crate::config::ArrivalPattern::Batched;
+        config.workload.arrival_pattern = crate::config::ArrivalPattern::Poisson;
+        config.workload.arrival_rate = 999.0; // ignored for manifest replay
+
         let mut simulator = Simulator::new(config, None).unwrap();
         simulator.run_with_callback(|_| {}).unwrap();
-        let rows = simulator.request_rows().to_vec();
-        assert_eq!(rows.len(), 3);
-        let bs = simulator.config().scheduler.block_size;
-        let s0 = &rows[0];
-        assert_eq!(s0.session, Some((0, 0)));
-        assert_eq!(s0.cached_tokens, 0);
-        assert_eq!(s0.reuse_distance_bytes, None);
-        let s1 = &rows[1];
-        assert_eq!(s1.session, Some((0, 1)));
-        assert!((s1.arrival - (s0.completion + 1.0)).abs() < 1e-9);
-        // 216 tokens shared, in whole blocks.
-        assert_eq!(s1.shared_tokens, Some((216 / bs) * bs));
-        assert_eq!(s1.cached_tokens, s1.shared_tokens.unwrap());
-        assert_eq!(s1.decode_cached_tokens, s1.shared_tokens);
-        // Nothing else ran: nothing was written between the parent's
-        // completion and this arrival.
-        assert_eq!(s1.reuse_distance_bytes, Some(0));
-        assert_eq!(s1.reuse_touched_bytes, Some(0));
-        let s2 = &rows[2];
-        assert_eq!(s2.shared_tokens, Some((276 / bs) * bs));
-        assert_eq!(s2.cached_tokens, s2.shared_tokens.unwrap());
-        assert_eq!(s2.decode_cached_tokens, s2.shared_tokens);
-        assert!((s2.arrival - (s1.completion + 0.5)).abs() < 1e-9);
-        let summary = simulator.summary();
-        let reusable = summary.reusable_kv.unwrap().total;
-        assert_eq!(reusable.requests, 2);
-        assert_eq!(
-            reusable.decoder_hit_prefill_hit.tokens,
-            reusable.reusable.tokens
-        );
-        assert_eq!(reusable.decoder_hit_prefill_miss.tokens, 0);
-        assert_eq!(reusable.decoder_miss_prefill_hit.tokens, 0);
-        assert_eq!(reusable.decoder_miss_prefill_miss.tokens, 0);
-        let sessions = summary.sessions.unwrap();
+
+        let rows = simulator.request_rows();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].arrival, 1.25);
+        assert!((rows[1].arrival - (rows[0].completion + 0.2)).abs() < 1e-9);
+        assert_eq!(rows[1].shared_tokens, Some(80));
+        let sessions = simulator.summary().sessions.unwrap();
         assert_eq!((sessions.started, sessions.completed), (1, 1));
-        assert_eq!(sessions.turns_completed, 3);
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn stationary_session_starts_mid_trace_with_a_cold_shared_prefix() {
-        let dir =
-            std::env::temp_dir().join(format!("il-stationary-sessions-{}", std::process::id()));
+    fn batchbench_block_seeds_share_prefix_cache_across_trajectories() {
+        let dir = std::env::temp_dir().join(format!("il-batchbench-prefix-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("s.jsonl");
+        let path = dir.join("plans.jsonl");
         std::fs::write(
             &path,
             concat!(
-                r#"{"id":"s","steps":["#,
-                r#"{"input":64,"new":64,"output":16,"gap":0},"#,
-                r#"{"input":96,"new":16,"output":8,"gap":10.0}]}"#,
+                r#"{"schema_version":2,"trajectory_id":"a","start_after_ms":0,"requests":["#,
+                r#"{"prompt_tokens":64,"output_tokens":8,"overhead_tokens":16,"blocks":["#,
+                r#"{"seed":"shared-system","tokens":32,"role":"system"},{"seed":"user-a","tokens":16,"role":"user"}]}]}"#,
+                "\n",
+                r#"{"schema_version":2,"trajectory_id":"b","start_after_ms":1000,"requests":["#,
+                r#"{"prompt_tokens":64,"output_tokens":8,"overhead_tokens":16,"blocks":["#,
+                r#"{"seed":"shared-system","tokens":32,"role":"system"},{"seed":"user-b","tokens":16,"role":"user"}]}]}"#,
                 "\n"
             ),
         )
         .unwrap();
         let mut config = create_minimal_test_config();
-        config.workload.sessions_path = Some(path.to_string_lossy().into_owned());
-        config.workload.num_sessions = Some(1);
-        config.workload.stationary_start_sessions = Some(512);
-        config.workload.num_requests = Some(1);
-        config.workload.arrival_pattern = crate::config::ArrivalPattern::Batched;
-        let mut simulator = Simulator::new(config, None).unwrap();
+        config.replicas = 1;
+        config.workload.replay_manifest_path = Some(path.to_string_lossy().into_owned());
+        config.workload.num_requests = None;
 
+        let mut simulator = Simulator::new(config, None).unwrap();
         simulator.run_with_callback(|_| {}).unwrap();
 
         let rows = simulator.request_rows();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].session, Some((0, 1)));
-        assert_eq!(rows[0].shared_tokens, Some(80));
+        assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].cached_tokens, 0);
+        assert_eq!(rows[1].cached_tokens, 32);
         std::fs::remove_dir_all(&dir).ok();
     }
 

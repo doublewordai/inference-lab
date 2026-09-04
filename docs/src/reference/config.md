@@ -253,14 +253,12 @@ The `[workload]` table, at top level of `workloads/<name>.toml`.
 | `rate_schedule` | Table | unset | Time-varying rate: `{ type = "sine", min, max, period_secs }`, `{ type = "square", low, high, period_secs, duty }`, or `{ type = "trace", points = [[t, rate], ...] }` |
 | `num_concurrent_users` | U32 | unset | Users for `closed_loop` |
 | `closed_loop_jitter_secs` | Float | unset | Uniform stagger of the initial closed-loop arrivals |
-| `input_len_dist`, `output_len_dist` | Table | — | `{ type = "fixed", value }`, `{ type = "uniform", min, max }`, `{ type = "normal", mean, std_dev }`, `{ type = "lognormal", mean, std_dev }` (ignored in dataset mode for input) |
-| `num_requests` | U32 | unset | Maximum total generated requests; in session mode every step counts (use `num_sessions` to bound starts instead) |
+| `input_len_dist`, `output_len_dist` | Table | — | `{ type = "fixed", value }`, `{ type = "uniform", min, max }`, `{ type = "normal", mean, std_dev }`, `{ type = "lognormal", mean, std_dev }` (ignored in replay mode; dataset mode ignores input) |
+| `num_requests` | U32 | unset | Maximum total generated requests; in replay mode every request counts (use `num_trajectories` to bound trajectory starts instead) |
 | `duration_secs` | Float | unset | Stop admitting arrivals after this many simulated seconds, then drain requests already in flight |
 | `dataset_path` | String | unset | JSONL in OpenAI batch format; prompts are tokenised with `--tokenizer` and hashed per KV block so shared prefixes hit the prefix cache |
-| `sessions_path` | String | unset | Session file (JSONL, one session per line, see [Sessions](../user-guide/configuration.md#sessions)). The arrival pattern then governs session *starts* (`arrival_rate` in sessions/s; `closed_loop` holds `num_concurrent_users` sessions in flight); each later step arrives at its parent's completion plus the step's gap. Mutually exclusive with `dataset_path`; length distributions are ignored |
-| `num_sessions` | U32 | unset | Session mode: maximum session starts; does not limit the total request steps emitted by those sessions (the file is cycled, so it may exceed the file's count) |
-| `stationary_start_sessions` | U32 | unset | Session mode: start this many sessions at t=0 at a time-weighted step in their trace, with fresh inherited-context hashes, then resume the open-loop arrival clock |
-| `resample_sessions` | Bool | `false` | Session mode: draw each session uniformly from the file with replacement instead of walking it in order; repeated instances receive fresh block hashes |
+| `replay_manifest_path` | String | unset | Batchbench replay manifest (`plans.jsonl`; schema v1 or v2). Uses recorded `start_after_ms`, token counts, resets, and delays; schema-v2 block seeds provide cross-trajectory prefix identity. Mutually exclusive with `dataset_path`; arrival settings and length distributions are ignored |
+| `num_trajectories` | U32 | unset | Replay mode: maximum trajectory starts; does not limit their total requests |
 | `seed` | U64 | — | |
 
 ---

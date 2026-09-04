@@ -488,22 +488,26 @@ fn run_sim(args: SimArgs) {
             config.scheduler.max_num_batched_tokens
         );
 
-        match config.workload.arrival_pattern {
-            ArrivalPattern::ClosedLoop => {
-                if let Some(users) = config.workload.num_concurrent_users {
-                    println!("  Arrival: closed-loop ({} concurrent users)", users);
-                } else {
-                    println!("  Arrival: closed-loop");
+        if config.workload.replay_manifest_path.is_some() {
+            println!("  Arrival: batchbench replay manifest (recorded offsets)");
+        } else {
+            match config.workload.arrival_pattern {
+                ArrivalPattern::ClosedLoop => {
+                    if let Some(users) = config.workload.num_concurrent_users {
+                        println!("  Arrival: closed-loop ({} concurrent users)", users);
+                    } else {
+                        println!("  Arrival: closed-loop");
+                    }
                 }
-            }
-            ArrivalPattern::Batched => {
-                println!("  Arrival: batched (all requests at t=0)");
-            }
-            pattern => {
-                println!(
-                    "  Arrival: {:?} ({} req/sec)",
-                    pattern, config.workload.arrival_rate
-                );
+                ArrivalPattern::Batched => {
+                    println!("  Arrival: batched (all requests at t=0)");
+                }
+                pattern => {
+                    println!(
+                        "  Arrival: {:?} ({} req/sec)",
+                        pattern, config.workload.arrival_rate
+                    );
+                }
             }
         }
         println!(
@@ -512,7 +516,13 @@ fn run_sim(args: SimArgs) {
                 .workload
                 .num_requests
                 .map(|n| n.to_string())
-                .unwrap_or_else(|| "unlimited".to_string())
+                .unwrap_or_else(|| {
+                    if config.workload.replay_manifest_path.is_some() {
+                        "all manifest requests".to_string()
+                    } else {
+                        "unlimited".to_string()
+                    }
+                })
         );
         println!("  Seed: {}", config.workload.seed);
         println!();

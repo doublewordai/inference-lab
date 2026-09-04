@@ -1,9 +1,9 @@
 //! Turns a [`WorkloadConfig`] into a stream of [`Request`]s: synthetic
 //! (lengths sampled from the configured distributions), from a dataset (real
-//! prompts, tokenised on a background thread), or sessions (chains of
-//! re-entering requests, see [`super::session`]).
+//! prompts, tokenised on a background thread), or Batchbench replay manifests.
 
-use super::session::{SessionSource, SessionSpec};
+use super::manifest::ReplayManifest;
+use super::session::SessionSource;
 use super::Request;
 use crate::config::{ArrivalPattern, RateSchedule, WorkloadConfig};
 use crate::dataset::{BatchTokenizerFn, DatasetEntry, UnparsedEntry};
@@ -31,9 +31,8 @@ enum Source {
         block_size: u32,
         exhausted: bool,
     },
-    /// Sessions: the arrival pattern starts sessions; each further step is
-    /// queued inside the source at its parent's completion plus gap.
-    Sessions(SessionSource),
+    /// Batchbench trajectories with recorded first arrivals and re-entry gaps.
+    Replay(SessionSource),
 }
 
 /// Generates requests based on workload configuration.
@@ -111,33 +110,24 @@ impl RequestGenerator {
         )
     }
 
-    /// Session workload. `block_size` is the scheduler's KV block size, used
-    /// to build each step's block hashes.
-    pub fn from_sessions(
+    /// Batchbench replay manifest. Trajectories start once at their recorded
+    /// `start_after_ms`; the workload arrival pattern is not consulted.
+    pub fn from_replay_manifest(
         workload: WorkloadConfig,
         block_size: u32,
-        sessions: Vec<SessionSpec>,
+        manifests: Vec<ReplayManifest>,
     ) -> Self {
-        let mut source = SessionSource::new(sessions, block_size);
-        if workload.resample_sessions {
-            source = source.with_resampling(workload.seed);
-        }
-        if let Some(count) = workload.stationary_start_sessions {
-            source = source.with_stationary_starts(count, workload.seed);
-        }
-        Self::build(workload, Source::Sessions(source))
+        let source = SessionSource::new(manifests, block_size);
+        Self::build(workload, Source::Replay(source))
     }
 
     fn build(workload: WorkloadConfig, source: Source) -> Self {
         let mut rng = StdRng::seed_from_u64(workload.seed);
         let mut pending_closed_loop = Vec::new();
-        let seed_sessions_at_zero = !workload.arrival_pattern.is_closed_loop()
-            && workload
-                .stationary_start_sessions
-                .is_some_and(|count| count > 0)
-            && matches!(&source, Source::Sessions(_));
         let next_arrival_time;
-        if workload.arrival_pattern.is_closed_loop() {
+        if matches!(&source, Source::Replay(_)) {
+            next_arrival_time = 0.0;
+        } else if workload.arrival_pattern.is_closed_loop() {
             // Seed the N initial arrivals. With `closed_loop_jitter_secs > 0`,
             // stagger them uniformly across [0, jitter) to break
             // synchronization; the stagger persists since each user
@@ -152,13 +142,6 @@ impl RequestGenerator {
                     }
                 })
                 .collect();
-            next_arrival_time = 0.0;
-        } else if seed_sessions_at_zero {
-            // The experimental reference sampled the first clock arrival
-            // before holding it for the seeded population. Consume that draw
-            // so post-seed Poisson/burst arrivals retain the same seeded RNG
-            // stream, while correcting the seed population's time to t=0.
-            let _ = Self::sample_next_arrival(&workload, 0.0, &mut rng);
             next_arrival_time = 0.0;
         } else {
             next_arrival_time = Self::sample_next_arrival(&workload, 0.0, &mut rng);
@@ -207,22 +190,11 @@ impl RequestGenerator {
 
     /// Next arrival time: the next clock arrival (open loop) or the earliest
     /// pending user slot (closed loop; infinite when none is pending), and
-    /// for sessions the earliest queued step if that comes first.
+    /// for replays the earliest queued trajectory request if that comes first.
     pub fn peek_next_arrival_time(&self) -> f64 {
-        let next_start = if self.reached_start_limit() {
-            f64::INFINITY
-        } else if self.workload.arrival_pattern.is_closed_loop() {
-            // Closed loop: the earliest pending user slot (jittered at init,
-            // then each completion time); infinite when no slot is pending.
-            self.pending_closed_loop
-                .iter()
-                .copied()
-                .fold(f64::INFINITY, f64::min)
-        } else {
-            self.next_arrival_time
-        };
+        let next_start = self.next_start_arrival_time();
         let next = match &self.source {
-            Source::Sessions(src) => src.peek_pending().unwrap_or(f64::INFINITY).min(next_start),
+            Source::Replay(src) => src.peek_pending().unwrap_or(f64::INFINITY).min(next_start),
             _ => next_start,
         };
         if Self::within_duration(self.workload.duration_secs, next) {
@@ -262,21 +234,31 @@ impl RequestGenerator {
         duration_secs.is_none_or(|deadline| arrival_time <= deadline)
     }
 
-    /// Sessions: no more sessions may start (`num_sessions` reached). Always
-    /// false for other sources.
+    /// Replay: no more trajectories may start (`num_trajectories` reached or
+    /// the manifest is exhausted). Always false for other sources.
     fn reached_start_limit(&self) -> bool {
-        match (&self.source, self.workload.num_sessions) {
-            (Source::Sessions(src), Some(max)) => src.num_started() as usize >= max,
+        match (&self.source, self.workload.num_trajectories) {
+            (Source::Replay(src), max) => {
+                src.starts_exhausted() || max.is_some_and(|max| src.num_started() as usize >= max)
+            }
             _ => false,
         }
     }
 
-    /// Whether the open-loop clock is still admitting the initial stationary
-    /// population at t=0.
-    fn seeding_stationary_sessions(&self) -> bool {
-        match (&self.source, self.workload.stationary_start_sessions) {
-            (Source::Sessions(source), Some(count)) => source.num_started() < count,
-            _ => false,
+    fn next_start_arrival_time(&self) -> f64 {
+        if self.reached_start_limit() {
+            return f64::INFINITY;
+        }
+        if let Source::Replay(src) = &self.source {
+            return src.peek_start().unwrap_or(f64::INFINITY);
+        }
+        if self.workload.arrival_pattern.is_closed_loop() {
+            self.pending_closed_loop
+                .iter()
+                .copied()
+                .fold(f64::INFINITY, f64::min)
+        } else {
+            self.next_arrival_time
         }
     }
 
@@ -288,8 +270,8 @@ impl RequestGenerator {
             return None;
         }
         let duration_secs = self.workload.duration_secs;
-        // Sessions: a queued step that is due comes before any new session.
-        if let Source::Sessions(src) = &mut self.source {
+        // A queued re-entry that is due comes before a new trajectory start.
+        if let Source::Replay(src) = &mut self.source {
             if src
                 .peek_pending()
                 .is_some_and(|t| Self::within_duration(duration_secs, t))
@@ -304,7 +286,13 @@ impl RequestGenerator {
                 return None;
             }
         }
-        let arrival_time = if self.workload.arrival_pattern.is_closed_loop() {
+        let arrival_time = if matches!(&self.source, Source::Replay(_)) {
+            let arrival = self.next_start_arrival_time();
+            if arrival > current_time || !Self::within_duration(duration_secs, arrival) {
+                return None;
+            }
+            arrival
+        } else if self.workload.arrival_pattern.is_closed_loop() {
             let pos = self
                 .pending_closed_loop
                 .iter()
@@ -364,13 +352,11 @@ impl RequestGenerator {
                     Self::compute_block_hashes(&entry.prompt_tokens, *block_size);
                 req
             }
-            Source::Sessions(src) => src.start_session(arrival_time),
+            Source::Replay(src) => src.start_next()?,
         };
         self.requests_generated += 1;
 
-        // Seeded sessions are the population present when the run begins, so
-        // hold the open-loop clock at t=0 until all of them have started.
-        if !self.seeding_stationary_sessions()
+        if !matches!(&self.source, Source::Replay(_))
             && !self.workload.arrival_pattern.is_closed_loop()
             && !self.reached_request_limit()
         {
@@ -408,14 +394,14 @@ impl RequestGenerator {
     }
 
     /// Whether every request has been generated: the request limit is
-    /// reached, the dataset ran out, or (sessions) no more sessions may start
-    /// and every started session has issued its last step.
+    /// reached, the dataset ran out, or replay has no trajectory starts or
+    /// active requests remaining.
     pub fn is_finished(&self) -> bool {
         match &self.source {
             Source::Dataset {
                 exhausted: true, ..
             } => return true,
-            Source::Sessions(src)
+            Source::Replay(src)
                 if self.reached_start_limit()
                     && src.num_active() == 0
                     && src.peek_pending().is_none() =>
@@ -437,21 +423,17 @@ impl RequestGenerator {
         }
     }
 
-    /// A request completed. Sessions: queue the session's next step at
-    /// `completion + gap`. Closed loop: the user slot issues a new request
-    /// (a new session, in session mode) at the completion time. Returns
-    /// `true` if the completed request has a successor step in its session.
+    /// A request completed. Replays queue the trajectory's next request at
+    /// `completion + gap`; synthetic closed-loop workloads release a user
+    /// slot. Returns `true` if a replay successor was queued.
     pub fn on_request_complete(&mut self, timing: &RequestTiming) -> bool {
         let completion_time = timing.completion_time;
         let mut has_successor = false;
-        let mut slot_freed = true;
-        if let (Source::Sessions(src), Some(step)) = (&mut self.source, &timing.session) {
+        if let (Source::Replay(src), Some(step)) = (&mut self.source, &timing.session) {
             has_successor =
                 src.on_step_complete_before(step, completion_time, self.workload.duration_secs);
-            // The user slot stays busy until the session's last step is done.
-            slot_freed = !has_successor;
         }
-        if slot_freed
+        if !matches!(&self.source, Source::Replay(_))
             && self.workload.arrival_pattern.is_closed_loop()
             && !self.reached_request_limit()
             && !self.reached_start_limit()
@@ -470,10 +452,10 @@ impl RequestGenerator {
         self.requests_generated
     }
 
-    /// Session lifecycle counters, or `None` for synthetic/dataset sources.
+    /// Replay trajectory lifecycle counters, or `None` for other sources.
     pub fn session_lifecycle(&self) -> Option<super::SessionLifecycle> {
         match &self.source {
-            Source::Sessions(source) => Some(source.lifecycle()),
+            Source::Replay(source) => Some(source.lifecycle()),
             _ => None,
         }
     }
@@ -491,10 +473,8 @@ mod tests {
     ) -> WorkloadConfig {
         WorkloadConfig {
             dataset_path: None,
-            sessions_path: None,
-            num_sessions: None,
-            stationary_start_sessions: None,
-            resample_sessions: false,
+            replay_manifest_path: None,
+            num_trajectories: None,
             arrival_pattern: pattern,
             arrival_rate: rate,
             rate_schedule: None,
@@ -687,69 +667,81 @@ mod tests {
         assert_eq!(generator.peek_next_arrival_time(), 3.0);
     }
 
-    fn session_specs() -> Vec<crate::request::SessionSpec> {
-        use crate::request::{SessionSpec, StepSpec};
-        let step = |input, new, output, gap| StepSpec {
-            input,
-            new,
-            output,
-            gap,
-            kind: None,
-        };
-        vec![
-            SessionSpec {
-                id: "a".into(),
-                steps: vec![step(64, 64, 16, 0.0), step(96, 16, 16, 2.0)],
-            },
-            SessionSpec {
-                id: "b".into(),
-                steps: vec![step(32, 32, 8, 0.0)],
-            },
-        ]
+    #[test]
+    fn replay_manifest_uses_recorded_starts_gaps_and_cross_trajectory_prefixes() {
+        let manifests = ReplayManifest::read_jsonl(
+            concat!(
+                r#"{"schema_version":2,"trajectory_id":"later","start_after_ms":2000,"requests":["#,
+                r#"{"prompt_tokens":40,"output_tokens":8,"overhead_tokens":8,"blocks":["#,
+                r#"{"seed":"sys","tokens":16,"role":"system"},{"seed":"other","tokens":16,"role":"user"}]}]}"#,
+                "\n",
+                r#"{"schema_version":2,"trajectory_id":"first","start_after_ms":1000,"requests":["#,
+                r#"{"prompt_tokens":40,"output_tokens":8,"overhead_tokens":8,"delay_after_ms":500,"blocks":["#,
+                r#"{"seed":"sys","tokens":16,"role":"system"},{"seed":"user","tokens":16,"role":"user"}]},"#,
+                r#"{"prompt_tokens":64,"output_tokens":4,"overhead_tokens":8,"blocks":["#,
+                r#"{"seed":"sys","tokens":16,"role":"system"},{"seed":"user","tokens":16,"role":"user"},"#,
+                r#"{"seed":"reply","tokens":8,"role":"assistant","live":true},{"seed":"tool","tokens":16,"role":"tool"}]}]}"#,
+                "\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let mut workload = create_test_workload(ArrivalPattern::Poisson, 999.0, 100);
+        workload.num_requests = None;
+        let mut generator = RequestGenerator::from_replay_manifest(workload, 16, manifests);
+
+        assert_eq!(generator.peek_next_arrival_time(), 1.0);
+        let first = generator.next_if_before(1.0).unwrap();
+        assert_eq!(first.request_id, "first/0");
+        assert_eq!(first.arrival_time, 1.0);
+        assert!(generator.on_request_complete(&completed(&first, 1.25)));
+
+        assert_eq!(generator.peek_next_arrival_time(), 1.75);
+        let successor = generator.next_if_before(1.75).unwrap();
+        assert_eq!(successor.request_id, "first/1");
+        assert_eq!(successor.session.as_ref().unwrap().gap, 0.5);
+        assert_eq!(successor.session.as_ref().unwrap().shared_tokens, 48);
+        assert_eq!(
+            &successor.prompt_block_hashes[..3],
+            &first.prompt_block_hashes[..3]
+        );
+        assert!(!generator.on_request_complete(&completed(&successor, 1.9)));
+
+        assert_eq!(generator.peek_next_arrival_time(), 2.0);
+        let later = generator.next_if_before(2.0).unwrap();
+        assert_eq!(later.request_id, "later/0");
+        assert_eq!(later.arrival_time, 2.0);
+        assert_eq!(later.prompt_block_hashes[0], first.prompt_block_hashes[0]);
+        assert_ne!(later.prompt_block_hashes[1], first.prompt_block_hashes[1]);
+        assert!(!generator.on_request_complete(&completed(&later, 2.1)));
+        assert!(generator.is_finished());
     }
 
     #[test]
-    fn sessions_steps_follow_completion_plus_gap_and_come_before_new_starts() {
-        // Uniform session starts every 10 s; a 2-step session's second step
-        // is due at completion + 2 s, ahead of the next session start.
-        let mut workload = create_test_workload(ArrivalPattern::Uniform, 0.1, 100);
-        workload.num_sessions = Some(2);
-        let mut g = RequestGenerator::from_sessions(workload, 16, session_specs());
-        assert_eq!(g.peek_next_arrival_time(), 10.0);
-        let a0 = g.next_if_before(10.0).unwrap();
-        assert_eq!(a0.request_id, "s0/0");
-        assert!(g.next_if_before(15.0).is_none());
-        // a0 completes at 12: step 1 due at 14, before the 20 s start.
-        assert!(g.on_request_complete(&completed(&a0, 12.0)));
-        assert_eq!(g.peek_next_arrival_time(), 14.0);
-        assert!(g.next_if_before(13.9).is_none());
-        let a1 = g.next_if_before(14.0).unwrap();
-        assert_eq!(a1.request_id, "s0/1");
-        assert_eq!(a1.arrival_time, 14.0);
-        assert_eq!(a1.session.as_ref().unwrap().shared_tokens, 80);
-        assert!(!g.on_request_complete(&completed(&a1, 15.0)));
-        // Second session starts at 20; the file cycles but num_sessions caps.
-        let b0 = g.next_if_before(20.0).unwrap();
-        assert_eq!(b0.request_id, "s1/0");
-        assert!(!g.is_finished());
-        assert!(g.next_if_before(1000.0).is_none());
-        assert!(g.peek_next_arrival_time().is_infinite());
-        assert!(!g.on_request_complete(&completed(&b0, 21.0)));
-        assert!(g.is_finished());
-        assert_eq!(g.num_generated(), 3);
-    }
-
-    #[test]
-    fn duration_stops_future_session_steps_and_starts() {
+    fn duration_stops_future_replay_requests_and_trajectories() {
+        let manifests = ReplayManifest::read_jsonl(
+            concat!(
+                r#"{"schema_version":2,"trajectory_id":"first","start_after_ms":1000,"requests":["#,
+                r#"{"prompt_tokens":16,"output_tokens":4,"delay_after_ms":500},"#,
+                r#"{"prompt_tokens":20,"output_tokens":4}]}"#,
+                "\n",
+                r#"{"schema_version":2,"trajectory_id":"later","start_after_ms":2000,"requests":["#,
+                r#"{"prompt_tokens":16,"output_tokens":4}]}"#,
+                "\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
         let mut workload = create_test_workload(ArrivalPattern::Uniform, 1.0, 100);
-        workload.duration_secs = Some(1.0);
-        let mut generator = RequestGenerator::from_sessions(workload, 16, session_specs());
+        workload.num_requests = None;
+        workload.duration_secs = Some(1.5);
+        let mut generator = RequestGenerator::from_replay_manifest(workload, 16, manifests);
 
         let first = generator.next_if_before(1.0).unwrap();
-        assert_eq!(first.request_id, "s0/0");
-        // Step 1 would arrive at completion (2 s) + its 2 s gap, and the
-        // next session would start at 2 s. Both fall after the deadline.
-        assert!(!generator.on_request_complete(&completed(&first, 2.0)));
+        assert_eq!(first.request_id, "first/0");
+        // Its successor would arrive at 1.75, while the other trajectory is
+        // recorded at 2.0. Both fall after the deadline.
+        assert!(!generator.on_request_complete(&completed(&first, 1.25)));
         assert!(generator.next_if_before(100.0).is_none());
         assert!(generator.peek_next_arrival_time().is_infinite());
         assert!(generator.is_finished());
@@ -758,94 +750,6 @@ mod tests {
         assert_eq!(lifecycle.completed, 0);
         assert_eq!(lifecycle.deadline_censored, 1);
         assert_eq!(lifecycle.active, 0);
-    }
-
-    #[test]
-    fn session_and_request_limits_count_starts_and_steps_respectively() {
-        let run = |mut g: RequestGenerator| {
-            let mut ids = Vec::new();
-            while !g.is_finished() {
-                let arrival = g.peek_next_arrival_time();
-                assert!(arrival.is_finite());
-                let req = g.next_if_before(arrival).unwrap();
-                ids.push(req.request_id.clone());
-                g.on_request_complete(&completed(&req, arrival));
-            }
-            ids
-        };
-
-        let mut starts_limited = create_test_workload(ArrivalPattern::Uniform, 0.1, 100);
-        starts_limited.num_sessions = Some(2);
-        assert_eq!(
-            run(RequestGenerator::from_sessions(
-                starts_limited,
-                16,
-                session_specs()
-            )),
-            ["s0/0", "s0/1", "s1/0"]
-        );
-
-        let mut steps_limited = create_test_workload(ArrivalPattern::Uniform, 0.1, 2);
-        steps_limited.num_sessions = Some(100);
-        assert_eq!(
-            run(RequestGenerator::from_sessions(
-                steps_limited,
-                16,
-                session_specs()
-            )),
-            ["s0/0", "s0/1"]
-        );
-    }
-
-    #[test]
-    fn all_seeded_sessions_have_started_at_t_zero() {
-        let mut workload = create_test_workload(ArrivalPattern::Uniform, 0.1, 100);
-        workload.num_sessions = Some(4);
-        workload.stationary_start_sessions = Some(3);
-        let mut generator = RequestGenerator::from_sessions(workload, 16, session_specs());
-
-        assert_eq!(generator.peek_next_arrival_time(), 0.0);
-        let seeded: Vec<_> = (0..3)
-            .map(|_| generator.next_if_before(0.0).unwrap())
-            .collect();
-        assert!(seeded.iter().all(|request| request.arrival_time == 0.0));
-        assert_eq!(
-            seeded
-                .iter()
-                .map(|request| request.request_id.as_str())
-                .collect::<Vec<_>>(),
-            ["s0/1", "s1/0", "s2/1"]
-        );
-        assert!(generator.next_if_before(0.0).is_none());
-        assert_eq!(generator.peek_next_arrival_time(), 10.0);
-        let ordinary = generator.next_if_before(10.0).unwrap();
-        assert_eq!(
-            (ordinary.request_id.as_str(), ordinary.arrival_time),
-            ("s3/0", 10.0)
-        );
-    }
-
-    #[test]
-    fn sessions_closed_loop_slot_is_held_for_the_whole_session() {
-        let mut workload = create_test_workload(ArrivalPattern::ClosedLoop, 0.0, 100);
-        workload.num_concurrent_users = Some(1);
-        workload.num_sessions = Some(2);
-        let mut g = RequestGenerator::from_sessions(workload, 16, session_specs());
-        let a0 = g.next_if_before(0.0).unwrap();
-        assert!(g.next_if_before(0.0).is_none());
-        // Completing step 0 queues step 1 and does not free the slot.
-        g.on_request_complete(&completed(&a0, 1.0));
-        assert!(g.next_if_before(2.9).is_none());
-        let a1 = g.next_if_before(3.0).unwrap();
-        assert_eq!(a1.request_id, "s0/1");
-        // The session's last step frees the slot: a new session starts.
-        g.on_request_complete(&completed(&a1, 4.0));
-        let b0 = g.next_if_before(4.0).unwrap();
-        assert_eq!(b0.request_id, "s1/0");
-        assert!(g.next_if_before(100.0).is_none());
-        g.on_request_complete(&completed(&b0, 5.0));
-        assert!(g.next_if_before(100.0).is_none());
-        assert!(g.is_finished());
     }
 
     #[test]

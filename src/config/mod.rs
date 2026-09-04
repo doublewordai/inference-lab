@@ -313,10 +313,8 @@ impl Config {
 
         let workload = WorkloadConfig {
             dataset_path: None,
-            sessions_path: None,
-            num_sessions: None,
-            stationary_start_sessions: None,
-            resample_sessions: false,
+            replay_manifest_path: None,
+            num_trajectories: None,
             arrival_pattern: ArrivalPattern::Poisson,
             arrival_rate: 1.0,
             rate_schedule: None,

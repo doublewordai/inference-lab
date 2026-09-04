@@ -50,36 +50,18 @@ pub struct WorkloadConfig {
     #[serde(default)]
     pub dataset_path: Option<String>,
 
-    /// Path to a session file (JSONL, one session per line; see
-    /// [`crate::request::session`]). Session mode: the arrival pattern
-    /// governs when sessions *start* (`arrival_rate` is sessions/sec;
-    /// `closed_loop` keeps `num_concurrent_users` sessions in flight), and
-    /// each later step of a session arrives at its parent's completion plus
-    /// the step's gap. Mutually exclusive with `dataset_path`; the length
-    /// distributions are ignored.
+    /// Path to a batchbench replay manifest (JSONL, one trajectory per line).
+    /// Trajectories use their recorded `start_after_ms`; subsequent requests
+    /// arrive after the preceding completion plus `delay_after_ms`. Mutually
+    /// exclusive with `dataset_path`.
     #[serde(default)]
-    pub sessions_path: Option<String>,
+    pub replay_manifest_path: Option<String>,
 
-    /// Session mode: maximum number of session starts. This does not limit
-    /// the total request steps emitted by those sessions; `num_requests`
-    /// provides that separate bound. Sessions cycle through the file, so this
-    /// may exceed the file's count.
+    /// Replay mode: maximum number of trajectory starts. This does not limit
+    /// the total request steps emitted by those trajectories; `num_requests`
+    /// provides that separate bound.
     #[serde(default)]
-    pub num_sessions: Option<usize>,
-
-    /// Session mode: start this many of the first sessions part-way through
-    /// their own trace, at a step drawn in proportion to the time the session
-    /// spends there. Without it an open-loop run needs a warm-up on the order
-    /// of the session-lifetime tail before the live population is stationary.
-    #[serde(default)]
-    pub stationary_start_sessions: Option<u32>,
-
-    /// Session mode: draw each new session uniformly at random from the file
-    /// with replacement instead of walking the file in order. Every sampled
-    /// instance receives fresh block hashes, so repeated traces do not share
-    /// cache state.
-    #[serde(default)]
-    pub resample_sessions: bool,
+    pub num_trajectories: Option<usize>,
 
     pub arrival_pattern: ArrivalPattern,
 
@@ -95,15 +77,16 @@ pub struct WorkloadConfig {
     #[serde(default)]
     pub rate_schedule: Option<RateSchedule>,
 
-    /// Input sequence length distribution (ignored in dataset mode)
+    /// Input sequence length distribution (ignored in dataset/replay mode)
     pub input_len_dist: LengthDistribution,
 
-    /// Output sequence length distribution (ignored in dataset mode)
+    /// Output sequence length distribution (ignored in dataset/replay mode)
     pub output_len_dist: LengthDistribution,
 
-    /// Maximum total requests generated. In session mode every step of every
-    /// session counts toward this limit; use `num_sessions` to bound session
-    /// starts instead. `None` leaves the total request count unbounded.
+    /// Maximum total requests generated. In replay mode every request in every
+    /// trajectory counts toward this limit; use `num_trajectories` to bound
+    /// starts instead. `None` leaves synthetic workloads unbounded; replay
+    /// manifests end after their final trajectory.
     pub num_requests: Option<usize>,
 
     /// Number of concurrent users for closed-loop pattern

@@ -181,10 +181,8 @@ fn config(lambda_rank: f64, duration_secs: f64, prefill_hbm_factor: f64) -> Conf
         time_correction: None,
         workload: WorkloadConfig {
             dataset_path: None,
-            sessions_path: Some("data/sessions/tracelab.jsonl".into()),
-            num_sessions: None,
-            stationary_start_sessions: None,
-            resample_sessions: true,
+            replay_manifest_path: Some("plans.jsonl".into()),
+            num_trajectories: None,
             arrival_pattern: ArrivalPattern::Poisson,
             arrival_rate: lambda_rank * DPA_RANKS as f64,
             rate_schedule: None,

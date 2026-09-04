@@ -68,10 +68,8 @@ pub fn closed_loop_config(
         time_correction: None,
         workload: WorkloadConfig {
             dataset_path: None,
-            sessions_path: None,
-            num_sessions: None,
-            stationary_start_sessions: None,
-            resample_sessions: false,
+            replay_manifest_path: None,
+            num_trajectories: None,
             arrival_pattern: ArrivalPattern::ClosedLoop,
             arrival_rate: 1.0,
             rate_schedule: None,

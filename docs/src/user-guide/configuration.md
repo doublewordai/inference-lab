@@ -300,73 +300,45 @@ inference-lab -c configs/llama-3-70b.toml -w workloads/dataset-poisson.toml \
   --chat-template None
 ```
 
-### Sessions
+### Batchbench replay manifests
 
-Agentic traffic: chains of requests where each step re-enters with its
-parent's whole context as prefix (prompt *and* the parent's output) plus some
-novel tokens, after the gap the harness spent between the parent's completion
-and this arrival (a tool call running, a user typing).
+Production-derived agent traffic can be simulated directly from the same
+JSONL manifest consumed by `batchbench-agent`:
 
 ```toml
-sessions_path = "data/sessions/tracelab.jsonl"
-arrival_pattern = "poisson"   # governs session starts
-arrival_rate = 0.05           # sessions/s
-num_sessions = 200            # stop starting sessions after this many
-# Optional: seed the first live population part-way through its traces.
-stationary_start_sessions = 128
-# Optional: draw sessions uniformly with replacement instead of in file order.
-resample_sessions = true
+replay_manifest_path = "plans.jsonl"
+
+# Ignored in replay mode, but retained for the common workload schema.
+arrival_pattern = "poisson"
+input_len_dist = { type = "fixed", value = 1 }
+output_len_dist = { type = "fixed", value = 1 }
+
+num_requests = 100000       # optional total-request cap
+duration_secs = 3600        # optional recorded-arrival deadline
 seed = 42
-
-input_len_dist = { type = "fixed", value = 1 }   # ignored in session mode
-output_len_dist = { type = "fixed", value = 1 }  # ignored in session mode
 ```
 
-The arrival pattern decides when sessions **start**: `poisson` / `uniform` /
-`burst` at `arrival_rate` sessions per second, `closed_loop` keeps
-`num_concurrent_users` sessions in flight (a slot starts a fresh session when
-its session's last step completes), `batched` starts every session at t=0.
-Every later step of a session arrives at its parent's completion plus the
-step's `gap`, so the simulated latency feeds back into the arrival process
-and long gaps are preserved. By default sessions are taken from the file in
-order and the file is cycled. `num_sessions` bounds session starts;
-`num_requests` separately bounds total emitted request steps across all
-sessions.
+Each line is a batchbench schema-v1 or schema-v2 trajectory. Schema v2
+`start_after_ms` sets the first request's exact arrival relative to simulation
+time zero (missing offsets, including schema v1, start at zero). Each later
+request arrives when its predecessor completes plus that
+predecessor's `delay_after_ms`; simulated latency therefore feeds back into the
+trajectory just as it does in live replay. `prompt_tokens`, `output_tokens`, and
+`reset_before` are used directly. The configured `arrival_pattern`,
+`arrival_rate`, and length distributions are ignored.
 
-`stationary_start_sessions` avoids waiting a session-lifetime tail for an
-open-loop live population to reach stationarity. All N seeded sessions enter
-at t=0; the arrival clock is held until they have started, then resumes
-normally. Each starts at a trace step sampled in proportion to that step's
-`gap` (the time the session waits before issuing it). Its inherited context
-receives fresh block hashes, so the first emitted request reports its shared
-prefix but must prefill that context once; later sessions start at step 0
-normally.
+Schema-v2 content `blocks` give prompts a stable, pseudonymous identity. Equal
+ordered seed prefixes produce equal KV-block hashes across trajectories, while
+`live` assistant blocks inherit the preceding simulated output through the
+trajectory context. Schema v1 has no cross-trajectory content identity.
+Batchbench records only the count, not the positions, of chat-template
+`overhead_tokens`; inference-lab conservatively represents them as a stable
+template run after the declared content blocks. Only complete KV blocks are
+shareable.
 
-`resample_sessions = true` draws every new session uniformly from the file
-with replacement. It preserves each sampled session's within-trace structure
-while avoiding file-order effects. Repeated instances receive fresh block
-hashes and therefore do not share cache state.
-
-**Session file:** JSONL, one session per line:
-
-```json
-{"id": "claude:000adcd5", "steps": [
-  {"input": 15524, "new": 15524, "output": 111, "gap": 0.0, "kind": "user"},
-  {"input": 17079, "new": 1444, "output": 96, "gap": 0.104, "kind": "tool"}
-]}
-```
-
-`input` is the step's prompt length, `new` the tokens of it that are not the
-parent's context (`input − new` is the reusable prefix, capped at what the
-parent actually had), `output` the tokens generated, `gap` the seconds from
-the parent's completion to this arrival (ignored on the first step), `kind`
-free-form. Prefix identity is built from block hashes: the parent's hashes
-over the shared prefix, fresh ones for the novel tail and the step's own
-output, so a re-entry hits the parent's generated tokens too. Whole blocks
-only: a partial block continued with new tokens is new content.
-
-`examples/sessions/tracelab_export.py` exports TraceLab's
-`per_step_stats.parquet` into this format.
+`num_trajectories` optionally truncates starts in recorded-time order.
+`num_requests` caps emitted requests and `duration_secs` excludes starts or
+successor requests after that recorded/simulated time.
 
 **Per-request CSV** (`--request-csv`) carries, for session steps, `session`,
 `step`, `worker` (the memory-graph id of the worker that served it), `gap`,
