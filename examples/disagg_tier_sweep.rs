@@ -150,6 +150,8 @@ fn run_one(cfg: &RunConfig, manifests: &[ReplayManifest]) -> RunResult {
     let workload = WorkloadConfig {
         dataset_path: None,
         replay_manifest_path: None,
+        measurement_start_secs: None,
+        measurement_duration_secs: None,
         num_trajectories: Some(cfg.num_sessions),
         arrival_pattern: ArrivalPattern::Poisson,
         arrival_rate: 1.0,

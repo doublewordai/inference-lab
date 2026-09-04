@@ -14,6 +14,7 @@ use std::collections::{BinaryHeap, HashMap, VecDeque};
 struct ReplayStep {
     input: u32,
     output: u32,
+    recorded_arrival: Option<f64>,
     reset: bool,
     gap: f64,
     kind: Option<String>,
@@ -53,6 +54,9 @@ impl ReplayTrace {
             steps.push(ReplayStep {
                 input: request.prompt_tokens,
                 output: request.output_tokens,
+                recorded_arrival: request
+                    .recorded_start_after_ms
+                    .map(|milliseconds| milliseconds as f64 / 1000.0),
                 reset: index == 0 || request.reset_before,
                 gap,
                 kind,
@@ -167,6 +171,10 @@ impl SessionSource {
             .into_iter()
             .map(ReplayTrace::from_manifest)
             .collect();
+        Self::from_traces(traces, block_size)
+    }
+
+    fn from_traces(traces: Vec<ReplayTrace>, block_size: u32) -> Self {
         let mut starts: Vec<_> = traces
             .iter()
             .enumerate()
@@ -332,6 +340,7 @@ impl SessionSource {
             output,
             output,
         );
+        request.recorded_arrival_time = step.recorded_arrival;
         request.prompt_block_hashes = hashes.clone();
         request.session = Some(Box::new(SessionStep {
             session: ordinal,

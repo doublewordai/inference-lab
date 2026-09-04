@@ -62,7 +62,7 @@ hardware preset unless `spec` says otherwise.
 |-------|------|---------|-------------|
 | `tp` | U32 | 1 | Replica world size: its GPUs pool FLOP rate, HBM bandwidth and memory; weights are sharded across them; each layer's output is all-reduced twice (after attention, after the FFN) |
 | `ep` | U32 | 1 | Experts sharded across `ep` of the ranks (divides `tp`). With TP attention every rank holds every token, so the MoE output is still combined by the FFN all-reduce (vLLM `--enable-expert-parallel`); under `dp_attention` the MoE layers dispatch + combine with all-to-alls over the `ep` group instead |
-| `dp_attention` | Bool | false | Attention runs data-parallel over the `tp` ranks (sglang `--enable-dp-attention`): the attention projections are replicated (`tp×` resident and read per step), a sequence's KV lives on one rank, no attention all-reduce; the TP-sharded FFN gathers the ranks' tokens with an all-gather and returns them with a reduce-scatter (with `ep > 1`, DeepEP-style dispatch + combine all-to-alls). **Each rank is its own worker**: its own scheduler and KV cache over its GPU's HBM (`1/tp` of the replica's), its own port into the node's `[memory]` stores; `[scheduler]` limits apply per rank. The `[router]` routes flat over ranks — the placement decision a DP-aware front end (Dynamo's `(worker, dp_rank)` endpoints) makes. The ranks step in lockstep as one group: the step is priced on the replica-wide roofline over the union batch plus the attention skew, the slowest rank's own-GPU attention time over the mean rank's (the ranks meet at every layer's FFN collective). Speculative decoding is not modelled with rank groups |
+| `dp_attention` | Bool | false | Attention runs data-parallel over the `tp` ranks (sglang `--enable-dp-attention`): the attention projections are replicated (`tp×` resident and read per step), a sequence's KV lives on one rank, no attention all-reduce; the TP-sharded FFN gathers the ranks' tokens with an all-gather and returns them with a reduce-scatter (with `ep > 1`, DeepEP-style dispatch + combine all-to-alls). **Each rank is its own worker**: its own scheduler and KV cache over its GPU's HBM (`1/tp` of the replica's), its own port into the node's `[memory]` stores; `[scheduler]` limits apply per rank. The `[router]` routes flat over ranks — the placement decision a DP-aware front end (Dynamo's `(worker, dp_rank)` endpoints) makes. The ranks step in lockstep as one group: the step is priced on the replica-wide roofline over the union batch plus the attention skew, the slowest rank's own-GPU attention time over the mean rank's (the ranks meet at every layer's FFN collective). Fixed-width speculative decoding is supported across the union decode batch; adaptive draft policies and measured speculative step tables are not |
 | `replicas` | U32 | 1 | Identical workers of this deployment (each a `tp`-GPU replica with its own scheduler and KV cache; `tp` rank workers each under `dp_attention`) behind the router |
 | `spec` | String or Table | the entry name | Another catalog preset, or an inline hardware table (fields below) |
 | `scheduler` | Table | `{}` | Keys merged over the shared `[scheduler]` for this entry |
@@ -257,7 +257,9 @@ The `[workload]` table, at top level of `workloads/<name>.toml`.
 | `num_requests` | U32 | unset | Maximum total generated requests; in replay mode every request counts (use `num_trajectories` to bound trajectory starts instead) |
 | `duration_secs` | Float | unset | Stop admitting arrivals after this many simulated seconds, then drain requests already in flight |
 | `dataset_path` | String | unset | JSONL in OpenAI batch format; prompts are tokenised with `--tokenizer` and hashed per KV block so shared prefixes hit the prefix cache |
-| `replay_manifest_path` | String | unset | Batchbench replay manifest (`plans.jsonl`; schema v1 or v2). Uses recorded `start_after_ms`, token counts, resets, and delays; schema-v2 block seeds provide cross-trajectory prefix identity. Mutually exclusive with `dataset_path`; arrival settings and length distributions are ignored |
+| `replay_manifest_path` | String | unset | Batchbench replay manifest (`plans.jsonl`; schema v1 or v2). Uses trajectory `start_after_ms`, per-request token counts, resets, and delays; current schema-v2 exports also carry `recorded_start_after_ms` for exact measurement-window selection and block seeds for cross-trajectory prefix identity. Mutually exclusive with `dataset_path`; arrival settings and length distributions are ignored |
+| `measurement_start_secs` | Float | unset | Run earlier arrivals normally to warm engine/cache state, but exclude requests whose recorded offset is before this time from request, token, latency, and work metrics. Manifests without per-request offsets and other workloads fall back to simulated arrival time |
+| `measurement_duration_secs` | Float | unset | Positive wall-clock width represented by the measured interval. Final throughput uses this denominator instead of simulator drain time |
 | `num_trajectories` | U32 | unset | Replay mode: maximum trajectory starts; does not limit their total requests |
 | `seed` | U64 | — | |
 
@@ -407,13 +409,18 @@ a KV-aware front end sees it, not the scheduler's admission-time lookup.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `policy` | String | `"round_robin"` | `round_robin`, `least_loaded`, `prefix_affinity`, `kv_aware`, `kv_aware_decode` |
+| `policy` | String | `"round_robin"` | `round_robin`, `least_loaded`, `session_affinity`, `weighted_session_affinity`, `prefix_affinity`, `kv_aware`, `kv_aware_decode` |
+| `weights`, `group_size` | Array[F64], U32 | — | `weighted_session_affinity` only: positive observed traffic weights for consecutive groups of `group_size` workers; the groups must cover the pool exactly |
 | `max_load_ratio` | F64 | unset | `prefix_affinity` only: pass over the prefix holder for the least-loaded replica when its requests in system exceed `max_load_ratio ×` the pool mean (bounded-load affinity) |
 | `load_weight` | F64 | 1.0 / 64.0 | `kv_aware`: weight on the replica's queued prefill tokens. `kv_aware_decode`: tokens of transfer one running sequence is worth (default one 64-token block) |
 
 - `round_robin` cycles through the replicas.
 - `least_loaded` picks the fewest requests in system (running + waiting),
   ties by queued prefill tokens, then index.
+- `session_affinity` keeps a trajectory on `session ordinal % workers`.
+- `weighted_session_affinity` keeps a trajectory sticky while reproducing an
+  observed load split across consecutive worker groups (for example, physical
+  replicas made of eight DP-attention ranks).
 - `prefix_affinity` picks the replica holding the longest cached prefix of
   the prompt (any tier); with none anywhere it falls back to
   `least_loaded`.

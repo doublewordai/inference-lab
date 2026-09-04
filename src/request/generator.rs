@@ -474,6 +474,8 @@ mod tests {
         WorkloadConfig {
             dataset_path: None,
             replay_manifest_path: None,
+            measurement_start_secs: None,
+            measurement_duration_secs: None,
             num_trajectories: None,
             arrival_pattern: pattern,
             arrival_rate: rate,
@@ -493,6 +495,8 @@ mod tests {
         RequestTiming {
             request_id: "x".into(),
             arrival_time: 0.0,
+            recorded_arrival_time: None,
+            record_metrics: true,
             prefill_done_time: t,
             handoff_done_time: t,
             first_token_time: t,
@@ -514,6 +518,8 @@ mod tests {
         RequestTiming {
             request_id: req.request_id.clone(),
             arrival_time: req.arrival_time,
+            recorded_arrival_time: req.recorded_arrival_time,
+            record_metrics: req.record_metrics,
             prefill_done_time: t,
             handoff_done_time: t,
             first_token_time: t,

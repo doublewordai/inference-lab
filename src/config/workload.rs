@@ -57,6 +57,18 @@ pub struct WorkloadConfig {
     #[serde(default)]
     pub replay_manifest_path: Option<String>,
 
+    /// Exclude requests arriving before this simulated time from request,
+    /// token, latency, and work metrics while still running them through the
+    /// engine to warm its state.
+    #[serde(default)]
+    pub measurement_start_secs: Option<f64>,
+
+    /// Wall-clock width represented by the measured replay export. When set,
+    /// final throughput divides the measured request/token population by this
+    /// interval rather than by simulator drain time.
+    #[serde(default)]
+    pub measurement_duration_secs: Option<f64>,
+
     /// Replay mode: maximum number of trajectory starts. This does not limit
     /// the total request steps emitted by those trajectories; `num_requests`
     /// provides that separate bound.

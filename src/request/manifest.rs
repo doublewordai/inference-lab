@@ -30,6 +30,11 @@ pub struct ReplayManifest {
 pub struct ReplayRequest {
     pub prompt_tokens: u32,
     pub output_tokens: u32,
+    /// Original request offset in the exported corpus. Replay scheduling still
+    /// follows completion plus `delay_after_ms`; this timestamp selects an
+    /// exact recorded measurement population.
+    #[serde(default)]
+    pub recorded_start_after_ms: Option<u64>,
     #[serde(default)]
     pub reset_before: bool,
     #[serde(default)]
@@ -151,7 +156,8 @@ impl ReplayManifest {
                 return Err(format!("request {number} max_tokens must be positive"));
             }
             if self.schema_version == 1
-                && (request.overhead_tokens.is_some()
+                && (request.recorded_start_after_ms.is_some()
+                    || request.overhead_tokens.is_some()
                     || request._stream.is_some()
                     || request._max_tokens.is_some()
                     || request.blocks.is_some())

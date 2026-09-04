@@ -74,6 +74,14 @@ pub fn build_router(cfg: &RouterConfig) -> Box<dyn Router> {
         RouterConfig::RoundRobin {} => Box::new(RoundRobin::default()),
         RouterConfig::LeastLoaded {} => Box::new(LeastLoaded),
         RouterConfig::SessionAffinity {} => Box::new(SessionAffinity::default()),
+        RouterConfig::WeightedSessionAffinity {
+            weights,
+            group_size,
+        } => Box::new(WeightedSessionAffinity {
+            weights: weights.clone(),
+            group_size: *group_size,
+            fallback: RoundRobin::default(),
+        }),
         RouterConfig::PrefixAffinity { max_load_ratio } => Box::new(PrefixAffinity {
             max_load_ratio: *max_load_ratio,
         }),
@@ -140,6 +148,55 @@ impl Router for SessionAffinity {
             |s| s.session as usize % n,
         )
     }
+}
+
+/// Sticky session placement across measured worker groups. The weights select
+/// a consecutive group (for example one eight-rank DP-attention replica), and
+/// a second stable hash selects a rank inside it.
+#[derive(Debug)]
+pub struct WeightedSessionAffinity {
+    weights: Vec<f64>,
+    group_size: usize,
+    fallback: RoundRobin,
+}
+
+impl Router for WeightedSessionAffinity {
+    fn route(&mut self, req: &Request, workers: &[WorkerSignal]) -> usize {
+        let Some(session) = req.session.as_ref().map(|step| u64::from(step.session)) else {
+            return self.fallback.route(req, workers);
+        };
+        assert!(
+            self.group_size > 0
+                && !self.weights.is_empty()
+                && self.weights.len() * self.group_size == workers.len()
+                && self
+                    .weights
+                    .iter()
+                    .all(|weight| weight.is_finite() && *weight > 0.0),
+            "weighted_session_affinity requires positive finite weights covering every worker"
+        );
+
+        let total: f64 = self.weights.iter().sum();
+        let group_draw = splitmix64(session) as f64 / u64::MAX as f64 * total;
+        let mut cumulative = 0.0;
+        let mut group = self.weights.len() - 1;
+        for (index, weight) in self.weights.iter().enumerate() {
+            cumulative += weight;
+            if group_draw < cumulative {
+                group = index;
+                break;
+            }
+        }
+        let rank = splitmix64(session ^ 0x9e37_79b9_7f4a_7c15) as usize % self.group_size;
+        group * self.group_size + rank
+    }
+}
+
+fn splitmix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
 }
 
 /// Send the request to the replica holding the longest cached prefix. With
@@ -406,6 +463,41 @@ mod tests {
             request.session.as_mut().unwrap().step = 9;
             assert_eq!(router.route(&request, &workers), session as usize % 3);
         }
+    }
+
+    #[test]
+    fn weighted_session_affinity_is_sticky_and_tracks_group_weights() {
+        let workers = vec![sig(0, 0, 0, None); 4];
+        let mut router = WeightedSessionAffinity {
+            weights: vec![0.75, 0.25],
+            group_size: 2,
+            fallback: RoundRobin::default(),
+        };
+        let mut groups = [0_u64; 2];
+        for session in 0..10_000 {
+            let mut request = req(10);
+            request.session = Some(Box::new(crate::request::SessionStep {
+                session,
+                step: 0,
+                gap: 0.0,
+                shared_tokens: 0,
+                shared_prefill_tokens: 0,
+                shared_decode_tokens: 0,
+                kind: None,
+                parent_bytes_written: None,
+                reuse_distance_bytes: None,
+                parent_bytes_touched: None,
+                reuse_touched_bytes: None,
+                next_gap: None,
+                next_shared_tokens: 0,
+            }));
+            let first = router.route(&request, &workers);
+            request.session.as_mut().unwrap().step = 9;
+            assert_eq!(router.route(&request, &workers), first);
+            groups[first / 2] += 1;
+        }
+        let first_fraction = groups[0] as f64 / groups.iter().sum::<u64>() as f64;
+        assert!((first_fraction - 0.75).abs() < 0.02, "{groups:?}");
     }
 
     #[test]

@@ -308,6 +308,10 @@ JSONL manifest consumed by `batchbench-agent`:
 ```toml
 replay_manifest_path = "plans.jsonl"
 
+# Optional: run the first 30 minutes as warmup, then measure one hour.
+measurement_start_secs = 1800
+measurement_duration_secs = 3600
+
 # Ignored in replay mode, but retained for the common workload schema.
 arrival_pattern = "poisson"
 input_len_dist = { type = "fixed", value = 1 }
@@ -339,6 +343,15 @@ shareable.
 `num_trajectories` optionally truncates starts in recorded-time order.
 `num_requests` caps emitted requests and `duration_secs` excludes starts or
 successor requests after that recorded/simulated time.
+
+For a like-for-like interval comparison, export one corpus that starts before
+the target interval. `measurement_start_secs` runs the earlier portion through
+the full engine and cache paths but excludes its requests from request, token,
+latency, and work metrics. Current Batchbench exports carry each request's
+`recorded_start_after_ms`, so later trajectory turns are selected by their
+production timestamp even when simulated completion time moves their replayed
+arrival. `measurement_duration_secs` preserves the recorded interval as the
+final throughput denominator even when the simulated fleet drains later.
 
 **Per-request CSV** (`--request-csv`) carries, for session steps, `session`,
 `step`, `worker` (the memory-graph id of the worker that served it), `gap`,

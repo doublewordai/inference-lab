@@ -20,6 +20,9 @@ pub struct MetricsSummary {
     /// between logical prompt length and positions the prefill workers
     /// actually computed.
     pub work: WorkMetrics,
+    /// Completion/token gate for the entire input corpus, including requests
+    /// before `measurement_start_secs`.
+    pub corpus: CorpusMetrics,
     pub utilization: Utilization,
     pub preemptions: Preemptions,
     pub requests: RequestCounts,
@@ -148,6 +151,15 @@ pub struct WorkMetrics {
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct CorpusMetrics {
+    pub requests_admitted: u64,
+    pub requests_completed: u64,
+    pub requests_rejected: u64,
+    pub completed_prompt_tokens: u64,
+    pub completed_output_tokens: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize)]
 pub struct CountStats {
     pub min: u64,
     pub mean: f64,
@@ -188,6 +200,11 @@ pub struct DeadlineMetrics {
 #[derive(Debug, Clone, Copy, Default, Serialize)]
 pub struct SimulationMetrics {
     pub end_time_secs: f64,
+    /// Start of the measured interval. Earlier replay work warms engine and
+    /// cache state but is excluded from request and token metrics.
+    pub measurement_start_secs: f64,
+    /// End of the recorded measurement interval, when declared by a replay.
+    pub measurement_end_secs: Option<f64>,
     pub arrival_deadline_secs: Option<f64>,
     /// Time after the arrival deadline until the engine became idle.
     pub drain_time_secs: f64,

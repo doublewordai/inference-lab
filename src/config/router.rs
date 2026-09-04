@@ -11,6 +11,11 @@
 //! policy = "session_affinity"                 # session ordinal modulo workers
 //!
 //! [router]
+//! policy = "weighted_session_affinity"        # measured replica skew
+//! group_size = 8
+//! weights = [0.19, 0.08, 0.19, 0.08, 0.22, 0.24]
+//!
+//! [router]
 //! policy = "prefix_affinity"
 //! max_load_ratio = 1.5                      # optional bounded-load cap
 //!
@@ -38,6 +43,13 @@ pub enum RouterConfig {
     /// Non-session requests fall back to round-robin. This is a deliberately
     /// load-oblivious control for experiments that must hold routing fixed.
     SessionAffinity {},
+    /// Deterministic session affinity with a measured distribution across
+    /// groups of consecutive workers. Useful for replaying observed replica
+    /// skew in a DP-attention fleet while keeping each trajectory sticky.
+    WeightedSessionAffinity {
+        weights: Vec<f64>,
+        group_size: usize,
+    },
     /// The replica holding the longest cached prefix of the prompt. With no
     /// cached prefix anywhere, or when the holder's request count exceeds
     /// `max_load_ratio × mean`, falls back to `least_loaded`.
@@ -85,6 +97,7 @@ impl RouterConfig {
             RouterConfig::RoundRobin {} => "round_robin",
             RouterConfig::LeastLoaded {} => "least_loaded",
             RouterConfig::SessionAffinity {} => "session_affinity",
+            RouterConfig::WeightedSessionAffinity { .. } => "weighted_session_affinity",
             RouterConfig::PrefixAffinity { .. } => "prefix_affinity",
             RouterConfig::KvAware { .. } => "kv_aware",
             RouterConfig::KvAwareDecode { .. } => "kv_aware_decode",
@@ -104,6 +117,17 @@ mod tests {
         assert_eq!(ll, RouterConfig::LeastLoaded {});
         let sa: RouterConfig = toml::from_str("policy = \"session_affinity\"").unwrap();
         assert_eq!(sa, RouterConfig::SessionAffinity {});
+        let weighted: RouterConfig = toml::from_str(
+            "policy = \"weighted_session_affinity\"\ngroup_size = 8\nweights = [0.6, 0.4]",
+        )
+        .unwrap();
+        assert_eq!(
+            weighted,
+            RouterConfig::WeightedSessionAffinity {
+                weights: vec![0.6, 0.4],
+                group_size: 8,
+            }
+        );
         let pa: RouterConfig =
             toml::from_str("policy = \"prefix_affinity\"\nmax_load_ratio = 1.5").unwrap();
         assert_eq!(

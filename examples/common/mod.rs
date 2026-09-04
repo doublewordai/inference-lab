@@ -69,6 +69,8 @@ pub fn closed_loop_config(
         workload: WorkloadConfig {
             dataset_path: None,
             replay_manifest_path: None,
+            measurement_start_secs: None,
+            measurement_duration_secs: None,
             num_trajectories: None,
             arrival_pattern: ArrivalPattern::ClosedLoop,
             arrival_rate: 1.0,

@@ -340,6 +340,40 @@ impl SpecPlanner {
             })
             .collect()
     }
+
+    /// Plan a fixed-width speculative round for `n` decode sequences without
+    /// requiring request references or a cost curve. DP-attention replicas use
+    /// this path because their rank-local schedulers advance as one lockstep
+    /// group, while production EAGLE applies one fixed width on every rank.
+    pub fn plan_fixed(&mut self, worker: WorkerKey, n: usize, end_time: f64) -> Vec<DraftPlan> {
+        debug_assert!(matches!(self.cfg.policy, GammaPolicy::Fixed));
+        if n == 0 {
+            return Vec::new();
+        }
+
+        let draft_len = self.cfg.gamma;
+        let rounds: Vec<Round> = (0..n)
+            .map(|_| self.acceptance.draw(&mut self.rng))
+            .collect();
+        let entry = self
+            .depth_buckets
+            .entry(end_time.max(0.0) as u64)
+            .or_insert((0, 0, 0));
+        entry.0 += u64::from(draft_len) * n as u64;
+        entry.1 += n as u64;
+        entry.2 += 1;
+
+        // Fixed policy has no switching state. Keep the worker key in this
+        // interface so it remains parallel to `plan` as grouped support grows.
+        let _ = worker;
+        rounds
+            .into_iter()
+            .map(|round| DraftPlan {
+                draft_len,
+                commits: round.commits,
+            })
+            .collect()
+    }
 }
 
 /// What the gating policies need to price a candidate allocation.

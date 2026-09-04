@@ -12,8 +12,8 @@ use super::spec::DepthSample;
 use crate::config::Config;
 use crate::dataset::{BatchTokenizerFn, DatasetLoader};
 use crate::metrics::{
-    DeadlineMetrics, HandoffMetrics, HbmMetrics, HbmPoolMetrics, HbmWorkerMetrics, KvAmount,
-    LatencySamples, MetricsCollector, MetricsSummary, RankReusableKvMetrics, RequestRow,
+    CorpusMetrics, DeadlineMetrics, HandoffMetrics, HbmMetrics, HbmPoolMetrics, HbmWorkerMetrics,
+    KvAmount, LatencySamples, MetricsCollector, MetricsSummary, RankReusableKvMetrics, RequestRow,
     ReusableKvMetrics, ReusableKvResidency, RouterMetrics, SampleCursor, SessionPrefillWork,
     SimulationMetrics, SummaryExtras,
 };
@@ -83,6 +83,9 @@ pub struct Simulator {
     total_prefill_tokens: u64,
     total_decode_tokens: u64,
     deadline_snapshot: Option<DeadlineMetrics>,
+    measurement_start_secs: f64,
+    measurement_end_secs: Option<f64>,
+    corpus: CorpusMetrics,
 
     /// Intended arrival time of every request admitted to the engine. This
     /// includes requests still running or waiting at a hard simulation
@@ -106,6 +109,19 @@ impl Simulator {
     /// `num_requests`, the dataset is counted and the config's `num_requests`
     /// filled in (see [`Simulator::config`]).
     pub fn new(mut config: Config, tokenizer: Option<BatchTokenizerFn>) -> Result<Self, String> {
+        let measurement_start_secs = match config.workload.measurement_start_secs {
+            Some(seconds) if seconds.is_finite() && seconds >= 0.0 => seconds,
+            Some(_) => return Err("measurement_start_secs must be non-negative and finite".into()),
+            None => 0.0,
+        };
+        let measurement_end_secs = match config.workload.measurement_duration_secs {
+            Some(seconds) if seconds.is_finite() && seconds > 0.0 => {
+                Some(measurement_start_secs + seconds)
+            }
+            Some(_) => return Err("measurement_duration_secs must be positive and finite".into()),
+            None => None,
+        };
+
         // One pool of workers, or — with a `[prefill]` block — a prefill
         // pool in front of the config's own pool, which then decodes.
         let topology = match config.disagg() {
@@ -167,16 +183,19 @@ impl Simulator {
         Ok(Self {
             engine,
             request_generator,
-            metrics: MetricsCollector::new(0.0),
+            metrics: MetricsCollector::new(measurement_start_secs),
             config,
             time_series: Vec::new(),
             sample_interval: None,
-            next_sample_time: 0.0,
+            next_sample_time: measurement_start_secs,
             window_prefill_tokens: 0,
             window_decode_tokens: 0,
             total_prefill_tokens: 0,
             total_decode_tokens: 0,
             deadline_snapshot: None,
+            measurement_start_secs,
+            measurement_end_secs,
+            corpus: CorpusMetrics::default(),
             admitted_arrival_times: Vec::new(),
             sent: SampleCursor::default(),
             bytes_at_completion: HashMap::new(),
@@ -209,7 +228,16 @@ impl Simulator {
         let now = self.engine.current_time();
         let bound = now + 1e-9;
         while let Some(mut req) = self.request_generator.next_if_before(bound) {
-            self.admitted_arrival_times.push(req.arrival_time);
+            self.corpus.requests_admitted += 1;
+            let measurement_time = req.recorded_arrival_time.unwrap_or(req.arrival_time);
+            req.record_metrics = measurement_time >= self.measurement_start_secs
+                && self
+                    .measurement_end_secs
+                    .is_none_or(|end| measurement_time < end);
+            if req.record_metrics {
+                self.admitted_arrival_times.push(req.arrival_time);
+                self.metrics.total_requests += 1;
+            }
             if let Some(step) = &mut req.session {
                 if let Some((written, touched)) = self
                     .bytes_at_completion
@@ -220,7 +248,6 @@ impl Simulator {
                 }
             }
             self.engine.submit(req);
-            self.metrics.total_requests += 1;
             n += 1;
         }
         n
@@ -241,7 +268,7 @@ impl Simulator {
     /// Capture the state after every event at or before the inclusive arrival
     /// deadline, but before processing the first event strictly after it.
     fn maybe_capture_deadline(&mut self) {
-        let Some(deadline) = self.config.workload.duration_secs else {
+        let Some(deadline) = self.arrival_deadline_secs() else {
             return;
         };
         if self.deadline_snapshot.is_some() || self.engine.current_time() > deadline {
@@ -263,8 +290,8 @@ impl Simulator {
             requests_admitted: self.metrics.total_requests,
             requests_completed: self.metrics.completed_requests,
             output_tokens_generated: self.total_decode_tokens,
-            output_tokens_per_sec: if deadline > 0.0 {
-                self.total_decode_tokens as f64 / deadline
+            output_tokens_per_sec: if deadline > self.measurement_start_secs {
+                self.total_decode_tokens as f64 / (deadline - self.measurement_start_secs)
             } else {
                 0.0
             },
@@ -364,7 +391,7 @@ impl Simulator {
 
             if stop_at_deadline && self.deadline_snapshot.is_some() {
                 self.engine
-                    .advance_to(self.config.workload.duration_secs.unwrap());
+                    .advance_to(self.arrival_deadline_secs().unwrap());
                 let _ = self.emit_progress(callback);
                 break;
             }
@@ -473,6 +500,9 @@ impl Simulator {
 
     fn handle_iteration(&mut self, iter: &IterationInfo) {
         for prog in &iter.progress {
+            if !prog.record_metrics {
+                continue;
+            }
             if prog.was_prefill {
                 self.window_prefill_tokens += prog.num_tokens as u64;
                 self.total_prefill_tokens += prog.num_tokens as u64;
@@ -480,15 +510,26 @@ impl Simulator {
             self.window_decode_tokens += prog.num_output as u64;
             self.total_decode_tokens += prog.num_output as u64;
         }
-        self.metrics.record_iteration_metrics(
-            self.engine.kv_cache_util(),
-            iter.flops_util,
-            iter.bandwidth_util,
-        );
+        if iter.end_time >= self.measurement_start_secs {
+            self.metrics.record_iteration_metrics(
+                self.engine.kv_cache_util(),
+                iter.flops_util,
+                iter.bandwidth_util,
+            );
+        }
     }
 
     fn handle_completion(&mut self, timing: &RequestTiming) {
-        self.metrics.record_request_completion(timing);
+        if timing.rejected {
+            self.corpus.requests_rejected += 1;
+        } else {
+            self.corpus.requests_completed += 1;
+            self.corpus.completed_prompt_tokens += u64::from(timing.num_prompt_tokens);
+            self.corpus.completed_output_tokens += u64::from(timing.num_output_tokens);
+        }
+        if timing.record_metrics {
+            self.metrics.record_request_completion(timing);
+        }
         let has_successor = self.request_generator.on_request_complete(timing);
         if has_successor {
             if let Some(step) = &timing.session {
@@ -641,13 +682,13 @@ impl Simulator {
             .session_lifecycle()
             .map(|lifecycle| self.metrics.session_metrics(lifecycle));
         let end_time = self.engine.current_time();
+        let arrival_deadline_secs = self.arrival_deadline_secs();
         let simulation = SimulationMetrics {
             end_time_secs: end_time,
-            arrival_deadline_secs: self.config.workload.duration_secs,
-            drain_time_secs: self
-                .config
-                .workload
-                .duration_secs
+            measurement_start_secs: self.measurement_start_secs,
+            measurement_end_secs: self.measurement_end_secs,
+            arrival_deadline_secs,
+            drain_time_secs: arrival_deadline_secs
                 .map_or(0.0, |deadline| (end_time - deadline).max(0.0)),
             at_deadline: self.deadline_snapshot,
         };
@@ -655,13 +696,20 @@ impl Simulator {
             work: self
                 .metrics
                 .work_metrics(self.total_prefill_tokens, self.total_decode_tokens),
+            corpus: self.corpus,
             sessions,
             simulation,
             reusable_kv,
             hbm,
         };
+        let metrics_end_time = if self.should_terminate() {
+            self.measurement_end_secs.unwrap_or(end_time)
+        } else {
+            self.measurement_end_secs
+                .map_or(end_time, |measurement_end| end_time.min(measurement_end))
+        };
         self.metrics.compute_summary_with(
-            self.engine.current_time(),
+            metrics_end_time,
             self.engine.aggregate_prefix_cache(),
             router,
             decode_router,
@@ -701,6 +749,10 @@ impl Simulator {
 
     pub fn current_time(&self) -> f64 {
         self.engine.current_time()
+    }
+
+    fn arrival_deadline_secs(&self) -> Option<f64> {
+        self.config.workload.duration_secs
     }
 
     /// All latency samples so far.
@@ -1008,6 +1060,62 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].cached_tokens, 0);
         assert_eq!(rows[1].cached_tokens, 32);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn measurement_start_warms_cache_but_excludes_earlier_requests() {
+        let dir = std::env::temp_dir().join(format!("il-batchbench-window-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("plans.jsonl");
+        let plan = |trajectory: &str,
+                    user: &str,
+                    start_after_ms: u64,
+                    recorded_start_after_ms: u64| {
+            format!(
+                concat!(
+                    r#"{{"schema_version":2,"trajectory_id":"{}","start_after_ms":{},"requests":["#,
+                    r#"{{"prompt_tokens":64,"output_tokens":8,"recorded_start_after_ms":{},"overhead_tokens":16,"blocks":["#,
+                    r#"{{"seed":"shared-system","tokens":32,"role":"system"}},"#,
+                    r#"{{"seed":"{}","tokens":16,"role":"user"}}]}}]}}"#,
+                    "\n"
+                ),
+                trajectory, start_after_ms, recorded_start_after_ms, user
+            )
+        };
+        std::fs::write(
+            &path,
+            plan("warm", "warm-user", 0, 0) + &plan("measure", "measure-user", 5_000, 10_000),
+        )
+        .unwrap();
+
+        let mut config = create_minimal_test_config();
+        config.replicas = 1;
+        config.workload.replay_manifest_path = Some(path.to_string_lossy().into_owned());
+        config.workload.measurement_start_secs = Some(10.0);
+        config.workload.measurement_duration_secs = Some(20.0);
+        config.workload.num_requests = None;
+
+        let mut simulator = Simulator::new(config, None).unwrap();
+        simulator.run_with_callback(|_| {}).unwrap();
+
+        let rows = simulator.request_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].arrival, 5.0);
+        assert_eq!(rows[0].recorded_arrival, Some(10.0));
+        assert_eq!(rows[0].cached_tokens, 32);
+        let summary = simulator.summary();
+        assert_eq!(summary.requests.total, 1);
+        assert_eq!(summary.requests.completed, 1);
+        assert_eq!(summary.corpus.requests_admitted, 2);
+        assert_eq!(summary.corpus.requests_completed, 2);
+        assert_eq!(summary.corpus.completed_prompt_tokens, 128);
+        assert_eq!(summary.corpus.completed_output_tokens, 16);
+        assert_eq!(summary.work.completed_prompt_tokens, 64);
+        assert_eq!(summary.work.completed_output_tokens, 8);
+        assert_eq!(summary.throughput_metrics.output_tokens_per_sec, 0.4);
+        assert_eq!(summary.simulation.measurement_start_secs, 10.0);
+        assert_eq!(summary.simulation.measurement_end_secs, Some(30.0));
         std::fs::remove_dir_all(&dir).ok();
     }
 

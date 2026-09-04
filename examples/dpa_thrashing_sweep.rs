@@ -125,6 +125,8 @@ fn config(lambda_rank: f64, seed: u64, duration_secs: f64) -> Config {
         workload: WorkloadConfig {
             dataset_path: None,
             replay_manifest_path: Some("plans.jsonl".into()),
+            measurement_start_secs: None,
+            measurement_duration_secs: None,
             num_trajectories: None,
             arrival_pattern: ArrivalPattern::Poisson,
             arrival_rate: lambda_rank * DPA_RANKS as f64,

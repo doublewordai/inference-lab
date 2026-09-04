@@ -1,8 +1,9 @@
 use super::distribution::{Distribution, RunningMean};
 use super::summary::{
-    CountStats, HandoffMetrics, HbmMetrics, LatencyMetrics, LatencyStats, MemoryMetrics,
-    MetricsSummary, Preemptions, PrefixCacheMetrics, RequestCounts, ReusableKvMetrics,
-    RouterMetrics, SessionMetrics, SimulationMetrics, ThroughputMetrics, Utilization, WorkMetrics,
+    CorpusMetrics, CountStats, HandoffMetrics, HbmMetrics, LatencyMetrics, LatencyStats,
+    MemoryMetrics, MetricsSummary, Preemptions, PrefixCacheMetrics, RequestCounts,
+    ReusableKvMetrics, RouterMetrics, SessionMetrics, SimulationMetrics, ThroughputMetrics,
+    Utilization, WorkMetrics,
 };
 use crate::kv_cache::PrefixCacheStats;
 use crate::request::SessionLifecycle;
@@ -70,6 +71,7 @@ pub struct SampleCursor {
 #[derive(Debug, Clone, Copy)]
 pub struct RequestRow {
     pub arrival: f64,
+    pub recorded_arrival: Option<f64>,
     pub completion: f64,
     pub ttft: f64,
     pub e2e: f64,
@@ -141,6 +143,7 @@ pub struct MetricsCollector {
 #[derive(Debug, Clone, Default)]
 pub struct SummaryExtras {
     pub work: WorkMetrics,
+    pub corpus: CorpusMetrics,
     pub sessions: Option<SessionMetrics>,
     pub simulation: SimulationMetrics,
     pub reusable_kv: Option<ReusableKvMetrics>,
@@ -214,6 +217,7 @@ impl MetricsCollector {
 
         self.request_rows.push(RequestRow {
             arrival: timing.arrival_time,
+            recorded_arrival: timing.recorded_arrival_time,
             completion: timing.completion_time,
             ttft,
             e2e,
@@ -462,6 +466,7 @@ impl MetricsCollector {
                 requests_per_sec: per_sec(self.completed_requests as f64),
             },
             work: extras.work,
+            corpus: extras.corpus,
             utilization: Utilization {
                 avg_kv_cache_util: self.kv_cache_util.mean(),
                 avg_flops_util: self.flops_util.mean(),
@@ -518,6 +523,8 @@ mod tests {
         RequestTiming {
             request_id: id.to_string(),
             arrival_time: arrival,
+            recorded_arrival_time: None,
+            record_metrics: true,
             prefill_done_time: first_token,
             handoff_done_time: first_token,
             first_token_time: first_token,

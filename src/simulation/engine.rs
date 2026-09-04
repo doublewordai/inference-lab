@@ -27,6 +27,10 @@ pub type PoolId = usize;
 pub struct RequestTiming {
     pub request_id: String,
     pub arrival_time: f64,
+    pub recorded_arrival_time: Option<f64>,
+    /// False for replay warmup requests, which affect engine state but are
+    /// excluded from the measured population.
+    pub record_metrics: bool,
     /// Time the request's prefill phase finished on the prefill worker. For
     /// aggregated topologies, falls back to `first_token_time`.
     pub prefill_done_time: f64,
@@ -536,6 +540,7 @@ impl Ord for TimedEvent {
 #[derive(Debug, Clone)]
 pub struct RequestProgress {
     pub request_id: String,
+    pub record_metrics: bool,
     /// Whether the request was in prefill phase BEFORE this iteration ran.
     pub was_prefill: bool,
     /// Positions computed for this request in the iteration: the prefill
@@ -667,9 +672,15 @@ impl Engine {
     /// Loads the trace bank / measured cost table the config names; a bad
     /// path is returned as an error.
     pub fn enable_speculative(&mut self, cfg: SpeculativeConfig, seed: u64) -> Result<(), String> {
-        if self.topology.pools.iter().any(|p| p.has_rank_groups()) {
+        let grouped = self.topology.pools.iter().any(|p| p.has_rank_groups());
+        if grouped && !matches!(cfg.policy, crate::config::GammaPolicy::Fixed) {
             return Err(
-                "speculative decoding is not modelled with dp_attention rank groups (tp > 1 with dp_attention = true)"
+                "dp_attention rank groups support fixed-width speculative decoding only".into(),
+            );
+        }
+        if grouped && cfg.measured_cost.is_some() {
+            return Err(
+                "measured speculative step tables are not supported with dp_attention rank groups"
                     .into(),
             );
         }
@@ -1471,6 +1482,7 @@ impl Engine {
                 let req = &ws[m].scheduler.running()[idx];
                 progress.push(RequestProgress {
                     request_id: req.request_id.clone(),
+                    record_metrics: req.record_metrics,
                     was_prefill: req.is_prefill(),
                     num_tokens: tokens,
                     num_output: 0,
@@ -1488,11 +1500,12 @@ impl Engine {
         // how many of the reserved draft tokens are accepted, and advance by
         // `accepted + 1`. The verify pass itself (`1 + draft` tokens) is the
         // cost. Prefill and chunked-prefill continuations (was_prefill) are
-        // never speculated. Not modelled across rank groups.
+        // never speculated. Fixed-width plans work across lockstep
+        // DP-attention rank groups; adaptive policies remain single-worker.
         let cost_tokens = tokens_per_request.clone(); // verify width per request
         let mut accepted_extra = vec![0u32; batch_size];
         let mut draft_widths: Vec<u32> = Vec::new(); // decode sequences only
-        if self.spec.is_some() && !grouped {
+        if self.spec.is_some() {
             for j in 0..batch_size {
                 if progress[j].was_prefill {
                     continue;
@@ -1551,21 +1564,20 @@ impl Engine {
             (t, measured, bw_util, fl_util)
         };
         if let Some(spec) = &mut self.spec {
-            if !grouped {
-                let ce = &self.topology.pools[pool].workers[worker].compute_engine;
-                // Drafter overhead on roofline-priced speculated steps.
-                // Table-priced steps skip this — the measured wall gap
-                // already embodies the full engine step, drafter included.
-                if !measured && draft_widths.iter().any(|&d| d > 0) {
-                    let peak = ce.bf16_peak_flops();
-                    let bw = ce.mem_bandwidth();
-                    iter_time += spec.drafter_seconds(&draft_widths, peak, bw, iter_time);
-                }
-                // Constrained-GatedAggregate per-switch stall: a width change
-                // decided at the end of the previous round costs the engine a
-                // rebuild on the first round executed at the new width.
-                iter_time += spec.take_pending_switch_cost((pool, worker));
+            let ce = &self.topology.pools[pool].workers[worker].compute_engine;
+            // Drafter overhead on roofline-priced speculated steps. A grouped
+            // DP-attention replica drafts its union decode batch in lockstep,
+            // using the same replica-wide compute engine as verification.
+            // Table-priced steps skip this — the measured wall gap already
+            // embodies the full engine step, drafter included.
+            if !measured && draft_widths.iter().any(|&d| d > 0) {
+                let peak = ce.bf16_peak_flops();
+                let bw = ce.mem_bandwidth();
+                iter_time += spec.drafter_seconds(&draft_widths, peak, bw, iter_time);
             }
+            // Grouped execution permits fixed width only, so its switching
+            // cost is zero. Keep the common path for the single-worker case.
+            iter_time += spec.take_pending_switch_cost((pool, worker));
         }
         let end_time = now + iter_time;
 
@@ -1606,7 +1618,31 @@ impl Engine {
         // drafter is about to run AND the carry-over decode set is known.
         // The next scheduler pass reads `pending_draft_len` and reserves
         // `1 + draft` of budget + KV.
-        if let (Some(spec), false) = (&mut self.spec, grouped) {
+        if let (Some(spec), true) = (&mut self.spec, grouped) {
+            let counts: Vec<usize> = members
+                .iter()
+                .map(|&m| {
+                    self.topology.pools[pool].workers[m]
+                        .scheduler
+                        .running()
+                        .iter()
+                        .filter(|r| !r.is_prefill() && !r.is_finished())
+                        .count()
+                })
+                .collect();
+            let plans = spec.plan_fixed((pool, worker), counts.iter().sum(), end_time);
+            let mut offset = 0;
+            for (&m, &count) in members.iter().zip(&counts) {
+                let rank_plans: Vec<(u32, Option<u32>)> = plans[offset..offset + count]
+                    .iter()
+                    .map(|p| (p.draft_len, Some(p.commits)))
+                    .collect();
+                self.topology.pools[pool].workers[m]
+                    .scheduler
+                    .set_draft_plans(&rank_plans);
+                offset += count;
+            }
+        } else if let Some(spec) = &mut self.spec {
             let w = &mut self.topology.pools[pool].workers[worker];
             let dec: Vec<&Request> = w
                 .scheduler
@@ -1886,6 +1922,8 @@ impl Engine {
         RequestTiming {
             request_id: req.request_id,
             arrival_time: req.arrival_time,
+            recorded_arrival_time: req.recorded_arrival_time,
+            record_metrics: req.record_metrics,
             prefill_done_time: prefill_done,
             handoff_done_time: handoff_done,
             first_token_time: first_token,
@@ -2063,7 +2101,9 @@ struct RunIterationOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, FabricConfig, FabricLink};
+    use crate::config::{
+        AcceptanceModel, Config, FabricConfig, FabricLink, GammaPolicy, SpeculativeConfig,
+    };
 
     #[test]
     fn reusable_kv_classification_is_a_complete_joint_partition() {
@@ -2204,6 +2244,57 @@ mod tests {
             iters.iter().all(|i| i.worker == 0),
             "events ride the leader"
         );
+    }
+
+    #[test]
+    fn fixed_speculation_advances_dp_attention_ranks_in_lockstep() {
+        let mut e = engine(2, true);
+        e.enable_speculative(
+            SpeculativeConfig {
+                gamma: 3,
+                acceptance: AcceptanceModel::Constant { alpha: 1.0 },
+                policy: GammaPolicy::Fixed,
+                measured_cost: None,
+                switch: Default::default(),
+                drafter: None,
+            },
+            7,
+        )
+        .unwrap();
+        e.submit(Request::new("rank-0".into(), 0, 0.0, 64, 13));
+        e.submit(Request::new("rank-1".into(), 0, 0.0, 64, 13));
+
+        let iters = run(&mut e);
+        assert!(iters.iter().any(|iteration| {
+            iteration
+                .progress
+                .iter()
+                .any(|progress| !progress.was_prefill && progress.num_output == 4)
+        }));
+        let depths = e.spec_depth_series();
+        assert!(!depths.is_empty());
+        assert!(depths
+            .iter()
+            .all(|sample| (sample.mean_draft - 3.0).abs() < 1e-12));
+    }
+
+    #[test]
+    fn adaptive_speculation_remains_rejected_for_dp_attention_groups() {
+        let mut e = engine(2, true);
+        let err = e
+            .enable_speculative(
+                SpeculativeConfig {
+                    gamma: 3,
+                    acceptance: AcceptanceModel::Constant { alpha: 0.8 },
+                    policy: GammaPolicy::GoodputBudget,
+                    measured_cost: None,
+                    switch: Default::default(),
+                    drafter: None,
+                },
+                7,
+            )
+            .unwrap_err();
+        assert!(err.contains("fixed-width"));
     }
 
     #[test]

@@ -51,6 +51,14 @@ pub struct Request {
     /// Arrival time (simulated seconds).
     pub arrival_time: f64,
 
+    /// Original arrival offset carried by a replay manifest. This does not
+    /// drive scheduling; it identifies the recorded measurement window.
+    pub recorded_arrival_time: Option<f64>,
+
+    /// Whether this request contributes to reported metrics. Replay warmup
+    /// requests exercise the full engine and cache paths with this disabled.
+    pub record_metrics: bool,
+
     /// Number of prompt tokens.
     pub num_prompt_tokens: u32,
 
@@ -221,6 +229,8 @@ impl Request {
             request_id,
             priority,
             arrival_time,
+            recorded_arrival_time: None,
+            record_metrics: true,
             num_prompt_tokens,
             max_output_tokens,
             target_output_tokens: target_output_tokens.clamp(1, max_output_tokens),

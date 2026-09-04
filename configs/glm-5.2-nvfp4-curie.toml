@@ -1,0 +1,61 @@
+# Curie production profile captured 2026-09-04 13:00-14:00 UTC.
+# Prometheus observed six 8xB300 replicas, each with eight DP-attention ranks.
+# Per-rank HBM and host KV token capacities were 2,503,680 and 4,005,952.
+
+model = "glm-5.2-nvfp4"
+
+[scheduler]
+max_num_batched_tokens = 65536
+max_num_seqs = 512
+policy = "priority"
+enable_chunked_prefill = true
+block_size = 64
+# 2,503,680 tokens/rank * 47,616 KV bytes/token * 8 ranks.
+kv_cache_capacity = 953721815040
+
+[speculative]
+# SGLang's three EAGLE draft steps verify at most four tokens. The observed
+# mean accept length was 2.830579 (bonus + accepted drafts); alpha solves
+# alpha + alpha^2 + alpha^3 = 1.830579 for a compact constant model.
+gamma = 3
+policy = "fixed"
+
+[speculative.acceptance]
+kind = "constant"
+alpha = 0.7725758130550326
+
+[speculative.drafter]
+kind = "autoregressive"
+dense_params = 1116602368
+expert_params = 37748736
+num_experts = 256
+experts_per_tok = 8
+shared_experts = 1
+
+[router]
+# Full-hour request fractions observed across ginyu-force-01..04, gohan, and
+# vegeta. Each physical replica contributes eight consecutive DP ranks.
+policy = "weighted_session_affinity"
+group_size = 8
+weights = [0.18784, 0.08318, 0.18999, 0.07806, 0.21932, 0.24161]
+
+[memory]
+tiers = ["host_dram"]
+source = { policy = "promote" }
+hbm_eviction = { policy = "lru" }
+write = { policy = "write_through" }
+eviction = { policy = "lru" }
+prefetch = { policy = "none" }
+promote_fill = "through"
+storage_prefetch = { policy = "wait_complete" }
+load_overlap = "layerwise"
+
+[memory.capacity]
+# 4,005,952 tokens/rank * 47,616 KV bytes/token * 8 ranks.
+host_dram = 1525979283456
+
+[hardware.b300]
+tp = 8
+dp_attention = true
+replicas = 6
+time_correction = { alpha = 4.0, beta = 0.0 }

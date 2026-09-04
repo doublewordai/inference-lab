@@ -5,7 +5,7 @@ use inference_lab::simulation::Simulator;
 use std::path::PathBuf;
 use std::time::Instant;
 
-const REQUEST_CSV_HEADER: &str = "arrival,completion,ttft,e2e,mean_tpot,prompt_toks,output_toks,cached_toks,decode_cached_toks,preemptions,session,step,worker,gap,shared_toks,reuse_distance_bytes,reuse_touched_bytes,lookup_at,hbm_cached_toks,tier_cached_toks,promote_start,promote_land,lookups\n";
+const REQUEST_CSV_HEADER: &str = "arrival,recorded_arrival,completion,ttft,e2e,mean_tpot,prompt_toks,output_toks,cached_toks,decode_cached_toks,preemptions,session,step,worker,gap,shared_toks,reuse_distance_bytes,reuse_touched_bytes,lookup_at,hbm_cached_toks,tier_cached_toks,promote_start,promote_land,lookups\n";
 
 #[cfg(feature = "cli")]
 use tokenizers::Tokenizer;
@@ -613,8 +613,9 @@ fn run_sim(args: SimArgs) {
 fn append_request_csv_row(out: &mut String, r: &inference_lab::metrics::RequestRow) {
     let opt = |v: Option<String>| v.unwrap_or_default();
     out.push_str(&format!(
-        "{:.4},{:.4},{:.5},{:.4},{:.6},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+        "{:.4},{},{:.4},{:.5},{:.4},{:.6},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
         r.arrival,
+        opt(r.recorded_arrival.map(|t| format!("{t:.4}"))),
         r.completion,
         r.ttft,
         r.e2e,
@@ -758,6 +759,18 @@ fn print_final_metrics(
         real_time.as_secs_f64()
     );
     println!("{}", "━".repeat(80).bright_black());
+
+    println!("\n{}", "CORPUS GATE".yellow().bold());
+    println!(
+        "  • Requests: {} admitted, {} completed, {} rejected",
+        summary.corpus.requests_admitted,
+        summary.corpus.requests_completed,
+        summary.corpus.requests_rejected
+    );
+    println!(
+        "  • Completed tokens: {} prompt, {} output",
+        summary.corpus.completed_prompt_tokens, summary.corpus.completed_output_tokens
+    );
 
     // Latency Metrics Table
     println!("\n{}", "LATENCY METRICS".yellow().bold());
@@ -981,10 +994,11 @@ mod tests {
     #[test]
     fn request_csv_places_worker_between_step_and_gap() {
         let header: Vec<_> = REQUEST_CSV_HEADER.trim_end().split(',').collect();
-        assert_eq!(&header[11..14], ["step", "worker", "gap"]);
+        assert_eq!(&header[12..15], ["step", "worker", "gap"]);
 
         let row = RequestRow {
             arrival: 1.0,
+            recorded_arrival: Some(0.75),
             completion: 2.0,
             ttft: 0.25,
             e2e: 1.0,
@@ -1012,7 +1026,7 @@ mod tests {
         let mut csv = String::new();
         append_request_csv_row(&mut csv, &row);
         let fields: Vec<_> = csv.trim_end().split(',').collect();
-        assert_eq!(&fields[10..14], ["3", "4", "7", "1.250"]);
-        assert_eq!(&fields[17..23], ["1.5000", "64", "0", "", "", "1"]);
+        assert_eq!(&fields[11..15], ["3", "4", "7", "1.250"]);
+        assert_eq!(&fields[18..24], ["1.5000", "64", "0", "", "", "1"]);
     }
 }
