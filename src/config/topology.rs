@@ -49,7 +49,31 @@ impl ClusterSpec {
     /// The roofline cost model for `model` on this cluster: its hardware
     /// (including the collective fabric) and parallel layout.
     pub fn compute_engine(&self, model: ModelSpec) -> ComputeEngine {
-        ComputeEngine::new(self.hardware.clone(), self.parallel.clone(), model)
+        let engine = ComputeEngine::new(self.hardware.clone(), self.parallel.clone(), model);
+        match self.active_kv_memory_per_gpu() {
+            Some((_, bandwidth)) => engine.with_kv_memory_bandwidth(bandwidth),
+            None => engine,
+        }
+    }
+
+    /// Capacity and direct GPU-read bandwidth of an active-KV tier, per GPU.
+    /// Validation restricts this to a capacity-bearing per-GPU store behind
+    /// a direct link, so no topology sharing factor is needed here.
+    pub fn active_kv_memory_per_gpu(&self) -> Option<(u64, f64)> {
+        let name = self.memory.active_tier.as_deref()?;
+        let template = self.hardware.memory.as_ref()?;
+        let store = template.normal_store(name)?;
+        let link = template.gpu_link_to(name)?;
+        let capacity = self
+            .memory
+            .capacity
+            .get(name)
+            .copied()
+            .unwrap_or(store.capacity);
+        Some((
+            capacity as u64,
+            self.memory.active_bandwidth.unwrap_or(link.bandwidth),
+        ))
     }
 
     /// Weights resident on the replica: every stream once, plus the
@@ -125,6 +149,9 @@ impl ClusterSpec {
         if scheduler.kv_cache_capacity > 0 {
             return scheduler.kv_cache_capacity;
         }
+        if let Some((capacity, _)) = self.active_kv_memory_per_gpu() {
+            return capacity.saturating_mul(self.parallel.tp as u64);
+        }
         let requested =
             (self.aggregate_memory_capacity() as f64 * scheduler.gpu_memory_utilization) as u64;
         requested.saturating_sub(model_size_bytes)
@@ -167,6 +194,28 @@ mod tests {
         cluster.hardware.fabric.as_mut().unwrap().scale_out = None;
         let e = cluster.validate().unwrap_err();
         assert!(e.contains("scale_out"), "{e}");
+    }
+
+    #[test]
+    fn active_grace_kv_uses_per_gpu_capacity_and_c2c_bandwidth() {
+        let config = crate::config::Config::test_default();
+        let mut cluster = config.cluster();
+        cluster.hardware = crate::catalog::hardware("gh200").unwrap();
+        cluster.parallel.tp = 16;
+        cluster.memory =
+            toml::from_str("active_tier = \"grace_dram\"\nactive_bandwidth = 420e9").unwrap();
+        cluster.validate().unwrap();
+
+        assert_eq!(
+            cluster.active_kv_memory_per_gpu(),
+            Some((120_000_000_000, 4.2e11))
+        );
+        let mut scheduler = config.scheduler;
+        scheduler.kv_cache_capacity = 0;
+        assert_eq!(
+            cluster.kv_cache_capacity(&scheduler, u64::MAX),
+            16 * 120_000_000_000
+        );
     }
 
     #[test]

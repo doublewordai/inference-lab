@@ -42,6 +42,7 @@ pub fn closed_loop_config(
             tp: 1,
             ep: 1,
             dp_attention: false,
+            ..Default::default()
         },
         model,
         scheduler: SchedulerConfig {
