@@ -22,3 +22,4 @@ examples/dsv4_decode_tpot_sweep.rs
 
 # Experiment data dumps — kept locally, not tracked
 /data/
+/results/
