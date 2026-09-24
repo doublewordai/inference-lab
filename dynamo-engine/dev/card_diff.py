@@ -1,7 +1,9 @@
 """Diff a model card registered in the local etcd against a production card.
-Usage: card_diff.py <prod cards json> <prod key substring> [local namespace substring]"""
+Usage: card_diff.py <prod cards json> <prod key substring> [local namespace substring]
+(HARNESS_ENV_FILE: the env file holding the harness image variables.)"""
 
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -9,8 +11,9 @@ import sys
 COMPOSE = str(pathlib.Path(__file__).with_name("compose.yaml"))
 prod_cards = json.load(open(sys.argv[1]))
 prod = next(v for k, v in prod_cards.items() if sys.argv[2] in k)
+env_file = ["--env-file", os.environ["HARNESS_ENV_FILE"]] if "HARNESS_ENV_FILE" in os.environ else []
 local_raw = subprocess.run(
-    ["docker", "compose", "-f", COMPOSE, "exec", "-T", "etcd",
+    ["docker", "compose", *env_file, "-f", COMPOSE, "exec", "-T", "etcd",
      "etcdctl", "get", "--prefix", "v1/mdc/", "-w", "json"],
     capture_output=True, text=True, check=True,
 ).stdout

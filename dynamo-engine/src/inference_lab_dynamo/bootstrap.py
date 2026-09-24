@@ -6,6 +6,9 @@ from inference_lab_dynamo import accelerator
 
 
 def install(module, argv):
+    from inference_lab_dynamo import metadata, simulation
+
+    simulation.TOOL_CALL_PARSER = metadata.argument(argv, "--dyn-tool-call-parser")
     if module == "dynamo.vllm":
         accelerator.ensure_driver_stub(argv)
     if os.environ.get("INFERENCE_LAB_FETCH_METADATA") == "1":

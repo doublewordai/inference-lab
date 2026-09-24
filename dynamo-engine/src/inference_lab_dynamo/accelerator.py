@@ -86,6 +86,57 @@ def ensure_driver_stub(argv=None):
     os.execve(sys.executable, [sys.executable] + argv[1:], env)
 
 
+class simulated_cuda:
+    """While active, torch.cuda and SGLang's platform present the placed GPU:
+    for running an engine's own default resolution (which asks the device for
+    its capability and memory) exactly as it runs on that GPU. Everything is
+    restored on exit, so nothing else in the worker believes a GPU exists."""
+
+    def __enter__(self):
+        import types
+
+        import torch
+
+        spec = gpu_spec()
+        properties = types.SimpleNamespace(
+            name=spec.name, total_memory=spec.memory_bytes, major=spec.capability[0],
+            minor=spec.capability[1], multi_processor_count=148, is_integrated=False,
+        )
+        replacements = {
+            "is_available": lambda: True,
+            "device_count": lambda: spec.count,
+            "current_device": lambda: 0,
+            "set_device": lambda *args, **kwargs: None,
+            "synchronize": lambda *args, **kwargs: None,
+            "get_device_capability": lambda *args, **kwargs: spec.capability,
+            "get_device_name": lambda *args, **kwargs: spec.name,
+            "get_device_properties": lambda *args, **kwargs: properties,
+            "mem_get_info": lambda *args, **kwargs: (int(spec.memory_bytes * 0.98), spec.memory_bytes),
+        }
+        self._saved = {name: getattr(torch.cuda, name) for name in replacements}
+        for name, replacement in replacements.items():
+            setattr(torch.cuda, name, replacement)
+        return spec
+
+    def __exit__(self, *exc):
+        import torch
+
+        for name, original in self._saved.items():
+            setattr(torch.cuda, name, original)
+        return False
+
+
+def pin_sglang_platform():
+    """SGLang resolves its platform once, lazily; resolve it to CUDA as if
+    the placed GPU were present."""
+    import sglang.srt.platforms as platforms
+
+    with simulated_cuda():
+        from sglang.srt.platforms.cuda import CudaSRTPlatform
+
+        platforms._current_platform = CudaSRTPlatform()
+
+
 def pin_vllm_platform():
     import vllm.platforms
     from vllm.platforms.cuda import NonNvmlCudaPlatform

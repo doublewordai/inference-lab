@@ -63,10 +63,13 @@ frontend's parsers.
 
 ## Local check
 
-`dev/compose.yaml` runs etcd, NATS, a Dynamo frontend and one SGLang and one
-vLLM worker on CPU. Set `FRONTEND_IMAGE`, `SGLANG_WORKER_IMAGE` and
-`VLLM_WORKER_IMAGE`, put the models' metadata in `dev/hf`, run
-`python3 dynamo-engine/build-zip.py`, then `docker compose up` and
-`python3 dev/probe.py 18300 <model> <service>`.
+`dev/compose.yaml` runs etcd, NATS, a Dynamo frontend and SGLang and vLLM
+workers on CPU. Put `FRONTEND_IMAGE`, `SGLANG_WORKER_IMAGE` and
+`VLLM_WORKER_IMAGE` in an env file (`HARNESS_ENV_FILE` for the scripts), the
+models' metadata in `dev/hf`, run `python3 dynamo-engine/build-zip.py`, then
+`docker compose --env-file <file> -f dynamo-engine/dev/compose.yaml up`. The
+`dev/*_check.py` scripts and `dev/probe.py` exercise request shapes, choices
+and tool-call parsing through the frontend; `dev/card_diff.py` compares a
+registered model card with a production one.
 
 Tests: `python3 -m unittest discover -s dynamo-engine/tests`.

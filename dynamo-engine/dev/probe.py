@@ -2,6 +2,7 @@
 simulated engine recorded for each. Usage: probe.py <port> <model> <worker service>"""
 
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -13,6 +14,7 @@ PORT, MODEL, SERVICE = int(sys.argv[1]), sys.argv[2], sys.argv[3]
 BASE = f"http://127.0.0.1:{PORT}/v1"
 MARKER = "\"record\":\"inference_lab\""
 COMPOSE = str(pathlib.Path(__file__).with_name("compose.yaml"))
+ENV_FILE = ["--env-file", os.environ["HARNESS_ENV_FILE"]] if "HARNESS_ENV_FILE" in os.environ else []
 
 
 def wait_ready(timeout=600):
@@ -30,7 +32,7 @@ def wait_ready(timeout=600):
 
 def records():
     out = subprocess.run(
-        ["docker", "compose", "-f", COMPOSE, "logs", "--no-log-prefix", SERVICE],
+        ["docker", "compose", *ENV_FILE, "-f", COMPOSE, "logs", "--no-log-prefix", SERVICE],
         capture_output=True, text=True, check=True,
     ).stdout
     return [json.loads(line[line.index("{"):]) for line in out.splitlines() if MARKER in line]

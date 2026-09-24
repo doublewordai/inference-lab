@@ -110,3 +110,29 @@ services:
       --structured-outputs-config.reasoning_parser, openai_gptoss,
       --structured-outputs-config.disable_additional_properties, "False",
       --structured-outputs-config.disable_any_whitespace, "False"]
+  qwenvl:
+    image: ${SGLANG_WORKER_IMAGE:?set SGLANG_WORKER_IMAGE to a Dynamo SGLang worker image}
+    depends_on: [etcd, nats]
+    volumes:
+      - ./hf:/hf:ro
+      - ../../charts/inference-lab-dynamo/files:/opt/inference-lab-dynamo:ro
+    environment:
+      <<: *plane
+      NVIDIA_VISIBLE_DEVICES: void
+      PYTHONPATH: /opt/inference-lab-dynamo/inference-lab-dynamo.zip
+      INFERENCE_LAB_SIMULATE: "1"
+      HF_HOME: /hf
+      DYN_NAMESPACE: dynamo-local-qwen3-vl
+      DYN_SYSTEM_PORT: "9090"
+      DYN_EVENT_PLANE: nats
+      DYN_SELF_HOST_METADATA: "0"
+      SGLANG_USE_CUDA_IPC_TRANSPORT: "0"
+      SIM_GPU_PRODUCT: NVIDIA-B200
+      SIM_GPU_COUNT: "1"
+    entrypoint: [python3, -m, dynamo.sglang]
+    command: [--model, Qwen/Qwen3-VL-30B-A3B-Instruct-FP8, --revision, d9748a51ae66354c4dad665aab2c71f26cf2c8cd,
+      --host, 0.0.0.0, --mem-fraction-static, "0.9", --enable-priority-scheduling, --dyn-tool-call-parser, hermes,
+      --schedule-conservativeness, "0.5", --enable-metrics,
+      --preferred-sampling-params, '{"temperature":0.6,"top_p":0.95,"top_k":20,"min_p":0.0,"presence_penalty":1.5,"repetition_penalty":1.0}',
+      --kv-events-config, '{"publisher": "zmq", "topic": "kv-events", "endpoint": "tcp://*:5557"}',
+      --priority-scheduling-preemption-threshold, "600"]

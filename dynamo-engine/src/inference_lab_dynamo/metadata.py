@@ -17,7 +17,7 @@ REPO_FLAGS = {
 }
 
 
-def _value(args, flag):
+def argument(args, flag):
     for index, arg in enumerate(args):
         if arg == flag and index + 1 < len(args):
             return args[index + 1]
@@ -30,9 +30,9 @@ def repositories(args):
     """(repo_id, revision) pairs named by a worker's arguments."""
     found = []
     for flag, revision_flag in REPO_FLAGS.items():
-        repo = _value(args, flag)
+        repo = argument(args, flag)
         if repo and not os.path.isabs(repo) and "/" in repo:
-            revision = _value(args, revision_flag) or _value(args, "--revision")
+            revision = argument(args, revision_flag) or argument(args, "--revision")
             if (repo, revision) not in found:
                 found.append((repo, revision))
     return found

@@ -46,6 +46,37 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(len(plan.token_ids), 4)
 
 
+class DirectiveTextTest(unittest.TestCase):
+    CALL = {"name": "Read", "arguments": {"file_path": "/tmp/a", "limit": 4}}
+
+    def render(self, parser, payload, prompt=""):
+        with unittest.mock.patch.object(simulation, "TOOL_CALL_PARSER", parser):
+            return simulation.directive_text(payload, prompt)
+
+    def test_hermes_tool_calls_are_json_in_tool_call_tags(self):
+        text = self.render("hermes", {"tool_calls": [self.CALL]})
+        self.assertEqual('<tool_call>\n{"name": "Read", "arguments": {"file_path": "/tmp/a", "limit": 4}}\n</tool_call>', text)
+
+    def test_glm47_tool_calls_use_arg_pairs(self):
+        text = self.render("glm47", {"tool_calls": [self.CALL]})
+        self.assertEqual("<tool_call>Read<arg_key>file_path</arg_key><arg_value>/tmp/a</arg_value>"
+                         "<arg_key>limit</arg_key><arg_value>4</arg_value></tool_call>", text)
+
+    def test_qwen3_coder_tool_calls_use_function_tags(self):
+        text = self.render("qwen3_coder", {"tool_calls": [self.CALL]})
+        self.assertIn("<function=Read>\n<parameter=file_path>\n/tmp/a\n</parameter>", text)
+
+    def test_an_open_thinking_block_is_closed_before_the_answer(self):
+        text = self.render("glm47", {"reasoning": "why", "text": "Paris."}, "<|assistant|><think>")
+        self.assertEqual("why</think>Paris.", text)
+
+    def test_reasoning_without_an_open_block_gets_a_whole_one(self):
+        self.assertEqual("<think>why</think>Paris.", self.render("hermes", {"reasoning": "why", "text": "Paris."}))
+
+    def test_unsupported_parser_keeps_the_text(self):
+        self.assertEqual("hi", self.render("harmony", {"text": "hi", "tool_calls": [self.CALL]}))
+
+
 class StepsTest(unittest.TestCase):
     def test_every_choice_streams_to_its_own_finish(self):
         choices = [simulation.Plan([1, 2, 3], False), simulation.Plan([4], True)]

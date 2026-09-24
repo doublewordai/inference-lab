@@ -15,11 +15,21 @@ import sglang
 import zmq
 from sglang.srt.server_args import PortArgs
 
-from inference_lab_dynamo import simulation
+from inference_lab_dynamo import accelerator, simulation
 from inference_lab_dynamo.records import emit
 
 _REAL_ENGINE = sglang.Engine
 _REAL_SIGNATURE = inspect.signature(_REAL_ENGINE.async_generate)
+
+
+def _resolved(server_args):
+    """SGLang's resolved view of its arguments where the build has one (the
+    raw ServerArgs keep None for defaults resolved against the device)."""
+    try:
+        from sglang.srt.arg_groups.overrides import resolving_view
+    except ImportError:
+        return server_args
+    return resolving_view(server_args)
 
 
 class SimTokenizerManager:
@@ -52,11 +62,20 @@ class SimEngine:
         from sglang.srt.utils.common import set_prometheus_multiproc_dir
 
         self.server_args = server_args
+        # What the real engine does first: resolve every default against the
+        # device (page size, chunked prefill, backends) and validate the
+        # arguments — here against the GPU the pod was placed for.
+        with accelerator.simulated_cuda():
+            if hasattr(server_args, "resolve_once"):
+                server_args.resolve_once()
+            server_args.check_server_args()
+        resolved = _resolved(server_args)
         if server_args.enable_metrics:
             set_prometheus_multiproc_dir()
         self.port_args = PortArgs.init_new(server_args)
         self.tokenizer_manager = SimTokenizerManager(server_args)
-        self.dp_size = server_args.dp_size if server_args.enable_dp_attention else 1
+        self.page_size = resolved.page_size or 1
+        self.dp_size = resolved.dp_size if resolved.enable_dp_attention else 1
         max_total = int(os.environ.get("SIM_MAX_TOTAL_NUM_TOKENS", "2055872"))
         self._scheduler_init_result = SimpleNamespace(
             scheduler_infos=[
@@ -67,7 +86,7 @@ class SimEngine:
         self.running = {rank: 0 for rank in range(self.dp_size)}
         self.waiting = {rank: 0 for rank in range(self.dp_size)}
         self.max_running = max(
-            1, (server_args.max_running_requests or 256) // self.dp_size
+            1, (resolved.max_running_requests or 256) // self.dp_size
         )
         self._stopped = False
         threading.Thread(target=self._push_load_reports, daemon=True).start()
@@ -76,7 +95,7 @@ class SimEngine:
             engine="sglang",
             served_model_name=server_args.served_model_name,
             dp_size=self.dp_size,
-            page_size=server_args.page_size,
+            page_size=self.page_size,
         )
 
     def _push_load_reports(self):
@@ -94,7 +113,7 @@ class SimEngine:
                         request_active_slots=self.running[rank],
                         request_total_slots=self.max_running,
                         kv_active_blocks=0,
-                        kv_total_blocks=total // max(1, self.server_args.page_size),
+                        kv_total_blocks=total // self.page_size,
                         num_requests_waiting=self.waiting[rank],
                         data_parallel_rank=rank,
                     )
@@ -186,4 +205,5 @@ SimEngine.async_generate.__signature__ = _REAL_SIGNATURE
 
 
 def install():
+    accelerator.pin_sglang_platform()
     sglang.Engine = SimEngine
