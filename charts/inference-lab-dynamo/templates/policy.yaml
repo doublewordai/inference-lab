@@ -79,6 +79,11 @@ spec:
         # empty and appended to one element at a time.
         expression: >-
           (has(object.spec.tolerations) ? [] : [JSONPatch{op: "add", path: "/spec/tolerations", value: []}]) +
+          (has(object.spec.volumes) ? [] : [JSONPatch{op: "add", path: "/spec/volumes", value: []}]) +
+          (has(object.spec.containers[variables.main].env) ? [] :
+            [JSONPatch{op: "add", path: "/spec/containers/" + string(variables.main) + "/env", value: []}]) +
+          (has(object.spec.containers[variables.main].volumeMounts) ? [] :
+            [JSONPatch{op: "add", path: "/spec/containers/" + string(variables.main) + "/volumeMounts", value: []}]) +
           [
             JSONPatch{
               op: "replace",

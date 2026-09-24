@@ -8,6 +8,7 @@ import pathlib
 import sys
 import tempfile
 import unittest
+import unittest.mock
 import zipfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -43,6 +44,44 @@ class PlanTest(unittest.TestCase):
         plan = simulation.plan(FakeTokenizer(), "<<respond:{not json}>>", 4)
         self.assertFalse(plan.scripted)
         self.assertEqual(len(plan.token_ids), 4)
+
+
+class StepsTest(unittest.TestCase):
+    def test_every_choice_streams_to_its_own_finish(self):
+        choices = [simulation.Plan([1, 2, 3], False), simulation.Plan([4], True)]
+        steps = list(simulation.steps(choices))
+        self.assertEqual(steps[0], [(0, [1], False), (1, [4], True)])
+        self.assertEqual(steps[-1], [(0, [3], True)])
+        finished = [index for step in steps for index, _, done in step if done]
+        self.assertEqual(sorted(finished), [0, 1])
+
+    def test_empty_scripted_output_still_finishes(self):
+        steps = list(simulation.steps([simulation.Plan([], True)]))
+        self.assertEqual(steps, [[(0, [], True)]])
+
+    def test_n_plans_one_sequence_per_choice(self):
+        self.assertEqual(len(simulation.plans(FakeTokenizer(), "hi", 2, 3)), 3)
+        self.assertEqual(len(simulation.plans(FakeTokenizer(), "hi", 2, None)), 1)
+
+
+class GpuSpecTest(unittest.TestCase):
+    def test_unknown_or_missing_product_falls_back(self):
+        from inference_lab_dynamo import accelerator
+
+        for product in ("", "MI355X"):
+            with unittest.mock.patch.dict("os.environ", {"SIM_GPU_PRODUCT": product}, clear=False):
+                spec = accelerator.gpu_spec()
+            self.assertEqual(spec.name, accelerator.GPU_PRODUCTS[accelerator.DEFAULT_PRODUCT][0])
+
+    def test_mig_slice_presents_its_own_memory(self):
+        from inference_lab_dynamo import accelerator
+
+        env = {"SIM_GPU_PRODUCT": "NVIDIA-RTX-PRO-6000-Blackwell-Server-Edition",
+               "SIM_GPU_RESOURCE": "nvidia.com/mig-2g.48gb", "SIM_GPU_COUNT": "1"}
+        with unittest.mock.patch.dict("os.environ", env, clear=False):
+            spec = accelerator.gpu_spec()
+        self.assertEqual(spec.memory_bytes, int(47.5 * 2**30))
+        self.assertEqual(spec.capability, (12, 0))
 
 
 class RepositoriesTest(unittest.TestCase):

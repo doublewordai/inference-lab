@@ -36,3 +36,24 @@ def plan(tokenizer, prompt_text, max_tokens):
     count = max_tokens or DEFAULT_MAX_TOKENS
     upper = max(1001, min(tokenizer.vocab_size - 1, 20000))
     return Plan([random.randint(1000, upper) for _ in range(count)], scripted=False)
+
+
+def plans(tokenizer, prompt_text, max_tokens, choices):
+    """One plan per requested choice (``n``)."""
+    return [plan(tokenizer, prompt_text, max_tokens) for _ in range(max(1, choices or 1))]
+
+
+def steps(choice_plans):
+    """Per generation step, the (choice index, new token ids, finished) triples
+    to emit. Every choice ends with exactly one finished triple, including a
+    choice whose plan is empty."""
+    longest = max((len(p.token_ids) for p in choice_plans), default=0)
+    for position in range(max(1, longest)):
+        emitted = []
+        for index, choice in enumerate(choice_plans):
+            length = len(choice.token_ids)
+            if position < length:
+                emitted.append((index, [choice.token_ids[position]], position == length - 1))
+            elif position == 0:
+                emitted.append((index, [], True))
+        yield emitted

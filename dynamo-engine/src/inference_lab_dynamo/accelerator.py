@@ -38,6 +38,8 @@ GPU_PRODUCTS = {
     "GH200": ("NVIDIA GH200 120GB", (9, 0), 95.0),
     "H200": ("NVIDIA H200", (9, 0), 140.0),
 }
+# Presented when a worker names no product, or one not listed above.
+DEFAULT_PRODUCT = "NVIDIA-B200"
 # A MIG slice presents its own memory size.
 GPU_RESOURCES = {"nvidia.com/mig-2g.48gb": 47.5}
 
@@ -46,7 +48,12 @@ def gpu_spec() -> GpuSpec:
     """The production GPU this worker is placed on, from SIM_GPU_PRODUCT
     (the variant's gpu.product selector), SIM_GPU_RESOURCE and SIM_GPU_COUNT;
     SIM_GPU_NAME / SIM_GPU_CAPABILITY / SIM_GPU_MEMORY_GIB override."""
-    product = os.environ.get("SIM_GPU_PRODUCT", "NVIDIA-B200")
+    product = os.environ.get("SIM_GPU_PRODUCT", "")
+    if product not in GPU_PRODUCTS:
+        from inference_lab_dynamo.records import emit
+
+        emit("gpu_product_unknown", product=product, using=DEFAULT_PRODUCT)
+        product = DEFAULT_PRODUCT
     name, capability, memory_gib = GPU_PRODUCTS[product]
     memory_gib = GPU_RESOURCES.get(os.environ.get("SIM_GPU_RESOURCE", ""), memory_gib)
     if "SIM_GPU_CAPABILITY" in os.environ:

@@ -121,44 +121,53 @@ class SimEngine:
         )
         emit("engine_request", engine="sglang", rid=rid, call=call, prompt_text=prompt)
         sampling = call.get("sampling_params") or {}
-        output = simulation.plan(tokenizer, prompt, sampling.get("max_new_tokens"))
+        choices = simulation.plans(
+            tokenizer, prompt, sampling.get("max_new_tokens"), sampling.get("n")
+        )
         rank = call.get("data_parallel_rank") or 0
-        return self._stream(rid, len(input_ids), output, rank)
+        return self._stream(rid, len(input_ids), choices, rank)
 
-    async def _stream(self, rid, prompt_len, output, rank):
+    async def _stream(self, rid, prompt_len, choices, rank):
         started = time.time()
         self.running[rank] = self.running.get(rank, 0) + 1
-        produced, first_token_at, finish = 0, None, None
+        produced = [0] * len(choices)
+        first_token_at, finish = None, None
 
-        def chunk(ids, finish_reason):
-            return {
+        def chunk(index, ids, finish_reason):
+            out = {
                 "output_ids": ids,
                 "meta_info": {
                     "id": rid,
                     "finish_reason": finish_reason,
                     "prompt_tokens": prompt_len,
-                    "completion_tokens": produced,
+                    "completion_tokens": produced[index],
                     "cached_tokens": 0,
                 },
             }
+            if len(choices) > 1:
+                out["index"] = index
+            return out
 
         try:
-            last = len(output.token_ids) - 1
-            for index, token in enumerate(output.token_ids):
+            for step in simulation.steps(choices):
                 await asyncio.sleep(simulation.INTER_TOKEN_SECONDS)
                 if rid in self.tokenizer_manager.aborted:
                     finish = {"type": "abort", "message": "aborted"}
-                    yield chunk([], finish)
+                    for index in range(len(choices)):
+                        yield chunk(index, [], finish)
                     return
-                produced += 1
+                for index, new_ids, done in step:
+                    produced[index] += len(new_ids)
+                    reason = None
+                    if done:
+                        reason = (
+                            {"type": "stop", "matched": None}
+                            if choices[index].scripted
+                            else {"type": "length", "length": produced[index]}
+                        )
+                        finish = reason
+                    yield chunk(index, new_ids, reason)
                 first_token_at = first_token_at or time.time()
-                if index == last:
-                    finish = (
-                        {"type": "stop", "matched": None}
-                        if output.scripted
-                        else {"type": "length", "length": produced}
-                    )
-                yield chunk([token], finish)
         finally:
             self.running[rank] -= 1
             emit(
@@ -166,7 +175,7 @@ class SimEngine:
                 engine="sglang",
                 rid=rid,
                 prompt_tokens=prompt_len,
-                completion_tokens=produced,
+                completion_tokens=sum(produced),
                 ttft_s=(first_token_at - started) if first_token_at else None,
                 e2e_s=time.time() - started,
                 finish_reason=finish,

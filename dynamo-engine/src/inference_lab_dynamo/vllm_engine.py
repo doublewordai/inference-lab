@@ -106,23 +106,27 @@ def install():
                 prompt_token_count=len(token_ids),
                 prompt_text=prompt_text,
             )
-            output = simulation.plan(self._tokenizer, prompt_text, call["sampling_params"].max_tokens)
+            params = call["sampling_params"]
+            choices = simulation.plans(self._tokenizer, prompt_text, params.max_tokens, params.n)
             rank = call.get("data_parallel_rank") or 0
             started, produced, first, finish = time.time(), 0, None, None
-            self.running[rank] += 1
+            self.running[rank] = self.running.get(rank, 0) + 1
             try:
-                last = len(output.token_ids) - 1
-                for index, token in enumerate(output.token_ids):
+                for step in simulation.steps(choices):
                     await asyncio.sleep(simulation.INTER_TOKEN_SECONDS)
                     if request_id in self.aborted:
                         finish = "abort"
-                        yield self._output(request_id, token_ids, [], finish)
+                        yield self._output(request_id, token_ids,
+                                           [(i, [], "abort") for i in range(len(choices))])
                         return
-                    produced += 1
+                    outputs = []
+                    for index, new_ids, done in step:
+                        produced += len(new_ids)
+                        reason = ("stop" if choices[index].scripted else "length") if done else None
+                        finish = reason or finish
+                        outputs.append((index, new_ids, reason))
                     first = first or time.time()
-                    if index == last:
-                        finish = "stop" if output.scripted else "length"
-                    yield self._output(request_id, token_ids, [token], finish)
+                    yield self._output(request_id, token_ids, outputs)
             finally:
                 self.running[rank] -= 1
                 emit(
@@ -137,18 +141,20 @@ def install():
                 )
 
         @staticmethod
-        def _output(request_id, prompt_ids, new_ids, finish):
+        def _output(request_id, prompt_ids, outputs):
+            """A RequestOutput in DELTA mode: per choice, only this step's tokens."""
             return SimpleNamespace(
                 request_id=request_id,
                 prompt_token_ids=prompt_ids,
                 num_cached_tokens=0,
                 prompt_logprobs=None,
-                finished=finish is not None,
+                finished=all(reason is not None for _, _, reason in outputs),
                 outputs=[
                     SimpleNamespace(
-                        index=0, token_ids=new_ids, finish_reason=finish,
+                        index=index, token_ids=new_ids, finish_reason=reason,
                         stop_reason=None, logprobs=None, routed_experts=None,
                     )
+                    for index, new_ids, reason in outputs
                 ],
             )
 
@@ -161,7 +167,10 @@ def install():
 
         async def do_log_stats(self, *args, **kwargs):
             for logger in self.loggers:
-                rank = getattr(logger, "engine_idx", 0) or 0
+                # Dynamo's stat loggers carry the DP rank they report for.
+                rank = getattr(logger, "dp_rank", None)
+                if rank is None:
+                    rank = getattr(logger, "engine_idx", 0) or 0
                 logger.record(
                     scheduler_stats=SchedulerStats(
                         num_running_reqs=self.running.get(rank, 0),

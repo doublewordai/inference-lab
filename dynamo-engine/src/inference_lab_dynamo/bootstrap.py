@@ -12,6 +12,18 @@ def install(module, argv):
         from inference_lab_dynamo import metadata
 
         metadata.fetch(argv)
+    # From here the worker must only read what is already in the cache: its
+    # own start-up paths (SGLang's argument parser, Dynamo's model
+    # registration) would otherwise download full weights for any model the
+    # production entry does not already mark offline.
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    try:
+        from huggingface_hub import constants
+
+        constants.HF_HUB_OFFLINE = True
+    except ImportError:
+        pass
     if module == "dynamo.sglang":
         from inference_lab_dynamo import sglang_engine
 
