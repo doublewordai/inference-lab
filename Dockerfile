@@ -28,6 +28,9 @@ RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/
 
 COPY --from=builder /app/target/release/inference-lab /usr/local/bin/inference-lab
 COPY configs/ /etc/inference-lab/configs/
+# Simulated engine for production Dynamo worker images; a worker pod's init
+# container copies this directory onto the worker's PYTHONPATH.
+COPY dynamo-engine/src/ /opt/inference-lab-dynamo/
 
 EXPOSE 8080
 

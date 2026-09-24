@@ -1,0 +1,142 @@
+{{- $env := list
+  (list "INFERENCE_LAB_SIMULATE" "1")
+  (list "INFERENCE_LAB_FETCH_METADATA" (ternary "1" "0" .Values.fetchMetadata))
+  (list "PYTHONPATH" "/opt/inference-lab-dynamo/inference-lab-dynamo.zip") -}}
+{{- range $name, $value := .Values.env }}
+{{- $env = append $env (list $name (toString $value)) }}
+{{- end -}}
+# Each Dynamo worker pod admitted in a bound namespace keeps its production
+# image, command, placement and discovery settings, and changes only in:
+#   - no GPU request: the resources are replaced (values.resources); the
+#     toleration Kubernetes adds for the removed GPU resource is kept, so the
+#     pod can land where its production counterpart would;
+#   - the simulated engine: the adapter ConfigMap is mounted and switched on,
+#     with the GPU the pod was placed for (product, count, resource) passed
+#     through so the engine resolves production's defaults;
+#   - no host state: hostPath model caches become emptyDir and hostNetwork is
+#     off, so a simulated pod never writes production caches or takes the
+#     ports of a production worker on the same host;
+#   - provider pools (pods selecting nebula.inftyai.com/nodepool or /provider):
+#     the GPU product node selector is dropped, since a pool admits a product
+#     selector only together with a GPU count.
+apiVersion: {{ .Values.policyApiVersion }}
+kind: MutatingAdmissionPolicy
+metadata:
+  name: {{ include "inference-lab-dynamo.policyName" . }}
+spec:
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods"]
+  matchConditions:
+    - name: dynamo-worker
+      expression: >-
+        has(object.metadata.labels) &&
+        object.metadata.labels[?"nvidia.com/dynamo-component-type"].orValue("") == "worker"
+  failurePolicy: Fail
+  reinvocationPolicy: Never
+  variables:
+    - name: main
+      expression: object.spec.containers.map(c, c.name).indexOf("main")
+    - name: limits
+      expression: object.spec.containers[variables.main].?resources.?limits.orValue({})
+    - name: gpuResources
+      expression: >-
+        variables.limits.filter(k, k == "nvidia.com/gpu" || k.startsWith("nvidia.com/mig-") || k == "amd.com/gpu")
+    - name: gpuResource
+      expression: >-
+        variables.gpuResources.size() > 0 ? string(variables.gpuResources[0]) : ""
+    - name: gpuCount
+      expression: >-
+        variables.gpuResource != "" ? string(variables.limits[variables.gpuResource]) : "0"
+    - name: terms
+      expression: >-
+        object.spec.?affinity.?nodeAffinity.?requiredDuringSchedulingIgnoredDuringExecution.?nodeSelectorTerms.orValue([])
+    - name: productKeys
+      expression: '["nvidia.com/gpu.product", "amd.com/gpu.product-name"]'
+    - name: productValues
+      expression: >-
+        variables.terms
+          .map(t, t.?matchExpressions.orValue([]).filter(e, e.key in variables.productKeys).map(e, e.?values.orValue([])))
+          .filter(l, l.size() > 0 && l[0].size() > 0)
+    - name: gpuProduct
+      expression: >-
+        string(object.spec.?nodeSelector[?"nvidia.com/gpu.product"].orValue(
+          object.spec.?nodeSelector[?"amd.com/gpu.product-name"].orValue(
+            variables.productValues.size() > 0 ? variables.productValues[0][0][0] : "")))
+    - name: providerPool
+      expression: >-
+        object.spec.?nodeSelector[?"nebula.inftyai.com/nodepool"].hasValue() ||
+        object.spec.?nodeSelector[?"nebula.inftyai.com/provider"].hasValue()
+    - name: hostPathVolumes
+      expression: object.spec.?volumes.orValue([]).filter(v, has(v.hostPath)).map(v, v.name)
+  mutations:
+    - patchType: JSONPatch
+      jsonPatch:
+        # A JSON patch value is never a list of objects: lists are created
+        # empty and appended to one element at a time.
+        expression: >-
+          (has(object.spec.tolerations) ? [] : [JSONPatch{op: "add", path: "/spec/tolerations", value: []}]) +
+          [
+            JSONPatch{
+              op: "replace",
+              path: "/spec/containers/" + string(variables.main) + "/resources",
+              value: Object.spec.containers.resources{
+                requests: {{ .Values.resources.requests | toJson }},
+                limits: {{ .Values.resources.limits | toJson }}
+              }
+            },
+            JSONPatch{
+              op: "add",
+              path: "/spec/containers/" + string(variables.main) + "/volumeMounts/-",
+              value: Object.spec.containers.volumeMounts{
+                name: "inference-lab-dynamo", mountPath: "/opt/inference-lab-dynamo", readOnly: true
+              }
+            },
+            JSONPatch{
+              op: "add",
+              path: "/spec/volumes/-",
+              value: Object.spec.volumes{
+                name: "inference-lab-dynamo",
+                configMap: Object.spec.volumes.configMap{name: "inference-lab-dynamo"}
+              }
+            }
+          ] +
+          {{ $env | toJson }}.map(kv, JSONPatch{
+            op: "add",
+            path: "/spec/containers/" + string(variables.main) + "/env/-",
+            value: Object.spec.containers.env{name: string(kv[0]), value: string(kv[1])}
+          }) +
+          [
+            ["SIM_GPU_PRODUCT", variables.gpuProduct],
+            ["SIM_GPU_COUNT", variables.gpuCount],
+            ["SIM_GPU_RESOURCE", variables.gpuResource]
+          ].map(kv, JSONPatch{
+            op: "add",
+            path: "/spec/containers/" + string(variables.main) + "/env/-",
+            value: Object.spec.containers.env{name: string(kv[0]), value: string(kv[1])}
+          }) +
+          (variables.gpuResource != "" &&
+           !object.spec.?tolerations.orValue([]).exists(t, t.?key.orValue("") == variables.gpuResource)
+            ? [JSONPatch{
+                op: "add",
+                path: "/spec/tolerations/-",
+                value: Object.spec.tolerations{key: variables.gpuResource, operator: "Exists", effect: "NoSchedule"}
+              }]
+            : []) +
+          variables.hostPathVolumes.map(n, JSONPatch{
+            op: "replace",
+            path: "/spec/volumes/" + string(object.spec.volumes.map(v, v.name).indexOf(n)),
+            value: Object.spec.volumes{name: n, emptyDir: Object.spec.volumes.emptyDir{}}
+          }) +
+          (object.spec.?hostNetwork.orValue(false)
+            ? [JSONPatch{op: "replace", path: "/spec/hostNetwork", value: false},
+               JSONPatch{op: "replace", path: "/spec/dnsPolicy", value: "ClusterFirst"}]
+            : []) +
+          (variables.providerPool
+            ? variables.productKeys
+                .filter(k, object.spec.?nodeSelector[?k].hasValue())
+                .map(k, JSONPatch{op: "remove", path: "/spec/nodeSelector/" + jsonpatch.escapeKey(k)})
+            : [])

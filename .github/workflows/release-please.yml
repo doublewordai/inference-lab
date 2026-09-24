@@ -111,3 +111,35 @@ jobs:
             ghcr.io/${{ env.IMAGE_NAME }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  publish-dynamo-chart:
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      - name: Package the simulated-engine chart
+        run: |
+          TAG="${{ needs.release-please.outputs.tag_name }}"
+          VERSION="${TAG#inference-lab-v}"
+          python3 dynamo-engine/build-zip.py
+          sed -E -i "s|^version:.*$|version: ${VERSION}|; s|^appVersion:.*$|appVersion: \"${VERSION}\"|" charts/inference-lab-dynamo/Chart.yaml
+          helm package charts/inference-lab-dynamo --destination .
+          echo "CHART=inference-lab-dynamo-${VERSION}.tgz" >> "$GITHUB_ENV"
+
+      - name: Push the chart to GHCR
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          helm registry login ghcr.io --username "${{ github.actor }}" --password-stdin <<< "${GITHUB_TOKEN}"
+          helm push "${CHART}" "oci://ghcr.io/${{ github.repository_owner }}/charts"

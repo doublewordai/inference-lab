@@ -1,0 +1,9 @@
+apiVersion: v2
+name: inference-lab-dynamo
+description: >-
+  Simulates the GPU engines of production Dynamo workers in chosen namespaces:
+  an admission policy strips each worker pod's GPU request and switches on
+  inference-lab's simulated engine, delivered as a ConfigMap.
+type: application
+version: 0.0.0
+appVersion: "0.0.0"

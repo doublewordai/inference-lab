@@ -1,0 +1,23 @@
+# Namespaces whose Dynamo worker pods run the simulated engine. Each gets the
+# adapter ConfigMap, which its pods mount. Empty means the release namespace.
+namespaces: []
+
+# admissionregistration.k8s.io/v1 from Kubernetes 1.36; v1beta1 before that
+# (behind the MutatingAdmissionPolicy feature gate).
+policyApiVersion: admissionregistration.k8s.io/v1
+
+# Replaces each worker container's resources. A simulated worker is the real
+# worker process without model weights: about 1.2 GiB resident, near-idle CPU.
+resources:
+  requests:
+    cpu: 100m
+    memory: 1536Mi
+  limits:
+    memory: 6Gi
+
+# Fetch config/tokenizer files for the models a worker names (no weights) from
+# Hugging Face at start-up, into the emptyDir that replaces its model cache.
+fetchMetadata: true
+
+# Extra environment for simulated workers, e.g. SIM_ITL_S (seconds per token).
+env: {}

@@ -1,0 +1,112 @@
+# Local check of the simulated engine inside real Dynamo worker images: etcd,
+# NATS, a Dynamo frontend and two workers started with full production-style
+# arguments. No GPUs are attached.
+name: ildyn
+x-plane-env: &plane
+  DYN_DISCOVERY_BACKEND: etcd
+  ETCD_ENDPOINTS: http://etcd:2379
+  NATS_SERVER: nats://nats:4222
+  DYN_REQUEST_PLANE: nats
+services:
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.17
+    command: [etcd, --listen-client-urls, http://0.0.0.0:2379, --advertise-client-urls, http://etcd:2379]
+  nats:
+    image: nats:2.11
+    command: [-js]
+  frontend:
+    image: ${FRONTEND_IMAGE:?set FRONTEND_IMAGE to a Dynamo frontend image}
+    depends_on: [etcd, nats]
+    volumes: ["./hf:/hf:ro"]
+    environment:
+      <<: *plane
+      HF_HOME: /hf
+      HF_HUB_OFFLINE: "1"
+      DYN_REQUEST_PLANE_CODEC: json
+      DYN_NAMESPACE: dynamo
+      DYN_NAMESPACE_PREFIX: dynamo
+      DYN_EVENT_PLANE: nats
+      DYN_ROUTER_EVENT_THREADS: "1"
+      DYN_ADMISSION_QUEUE_MARGIN: "64"
+      DYN_TCP_RESPONSE_STREAM_PORT: "51821"
+      DYN_TCP_RESP_ADVERTISE_HOST: frontend
+      DYN_TCP_RESP_ADVERTISE_PORT: "51821"
+      DYN_LOG: info
+    entrypoint: [python3, -m, dynamo.frontend, --http-port, "8000", --router-mode, kv,
+      --router-temperature, "0", --router-kv-overlap-score-credit, "1.0",
+      --router-kv-overlap-score-credit-decay, "0.0", --router-prefill-load-scale, "1.0",
+      --router-track-prefill-tokens, --router-replica-sync, --no-router-track-active-blocks,
+      --router-predicted-ttl-secs, "5", --migration-limit, "3"]
+    ports: ["127.0.0.1:18300:8000"]
+  glm52:
+    image: ${SGLANG_WORKER_IMAGE:?set SGLANG_WORKER_IMAGE to a Dynamo SGLang worker image}
+    depends_on: [etcd, nats]
+    volumes:
+      - ./hf:/hf:ro
+      - ../../charts/inference-lab-dynamo/files:/opt/inference-lab-dynamo:ro
+    environment:
+      <<: *plane
+      NVIDIA_VISIBLE_DEVICES: void
+      PYTHONPATH: /opt/inference-lab-dynamo/inference-lab-dynamo.zip
+      INFERENCE_LAB_SIMULATE: "1"
+      HF_HOME: /hf
+      DYN_NAMESPACE: dynamo-local-glm52
+      DYN_SYSTEM_PORT: "9090"
+      DYN_WORKER_TAINTS: country=us,region=us,plane=us
+      DYN_GRACEFUL_SHUTDOWN_DRAIN_TIMEOUT_SECS: "120"
+      DYN_EVENT_PLANE: nats
+      DYN_SELF_HOST_METADATA: "0"
+      SGLANG_DEFAULT_THINKING: "1"
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      SIM_MAX_TOTAL_NUM_TOKENS: "2055872"
+      SIM_GPU_PRODUCT: NVIDIA-B300-SXM6-AC
+      SIM_GPU_COUNT: "4"
+    entrypoint: [python3, -m, dynamo.sglang]
+    command: [--model, nvidia/GLM-5.2-NVFP4, --revision, aec724e8c7b8ee9db3b48c01c320f63f9cdaf8aa,
+      --served-model-name, "zai-org/GLM-5.2 zai-org/GLM-5.2:throughput",
+      --host, 0.0.0.0, --enable-metrics, --tp, "4", --quantization, modelopt_fp4,
+      --dp, "4", --enable-dp-attention, --mem-fraction-static, "0.849",
+      --max-running-requests, "256", --enable-priority-scheduling, --disable-priority-preemption,
+      --chunked-prefill-size, "32768", --enable-prefill-delayer, --page-size, "64",
+      --enable-hierarchical-cache, --hicache-ratio, "1.6", --hicache-io-backend, direct,
+      --hicache-mem-layout, page_first_direct, --hicache-write-policy, write_through,
+      --reasoning-parser, glm45, --dyn-reasoning-parser, glm45, --dyn-tool-call-parser, glm47,
+      --soft-watchdog-timeout, "120", --speculative-algorithm, EAGLE,
+      --speculative-draft-model-revision, aec724e8c7b8ee9db3b48c01c320f63f9cdaf8aa,
+      --speculative-num-steps, "3", --speculative-eagle-topk, "1", --speculative-num-draft-tokens, "4",
+      --speculative-moe-runner-backend, triton, --speculative-moe-a2a-backend, none,
+      --cuda-graph-max-bs-decode, "128",
+      --kv-events-config, '{"publisher": "zmq", "topic": "kv-events", "endpoint": "tcp://*:5557"}']
+  gptoss:
+    image: ${VLLM_WORKER_IMAGE:?set VLLM_WORKER_IMAGE to a Dynamo vLLM worker image}
+    depends_on: [etcd, nats]
+    volumes:
+      - ./hf:/hf:ro
+      - ../../charts/inference-lab-dynamo/files:/opt/inference-lab-dynamo:ro
+    environment:
+      <<: *plane
+      NVIDIA_VISIBLE_DEVICES: void
+      PYTHONPATH: /opt/inference-lab-dynamo/inference-lab-dynamo.zip
+      INFERENCE_LAB_SIMULATE: "1"
+      HF_HOME: /hf
+      HF_HUB_OFFLINE: "1"
+      DYN_NAMESPACE: dynamo-local-gpt-oss-20b
+      DYN_SYSTEM_PORT: "9090"
+      DYN_WORKER_TAINTS: region=us,plane=us,country=us
+      DYN_EVENT_PLANE: nats
+      DYN_SELF_HOST_METADATA: "0"
+      VLLM_FLASHINFER_MOE_BACKEND: throughput
+      VLLM_ENABLE_RESPONSES_API_STORE: "1"
+      SIM_NUM_GPU_BLOCKS: "74403"
+      SIM_GPU_PRODUCT: NVIDIA-RTX-PRO-6000-Blackwell-Server-Edition
+      SIM_GPU_RESOURCE: nvidia.com/mig-2g.48gb
+      SIM_GPU_COUNT: "1"
+    entrypoint: [python3, -m, dynamo.vllm]
+    command: [--model, openai/gpt-oss-20b, --revision, 6cee5e81ee83917806bbde320786a8fb61efebee,
+      --served-model-name, openai/gpt-oss-20b-structured, --gpu-memory-utilization, "0.9",
+      --tensor-parallel-size, "1", --scheduling-policy, priority, --dyn-tool-call-parser, harmony,
+      --generation-config, auto, --trust-remote-code, --async-scheduling,
+      --structured-outputs-config.reasoning_parser, openai_gptoss,
+      --structured-outputs-config.disable_additional_properties, "False",
+      --structured-outputs-config.disable_any_whitespace, "False"]
