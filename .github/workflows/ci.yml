@@ -24,6 +24,19 @@ jobs:
       - name: Test
         run: cargo test --features serve
 
+  dynamo-engine:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: azure/setup-helm@v4
+      - name: Test the simulated engine and its chart
+        run: |
+          pip install pyyaml
+          python3 -m unittest discover -s dynamo-engine/tests -v
+
   wasm:
     runs-on: ubuntu-latest
     steps:

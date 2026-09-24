@@ -1,0 +1,12 @@
+apiVersion: {{ .Values.policyApiVersion }}
+kind: MutatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "inference-lab-dynamo.policyName" . }}
+spec:
+  policyName: {{ include "inference-lab-dynamo.policyName" . }}
+  matchResources:
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: In
+          values: {{ include "inference-lab-dynamo.namespaces" . }}

@@ -1,0 +1,17 @@
+{{- $zip := .Files.Get "files/inference-lab-dynamo.zip" -}}
+{{- if not $zip -}}
+{{- fail "files/inference-lab-dynamo.zip is missing: run dynamo-engine/build-zip.py before packaging" -}}
+{{- end -}}
+{{- range $namespace := include "inference-lab-dynamo.namespaces" . | fromJsonArray }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: inference-lab-dynamo
+  namespace: {{ $namespace }}
+  labels:
+    app.kubernetes.io/name: inference-lab-dynamo
+    app.kubernetes.io/version: {{ $.Chart.AppVersion | quote }}
+binaryData:
+  inference-lab-dynamo.zip: {{ $zip | b64enc }}
+{{- end }}
