@@ -46,6 +46,12 @@ class PlanTest(unittest.TestCase):
         plan = simulation.plan(FakeTokenizer(), prompt, 3)
         self.assertEqual(plan.token_ids, [ord(ch) for ch in "second >> still"])
 
+    def test_a_later_malformed_directive_does_not_replace_a_valid_one(self):
+        for bad in ('{"tool_calls": "bad"}', '{"tool_calls": [{"arguments": {}}]}', '{"text": 3}'):
+            with self.subTest(bad=bad):
+                plan = simulation.plan(FakeTokenizer(), f'<<respond:{{"text": "ok"}}>> <<respond:{bad}>>', 3)
+                self.assertEqual(plan.token_ids, [ord(ch) for ch in "ok"])
+
     def test_malformed_directive_falls_back_to_junk(self):
         plan = simulation.plan(FakeTokenizer(), "<<respond:{not json}>>", 4)
         self.assertFalse(plan.scripted)

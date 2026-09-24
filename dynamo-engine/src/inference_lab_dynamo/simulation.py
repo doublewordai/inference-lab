@@ -95,9 +95,24 @@ def directive_text(payload, prompt_text=""):
     return text
 
 
+def _well_formed(payload):
+    """The shape ``inference-lab serve`` deserializes a directive into."""
+    if not isinstance(payload, dict):
+        return False
+    if any(not isinstance(payload.get(key), (str, type(None))) for key in ("text", "reasoning", "finish_reason")):
+        return False
+    calls = payload.get("tool_calls")
+    if calls is None:
+        return True
+    return isinstance(calls, list) and all(
+        isinstance(call, dict) and isinstance(call.get("name"), str)
+        and isinstance(call.get("arguments", {}), dict)
+        for call in calls)
+
+
 def find_directive(prompt_text):
-    """The last directive in the prompt whose JSON parses, or None. Exactly one
-    JSON value is read after each marker, so ``>>`` inside its strings is
+    """The last well-formed directive in the prompt, or None. Exactly one JSON
+    value is read after each marker, so ``>>`` inside its strings is
     harmless."""
     decoder = json.JSONDecoder()
     found = None
@@ -108,7 +123,7 @@ def find_directive(prompt_text):
             payload, _ = decoder.raw_decode(prompt_text, start)
         except ValueError:
             payload = None
-        if isinstance(payload, dict):
+        if _well_formed(payload):
             found = payload
         position = prompt_text.find(MARKER, start)
     return found
