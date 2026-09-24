@@ -40,6 +40,12 @@ class PlanTest(unittest.TestCase):
         self.assertTrue(plan.scripted)
         self.assertEqual(plan.token_ids, [ord(ch) for ch in "<tool_call>f</tool_call>"])
 
+    def test_the_last_directive_wins(self):
+        prompt = ('<|user|>task <<respond:{"text": "first"}>><|tool|>'
+                  'result <<respond:{"text": "second >> still"}>> <<respond:{broken}>>')
+        plan = simulation.plan(FakeTokenizer(), prompt, 3)
+        self.assertEqual(plan.token_ids, [ord(ch) for ch in "second >> still"])
+
     def test_malformed_directive_falls_back_to_junk(self):
         plan = simulation.plan(FakeTokenizer(), "<<respond:{not json}>>", 4)
         self.assertFalse(plan.scripted)

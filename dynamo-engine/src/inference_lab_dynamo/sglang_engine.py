@@ -65,7 +65,7 @@ class SimEngine:
         # What the real engine does first: resolve every default against the
         # device (page size, chunked prefill, backends) and validate the
         # arguments — here against the GPU the pod was placed for.
-        with accelerator.simulated_cuda():
+        with accelerator.simulated_sglang_device():
             if hasattr(server_args, "resolve_once"):
                 server_args.resolve_once()
             server_args.check_server_args()

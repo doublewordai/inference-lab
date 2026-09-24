@@ -126,6 +126,45 @@ class simulated_cuda:
         return False
 
 
+class simulated_sglang_device(simulated_cuda):
+    """simulated_cuda, plus SGLang's platform facts (``get_platform().is_cuda``
+    and the rest) answered for the placed GPU. SGLang caches each fact the
+    first time it is read, which in this process is before the simulated
+    device exists; the facts are re-probed under it and scoped over the block
+    with SGLang's own ``override_platform``. The probe caches are cleared
+    again on exit, so later readers probe the real machine as before."""
+
+    def __enter__(self):
+        spec = super().__enter__()
+        self._override = None
+        try:
+            from sglang.srt import runtime_context
+            from sglang.srt.utils import common
+        except ImportError:
+            return spec
+        probes = [getattr(common, name, None)
+                  for name in {**runtime_context._PLATFORM_PROBES, **runtime_context._PLATFORM_VALUES}.values()]
+        self._probes = [probe for probe in probes if hasattr(probe, "cache_clear")]
+        for probe in self._probes:
+            probe.cache_clear()
+        facts = {}
+        for name, probe in {**runtime_context._PLATFORM_PROBES, **runtime_context._PLATFORM_VALUES}.items():
+            try:
+                facts[name] = getattr(common, probe)()
+            except Exception:
+                continue
+        self._override = runtime_context.override_platform(**facts)
+        self._override.install()
+        return spec
+
+    def __exit__(self, *exc):
+        if self._override is not None:
+            self._override.restore()
+            for probe in self._probes:
+                probe.cache_clear()
+        return super().__exit__(*exc)
+
+
 def pin_sglang_platform():
     """SGLang resolves its platform once, lazily; resolve it to CUDA as if
     the placed GPU were present."""

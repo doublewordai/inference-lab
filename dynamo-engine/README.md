@@ -46,10 +46,19 @@ With Loki: `{namespace="<ns>"} |= "\"record\":\"inference_lab\"" | json`.
 
 ## Scripted output
 
-A prompt containing `<<respond:{"text": "..."}>>` makes the engine emit exactly
-that text, tokenized with the model's tokenizer, and stop. Write it in the
-model's own output format (reasoning or tool-call markup) to exercise the
-frontend's parsers.
+A prompt containing a directive makes the engine emit scripted output and stop,
+following the same contract as `inference-lab serve`:
+
+```text
+<<respond:{"reasoning": "...", "text": "...", "tool_calls": [{"name": "Read", "arguments": {"file_path": "/x"}}]}>>
+```
+
+The engine writes the output in the model's own format, so the frontend's
+parsers do the real work: reasoning goes in a thinking block (closing one the
+chat template has opened), and tool calls are rendered for the worker's
+`--dyn-tool-call-parser` (`hermes`, `qwen25`, `qwen3_coder`, `glm47`). The last
+well-formed directive in the prompt wins, so a chained agent loop advances on
+the directive carried by its newest tool result.
 
 ## Settings
 

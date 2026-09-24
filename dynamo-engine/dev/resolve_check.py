@@ -15,11 +15,11 @@ from dynamo.sglang.args import parse_args  # noqa: E402
 
 config = asyncio.run(parse_args(sys.argv[1:]))
 server_args = config.server_args
-with accelerator.simulated_cuda():
+with accelerator.simulated_sglang_device():
     server_args.resolve_once()
 from sglang.srt.arg_groups.overrides import resolving_view  # noqa: E402
 
-with accelerator.simulated_cuda():
+with accelerator.simulated_sglang_device():
     server_args.check_server_args()
     view = resolving_view(server_args)
 for field in ("page_size", "context_length", "max_running_requests", "chunked_prefill_size",

@@ -3,14 +3,16 @@
 Output is junk tokens up to the request's token limit, unless the prompt
 carries an inference-lab directive, ``<<respond:{"text": ...}>>``, in which
 case the engine emits exactly that text (in the model's own format, e.g.
-reasoning or tool-call markup) and stops."""
+reasoning or tool-call markup) and stops. The directive contract is the one
+``inference-lab serve`` follows: the last well-formed directive in the prompt
+wins, so a chained agent loop advances on the directive in its newest tool
+result."""
 
 import json
 import os
 import random
-import re
 
-DIRECTIVE = re.compile(r"<<respond:(\{.*?\})>>", re.S)
+MARKER = "<<respond:"
 DEFAULT_MAX_TOKENS = int(os.environ.get("SIM_DEFAULT_MAX_TOKENS", "16"))
 INTER_TOKEN_SECONDS = float(os.environ.get("SIM_ITL_S", "0.02"))
 
@@ -93,16 +95,30 @@ def directive_text(payload, prompt_text=""):
     return text
 
 
-def plan(tokenizer, prompt_text, max_tokens):
-    directive = DIRECTIVE.search(prompt_text or "")
-    if directive:
+def find_directive(prompt_text):
+    """The last directive in the prompt whose JSON parses, or None. Exactly one
+    JSON value is read after each marker, so ``>>`` inside its strings is
+    harmless."""
+    decoder = json.JSONDecoder()
+    found = None
+    position = prompt_text.find(MARKER)
+    while position != -1:
+        start = position + len(MARKER)
         try:
-            payload = json.loads(directive.group(1))
+            payload, _ = decoder.raw_decode(prompt_text, start)
         except ValueError:
             payload = None
         if isinstance(payload, dict):
-            text = directive_text(payload, prompt_text)
-            return Plan(tokenizer.encode(text, add_special_tokens=False), scripted=True)
+            found = payload
+        position = prompt_text.find(MARKER, start)
+    return found
+
+
+def plan(tokenizer, prompt_text, max_tokens):
+    payload = find_directive(prompt_text or "")
+    if payload is not None:
+        text = directive_text(payload, prompt_text)
+        return Plan(tokenizer.encode(text, add_special_tokens=False), scripted=True)
     count = max_tokens or DEFAULT_MAX_TOKENS
     upper = max(1001, min(tokenizer.vocab_size - 1, 20000))
     return Plan([random.randint(1000, upper) for _ in range(count)], scripted=False)
