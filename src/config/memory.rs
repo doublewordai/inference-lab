@@ -40,6 +40,7 @@
 //!
 //! ```toml
 //! [memory]
+//! active_tier = "grace_dram"                    # optional active-KV placement
 //! tiers = ["grace_dram", "nvme"]
 //! write = { policy = "write_through" }        # write_back | write_through | selective
 //! eviction = { policy = "ttl", seconds = 3600 }   # fifo | lru | ttl
@@ -767,6 +768,17 @@ impl MemoryTemplate {
 #[derive(Debug, Clone, PartialEq, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct MemoryConfig {
+    /// Optional directly attached store that holds active KV instead of HBM.
+    /// Decode reads use the store's direct GPU link. This is distinct from
+    /// `tiers`, which hold inactive prefixes that must be promoted before
+    /// execution. Currently restricted to a per-GPU capacity-bearing store
+    /// behind a direct link (for example GH200 Grace LPDDR over C2C).
+    #[serde(default)]
+    pub active_tier: Option<String>,
+    /// Optional measured per-GPU read bandwidth for `active_tier`, overriding
+    /// the hardware template's direct-link figure.
+    #[serde(default)]
+    pub active_bandwidth: Option<f64>,
     /// Store names, closest to HBM first. KV evicted from HBM falls through
     /// them in this order and is promoted back over each store's link
     /// instead of being recomputed. Empty: no tiering.
@@ -868,8 +880,8 @@ impl MemoryConfig {
         self.tiers.is_empty()
     }
 
-    /// Check every tier names a store the template has, reachable from a
-    /// GPU over its links, and every capacity override names a tier.
+    /// Check every spill tier and the optional active tier against the
+    /// hardware template.
     pub fn validate(&self, template: Option<&MemoryTemplate>) -> Result<(), String> {
         if let Some(StoragePrefetchPolicy::Timeout { seconds }) = self.storage_prefetch {
             if !seconds.is_finite() || seconds <= 0.0 {
@@ -878,7 +890,17 @@ impl MemoryConfig {
                 );
             }
         }
-        if self.tiers.is_empty() {
+        if let Some(bandwidth) = self.active_bandwidth {
+            if self.active_tier.is_none() {
+                return Err("[memory] active_bandwidth needs active_tier".to_string());
+            }
+            if !bandwidth.is_finite() || bandwidth <= 0.0 {
+                return Err(format!(
+                    "[memory] active_bandwidth must be finite and > 0 (got {bandwidth})"
+                ));
+            }
+        }
+        if self.tiers.is_empty() && self.active_tier.is_none() {
             if let Some(name) = self.capacity.keys().next() {
                 return Err(format!(
                     "[memory] capacity override for `{name}` but no tiers"
@@ -888,8 +910,8 @@ impl MemoryConfig {
         }
         let Some(template) = template else {
             return Err(format!(
-                "[memory] tiers {:?} but the hardware declares no [memory] stores",
-                self.tiers
+                "[memory] tiers {:?}, active_tier {:?}, but the hardware declares no [memory] stores",
+                self.tiers, self.active_tier
             ));
         };
         let mut seen = std::collections::HashSet::new();
@@ -910,10 +932,32 @@ impl MemoryConfig {
                 ));
             }
         }
-        for (name, cap) in &self.capacity {
-            if !self.tiers.iter().any(|t| t == name) {
+        if let Some(name) = &self.active_tier {
+            if self.tiers.iter().any(|tier| tier == name) {
                 return Err(format!(
-                    "[memory] capacity override for `{name}`, which is not a tier"
+                    "[memory] active_tier `{name}` cannot also be a spill tier"
+                ));
+            }
+            let store = template.normal_store(name).ok_or_else(|| {
+                format!(
+                    "[memory] active_tier `{name}` is not a capacity-bearing store of this hardware"
+                )
+            })?;
+            if store.per != Scope::Gpu {
+                return Err(format!(
+                    "[memory] active_tier `{name}` must be per = \"gpu\""
+                ));
+            }
+            if template.gpu_link_to(name).is_none() {
+                return Err(format!(
+                    "[memory] active_tier `{name}` needs a direct gpu-to-store link"
+                ));
+            }
+        }
+        for (name, cap) in &self.capacity {
+            if !self.tiers.iter().any(|t| t == name) && self.active_tier.as_deref() != Some(name) {
+                return Err(format!(
+                    "[memory] capacity override for `{name}`, which is not a tier or active_tier"
                 ));
             }
             if *cap <= 0.0 {
@@ -1111,6 +1155,12 @@ bandwidth = 1e12
     #[test]
     fn deployment_side_checks_against_the_template() {
         let t: MemoryTemplate = toml::from_str(TEMPLATE).unwrap();
+        let active: MemoryConfig = toml::from_str(
+            "active_tier = \"grace_dram\"\nactive_bandwidth = 420e9\n[capacity]\ngrace_dram = 120e9",
+        )
+        .unwrap();
+        active.validate(Some(&t)).unwrap();
+        assert_eq!(active.active_bandwidth, Some(420e9));
         let ok: MemoryConfig =
             toml::from_str("tiers = [\"grace_dram\", \"nvme\"]\n[capacity]\ngrace_dram = 200e9")
                 .unwrap();
@@ -1129,7 +1179,23 @@ bandwidth = 1e12
         assert!(bad_cap
             .validate(Some(&t))
             .unwrap_err()
-            .contains("not a tier"));
+            .contains("not a tier or active_tier"));
+        let both: MemoryConfig =
+            toml::from_str("active_tier = \"grace_dram\"\ntiers = [\"grace_dram\"]").unwrap();
+        assert!(both
+            .validate(Some(&t))
+            .unwrap_err()
+            .contains("cannot also be a spill tier"));
+        let node_active: MemoryConfig = toml::from_str("active_tier = \"nvme\"").unwrap();
+        assert!(node_active
+            .validate(Some(&t))
+            .unwrap_err()
+            .contains("per = \"gpu\""));
+        let no_active: MemoryConfig = toml::from_str("active_bandwidth = 420e9").unwrap();
+        assert!(no_active
+            .validate(Some(&t))
+            .unwrap_err()
+            .contains("needs active_tier"));
         let unreachable = TEMPLATE.replace("to = \"nvme\"", "to = \"switch\"");
         let t2: MemoryTemplate = toml::from_str(&unreachable).unwrap();
         let nv: MemoryConfig = toml::from_str("tiers = [\"nvme\"]").unwrap();

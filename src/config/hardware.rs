@@ -209,6 +209,36 @@ impl FabricConfig {
         let inter = out.latency + (gf - kf) / gf * per_rank_bytes / out.bandwidth;
         intra.max(inter)
     }
+
+    /// The fixed call latency and byte-transfer portion of a cross-rank
+    /// all-to-all. This decomposition is used by overlap-aware MoE pricing:
+    /// the wire portion may hide behind expert execution, but the call floor
+    /// remains exposed. For a group spanning nodes, `scale_out.latency` is
+    /// the per-op floor and the slower of the scale-up and scale-out byte
+    /// paths is the wire portion.
+    pub fn alltoall_latency_and_wire_time(&self, g: u32, per_rank_bytes: f64) -> (f64, f64) {
+        if g <= 1 {
+            return (0.0, 0.0);
+        }
+        let k = self.gpus_per_node.max(1);
+        let up = self.scale_up;
+        let gf = g as f64;
+        if g <= k {
+            return (up.latency, (gf - 1.0) / gf * per_rank_bytes / up.bandwidth);
+        }
+        let out = self
+            .scale_out
+            .expect("group spans nodes: validated by ClusterSpec::validate");
+        let kf = k as f64;
+        // Keep the scale-out call floor exposed. If an unusually slow
+        // scale-up path would dominate despite its lower call floor, fold
+        // only that residual into the wire portion so latency + wire stays
+        // exactly equal to `alltoall_time`.
+        let intra =
+            (up.latency + (kf - 1.0) / gf * per_rank_bytes / up.bandwidth - out.latency).max(0.0);
+        let inter = (gf - kf) / gf * per_rank_bytes / out.bandwidth;
+        (out.latency, intra.max(inter))
+    }
 }
 
 /// Per-GPU physical spec: what the accelerator can do, independent of how
@@ -332,6 +362,9 @@ mod tests {
         // (4 MB / 100 GB/s = 40 µs + 10); the NIC bounds the call.
         let t = fabric(false).alltoall_time(16, 8e6);
         assert!((t - 50e-6).abs() < 1e-12, "{t}");
+        let (latency, wire) = fabric(false).alltoall_latency_and_wire_time(16, 8e6);
+        assert_eq!(latency, 1e-5);
+        assert!((wire - 40e-6).abs() < 1e-12, "{wire}");
     }
 
     #[test]

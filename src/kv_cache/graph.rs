@@ -2052,6 +2052,7 @@ latency = 0.25
                 tp,
                 ep: 1,
                 dp_attention: false,
+                ..Default::default()
             },
             num_workers,
             memory: sel,
