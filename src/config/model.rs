@@ -63,6 +63,24 @@ pub struct WeightStream {
     /// constant active footprint.
     #[serde(default)]
     pub routing: Option<Routing>,
+    /// Block quantization scales stored beside the values (NVFP4: one fp8
+    /// scale per 16 values; MXFP4: one E8M0 per 32). Their bytes are read and
+    /// held with the weights.
+    #[serde(default)]
+    pub scale: Option<BlockScale>,
+}
+
+/// One scale of `bytes` per `group` consecutive values of a weight stream.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct BlockScale {
+    pub group: u32,
+    #[serde(default = "one_byte")]
+    pub bytes: f64,
+}
+
+fn one_byte() -> f64 {
+    1.0
 }
 
 /// Expert routing for a weight stream.
@@ -191,6 +209,9 @@ pub fn expected_distinct_experts(num_experts: u32, draws: f64) -> f64 {
 impl WeightStream {
     fn bytes_per_value(&self) -> f64 {
         self.precision.bytes_per_value()
+            + self
+                .scale
+                .map_or(0.0, |s| s.bytes / f64::from(s.group.max(1)))
     }
 
     /// Matmul FLOPs per token through this stream's active params.
@@ -807,6 +828,7 @@ mod tests {
             attention_precision: precision,
             activation_bytes: 2,
             weights: vec![WeightStream {
+                scale: None,
                 precision,
                 active_params: params,
                 resident_params: params,
@@ -828,6 +850,7 @@ mod tests {
     // expert, 1000 params per expert. active = (8+1)*1000, resident = (256+1)*1000.
     fn moe_stream(routed: u32) -> WeightStream {
         WeightStream {
+            scale: None,
             precision: Precision::Fp4,
             active_params: 9000,
             resident_params: 257_000,
@@ -1137,6 +1160,7 @@ mod tests {
         m.weights = vec![
             moe_stream(256),
             WeightStream {
+                scale: None,
                 precision: Precision::Fp8,
                 active_params: 1000,
                 resident_params: 1000,
@@ -1245,5 +1269,51 @@ mod tests {
             "#,
         );
         assert!(bad.is_err());
+    }
+}
+
+#[cfg(test)]
+mod block_scale_tests {
+    use super::*;
+
+    #[test]
+    fn block_scales_add_their_bytes_to_every_value() {
+        let stream = |scale: Option<BlockScale>| WeightStream {
+            scale,
+            precision: Precision::Fp4,
+            active_params: 1_600,
+            resident_params: 1_600,
+            routing: None,
+        };
+        assert_eq!(stream(None).bytes_per_step(1), 800);
+        // NVFP4: one fp8 scale per 16 values.
+        assert_eq!(
+            stream(Some(BlockScale {
+                group: 16,
+                bytes: 1.0
+            }))
+            .bytes_per_step(1),
+            900
+        );
+        // MXFP4: one E8M0 per 32.
+        assert_eq!(
+            stream(Some(BlockScale {
+                group: 32,
+                bytes: 1.0
+            }))
+            .bytes_per_step(1),
+            850
+        );
+        let parsed: WeightStream = toml::from_str(
+            "precision = \"fp4\"\nactive_params = 1\nresident_params = 1\nscale = { group = 32, bytes = 2 }",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.scale,
+            Some(BlockScale {
+                group: 32,
+                bytes: 2.0
+            })
+        );
     }
 }

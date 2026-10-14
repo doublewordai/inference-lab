@@ -291,6 +291,7 @@ impl Config {
             attention_precision: Precision::Bf16,
             activation_bytes: 2,
             weights: vec![WeightStream {
+                scale: None,
                 precision: Precision::Bf16,
                 active_params: 7_000_000_000,
                 resident_params: 7_000_000_000,

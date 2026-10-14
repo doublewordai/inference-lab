@@ -492,6 +492,7 @@ mod tests {
         });
         let mut model = base.model.clone();
         model.weights.push(WeightStream {
+            scale: None,
             precision: Precision::Bf16,
             active_params: 1_000_000,
             resident_params: 64_000_000,
