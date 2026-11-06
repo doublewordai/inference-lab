@@ -3,7 +3,7 @@ name = "specdec-calibration"
 version = "0.1.0"
 description = "Collate SGLang speculative-decoding acceptance and speculator parquet banks for any model/speculator combination."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
     "pyarrow>=15",
     "pandas>=2",
@@ -38,3 +38,7 @@ dev = ["pytest>=8"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.uv]
+# Patched transitive dependencies used by the dataset loader.
+constraint-dependencies = ["aiohttp>=3.14.4", "filelock>=4.2.1", "fsspec>=2026.6.0", "urllib3>=2.8.0"]
