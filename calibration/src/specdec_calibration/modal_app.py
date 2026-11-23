@@ -39,7 +39,10 @@ image = (
     .entrypoint([])  # clear the sglang server ENTRYPOINT so Modal runs our function
     # `datasets` so prompts are built IN-CONTAINER (the long-context SPEED-Bench
     # configs are huge -- building locally + shipping prompts over pickle is infeasible).
-    .pip_install("pyarrow>=15", "pyyaml>=6", "hf_transfer", "datasets>=2.18")
+    .pip_install(
+        "pyarrow>=15", "pyyaml>=6", "hf_transfer", "datasets>=2.18",
+        "aiohttp>=3.14.4", "filelock>=4.2.1", "fsspec>=2026.6.0", "urllib3>=2.8.0",
+    )
     # Mount the HF cache volume at a fresh path (the sglang image already populates
     # /root/.cache/huggingface, which Modal refuses to mount over) and point HF there.
     # SGLANG_ENABLE_SPEC_V2=1 selects the v2 speculative workers (eagle_worker_v2,
